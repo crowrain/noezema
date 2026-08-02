@@ -1,10 +1,25 @@
 # NOEZEMA — Architecture Draft
 
-> Status: draft v0.4  
+> Status: draft v0.5  
 > Language: Russian  
 > Purpose: describe the target architecture of a local-first autonomous thinker focused on curiosity, verifiable learning, persistent memory, safe action, and human-observable operation.
 
 ## 0. Что изменилось
+
+### v0.5
+
+Версия 0.5 уточняет контракты безопасности, доказательности и восстановления:
+
+- идентификаторы model run, turn, action и idempotency key создаёт только доверенный контур; LLM больше не выбирает ключ дедупликации;
+- evidence grade перенесён с отдельного evidence на версионируемый claim assessment по набору доказательств;
+- реестр claim types стал машиночитаемым: заданы количества evidence, независимость, scope и AND/OR-условия;
+- soft budget exhaustion отделён от обрыва внутри LLM/tool call;
+- добавлены операционные пути `stop_gracefully` и `abort_session`;
+- optimistic validation привязана к монотонной domain revision;
+- heartbeat продлевает lease только при живом coordinator и непросроченном phase deadline;
+- классы инструментов унифицированы, а завершение сессии вынесено из Tool Broker;
+- independence groups версионируются и пересчитывают затронутые assessments;
+- GC учитывает все ссылки доменной БД и backup manifests, а temporal facts поддерживают открытый `valid_to`.
 
 ### v0.4
 
@@ -112,11 +127,13 @@ LLM Gateway проектируется вокруг локального OpenAI-
 
 Ключ диагностического профиля хранится вне PostgreSQL и вне резервных копий базы. Это защищает от кражи диска и утечки дампа, но не от компрометации живого хоста: модель угрозы здесь именно такая, и большего шифрование не даёт.
 
-### 3.7. Верификация типизирована и ограничена областью доказательства
+### 3.7. Верификация оценивает набор доказательств
 
 Проверка подтверждает только то, что действительно измеряет. Совпадение цитаты доказывает целостность цитирования, но не истинность источника; два сайта могут копировать одну ошибку; успешный тест подтверждает результат лишь для зафиксированного окружения.
 
-Каждый evidence имеет `verification_kind` и `evidence_grade`. Минимальный набор видов: `quote_integrity`, `corroboration`, `replication`, `computation`, `formal_check`, `local_observation` и `human_review`. Допустимый переход статуса зависит от типа claim и комбинации независимых доказательств. Суждение verifier-роли само по себе статус claim не повышает.
+Отдельный evidence хранит наблюдение и способ его получения: `source_assertion`, `quote_integrity`, `experiment_run`, `computation`, `formal_check` или `local_observation`. Уровень E0–E4 не назначается отдельному evidence: он вычисляется claim assessment по набору evidence, их scope, independence groups и версии правил claim type.
+
+`corroboration` и `replication` являются методами assessment над несколькими evidence. Operator attestation хранится отдельно и не повышает grade без новых проверяемых данных. Суждение verifier-роли само по себе статус claim не меняет.
 
 ## 4. Контекст системы
 
@@ -226,32 +243,41 @@ Orchestrator недоступен для изменения из sandbox.
 
 Работа активной сессии не должна частично появляться в долговременной памяти.
 
-1. Все доменные предложения сессии пишутся только в `session_staging`. Вариант с флагом `committed=false` прямо в доменных таблицах отвергнут: он делает корректность зависимой от того, что ни один путь чтения — retrieval Memory Service, Query API, дедупликация, уникальные индексы, embedding search — не забыл фильтр, и первая же пропущенная фильтрация молча публикует незафиксированное знание.
-2. Файлы пишутся в COW overlay. Полученные артефакты сохраняются content-addressed; до commit они недостижимы из текущего workspace.
+1. Предложения изменить questions, claims, evidence и identity пишутся только в `session_staging`. Operational rows — session state, actions, model runs и audit событий уже выполненных шагов — фиксируются сразу и явно помечаются session ID.
+2. Файлы пишутся в COW overlay. Полученные артефакты сохраняются content-addressed; до commit они недостижимы из текущего workspace и долговременной памяти.
 3. При завершении overlay замораживается, для каждого файла вычисляются path, size и SHA-256, затем создаётся неизменяемый workspace manifest.
-4. Тяжёлая валидация выполняется до транзакции: схема, provenance, evidence grade, независимость источников, дедупликация и embedding-поиск похожих claims против согласованного snapshot доменного состояния. Её результат фиксируется вместе с версией состояния, на которой она проводилась.
-5. После успешной загрузки объектов Orchestrator открывает одну короткую транзакцию PostgreSQL: блокирует строку сессии `SELECT ... FOR UPDATE`, проверяет fencing-условие, применяет валидированные операции, проверяет только дешёвые инварианты — FK, уникальность, квота и неизменность версии состояния, использованной при валидации, — делает manifest текущим, записывает `SessionCommitted` и outbox-события.
-6. При расхождении версии транзакция откатывается, тяжёлая валидация повторяется, commit пробуется заново ограниченное число раз.
-7. Если транзакция так и не состоялась, предыдущий snapshot остаётся текущим. Незакреплённые объекты являются orphan и удаляются сборщиком мусора после grace period.
+4. Тяжёлая валидация выполняется до commit-транзакции против snapshot с монотонным `domain_revision`. Результат сохраняет `validated_against_revision`, payload hash, rules/config hash, independence snapshot и список подготовленных claim assessments.
+5. После загрузки объектов Orchestrator открывает короткую транзакцию PostgreSQL: блокирует session row и строку `domain_revisions(scope='knowledge')`, проверяет fencing и совпадение revision, применяет подготовленные операции, проверяет FK/unique/quota, делает manifest текущим, увеличивает domain revision, записывает терминальное событие и outbox.
+6. Если revision изменилась, транзакция откатывается, staging повторно валидируется против нового snapshot. Число повторов ограничено; после исчерпания сессия завершается без публикации staging.
+7. При неудаче предыдущий snapshot остаётся текущим. Незакреплённые объекты удаляются GC только после grace period и проверки полного root set §15.3.
 
 Fencing-условие коммита:
 
 ```text
-state = 'committing' AND lease_owner = :me AND lease_expires_at > now()
+state = 'committing'
+AND lease_owner = :me
+AND lease_expires_at > now()
+AND domain_revision = :validated_against_revision
 ```
 
-Состояния `succeeded`, `succeeded_partial`, `failed` и `cancelled` поглощающие: переход из них запрещён на уровне БД. Recovery worker блокирует ту же строку сессии, поэтому orchestrator, чью сессию уже объявили `failed` по истечении lease, не может закоммитить работу задним числом.
+Состояния `succeeded`, `succeeded_partial`, `failed` и `cancelled` поглощающие. Recovery worker блокирует ту же session row, поэтому потерявший lease Orchestrator не может закоммитить работу задним числом.
 
-Тяжёлая валидация вынесена наружу намеренно: embedding-поиск и дедупликация внутри commit-транзакции удерживали бы блокировки секундами, конкурируя с outbox-проектором, и превращали бы `commit latency` из §16.1 в метрику качества retrieval.
+Если v1 сохраняет инвариант одного writer-а памяти, revision почти всегда совпадает. Тем не менее она остаётся явной частью схемы: operator migration, maintenance job или будущий второй thinker не должны молча обойти проверку.
 
 Такой порядок даёт атомарную видимость базы и workspace без распределённой транзакции с файловой системой: authoritative pointer меняется только внутри PostgreSQL.
 
-#### 5.2.3. Lease и heartbeat
+#### 5.2.3. Lease, heartbeat и progress watchdog
 
-- Lease продлевается отдельной задачей, а не потоком, заблокированным на генерации LLM: фаза на модели класса 30B занимает десятки секунд (§5.5), и heartbeat внутри неё истёк бы на полностью здоровой сессии.
-- TTL строго больше максимального таймаута фазы плюс время загрузки модели. Иначе recovery worker убивает работающую сессию, и это выглядит как случайные сбои под нагрузкой.
-- Каждое продление фиксируется в audit log: возраст последнего heartbeat — эксплуатационный сигнал, а не внутреннее состояние процесса.
-- Если продлить lease не удалось, Orchestrator прекращает работу сам и не пытается коммитить: право на фиксацию уже могло перейти к recovery worker.
+Heartbeat исполняется независимо от блокирующего LLM/backend вызова, но не является безусловным «я жив»:
+
+- coordinator фиксирует `last_progress_at` и `phase_deadline` при входе в фазу и после каждого терминального action result;
+- watchdog прерывает фазу при превышении deadline;
+- heartbeat продлевает lease условным UPDATE только если session owner совпадает, состояние не терминальное и phase deadline не просрочен;
+- если coordinator перестал подтверждать здоровье либо deadline истёк, heartbeat прекращает продление даже при живом процессе;
+- TTL равен нескольким heartbeat intervals с запасом на scheduler jitter; максимальная длительность фазы задаётся отдельно через `phase_deadline`;
+- при неуспешном conditional UPDATE Orchestrator прекращает новые действия и не пытается коммитить.
+
+Обычное продление хранится в `sessions.last_heartbeat_at` и экспортируется как gauge. Audit event создаётся при смене владельца, пропуске heartbeat, превышении deadline и recovery, но не на каждом периодическом UPDATE: иначе неизменяемый журнал превращается в высокочастотную телеметрию.
 
 ### 5.3. Curiosity Engine
 
@@ -372,7 +398,16 @@ Policy Engine авторизует действие по capability-профил
 
 ### 5.7. Tool Broker
 
-Предоставляет модели типизированные инструменты. Каждый объявляет класс идемпотентности (§15.2) и профили, в которых он вообще существует:
+Tool contract использует единый enum класса повторяемости:
+
+```text
+pure                 повтор безопасен; долговременного наблюдения не создаёт
+observation          read-only, но результат зависит от времени; после старта не retry
+idempotent(key)      backend гарантирует один эффект по host-generated key
+non_idempotent       автоматический retry после старта запрещён
+```
+
+Инструменты первой версии:
 
 ```text
 инструмент         класс            доступность
@@ -381,18 +416,17 @@ workspace.list     pure             все профили
 workspace.write    idempotent(key)  все профили, только session overlay
 artifact.create    idempotent(key)  все профили
 memory.search      pure             все профили
-question.create    idempotent(key)  все профили
+question.create    idempotent(key)  все профили, запись в staging
 message.reply      idempotent(key)  все профили
 shell.execute      non_idempotent   все профили
 python.execute     non_idempotent   все профили
-web.search         read_only        sealed: локальный индекс; curated: SearxNG; open_lab: внешний API
-web.fetch          read_only        curated, open_lab
-session.complete   non_idempotent   все профили
+web.search         observation      sealed: локальный индекс; curated: SearxNG; open_lab: внешний API
+web.fetch          observation      curated, open_lab
 ```
 
-`read_only` означает отсутствие внешнего эффекта, но не идентичность результата: повтор создаёт новое наблюдение с новым `retrieved_at`, поэтому автоматический retry после `ActionStarted` запрещён и для него.
+Решение завершить сессию — `decision.kind=complete` в протоколе §7, а не инструмент Tool Broker. Это внутренний fenced transition Orchestrator и не имеет внешнего эффекта.
 
-Инструмент, недоступный в текущем профиле, отсутствует в схеме, передаваемой модели, а не возвращает ошибку: модель не должна видеть право, которого у неё нет. Tool Broker не преобразует неизвестное действие в shell-команду «по догадке».
+Инструмент, недоступный профилю, отсутствует в схеме модели и всё равно отклоняется Policy Engine при прямой попытке вызова. Host-generated idempotency key навсегда связывается с tool name и canonical arguments hash; повтор ключа с другими аргументами является инцидентом.
 
 ### 5.8. Sandbox Runtime
 
@@ -416,16 +450,17 @@ no SSH keys or host secrets
 
 ### 5.9. Memory Service
 
-Отвечает за поиск, дедупликацию, консолидацию и проверку памяти. Модель предлагает изменения через типизированные команды, но не меняет системные таблицы напрямую.
-
-Memory Service:
+Модель предлагает изменения только через staging-команды. Memory Service:
 
 - различает epistemic confidence и freshness;
-- проверяет допустимость статуса claim по его типу и evidence grade;
+- строит claim assessment по evidence set, claim type rules, scope и independence snapshot;
 - управляет сроками ре-верификации без автоматического объявления устаревшего знания ложным;
 - хранит dependency fingerprints и reproducibility capsules;
+- инвалидирует assessments при изменении rules, dependencies или source grouping;
 - ограничивает число активных claims в теме и требует консолидацию;
-- отклоняет циклическое использование claim как собственного доказательства.
+- запрещает циклическое использование claim как собственного доказательства.
+
+Ни LLM, ни verifier не записывают `effective_grade` напрямую: они создают evidence и предложения, а grade вычисляет версионируемый rules engine.
 
 ### 5.10. Data Store и Audit Log
 
@@ -478,15 +513,16 @@ Research Proxy:
 
 ## 6. Цикл и машина состояний сессии
 
-Канонический enum сессии:
+Канонический enum:
 
 ```text
 created | waking | orienting | selecting_question | planning |
-exploring | verifying | consolidating | reporting | committing |
+exploring | verifying | stopping | consolidating | reporting |
+committing | aborting |
 succeeded | succeeded_partial | failed | cancelled
 ```
 
-Состояние узла `sleeping | paused` хранится отдельно от состояния сессии. Сайт отображает именно этот enum, а не собственный сокращённый набор.
+Состояние узла `sleeping | paused` хранится отдельно. Поля `stop_requested_at` и `abort_requested_at` фиксируют operator intent до достижения безопасной границы.
 
 ```mermaid
 stateDiagram-v2
@@ -498,28 +534,22 @@ stateDiagram-v2
     Planning --> Exploring
     Exploring --> Exploring: действие → наблюдение
     Exploring --> Verifying
-    Exploring --> Consolidating: бюджет исчерпан
-    Verifying --> Exploring: нужны дополнительные данные
+    Verifying --> Exploring: нужны данные
     Verifying --> Consolidating
+    Stopping --> Consolidating
     Consolidating --> Reporting
     Reporting --> Committing
     Committing --> Succeeded
     Committing --> SucceededPartial
+    Created --> Aborting
+    Aborting --> Cancelled
     Succeeded --> [*]
     SucceededPartial --> [*]
-    Created --> Cancelled
-    Waking --> Failed
-    Orienting --> Failed
-    SelectingQuestion --> Failed
-    Planning --> Failed
-    Exploring --> Failed
-    Verifying --> Failed
-    Consolidating --> Failed
-    Reporting --> Failed
-    Committing --> Failed
     Failed --> [*]
     Cancelled --> [*]
 ```
+
+Переходы ошибки из любой нетерминальной фазы в `failed` и operator transitions показаны текстом, чтобы диаграмма не скрывала основной цикл множеством одинаковых рёбер. Терминальные состояния поглощающие.
 
 ### 6.1. Пробуждение и ориентация
 
@@ -527,67 +557,80 @@ Orchestrator создаёт lease, фиксирует конфигурацию, 
 
 ### 6.2. Выбор вопроса и планирование
 
-Curiosity Engine ранжирует кандидатов. План формулирует наблюдения, которые способны повысить или снизить уверенность, критерии остановки и требуемые виды проверки.
+Curiosity Engine ранжирует кандидатов. План формулирует наблюдения, которые могут изменить уверенность, критерии остановки и требуемые assessment methods.
 
 ### 6.3. Исследование
 
-Каждый шаг содержит краткую публичную мотивировку, одно типизированное действие, ожидаемую информацию и ссылку на полученное наблюдение. Несколько действий за один ответ запрещены: это сохраняет точную границу policy check и crash recovery.
+Каждый шаг содержит краткую публичную мотивировку, одно типизированное решение, ожидаемую информацию и ссылку на наблюдение. Несколько tool calls за один ответ запрещены.
 
-### 6.4. Верификация
+### 6.4. Верификация и assessment
 
-Evidence получает один из видов:
+Отдельные evidence kinds:
 
+- `source_assertion` — утверждение из источника с точным source chunk;
 - `quote_integrity` — сохранённый фрагмент совпадает с источником по хешу и диапазону;
-- `corroboration` — утверждение независимо поддержано источниками без общего первичного происхождения;
-- `replication` — эксперимент повторён в зафиксированном окружении;
-- `computation` — числовой результат получен воспроизводимым вычислением;
-- `formal_check` — утверждение проверено формальным инструментом в заданной модели;
-- `local_observation` — наблюдение относится к конкретной локальной системе и моменту;
-- `human_review` — оператор явно подтвердил вывод и область подтверждения.
+- `experiment_run` — один запуск воспроизводимого эксперимента;
+- `computation` — результат для точных входов и алгоритма;
+- `formal_check` — результат формального инструмента в заданной модели;
+- `local_observation` — наблюдение конкретной локальной системы и времени.
 
-Уровни evidence:
+Claim assessment агрегирует эти записи и получает effective grade:
 
 ```text
-E0 unverified
-E1 integrity_checked
-E2 single_method_supported
-E3 independently_corroborated_or_replicated
-E4 formally_or_repeatedly_verified_in_declared_scope
+E0  unverified
+E1  integrity_checked
+E2  single_method_supported_in_scope
+E3  independently_corroborated_or_replicated_in_scope
+E4  formally_verified_or_repeatedly_replicated_in_declared_scope
 ```
 
-Тип claim определяет минимальный уровень и допустимые методы. Например, `quote_integrity` не поднимает внешний фактический claim выше E1; локальный benchmark не становится универсальным свойством модели; два пересказа одного первичного источника не дают независимой corroboration.
+Grade вычисляет rules engine по `claim_type_rules`: количество evidence, допустимые виды, independence groups, покрытие scope и counterevidence. `corroboration` и `replication` — результаты агрегации, а не значения отдельной строки evidence.
 
-Verifier ищет контрпримеры, общие первоисточники, ошибки эксперимента и несовпадение области claim с областью проверки. Без подходящего evidence вывод остаётся `hypothesis`.
+Verifier ищет контрпримеры, общие первоисточники, ошибки эксперимента и несовпадение scope. Он предлагает assessment, но окончательный grade механически пересчитывает Memory Service. Operator attestation может добавить комментарий или новые данные, но не повышает grade сама по себе.
 
 ### 6.5. Консолидация, отчёт и commit
 
-Curator предлагает изменения памяти. Memory Service валидирует схему, происхождение, зависимости и evidence grade. Затем формируются итог, открытые вопросы, handoff и публичный отчёт.
+Curator предлагает изменения памяти. Memory Service валидирует схему, provenance, зависимости и assessment. Затем формируются итог, открытые вопросы, handoff и публичный отчёт.
 
-Единственный сигнал нормального завершения от модели — действие `session.complete`. Boolean-поле с тем же смыслом не используется. После него Orchestrator переходит в `reporting` и `committing` и выполняет протокол §5.2.2.
+Решение модели `decision.kind=complete` переводит Orchestrator в `consolidating`. После подготовки staging Orchestrator проходит `reporting → committing` и выполняет §5.2.2. Boolean или tool с дублирующей семантикой не используется.
 
-При ошибке в любой активной фазе Orchestrator сам создаёт минимальный failure report: причина, последняя завершённая операция, неопределённые действия и ссылки на диагностические артефакты. Доступность LLM для этого не требуется.
+При ошибке Orchestrator создаёт host-generated failure report: причина, последняя завершённая операция, неопределённые действия и ссылки на диагностику. LLM для этого не требуется.
 
-### 6.6. Исчерпание бюджета
+### 6.6. Soft budget exhaustion
 
-Исчерпание лимита шагов, времени или токенов — штатный исход, а не сбой. Сессия, упёршаяся в лимит, не теряет работу.
+Soft budgets проверяются только на безопасной границе: до следующего LLM/tool call и после терминального результата предыдущего action. Часть токенов и времени заранее резервируется для consolidation/report/commit.
 
-- Часть бюджета резервируется под `consolidating`, `reporting` и `committing` и не может быть израсходована в `exploring`. Без резерва система, дошедшая до лимита, не имеет ресурсов даже на то, чтобы зафиксировать уже сделанное.
-- При исчерпании рабочей части Orchestrator переводит сессию в `consolidating` с причиной `budget_exhausted`. Curator фиксирует то, что уже прошло верификацию; незакрытые линии уходят в handoff как открытые вопросы.
-- Claims, не набравшие требуемый evidence grade, сохраняются как `hypothesis` со ссылкой на проделанные проверки, а не отбрасываются: проделанная работа по исключению вариантов — тоже результат.
-- Сессия завершается как `succeeded_partial`. Для метрик §16.2 она считается результативной, если появилось новое evidence.
-- Жёсткий таймаут, нарушение политики и падение процесса по-прежнему ведут в `failed` с отбрасыванием staging: там состояние может быть некорректным, а не просто неполным. Разница принципиальна — «не успели» и «не знаем, что произошло» требуют разной обработки.
+При исчерпании soft budget:
 
-## 7. Структурированный протокол действий
+- новые действия не запускаются;
+- сессия переходит в `stopping` с причиной `budget_exhausted`;
+- verified work и hypotheses с выполненными проверками проходят обычную валидацию;
+- после commit терминальное состояние — `succeeded_partial`.
 
-Модель возвращает ровно один envelope:
+`succeeded_partial` допустим только если нет `ActionStarted` без терминального результата, последний model output полностью прошёл schema validation, phase deadline не был нарушен и staging успешно валидирован.
+
+Обрыв генерации по `max_output_tokens`, hard timeout LLM/tool, нарушение политики, падение процесса или неопределённый исход действия не являются soft exhaustion. Они ведут в `failed` и отбрасывают staging.
+
+### 6.7. Остановка оператором
+
+- `stop_gracefully` запрещает запуск следующего действия. На ближайшей безопасной границе сессия проходит `stopping → consolidating → reporting → committing` и завершается `succeeded_partial` с причиной `operator_stop`.
+- `abort_session` запрещает новые действия и отбрасывает staging. Если активного action нет, сессия проходит `aborting → cancelled`.
+- Если во время abort есть `ActionStarted`, Orchestrator ждёт его терминального результата до tool deadline. При `ActionOutcomeUnknown` итог — `failed`, не `cancelled`.
+- Во время короткой commit-транзакции обе команды отклоняются: authoritative state уже меняется атомарно.
+
+## 7. Структурированный протокол решений
+
+Перед каждым вызовом Orchestrator создаёт `turn_id` и `model_run_id`. Они связываются с input/context manifest вне текста ответа и не выбираются LLM.
+
+Модель возвращает одно решение без идентификаторов дедупликации:
 
 ```json
 {
-  "request_id": "01J...ULID",
   "public_rationale": "Проверить наличие официальной спецификации",
   "expected_information": "Первичный источник либо подтверждённое отсутствие",
-  "action": {
-    "type": "web.search",
+  "decision": {
+    "kind": "tool",
+    "tool": "web.search",
     "arguments": {
       "query": "название технологии official specification"
     }
@@ -595,16 +638,30 @@ Curator предлагает изменения памяти. Memory Service в�
 }
 ```
 
-Завершение использует тот же envelope с `"action": {"type": "session.complete", "arguments": {...}}`. Ответ проверяется JSON Schema; неизвестный action type отклоняется, а не преобразуется в shell.
+Нормальное завершение:
 
-Lifecycle действия:
+```json
+{
+  "public_rationale": "План выполнен, результаты готовы к консолидации",
+  "decision": {
+    "kind": "complete",
+    "reason": "goal_reached"
+  }
+}
+```
+
+После schema validation Tool Broker создаёт host-generated `action_id` и `idempotency_key`, связывает их с `model_run_id`, tool name и canonical arguments hash. Ограничение `UNIQUE(actions.model_run_id)` гарантирует, что один model run не породит два действия. Повтор того же key допустим только с тем же hash.
+
+Lifecycle tool action:
 
 ```text
 ActionProposed → PolicyEvaluated → ActionAccepted → ActionStarted
               → ActionCompleted | ActionFailed | ActionOutcomeUnknown
 ```
 
-`request_id` обеспечивает дедупликацию записей в Broker, но не делает произвольную shell-команду идемпотентной. Если процесс упал после старта и до надёжной записи результата, действие получает `ActionOutcomeUnknown`. Оно не повторяется вслепую; незавершённый overlay отбрасывается, а следующая сессия начинает с последнего committed snapshot. Повтор разрешён только для инструмента с явной идемпотентной семантикой и тем же ключом.
+`decision.kind=complete` не проходит Tool Broker: Orchestrator применяет идемпотентный state transition под lease/fencing. Неизвестный decision kind или tool отклоняется.
+
+Если процесс упал после `ActionStarted`, action получает `ActionOutcomeUnknown` и не повторяется вслепую. Повтор разрешён только для `idempotent(key)` с тем же host-generated key; для `observation` создаётся новый model run и новое наблюдение с новым timestamp.
 
 ## 8. Модель памяти
 
@@ -623,18 +680,20 @@ epistemic_status: hypothesis | supported | disputed | refuted | deferred
 epistemic_confidence
 freshness_status: fresh | due | stale | unknown
 valid_from
-valid_to
+valid_to: nullable
+as_of
 observed_at
 reverify_after
 dependency_fingerprint
+current_assessment_id
 evidence[]
 counterevidence[]
 created_in_session
 ```
 
-`epistemic_confidence` оценивает поддержку утверждения доказательствами. Она меняется при появлении evidence, counterevidence или пересмотре модели аргументации, но не уменьшается автоматически только из-за времени. `freshness_status` показывает, насколько актуальна проверка для зависящего от времени claim.
+`epistemic_confidence` оценивает поддержку claim текущим assessment. Она меняется при новых evidence, counterevidence, изменении independence groups или revision правил, но не уменьшается автоматически только из-за времени. `freshness_status` отдельно показывает актуальность проверки.
 
-Статус `supported` или `refuted` требует evidence grade, допустимый для `claim_type`. Число confidence не заменяет доказательства и не сравнивается между типами claim без калибровки.
+Effective grade принадлежит `claim_assessment` и вычисляется по набору evidence. Число confidence не заменяет assessment и не сравнивается между claim types без калибровки.
 
 ### 8.3. Процедурная память
 
@@ -657,45 +716,60 @@ created_in_session
 
 ### 8.6. Жизненный цикл знания
 
-- Срок ре-верификации выводится из реестра §8.7: claim type, volatility и valid interval. Модель может предложить более короткий срок, но не более длинный.
-- Истечение `reverify_after` переводит freshness в `due` или `stale`, но не меняет автоматически epistemic confidence и не объявляет claim ложным.
-- Claim в статусе `hypothesis` не может служить достаточным evidence для другого claim; он может быть только зависимостью или направлением поиска.
-- Локальный эксперимент не «бессрочен»: он получает reproducibility capsule с кодом, входами, seed, зависимостями, hardware/backend fingerprint и границами применимости.
-- Изменение dependency fingerprint ставит связанные claims в очередь перепроверки.
+- Срок ре-верификации выводится из claim type rules, volatility, `as_of` и valid interval. Модель может предложить более короткий срок, но не более длинный.
+- Для текущего temporal fact обязательны `as_of` и scope. `valid_to` может быть NULL и означает «конец действия пока неизвестен», а не бесконечную истинность.
+- Истечение `reverify_after` переводит freshness в `due/stale`, но само по себе не меняет epistemic confidence.
+- Hypothesis не является достаточным evidence для другого claim; она может быть зависимостью или направлением поиска.
+- Эксперимент получает reproducibility capsule с кодом, входами, seed, зависимостями, hardware/backend fingerprint и scope.
+- Изменение dependency fingerprint, rules version или independence snapshot инвалидирует текущий assessment и ставит claim в очередь переоценки.
 - На тему действует лимит активных claims; превышение запускает консолидацию.
-- Физического удаления из истории нет: текущая запись обновляется транзакционно, а изменения фиксируются в `claim_revisions` и audit log.
+- История сохраняется в `claim_revisions`, `claim_assessments` и audit log.
 
 ### 8.7. Реестр типов утверждений
 
-`claim_type` — не свободный текст, а закрытый реестр в конфигурации. На него опираются §3.7, §6.4, §8.2, §8.6 и §11.3, поэтому без него все правила доказательности остаются декларацией. Для каждого типа заданы минимальный evidence grade для перехода в `supported`, достаточные и заведомо недостаточные виды проверки, volatility как база для `reverify_after` и требование к scope.
+`claim_type` — закрытый версионируемый реестр. Правило является исполняемым выражением над evidence set, а не текстовой подсказкой. Оно задаёт:
+
+- допустимые evidence kinds;
+- минимальное количество evidence и independence groups;
+- AND/OR-комбинации методов;
+- предикат покрытия claim scope;
+- максимальный grade при отсутствии обязательных полей;
+- volatility и расчёт `reverify_after`.
+
+Базовые типы v1:
 
 ```text
-claim_type          min_grade  достаточные виды               недостаточно
-local_observation   E2         local_observation, replication, corroboration
-                               computation
-mathematical        E2         computation, formal_check       corroboration
-procedural          E3         replication, local_observation  quote_integrity
-external_fact       E3         независимая corroboration,      quote_integrity,
-                               replication, human_review       один источник
-temporal_fact       E3         corroboration с valid interval  corroboration без
-                                                               временной привязки
-self_model          E2         local_observation, human_review любой внешний источник
+claim_type             min assessment для supported
+local_observation      E2: >=1 local_observation, exact environment/time scope
+computed_result        E2: >=1 computation, exact inputs+algorithm scope
+formal_theorem         E4: formal_check/proof artifact, axioms/model scope
+empirical_conjecture   E3: >=2 experiment_run в независимых environments
+procedural             E3: >=2 успешных replication с dependency fingerprints
+external_fact          E3: >=2 source_assertion из разных independence groups
+temporal_fact          E3: external_fact rule + обязательные as_of и temporal scope
+self_model             E2: локальное наблюдение config/identity state
 ```
 
-```text
-claim_type          volatility        обязательный scope
-local_observation   срок жизни окружения   hardware/backend fingerprint
-mathematical        бессрочно              набор аксиом или модель
-procedural          версия инструмента     версии зависимостей
-external_fact       от дней до лет         источник и дата
-temporal_fact       от часов до месяцев    valid_from/valid_to
-self_model          до смены identity      config snapshot
+Пример машиночитаемого правила:
+
+```yaml
+external_fact:
+  supported:
+    min_grade: E3
+    all:
+      - count(kind: source_assertion, integrity: checked) >= 2
+      - count_distinct(independence_group) >= 2
+      - every(scope_covers_claim) == true
+      - counterevidence_unresolved == false
+  max_grade:
+    quote_integrity_only: E1
+    operator_attestation_only: E0
+  volatility: configurable
 ```
 
-- `quote_integrity` подтверждает целостность цитирования и не поднимает выше E1 ни один тип, кроме случая, когда предметом claim является сам факт наличия текста в источнике.
-- `temporal_fact` без заполненных `valid_from` и `valid_to` не может подняться выше `hypothesis`.
-- Тип назначается при создании claim и меняется только через revision с обоснованием: смена типа — самый простой способ обойти требование grade, поэтому она аудируется отдельно.
-- Минимальные grade, volatility и правила scope живут в `config_snapshots.claim_type_rules` и фиксируются на сессию. Их изменение требует ADR (§21.8) и не действует задним числом на уже зафиксированные claims.
+Finite computation не доказывает universal theorem: она создаёт `computed_result` либо counterexample в точном диапазоне. Operator attestation не является evidence kind и без новых данных grade не повышает.
+
+Тип назначается при создании claim и меняется только revision с обоснованием и новым assessment. Rules живут в `config_snapshots.claim_type_rules`; новая версия не меняет прошлые revisions молча, но ставит затронутые актуальные claims в очередь переоценки.
 
 ## 9. Познание нового и защита от повторений
 
@@ -782,16 +856,22 @@ deferred → selected
 
 ### 11.3. Доказательства из внешних данных
 
-Источник может поддерживать claim только в пределах своего типа и provenance. Для внешнего фактического claim один недоверенный документ даёт не более E1/E2 по правилам claim type; повышение требует первичного источника, независимой corroboration, replication или human review. Независимость источников проверяется по общему происхождению, ссылкам и совпадающим фрагментам, а не только по доменам.
+Источник поддерживает claim только в пределах scope и provenance. Один внешний документ не создаёт independent corroboration независимо от числа его зеркал.
 
-`independence_group` вычисляется системой детерминированно, а не заявляется моделью: иначе corroboration ломается ровно тем способом, который описан в §20.7, и E3 достигается двумя зеркалами одного текста. Источники попадают в одну группу при любом из условий:
+Independence grouping выполняется детерминированным versioned алгоритмом. Snapshot группы фиксирует:
 
-- совпадает registrable domain или canonical URI после нормализации;
-- совпадает `parent_source_id`, либо один источник достижим из другого по цепочке `sources.parent_source_id`;
-- перекрытие нормализованного текста в цитируемой области выше порога (shingling или simhash);
-- документы указывают один и тот же первичный источник.
+- algorithm/version и thresholds;
+- Public Suffix List и URI-normalization version;
+- source membership;
+- dependency edges и основание каждого объединения;
+- text-overlap fingerprint;
+- время расчёта.
 
-Пока источники в одной группе, они дают один вклад в corroboration, сколько бы их ни было. Разделить группу может независимая цепочка provenance или `human_review`; модель вправе предложить разделение с обоснованием, но не подтвердить его сама.
+Источники объединяются при общем registrable domain, canonical/parent source, существенном перекрытии текста или ссылке на один первичный источник. Эти признаки консервативны: они могут недооценить независимость, но не должны завышать grade.
+
+Operator attestation не разделяет группу. Исправление ложного объединения оформляется как отдельная source-graph correction с проверяемой provenance-цепочкой, actor и audit record; это меняет классификацию, но само не считается evidence claim.
+
+Если новый источник или correction объединяет ранее разные группы, зависимые claim assessments инвалидируются и пересчитываются. Claim может перейти из `supported` в `disputed/hypothesis` через обычную revision — прошлый grade не сохраняется только потому, что когда-то был вычислен.
 
 ### 11.4. Остаточные риски
 
@@ -879,14 +959,16 @@ Live timeline получает committed события из outbox-проект
 
 ### 13.2. Command API
 
-Command API не вызывает Tool Broker и не меняет память напрямую. Он выполняет аутентификацию, CSRF-защиту, schema validation, rate limit и записывает команду в durable inbox с idempotency key. Orchestrator забирает команду, проверяет допустимость относительно текущего состояния и публикует результат.
+Command API не вызывает Tool Broker и не меняет память напрямую. Он выполняет authentication, CSRF protection, schema validation, rate limit и записывает команду в durable inbox с host-generated idempotency key. Orchestrator применяет её относительно текущего session state и публикует результат.
 
-Есть два разных типа входа:
+Входы разделены:
 
-- `user_message` — свободный текст для мыслителя; всегда недоверенные данные без системных прав;
-- `operator_command` — типизированная команда владельца: `pause`, `resume`, `wake_now`, `cancel_session`, `set_budget`, `set_access_profile`, `restore_checkpoint`.
+- `user_message` — свободный текст для мыслителя; недоверенные данные без системных прав;
+- `operator_command` — закрытый enum: `pause`, `resume`, `wake_now`, `stop_gracefully`, `abort_session`, `set_budget`, `set_access_profile`, `restore_checkpoint`.
 
-Свободный текст никогда не парсится как operator command. Для опасных команд применяются повторное подтверждение, reason field и журналирование actor/session/IP. В удалённом режиме добавляются TLS, secure cookies, SameSite, MFA или reverse-proxy authentication.
+Свободный текст никогда не парсится как operator command. `stop_gracefully` пытается сохранить проверенную работу на безопасной границе; `abort_session` явно отбрасывает staging. UI объясняет различие до подтверждения.
+
+Для опасных команд применяются повторное подтверждение, reason field и audit actor/session/IP. В удалённом режиме добавляются TLS, secure cookies, SameSite и MFA либо reverse-proxy authentication.
 
 ### 13.3. Главная страница
 
@@ -915,7 +997,9 @@ Timeline строится из audit events и actions, а не из постф�
 
 ### 13.5. Знания
 
-Интерфейс показывает epistemic status и freshness раздельно, valid interval, evidence scope, counterevidence, dependency fingerprint и историю revision. Из каждого claim можно перейти к точному фрагменту источника или reproducibility capsule.
+Интерфейс показывает epistemic status и freshness раздельно, current assessment, effective grade, rule version, evidence set, independence snapshot, valid interval, scope, counterevidence и dependency fingerprint. Из claim можно перейти к точному source chunk, experiment run или reproducibility capsule.
+
+При инвалидированном assessment UI не продолжает показывать старый grade как действующий: отображаются предыдущая оценка, причина invalidation и состояние очереди переоценки.
 
 ### 13.6. Сообщения
 
@@ -931,26 +1015,47 @@ created → queued → delivered → acknowledged → answered | expired
 
 ### 13.7. Управление
 
-Каждая кнопка создаёт typed operator command. UI показывает `accepted | rejected | executing | completed | failed`, а не оптимистично меняет состояние до ответа Orchestrator. Восстановление checkpoint недоступно во время активной сессии и требует отдельного подтверждения.
+Каждая кнопка создаёт typed operator command. UI показывает `accepted | rejected | waiting_safe_boundary | executing | completed | failed`.
+
+- `stop_gracefully` показывает, что verified staging будет зафиксирован как partial success;
+- `abort_session` предупреждает об удалении staging;
+- при активном non-idempotent action обе команды показывают ожидание его терминального результата;
+- restore checkpoint недоступен во время активной сессии и требует отдельного подтверждения.
 
 ## 14. Модель данных v1
 
-Ниже — логическая схема; типы, индексы и ограничения уточняются миграциями.
+Ниже — логическая схема; конкретные типы, FK, индексы и CHECK constraints задаются миграциями.
 
 ```text
 sessions
-  id, state, lease_owner, lease_expires_at, question_id,
-  base_workspace_manifest_id, committed_workspace_manifest_id,
+  id, state, lease_owner, lease_expires_at, last_heartbeat_at,
+  last_progress_at, phase_deadline, stop_requested_at, abort_requested_at,
+  question_id, base_workspace_manifest_id, committed_workspace_manifest_id,
   config_snapshot_id, started_at, finished_at, termination_reason
 
+domain_revisions
+  scope, revision, updated_at
+
 session_staging
-  id, session_id, aggregate_type, operation,
-  payload, schema_version, created_at
+  id, session_id, aggregate_type, operation, payload, payload_hash,
+  schema_version, validation_status, validated_against_revision,
+  validation_rules_hash, independence_snapshot_id, created_at
+
+staging_artifacts
+  staging_id, artifact_id
+
+model_runs
+  id, session_id, turn_id, phase, model_fingerprint,
+  context_manifest_hash, context_manifest_artifact_id,
+  prompt_version, tool_schema_hash,
+  input_tokens, output_tokens, latency_ms, finish_reason,
+  output_schema_valid, raw_response_artifact_id,
+  raw_retention_until, created_at
 
 actions
-  id, session_id, request_id, tool, arguments_hash,
-  policy_decision, state, started_at, finished_at,
-  result_artifact_id, error_code
+  id, session_id, model_run_id, idempotency_key, idempotency_class,
+  tool, arguments_hash, policy_decision, state,
+  started_at, finished_at, result_artifact_id, error_code
 
 questions
   id, text, origin, state, priority, parent_id,
@@ -959,25 +1064,49 @@ questions
 claims
   id, statement, claim_type, epistemic_status,
   epistemic_confidence, freshness_status,
-  valid_from, valid_to, observed_at, reverify_after,
-  dependency_fingerprint, topic, created_in_session
+  valid_from, valid_to, as_of, observed_at, reverify_after,
+  dependency_fingerprint, topic, current_assessment_id,
+  created_in_session
 
 claim_revisions
   id, claim_id, session_id, previous_value, new_value,
   changed_at, reason_audit_event_id
 
 evidence
-  id, claim_id, relation, verification_kind, evidence_grade,
+  id, claim_id, relation, verification_kind,
   scope, source_id, chunk_id, verification_artifact_id,
-  independence_group, created_in_session
+  created_in_session
+
+claim_assessments
+  id, claim_id, effective_grade, epistemic_status,
+  rules_version, rules_hash, independence_snapshot_id,
+  evidence_set_hash, assessed_scope, confidence,
+  valid, invalidation_reason, created_in_session, created_at
+
+assessment_evidence
+  assessment_id, evidence_id, role
+
+operator_attestations
+  id, actor_id, claim_id, body, supporting_artifact_id, created_at
 
 sources
   id, source_type, canonical_uri, retrieved_at,
   content_hash, metadata, parent_source_id
 
+source_independence_snapshots
+  id, algorithm_version, thresholds, psl_fingerprint,
+  uri_normalizer_version, created_at
+
+source_independence_members
+  snapshot_id, source_id, group_id, basis
+
+source_dependency_edges
+  id, from_source_id, to_source_id, kind,
+  basis_artifact_id, origin, created_at
+
 artifacts
   id, sha256, media_type, size, storage_key,
-  safety_status, created_in_session
+  safety_status, created_in_session, retention_class
 
 artifact_chunks
   id, artifact_id, byte_or_text_range, sha256,
@@ -991,17 +1120,12 @@ workspace_entries
   manifest_id, path, artifact_id, mode, size, sha256
 
 messages
-  id, sender, body, priority, state, created_at,
+  id, sender, body, priority, state, expires_at, created_at,
   delivered_at, acknowledged_at, response_audit_event_id
 
 operator_commands
   id, actor_id, type, arguments, state, idempotency_key,
   reason, created_at, finished_at, result
-
-model_runs
-  id, session_id, action_id, request_id, phase, model_fingerprint,
-  context_manifest_hash, prompt_version, tool_schema_hash,
-  input_tokens, output_tokens, latency_ms, finish_reason
 
 config_snapshots
   id, model, embeddings, prompts, policy,
@@ -1017,128 +1141,165 @@ outbox_events
 
 checkpoints
   id, session_id, workspace_manifest_id,
-  database_commit_id, created_at
+  database_commit_id, domain_revision, created_at
+
+backup_manifests
+  id, database_recovery_point, artifact_inventory_hash,
+  artifact_inventory_artifact_id, retention_until,
+  verified_at, created_at
 ```
 
-### 14.1. Источник правды и транзакции
+### 14.1. Источник правды и границы видимости
 
-Доменное состояние — источник правды. `audit_events` и `outbox_events` добавляются в той же транзакции, что и доменное изменение. Приложения не могут UPDATE/DELETE audit rows; это закрепляется отдельной DB role и, при необходимости, trigger-ом.
+Доменное состояние — источник правды. `audit_events` и `outbox_events` добавляются в той же транзакции, что и наблюдаемое доменное изменение. Append-only закрепляется отдельной DB role и trigger/permissions.
 
-`model_runs.action_id` связывает вызов модели с порождённым действием. Без него страница сессии §13.4 не может показать, какой именно вызов и с каким fingerprint дал конкретный шаг: пара `(session_id, phase)` при нескольких шагах в фазе неоднозначна. Для вызовов, не породивших действие — отклонённых схемой или завершившихся ошибкой, — поле пустое, но `request_id` сохраняется.
+Staging содержит только предложения долговременной памяти и identity. Session state, model runs, actions, policy decisions и результаты уже выполненных инструментов являются operational history и фиксируются сразу: иначе live timeline и recovery были бы невозможны. Query API явно различает committed knowledge, active operational events и discarded staging diagnostics.
 
-`session_staging` не видно Memory Service retrieval и обычному Query API. При `SessionCommitted` валидированные операции применяются к доменным таблицам, создаются revisions, обновляется workspace pointer и записывается checkpoint. После commit staging очищается асинхронно. При failure он отбрасывается.
+### 14.2. Host-generated causality и idempotency
 
-### 14.2. Порядок и совместимость событий
+`model_runs.id` и `turn_id` создаёт Orchestrator. `actions.id` и `idempotency_key` создаёт Tool Broker после валидного model output.
 
-Пара `(session_id, sequence)` уникальна. Тип события и `schema_version` обязательны. Consumers должны игнорировать неизвестные необязательные поля и останавливать обработку неизвестной major version. Outbox projector идемпотентен по `outbox_events.id`.
+Обязательные ограничения:
 
-Audit log не обещает полноценный replay бизнеса, но обязан позволять объяснить каждое изменение claim, действие, policy decision, команду оператора и смену состояния сессии.
+```text
+UNIQUE(model_runs.session_id, model_runs.turn_id)
+UNIQUE(actions.model_run_id)
+UNIQUE(actions.session_id, actions.idempotency_key)
+```
+
+LLM не может выбрать или переиспользовать ключ. При conflict по `(session_id, idempotency_key)` Broker читает существующую строку: совпадающие tool/arguments_hash возвращают прежний result, несовпадение фиксируется как security incident. Межстрочный инвариант не моделируется CHECK constraint, потому что PostgreSQL CHECK не сравнивает разные строки. Model run без action допустим для schema failure, complete decision и backend error.
+
+### 14.3. Assessment и versioned validation
+
+Effective grade хранится только в `claim_assessments`. Каждая assessment ссылается через `assessment_evidence` на точный набор evidence и фиксирует rules/independence snapshot. `claims.current_assessment_id` указывает только на valid assessment того же claim.
+
+`session_staging.validated_against_revision` сравнивается с `domain_revisions(scope='knowledge')` в commit-транзакции. Изменение domain revision, rules или source grouping инвалидирует подготовленный результат и требует повторной валидации.
+
+### 14.4. События и совместимость
+
+Пара `(session_id, sequence)` уникальна. Тип события и `schema_version` обязательны. Consumers игнорируют неизвестные необязательные поля и останавливаются на неизвестной major version. Outbox projector идемпотентен по `outbox_events.id`.
+
+Audit log не обязан восстанавливать бизнес-состояние replay, но объясняет каждое изменение claim/assessment, action, policy decision, operator command, source grouping и session state.
 
 ## 15. Надёжность, commit и восстановление
 
-- Lease имеет TTL и обновляется только Orchestrator.
-- Счётчик и state transitions принадлежат Orchestrator, а не модели.
-- Ошибка LLM, schema validation или инструмента не считается успехом.
-- Model/memory/workspace становятся видимыми только после протокола §5.2.2.
-- Версии модели, embeddings, промптов, tool schema и политики фиксируются на сессию.
-- Вывод инструмента ограничивается в ответе LLM, а полный результат сохраняется content-addressed.
-- После нескольких ошибок схемы или транзиентных сбоев применяется ограниченный retry с backoff.
-- Дисковая квота проверяется перед сессией и перед commit.
-- Outbox повторно доставляет только события; бизнес-операция повторно не выполняется.
+- Lease имеет TTL, conditional heartbeat и progress watchdog.
+- State transitions принадлежат Orchestrator, а не модели.
+- Ошибка LLM/schema/tool не считается успехом.
+- Memory и workspace публикуются только через §5.2.2.
+- Версии модели, embeddings, prompts, tool schema, rules и policy фиксируются на сессию.
+- Tool output ограничивается в контексте, полный результат сохраняется content-addressed.
+- Retry разрешён только контрактом класса инструмента.
+- Квота проверяется перед сессией и commit.
+- Outbox повторяет доставку событий, но не бизнес-операцию.
 
 ### 15.1. Crash recovery
 
 При истечении lease recovery worker:
 
-1. блокирует дальнейшие действия старого session owner;
-2. переводит `ActionStarted` без терминального события в `ActionOutcomeUnknown`;
-3. отмечает сессию `failed` и создаёт host-generated failure report;
-4. удаляет session staging и COW overlay;
-5. оставляет текущими последние committed domain state и workspace manifest;
-6. запускает orphan GC только после grace period и проверки ссылок.
+1. блокирует session row и проверяет owner/expiry;
+2. запрещает новые actions старому owner;
+3. переводит `ActionStarted` без терминального события в `ActionOutcomeUnknown`;
+4. отмечает сессию `failed` и создаёт host-generated failure report;
+5. удаляет session staging и COW overlay;
+6. оставляет последние committed domain state и workspace manifest;
+7. запускает orphan GC после grace period и расчёта root set.
 
-Продолжение «с середины» в v1 не поддерживается: невозможно надёжно восстановить скрытое состояние модели и внешний эффект произвольной команды. Следующая сессия может прочитать failure report и повторно спланировать работу от последнего committed checkpoint.
+Продолжение скрытого состояния LLM «с середины» в v1 не поддерживается. Следующая сессия читает failure report и планирует заново от последнего checkpoint.
 
-### 15.2. Идемпотентность действий
+### 15.2. Классы повторяемости
 
-Tool contract явно объявляет один из классов:
+Tool contract объявляет ровно один класс:
 
-- `pure` — безопасно повторить;
-- `idempotent(key)` — backend гарантирует одинаковый эффект по ключу;
-- `non_idempotent` — автоматический retry после `ActionStarted` запрещён.
+- `pure` — повтор безопасен;
+- `observation` — read-only, но новый вызов является новым наблюдением;
+- `idempotent(key)` — backend гарантирует один эффект по host-generated key;
+- `non_idempotent` — retry после `ActionStarted` запрещён.
 
-Workspace writes безопасны за счёт session overlay. Shell и Python по умолчанию считаются `non_idempotent`, даже если конкретная команда выглядит безобидной. Сетевые инструменты v1 read-only. Класс каждого инструмента перечислен в таблице §5.7 и входит в схему, передаваемую модели.
+Workspace writes безопасны за счёт overlay и key binding. Shell/Python по умолчанию non-idempotent. Web search/fetch — observation: после неопределённого старта автоматического retry нет, новый осознанный вызов получает новый model run и timestamp.
 
-### 15.3. Checkpoint и backup — разные механизмы
+Complete decision не является tool action. Его state transition идемпотентен внутри Orchestrator и защищён lease/fencing.
 
-Checkpoint — логическая committed-граница: database commit ID плюс immutable workspace manifest. Он создаётся каждой успешной сессией и позволяет вернуться к согласованному состоянию приложения.
+### 15.3. Checkpoint, backup и GC roots
 
-Backup защищает от потери диска или всей базы и выполняется независимо от сессий:
+Checkpoint — committed database revision плюс immutable workspace manifest. Backup независимо защищает базу и Artifact Store.
 
-- PostgreSQL: регулярный base backup/`pg_dump` плюс WAL/PITR согласно выбранному профилю;
-- Artifact Store: versioned snapshot или репликация content-addressed объектов;
-- backup manifest связывает database recovery point и множество доступных artifact hashes;
-- restore-тест сначала проверяет наличие всех объектов текущего workspace manifest и только затем открывает систему;
-- retention `workspace_manifests` и content-addressed объектов не меньше глубины backup retention;
-- orphan GC удаляет только объекты, недостижимые ни из одного манифеста внутри этого окна;
-- restore drill проверяет случайную точку внутри окна, а не только текущее состояние.
+Минимальная схема:
 
-Без двух последних правил PITR в точку внутри окна восстановит базу, ссылающуюся на уже удалённые объекты, а проверка только текущего манифеста этого не заметит: сбой обнаружится в момент, когда бэкап понадобится по-настоящему.
+- PostgreSQL: base backup/`pg_dump` и WAL/PITR согласно профилю;
+- Artifact Store: versioned snapshot или репликация;
+- `backup_manifests` связывает recovery point с content-addressed artifact inventory, его hash и retention deadline;
+- restore drill выбирает случайную точку внутри retention window и проверяет все referenced hashes;
+- object retention не короче глубины backup retention.
 
-Нельзя считать `pg_dump после каждой сессии` механизмом атомарного commit. Restore drill запускается автоматически на отдельном экземпляре не реже заданного периода.
+GC удаляет объект только если он недостижим из полного набора корней:
 
-### 15.4. Failpoint tests
+- всех актуальных FK доменной БД: evidence, chunks, experiment results, context manifests, model/tool outputs и operator attestations;
+- всех workspace manifests внутри retention window;
+- всех backup manifests до `retention_until`;
+- active session staging, `staging_artifacts` и overlays до истечения grace period;
+- pinned/legal-retention объектов.
 
-Интеграционные тесты принудительно останавливают процесс:
+Reachability вычисляется по database snapshot/recovery catalog, а не только по текущему workspace manifest. Иначе можно удалить source artifact, на который ссылается claim, либо объект, нужный PITR в прошлую точку.
 
-- до и после загрузки content-addressed объектов;
-- до и после PostgreSQL commit;
-- между `ActionStarted` и записью результата;
-- до публикации outbox;
-- во время очистки staging/orphan.
+### 15.4. Failpoint и invariant tests
 
-После каждого сценария инвариант один: виден либо предыдущий checkpoint, либо полностью новый; смешанного состояния нет.
+Процесс принудительно останавливается:
+
+- до/после object upload и PostgreSQL commit;
+- между `ActionStarted` и результатом;
+- до outbox publication;
+- во время staging/orphan cleanup;
+- при domain revision conflict;
+- во время stop/abort на каждой action boundary;
+- при soft budget до следующего вызова и hard timeout внутри вызова;
+- при merge independence groups, инвалидирующем assessment.
+
+Инварианты: виден предыдущий либо полностью новый checkpoint; LLM не задаёт idempotency key; partial success не содержит unknown action; invalid assessment не остаётся current; GC не удаляет ни один root-reachable object.
 
 ## 16. Наблюдаемость и метрики
 
 ### 16.1. Технические
 
-- длительность сессии и фаз;
-- latency и input/output tokens LLM;
-- schema failures и retry count;
-- actions по типу и состоянию;
+- длительность session/phase и LLM latency/tokens;
+- schema failures и backend retries;
+- actions по классу и состоянию;
 - Policy Engine `allow | deny | require_operator`;
-- `ActionOutcomeUnknown` и возраст незакрытого инцидента;
-- lease expiry и recovery duration;
-- commit latency и failures;
-- outbox lag и delivery attempts;
-- orphan bytes и время их очистки;
-- CPU, RAM, GPU, VRAM, диск и model load time;
-- возраст последнего успешного backup и restore drill.
+- `ActionOutcomeUnknown` и возраст инцидента;
+- heartbeat age, progress age, phase deadline misses и lease recovery;
+- soft budget exhaustion отдельно от hard limit failures;
+- domain revision conflicts и validation retries;
+- commit latency/failures, outbox lag и attempts;
+- orphan bytes по retention class и root scan duration;
+- CPU, RAM, GPU/VRAM, disk и model load time;
+- возраст backup и restore drill.
 
 ### 16.2. Познавательные
 
 - новые, изменённые и переиспользованные claims;
-- распределение claims по epistemic status, freshness и evidence grade;
-- доля time-sensitive claims с `due/stale`;
-- доля внешних supported claims с независимой corroboration;
-- глубина цепочек вопросов и закрытых зависимостей;
-- семантическая близость к последним вопросам и планам;
-- доля сессий без нового evidence или осмысленного уточнения;
+- распределение current assessments по effective grade и rules version;
+- invalid assessment backlog и причины;
+- freshness distribution и overdue temporal claims;
+- внешние supported claims по числу independence groups;
+- глубина вопросов и закрытых зависимостей;
+- semantic near-duplicates вопросов/планов;
+- sessions без нового evidence или содержательного revision;
 - counterevidence found rate;
-- ручная выборочная оценка точности scope и навигации к provenance.
+- ручная оценка scope/provenance.
 
 ### 16.3. Безопасность и взаимодействие
 
 - blocked actions по правилу;
-- обращения к forbidden path/address;
-- provenance gaps;
-- operator confirmation rate;
-- число user messages, в которых детектор нашёл императивы, похожие на operator commands: это сигнал давления на границу, а не факт исполнения — свободный текст как команда не парсится в принципе;
-- время доставки, acknowledgment и ответа на сообщение;
-- ошибки CSRF/auth/rate limit.
+- forbidden path/address attempts;
+- provenance gaps и source-group corrections;
+- idempotency key mismatch attempts;
+- stop_gracefully/abort outcomes и ожидание safe boundary;
+- operator confirmations;
+- messages с императивами, похожими на команды, без попытки исполнения;
+- delivery/acknowledgment/reply latency;
+- CSRF/auth/rate-limit failures.
 
-Метрики не меняют критерий успеха задним числом: пороги фиксируются конфигурацией evaluation run до запуска серии сессий.
+Пороги evaluation run фиксируются до серии и не меняются после просмотра результата.
 
 ## 17. Предлагаемый стек
 
@@ -1193,107 +1354,115 @@ noezema/
 
 ### Этап 1. Контракты и локальная LLM
 
-- канонические state/action/event enums и JSON Schemas;
-- LLM Gateway и полный fingerprint §12;
-- compatibility suite для выбранных моделей и backends;
-- доменная схема, audit log и transactional outbox;
-- минимальные Query API и Command API.
+- session/decision/action/event enums и JSON Schemas;
+- host-generated turn/model/action IDs;
+- LLM Gateway и полный fingerprint;
+- compatibility suite;
+- domain schema, audit/outbox;
+- минимальные Query/Command API.
 
-Gate: модель стабильно выдаёт один валидный action envelope, а неизвестные действия безопасно отклоняются.
+Gate: модель стабильно выдаёт один валидный decision; повтор или коллизия model output не влияют на idempotency key.
 
 ### Этап 2. Изоляция и атомарная сессия
 
 - rootless sandbox и capability policy;
-- Tool Broker и action lifecycle;
-- COW workspace overlay;
-- content-addressed Artifact Store;
-- session staging, `SessionCommitted`, fencing и heartbeat lease;
-- резерв бюджета и путь `budget_exhausted → succeeded_partial`;
-- failpoint tests до/после commit.
+- Tool Broker с четырьмя retry classes;
+- COW overlay и content-addressed store;
+- staging, domain revision, fencing и conditional heartbeat;
+- soft budget, graceful stop и abort;
+- failpoint tests.
 
-Gate: ни один crash point не создаёт смешанного состояния; outcome unknown не повторяется вслепую; исчерпание бюджета фиксирует проверенную часть работы, а не отбрасывает сессию.
+Gate: нет смешанного состояния; partial success возможен только на safe boundary; active cancellation соответствует §6.7.
 
 ### Этап 3. Память и доказательства
 
-- questions, claims, revisions, sources и evidence;
-- реестр `claim_type` §8.7 и детерминированный `independence_group`;
-- verification kinds и grades с механическим назначением по правилам: verifier-роль появляется только на этапе 4, поэтому на этапе 3 grade выставляют правила, а не модель;
-- provenance chunks;
-- confidence/freshness split;
-- hybrid retrieval и context token budgets;
+- claims, revisions, evidence и source chunks;
+- executable claim type rules;
+- claim assessments и evidence sets;
+- versioned independence snapshots;
+- confidence/freshness и open-ended temporal intervals;
+- hybrid retrieval/context budgets;
 - identity versions и handoff.
 
-Gate: Query API проводит от claim до точного source chunk/reproducibility capsule, а неподходящий evidence не повышает статус.
+Gate: claim trace ведёт к evidence set и rules version; single evidence не получает агрегатный E3/E4; invalidation снимает current assessment.
 
 ### Этап 4. Познавательный цикл
 
-- Curiosity Engine baseline §5.3.1;
-- planning, explorer, verifier и curator;
-- защита от семантических повторений;
-- extraction-профиль для недоверенных локальных документов;
-- сценарные тесты длинных серий.
+- Curiosity Engine baseline;
+- planning/explorer/verifier/curator;
+- semantic-repeat protection;
+- extraction profile для недоверенных документов;
+- long-run scenario tests.
 
-Gate: система завершает серию Sealed-сессий без ручной правки БД и не повторяет перефразированный вопрос как новый.
+Gate: Sealed-серия работает без ручной правки БД; verifier не способен напрямую назначить grade.
 
 ### Этап 5. Research Proxy
 
-- безопасный read-only fetch;
-- SSRF, redirect, size, MIME и timeout policy;
-- выбранный search backend с честной моделью egress;
-- source/chunk provenance;
-- security tests на prompt injection и poisoned documents.
+- безопасный read-only fetch и SSRF policy;
+- search backend с явным egress;
+- source provenance и independence grouping;
+- injection/poisoning security tests.
 
-Gate: внешний контент не меняет capabilities, а каждый внешний claim имеет navigable provenance.
+Gate: внешний текст не меняет capabilities, а group merge корректно переоценивает зависимые claims.
 
 ### Этап 6. Полный веб-модуль
 
-- dashboard и live timeline;
-- страницы сессий и знаний;
-- сообщения;
-- typed operator commands и подтверждения;
-- эксплуатационные предупреждения.
+- dashboard/timeline;
+- sessions, knowledge и assessments;
+- messages;
+- typed operator commands;
+- stop/abort UX и эксплуатационные предупреждения.
 
-Gate: сайт не имеет write credentials к доменным/audit таблицам, а команды исполняются только через durable inbox.
+Gate: сайт не пишет в domain/audit tables напрямую; свободный текст не становится operator command.
 
 ### Этап 7. Эксплуатация и оценка
 
-- backup/PITR и restore drills;
-- квоты, retention и orphan GC;
-- security regression suite;
-- evaluation run на 50–100 сессий;
-- ADR по результатам измерений.
+- backup/PITR и full-root GC;
+- restore drills;
+- retention/quotas;
+- security regression;
+- evaluation run 50–100 sessions;
+- ADR по измерениям.
 
-Gate: выполнены технические критерии §22.1 и заранее зафиксированные quality gates §22.2.
+Gate: выполнены §22.1 и замороженные quality gates §22.2.
 
 ## 20. Риски первого уровня
 
 ### 20.1. Тривиальная новизна
 
-Система накапливает легко проверяемые, но бесполезные факты. Контроль: reuse rate, глубина вопроса, coverage gap и ручная оценка ценности выборки, а не только число новых claims.
+Система накапливает легко проверяемые, но бесполезные факты. Контроль: reuse, question depth, coverage gap и ручная оценка ценности.
 
 ### 20.2. Театр верификации
 
-Наличие непустого `verification_kind` ошибочно воспринимается как истина. Контроль: evidence grade, scope, independence group, claim-type rules и выборочный аудит первичных фрагментов.
+Наличие verification kind ошибочно принимается за истину. Контроль: claim assessment по evidence set, executable rules, scope и independence snapshot.
 
 ### 20.3. Смешение уверенности и свежести
 
-Старое знание объявляется менее истинным без новых данных либо сохраняется как «свежее» бесконечно. Контроль: разные поля, разные переходы, reverify queue и метрики overdue time-sensitive claims.
+Старое знание объявляется менее истинным либо остаётся «свежим» бесконечно. Контроль: разные поля/переходы и temporal reverify queue.
 
 ### 20.4. Наблюдаемость как нарратив
 
-Сайт показывает убедительный итог модели вместо фактической последовательности. Контроль: timeline только из committed audit/actions; модельный summary отображается как отдельный артефакт.
+Сайт показывает модельный рассказ вместо фактов. Контроль: timeline из operational/audit events; summary — отдельный артефакт.
 
 ### 20.5. Частичный commit
 
-База ссылается на файлы, которых нет, или workspace содержит знания, не попавшие в память. Контроль: immutable objects до DB commit, authoritative manifest pointer, failpoints и restore validation.
+База и workspace расходятся либо unsafe mid-action state публикуется как partial success. Контроль: revision/fencing, safe-boundary invariant и failpoints.
 
 ### 20.6. Командный обход через сообщения
 
-Свободный текст или prompt injection превращается в pause/restore/set-budget. Контроль: отдельные схемы, endpoints, DB tables, auth и capabilities для user messages и operator commands.
+Свободный текст превращается в control action. Контроль: разные endpoints/schemas/tables/auth для messages и operator commands.
 
-### 20.7. Игровая оптимизация метрик
+### 20.7. Idempotency hijack
 
-Мыслитель максимизирует novelty или число evidence, ухудшая качество. Контроль: набор взаимно ограничивающих метрик, замороженные evaluation thresholds и слепая ручная выборка, которую LLM не видит.
+LLM повторяет или подбирает key и подавляет другое действие. Контроль: все причинные IDs и keys создаёт доверенный контур и связывает с canonical arguments hash.
+
+### 20.8. Устаревший assessment
+
+Новая зависимость источников обнаружена, но старый E3 остаётся current. Контроль: versioned independence snapshots, invalidation queue и FK на valid current assessment.
+
+### 20.9. Ошибка GC
+
+Source/evidence artifact удаляется, хотя нужен текущей БД или backup. Контроль: полный root set, retention classes и restore drills по случайной точке.
 
 ## 21. Открытые архитектурные вопросы
 
@@ -1302,50 +1471,57 @@ Gate: выполнены технические критерии §22.1 и за�
 1. Может ли мыслитель менять identity document сам или только предлагать revision человеку?
 2. Нужен ли `Open Lab` в основном продукте либо только в отдельной экспериментальной сборке?
 3. Разрешать ли зависимости из локального подписанного package mirror?
-4. Как калибровать epistemic confidence отдельно для разных claim types?
+4. Как калибровать epistemic confidence отдельно для claim types и effective grades?
 5. Какие visibility-классы допустимы при публикации сайта вне локальной сети?
-6. Нужна ли будущая multi-thinker tenancy и какие aggregate IDs заложить заранее?
-7. Какие веса novelty/coverage/reuse сохраняют содержательную, а не формальную новизну?
-8. Какой минимальный evidence grade требуется для каждого claim type?
-9. Какой Artifact Store выбрать для v1: обычная файловая система с content addressing или S3-compatible локальный backend?
-10. Какой модельный профиль даёт приемлемый баланс schema reliability, качества verifier и latency на целевом железе?
-11. Какой период restore drill и retention raw diagnostic responses приемлемы владельцу?
+6. Нужна ли будущая multi-thinker tenancy и какие aggregate IDs закладывать заранее?
+7. Какие веса novelty/coverage/reuse сохраняют содержательную новизну?
+8. Какие точные executable rules и thresholds принять для каждого claim type?
+9. Какой Artifact Store выбрать: filesystem content addressing или локальный S3-compatible backend?
+10. Какой model profile даёт приемлемый баланс schema reliability, verifier quality и latency?
+11. Какой период restore drill и retention diagnostic responses приемлемы владельцу?
+12. Какой объём и схема стратификации ручной выборки дают приемлемую статистическую мощность?
 
 ## 22. Критерии успеха первой версии
 
 ### 22.1. Техническая приёмка
 
-Первая версия считается технически готовой, если она полностью локально:
+Первая версия технически готова, если она полностью локально:
 
-1. пробуждается по расписанию и корректно соблюдает pause/backoff;
-2. использует локальную LLM с полным воспроизводимым fingerprint;
-3. выбирает вопрос и выполняет несколько типизированных действий в sandbox;
-4. сохраняет claim с подходящим evidence, provenance и scope;
-5. публикует domain state и workspace одним `SessionCommitted`;
-6. после падения в каждом failpoint отбрасывает незавершённую сессию и открывается с последнего committed checkpoint;
-7. показывает фактическую хронологию, статус и знания через read-only Query API;
-8. принимает user message и typed operator command по разным безопасным путям;
-9. не делает blind retry действия с неопределённым исходом;
-10. восстанавливается из backup на отдельном тестовом экземпляре с проверкой всех workspace hashes;
-11. при исчерпании бюджета фиксирует уже проверенную часть работы как `succeeded_partial`, а не отбрасывает сессию.
+1. пробуждается по расписанию и соблюдает pause/backoff;
+2. использует локальную LLM с полным fingerprint;
+3. создаёт turn/model/action IDs только в доверенном контуре и выполняет типизированные actions в sandbox;
+4. сохраняет claim с valid current assessment, evidence set, provenance и scope;
+5. публикует memory и workspace одним fenced `SessionCommitted` с domain revision;
+6. после каждого failpoint открывается с предыдущего либо полностью нового checkpoint;
+7. показывает operational timeline, committed knowledge и invalidation state через Query API;
+8. раздельно обрабатывает user messages, stop_gracefully, abort_session и остальные operator commands;
+9. не делает blind retry unknown, observation и non-idempotent actions;
+10. восстанавливает случайную точку backup window и проверяет полный root set объектов;
+11. фиксирует soft budget work как `succeeded_partial` только на safe boundary, а mid-call hard limit завершает как `failed`;
+12. при merge independence groups инвалидирует и пересчитывает зависимые assessments;
+13. не оставляет claim.current_assessment_id, указывающий на invalid assessment.
 
-Пункт 6 означает не продолжение скрытого состояния модели «с середины», а обнаружение incomplete session, её безопасное отбрасывание и новую сессию от последней committed-границы.
+Crash recovery означает новую сессию от committed boundary, а не продолжение скрытого состояния модели.
 
 ### 22.2. Познавательная оценка
 
-После технической приёмки запускается серия из 50–100 сессий с замороженными моделью, политикой и порогами. Термины, входящие в пороги, фиксируются вместе с порогами и не уточняются по ходу серии:
+После технической приёмки запускается серия 50–100 сессий с замороженными model/config/rules и порогами.
 
-- **значимый claim** — claim со статусом выше `hypothesis`, относящийся к теме с активным вопросом либо имеющий хотя бы одну исходящую зависимость от другого claim или вопроса;
-- **слепая ручная выборка** — 30 claims на серию, равномерно случайный отбор по завершённым сессиям, оценка человеком по экспортированному списку; ни выборка, ни её результат модели не передаются. Проверяются два признака: работает ли путь к provenance и не выходит ли формулировка claim за scope собственного evidence.
+Термины:
 
-Стартовые quality gates, которые затем уточняются ADR до запуска, но не после просмотра результата:
+- **значимый claim** — claim с valid assessment E2+ и статусом `supported | disputed | refuted` либо claim любого статуса, используемый активным вопросом или другим claim как зависимость;
+- **eligible session** — терминальная сессия, запущенная по расписанию или `wake_now`; operator abort исключается, technical failure включается;
+- **слепая ручная выборка** — минимум 50 claims либо все claims, если их меньше; стратификация по claim type/status, фиксированный seed после завершения серии, результат модели не передаётся; вместе с долями публикуется 95% confidence interval.
 
-- не менее 80% новых `supported/refuted` claims имеют evidence E2+; внешние фактические `supported` claims соответствуют более строгому правилу claim type, обычно E3;
-- не менее 60% завершённых сессий создают новый evidence, закрывают/уточняют вопрос или содержательно пересматривают существующий claim;
-- не более 15% выбранных вопросов являются семантическими near-duplicates недавних вопросов без нового метода проверки;
-- не менее 25% значимых claims переиспользуются, перепроверяются или становятся зависимостью последующего вопроса в пределах 20 сессий;
-- доля `due/stale` среди активных time-sensitive claims остаётся ниже 20%;
-- отсутствуют незакрытые high-severity policy bypass и случаи исполнения operator command из user message;
-- в слепой ручной выборке не менее 90% claims имеют рабочий путь к provenance, а не менее 80% не выходят за scope собственного evidence.
+Стартовые quality gates:
 
-Порог может быть изменён только до evaluation run с новой версией конфигурации. Техническая работоспособность без прохождения познавательной оценки означает «платформа работает, исследовательская гипотеза не подтверждена», а не успех проекта.
+- не менее 80% новых `supported/refuted` claims имеют valid assessment E2+; external/temporal facts выполняют более строгий E3 rule;
+- не менее 60% eligible sessions создают новый evidence, закрывают/уточняют вопрос или содержательно пересматривают claim;
+- не более 15% выбранных вопросов — near-duplicates без нового метода проверки;
+- не менее 25% значимых claims переиспользуются, перепроверяются или становятся зависимостью в пределах 20 сессий;
+- `due/stale` среди активных time-sensitive claims ниже 20%;
+- invalid assessment не остаётся current дольше одной следующей сессии;
+- отсутствуют незакрытые high-severity policy bypass, idempotency mismatch с выполненным эффектом и operator command из user message;
+- в слепой выборке не менее 90% claims имеют рабочий provenance path и не менее 80% не выходят за evidence scope.
+
+Порог изменяется только до нового evaluation run с новой config version. Техническая работоспособность без quality gates означает «платформа работает, исследовательская гипотеза не подтверждена».
