@@ -1,10 +1,21 @@
 # NOEZEMA — Architecture Draft
 
-> Status: draft v0.9  
+> Status: draft v0.10  
 > Language: Russian  
 > Purpose: describe the target architecture of a local-first autonomous thinker focused on curiosity, verifiable learning, persistent memory, safe action, and human-observable operation.
 
 ## 0. Что изменилось
+
+### v0.10
+
+Версия 0.10 закрывает несогласованности, оставшиеся после v0.9:
+
+- канонический порядок блокировок расширен на обе revision-строки, включая `dependency_graph`;
+- у смены rules version в MVP появился исполнитель: одноразовый maintenance runner, описанный нормативно, а не в буллете этапа;
+- `blocked` barrier не блокирует wake, симметрично `blocked` job;
+- синхронные replacement assessments вошли в host reserve, добавлен предел затрагиваемых claims на сессию;
+- §22.2 явно относится к полной приёмке, а не к MVP-серии;
+- устранён дрейф про verifier-профиль в §5.5, §18 и README.
 
 ### v0.9
 
@@ -307,7 +318,18 @@ Orchestrator недоступен для изменения из sandbox.
 3. При завершении overlay замораживается и создаётся immutable workspace manifest с path, size и SHA-256 каждого объекта.
 4. До тяжёлой валидации сессия регистрирует приоритетный writer intent (§5.9.1). Валидация выполняется против snapshot с `domain_revision` и сохраняет revision, payload/rules hashes, independence snapshots и подготовленные assessments.
 5. Orchestrator создаёт host-generated `commit_attempt_id` и durable строку `commit_attempts(status='prepared')`, связанную со staging hash и workspace manifest.
-6. Финальная короткая транзакция берёт блокировки в каноническом порядке `sessions → domain_revisions(scope='knowledge') → commit_attempts`, проверяет fencing/revision и условие `attempt.status='prepared'`, применяет staging, обновляет workspace pointer и revision, переводит attempt в `committed`, записывает checkpoint, terminal session state, audit и outbox.
+6. Финальная короткая транзакция берёт блокировки в каноническом порядке, проверяет fencing/revision и условие `attempt.status='prepared'`, применяет staging, обновляет workspace pointer и revisions, переводит attempt в `committed`, записывает checkpoint, terminal session state, audit и outbox.
+
+Канонический порядок блокировок общий для всей системы:
+
+```text
+sessions
+  → domain_revisions(scope='knowledge')
+  → domain_revisions(scope='dependency_graph')
+  → commit_attempts
+```
+
+Порядок обязателен для любой транзакции, независимо от того, сколько строк она трогает: session commit берёт обе revision-строки, если staging меняет evidential edges; barrier processor (§8.6) берёт writer gate и `dependency_graph`; reconciler (§15.1) — `sessions` и `commit_attempts`. Две revision-строки существуют потому, что запись assessment не должна делать графовый snapshot устаревшим, — но именно поэтому их нельзя брать в произвольном порядке: это единственное место в схеме, где возможен классический deadlock между сессией и фоновым процессом. Транзакция, обнаружившая, что ей нужна пропущенная строка, откатывается и начинается заново, а не доблокирует её вне порядка.
 7. При revision conflict staging валидируется заново. Число повторов ограничено; writer intent не позволяет фоновому worker менять revision во время session validation.
 8. Если DB однозначно отклонила или откатила транзакцию, attempt становится `aborted`, предыдущий checkpoint остаётся текущим.
 9. Если ответ COMMIT потерян или DB недоступна, исход не объявляется failure. Узел блокирует новые сессии и переходит в `reconciling_commit`; если БД доступна, attempt условно переводится `prepared → reconciling`. Невозможность записать этот переход не является доказательством исхода: `prepared` уже считается unresolved.
@@ -511,6 +533,8 @@ Hard-секции протокола резервируются первыми. 
 - ограничение контекста и ответа;
 - сохранение метаданных вызова;
 - переключение ролей explorer, verifier и curator.
+
+В MVP профилей два — explorer и curator (§5.3.2); отдельный verifier-профиль появляется на этапе 4. Gateway поддерживает переключение ролей с самого начала, но набор доступных prompt snapshots задаётся config snapshot, а не кодом.
 
 В первой версии роли может выполнять одна локальная модель с разными промптами. Для explorer и curator это приемлемо. Для verifier совмещение допустимо только в смысле §3.7: модель организует детерминированные проверки и интерпретирует их результат, но её собственное суждение о собственном же выводе статус утверждения не меняет.
 
@@ -777,7 +801,9 @@ Curator предлагает изменения. Memory Service валидиру
 Soft budgets проверяются до следующего LLM/tool call и после терминального результата action. Резерв разделён:
 
 - cognitive reserve — curator/consolidation;
-- host reserve — deterministic validation, minimal report, commit и reconciliation; он не зависит от LLM tokens.
+- host reserve — deterministic validation, синхронные replacement assessments затронутых claims (§19, этап 3a), minimal report, commit и reconciliation; он не зависит от LLM tokens.
+
+Пересчёт assessments масштабируется с числом claims, которые сессия задела, поэтому одного резерва мало: нужен предел. Memory Service ограничивает число существующих claims, чей evidence set одна сессия может изменить; при превышении staged-операции сверх лимита отклоняются на валидации с понятной причиной, и curator получает это как ошибку предложения, а не как молчаливое усечение. Без предела curator, тронувший сорок claims, выносит host reserve и превращает штатную консолидацию в `failed`.
 
 При soft exhaustion новые actions не запускаются, verified work проходит validation и после commit даёт `succeeded_partial`. Это допустимо только без unknown action, с валидным последним model output и непросроченным cognitive phase deadline.
 
@@ -934,6 +960,8 @@ Invalidation выполняется так:
 
 Статусы barrier: `discovering | active | closing | resolved | blocked`. Транзиентная ошибка processor-а даёт retry с backoff. Hash mismatch manifest-а, невозможный cursor или нарушение closure-инварианта переводят barrier в `blocked`, сохраняют ancestor protection и требуют audited operator recovery; такой barrier никогда не закрывается автоматически как успешный.
 
+`blocked` barrier не блокирует пробуждение — симметрично `blocked` job (§5.9.1) и по той же причине: безопасность обеспечивается не остановкой системы, а тем, что защищённые барьером downstream claims не считаются current и не могут быть evidence или действующей зависимостью. Останавливать весь познавательный цикл из-за одного повреждённого closure значило бы менять локальную неисправность на глобальную. Barrier в `blocked` держит critical alert, остаётся GC root и виден оператору отдельно; активные и `discovering | closing` барьеры пробуждению тоже не мешают — их продолжает processor.
+
 Циклы dependency graph запрещены для evidential dependencies; обнаруженный legacy cycle целиком переводится в pending и требует operator review. Worker пересчитывает только из существующих evidence. Успех возвращает `assessment_state=current`; недостаток данных переводит в `invalid` и создаёт вопрос с высоким coverage gap. Pending/invalid claim не может быть evidence или действующей зависимостью и подаётся retrieval только с явной меткой.
 
 История сохраняется в revisions, assessments, barrier manifests, jobs и audit log.
@@ -982,7 +1010,30 @@ external_fact:
 
 Finite computation не доказывает universal theorem: она создаёт `computed_result` либо counterexample в точном диапазоне. Operator attestation не является evidence kind и без новых данных grade не повышает.
 
-Тип назначается при создании claim и меняется только revision с обоснованием и новым assessment. Rules живут в `config_snapshots.claim_type_rules`; новая версия не меняет прошлые revisions молча, но ставит затронутые актуальные claims в очередь переоценки.
+Тип назначается при создании claim и меняется только revision с обоснованием и новым assessment. Rules живут в `config_snapshots.claim_type_rules`; новая версия не меняет прошлые revisions молча.
+
+#### 8.7.0. Активация новой версии правил
+
+Правила придётся править — это основная работа на этапе 3a, — поэтому у смены версии должен быть исполнитель, а не только намерение. Их два, и они соответствуют разным конфигурациям системы:
+
+- **С фоновым worker (3b и далее).** Активация версии инвалидирует затронутые актуальные claims и ставит их в очередь переоценки; дальше работает §5.9.1. Claims проходят через `pending` и возвращаются в `current` по мере разгребания очереди.
+- **Без worker (MVP).** Очереди нет, поэтому активация выполняется одноразовым maintenance runner доверенного контура — отдельным процессом с actor `system:rules_activation`, не сессией и не worker-ом:
+
+```text
+pause                        → новые пробуждения запрещены, активной сессии нет
+batch reassessment           → runner пересчитывает затронутые claims
+                               существующими evidence по новой версии правил,
+                               ограниченными транзакциями, с audit на каждый батч
+atomic rules activation      → новая rules version становится действующей
+                               в той же транзакции, что и последний батч
+resume                       → пробуждения разрешены
+```
+
+Runner подчиняется общим правилам записи знания: канонический порядок блокировок, writer intent, revision check, append-only audit. Он не создаёт evidence и не вызывает LLM — только применяет детерминированный rules engine к тому, что уже есть.
+
+Прерывание runner-а безопасно: незавершённая активация оставляет прежнюю действующую версию правил, а пересчитанные батчи идемпотентны. Claim, для которого новые правила не дают действующего assessment, остаётся `invalid` с alert — в MVP это означает работу для человека, а не молчаливую потерю статуса.
+
+На период работающего MVP rules version заморожена между активациями: менять правила во время серии сессий нельзя, иначе часть claims оценена по одной версии, часть по другой, и §22.2 теряет смысл.
 
 В MVP действует консервативное source grouping локального корпуса. Independence group назначает trusted host по canonical origin и объявленной lineage; одинаковый content parent, зеркало, экспорт или неизвестное происхождение считаются одной группой. Если host не может доказать две разные группы, `external_fact | temporal_fact` не получает E3 и не становится `supported` по базовому правилу. Полный source graph, merge/correction и каскадная переоценка появляются в 3b/этапе 5.
 
@@ -1692,9 +1743,9 @@ noezema/
 │   └── policy/
 ├── prompts/
 │   ├── identity.md
-│   ├── explorer.md
-│   ├── verifier.md
-│   └── curator.md
+│   ├── explorer.md          # MVP
+│   ├── curator.md           # MVP
+│   └── verifier.md          # этап 4
 ├── docs/
 │   └── adr/
 ├── migrations/
@@ -1747,9 +1798,10 @@ Gate: неизвестный ответ COMMIT reconciled; нет mixed state; p
 - confidence/freshness;
 - консервативные source independence groups для локального корпуса;
 - context retrieval с токенными бюджетами и обработкой pending claims;
+- maintenance runner активации rules version §8.7.0;
 - identity/handoff.
 
-Фонового пересчёта в MVP нет, но assessment не является одноразовым: любая staged-операция, меняющая evidence set существующего claim, синхронно создаёт replacement assessment во время validation текущей сессии. Rules version на период работающего MVP заморожена. Её смена выполняется maintenance-процедурой `pause → batch reassessment → atomic rules activation → resume`, поэтому claims не остаются pending без worker.
+Фонового пересчёта в MVP нет, но assessment не является одноразовым: любая staged-операция, меняющая evidence set существующего claim, синхронно создаёт replacement assessment во время validation текущей сессии, в пределах лимита затрагиваемых claims (§6.6). Rules version на период работающего MVP заморожена; её смена выполняется maintenance runner §8.7.0, поэтому claims не остаются pending без исполнителя.
 
 Gate: duplicate evidence не повышает grade; новое counterevidence меняет assessment в том же session commit; неизвестная source lineage не создаёт ложную независимость; pending/invalid claim не подаётся как current; grade назначает только rules engine.
 
@@ -1906,7 +1958,9 @@ Resolution без valid independent basis повышает grade. Контрол
 
 ### 22.2. Познавательная оценка
 
-После приёмки запускается 50–100 eligible sessions с замороженными model/config/rules.
+Познавательная оценка относится к полной приёмке после этапа 7, а не к MVP-серии. Запускать её на MVP бессмысленно и опасно: консервативное source grouping (§8.7) означает, что в Sealed-MVP популяция `external_fact` и `temporal_fact` близка к нулю, поэтому гейт про E3 для них окажется истинным вакуумно, а не выполненным. Сессии MVP дают эксплуатационные данные — пороги очереди, размер резерва, latency консолидации, — но не проходят §22.2.
+
+После полной приёмки запускается 50–100 eligible sessions с замороженными model/config/rules.
 
 Определения:
 
