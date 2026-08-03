@@ -1,0 +1,202 @@
+# NOEZEMA
+
+**Local-first autonomous thinker** — система, которая периодически пробуждается, выбирает неизвестный ей вопрос, исследует его, проверяет выводы с доказательствами и сохраняет знания для следующей сессии и человека-наблюдателя.
+
+| Параметр | Значение |
+|----------|----------|
+| Статус | Архитектурный draft v0.7 |
+| Язык | Python |
+| Бэкенд | Локальная LLM (OpenAI-compatible API) |
+| База данных | PostgreSQL 15+ |
+| Сэндбокс | Rootless Podman / Docker |
+| Веб-интерфейс | FastAPI + HTMX + SSE |
+
+---
+
+## Идея
+
+NOEZEMA — автономный локальный мыслитель. Каждая сессия:
+
+1. **Пробуждение** — система определяет, что условия выполнены (GPU, диск, нет активной сессии)
+2. **Выбор вопроса** — Curiosity Engine ранжирует кандидатов по новизне, проверяемости, связи с интересами
+3. **Исследование** — LLM выполняет типизированные действия внутри изолированного sandbox
+4. **Верификация** — правила доказательств (E0–E4) оценивают каждый claim по набору evidence
+5. **Консолидация** — Curator предлагает изменения; Memory Service валидирует staging
+6. **Атомарный commit** — результат фиксируется одной транзакцией; при сбое — reconciliation
+
+Мыслитель свободен выбирать темы, развивать идентичность и организовывать рабочее пространство. Границы безопасности, планировщик и журнал событий находятся вне его контроля.
+
+## Ключевые отличия
+
+Относительно экспериментального подхода «AI lives on computer»:
+
+- ✅ Управляющий контур отделён от среды мыслителя
+- ✅ Модель не исполняет команды непосредственно на хосте
+- ✅ Действия передаются через типизированный протокол с capability-профилями
+- ✅ Знания отделены от субъективных воспоминаний
+- ✅ Каждое утверждение связано с доказательствами и статусом проверки
+- ✅ История событий неизменяема
+- ✅ Локальная LLM — штатный режим, а не дополнительный
+- ✅ Наблюдаемость через веб-интерфейс
+
+## Архитектура
+
+```
+┌─────────────────────────────────────────────────┐
+│           Доверенный контур (Linux VM)           │
+│                                                  │
+│  Supervisor → Orchestrator → Curiosity Engine    │
+│                  → Context Builder               │
+│                  → LLM Gateway → Локальная LLM   │
+│                  → Policy Engine                 │
+│                  → Tool Broker → Sandbox         │
+│                  → Memory Service                │
+│                                                  │
+│  PostgreSQL (domain + audit + outbox)            │
+│  Content-addressed Artifact Store                │
+│  Research Proxy (контролируемый egress)          │
+│  Query API / Command API → Веб-модуль            │
+└─────────────────────────────────────────────────┘
+         ↕
+┌─────────────────────────────────────────────────┐
+│       Sandbox (одноразовый, COW overlay)         │
+│  /workspace (base snapshot + overlay)            │
+│  Ограниченный shell / Python                     │
+└─────────────────────────────────────────────────┘
+```
+
+Подробнее: [ARCHITECTURE.md](ARCHITECTURE.md)
+
+## Модель доказательств
+
+Каждое значимое утверждение проходит оценку по уровням:
+
+| Grade | Статус | Требование |
+|-------|--------|------------|
+| E0 | `unverified` | Нет проверки |
+| E1 | `integrity_checked` | Проверка целостности цитирования |
+| E2 | `single_method_supported` | Один метод в рамках scope |
+| E3 | `independently_corroborated` | Независимые источники или репликация |
+| E4 | `formally_verified` | Формальная верификация или многократная репликация |
+
+Grade вычисляет версионируемый rules engine — не LLM, не verifier. Claim assessment строится по evidence set, claim type rules, independence groups и scope.
+
+### Типы утверждений (v1)
+
+| Тип | Минимальный grade для `supported` |
+|-----|----------------------------------|
+| `local_observation` | E2 |
+| `computed_result` | E2 |
+| `formal_theorem` | E4 |
+| `empirical_conjecture` | E3 (≥2 независимых экспериментов) |
+| `procedural` | E3 (≥2 успешных репликаций) |
+| `external_fact` | E3 (≥2 независимых источника) |
+| `temporal_fact` | E3 + временной scope |
+| `self_model` | E2 |
+
+## Безопасность
+
+**Модель нарушителя:** внешняя страница, сообщение человека, LLM, код в sandbox и артефакты прошлых сессий считаются недоверенными.
+
+Защита слоями:
+
+- **Изоляция** — одноразовый rootless-контейнер, read-only rootfs, no network, cap-drop ALL
+- **Capability security** — права задаются профилем, содержание контекста их не расширяет
+- **Provenance** — каждый chunk имеет origin, hash, transform chain и trust class
+- **Evidence rules** — grade вычисляется детерминированно, не моделью
+- **Наблюдаемость** — operational timeline из audit events, не из нарратива модели
+- **Операторское подтверждение** — для действий с внешним эффектом
+
+### Режимы доступа к интернету
+
+| Режим | Поиск | Egress |
+|-------|-------|--------|
+| **Sealed** | Локальный индекс | Нет |
+| **Curated** | SearXNG через Research Proxy | Контролируемый |
+| **Open Lab** | Внешний API | Разрешённые домены |
+
+## Стек
+
+| Компонент | Технология |
+|-----------|-----------|
+| Язык | Python 3.11+ |
+| Веб-фреймворк | FastAPI + Pydantic |
+| База данных | PostgreSQL 15+ (опционально pgvector) |
+| ORM / миграции | SQLAlchemy + Alembic |
+| Веб-UI | HTMX + Server-Sent Events |
+| Сэндбокс | Rootless Podman или Docker |
+| Оркестрация | systemd |
+| LLM-бэкенд | llama.cpp / Ollama / vLLM |
+| Тесты | pytest (unit, scenario, security, model_compatibility) |
+
+### Требования к железу (ориентир)
+
+Модель класса **30B в Q4** — ~24 GB VRAM, 64 GB RAM.
+
+## Структура репозитория
+
+```
+noezema/
+├── apps/
+│   ├── orchestrator/        # Машина состояний сессий
+│   ├── web/                 # FastAPI: Query API + Command API + UI
+│   └── research_proxy/      # Контролируемый egress
+├── packages/
+│   ├── domain/              # Доменные модели, схемы, constraints
+│   ├── llm_gateway/         # OpenAI-compatible API, fingerprint
+│   ├── cognition/           # Curiosity Engine, Context Builder
+│   ├── memory/              # Claims, evidence, assessments, rules
+│   ├── policy/              # Capability checks, profiles
+│   ├── tool_broker/         # Типизированные инструменты, retry
+│   └── observability/       # Метрики, audit, outbox
+├── sandbox/
+│   ├── Containerfile        # Базовый образ sandbox
+│   └── policy/              # Security profiles
+├── prompts/
+│   ├── identity.md          # Документ идентичности
+│   ├── explorer.md          # Промпт исследователя
+│   ├── verifier.md          # Промпт верификатора
+│   └── curator.md           # Промпт куратора
+├── docs/adr/                # Архитектурные решения
+├── migrations/              # Alembic миграции
+├── infra/
+│   ├── compose.yaml         # Локальная разработка
+│   └── systemd/             # Production supervisor
+└── tests/
+    ├── scenarios/           # Сценарные тесты сессий
+    ├── security/            # Invariant и failpoint-тесты
+    └── model_compatibility/  # Compatibility suite для LLM
+```
+
+## Этапы реализации
+
+| Этап | Что | Gate |
+|------|-----|------|
+| **1. Контракты и LLM** | Enums, schemas, host-generated IDs, LLM Gateway, FIFO Question Selector | Валидный decision envelope, одна Sealed-сессия |
+| **2. Изоляция и commit** | Sandbox, capability policy, Tool Broker, COW/staging, reconciliation | Unknown COMMIT reconciled, нет mixed state |
+| **3. Память и доказательства** | Claims/evidence/assessments, rules engine, cascade invalidation | Invalid ancestor блокирует downstream |
+| **4. Познавательный цикл** | Curiosity ranking, verifier/curator, защита от повторений | Verifier не назначает grade |
+| **5. Research Proxy** | SSRF-safe fetch/search, provenance, injection tests | Внешний текст не меняет capabilities |
+| **6. Веб-модуль** | Dashboard, timeline, knowledge graph, messages, controls | Сайт read-only к domain/audit |
+| **7. Эксплуатация** | Backup/PITR, GC, security regression, 50–100 сессий | Техническая + познавательная приёмка |
+
+MVP — этапы 1–3 + dashboard/timeline из этапа 6.
+
+## Не-цели первой версии
+
+- Доказательство сознания или субъективного опыта
+- Неограниченный доступ к хостовой системе
+- Выполнение произвольных действий от имени владельца
+- Multi-agent orchestration ради сложности
+- Дообучение основной LLM во время работы
+- Публичное раскрытие скрытой chain of thought
+
+## Статус
+
+📝 Архитектурный draft v0.7 — документация без кода.
+
+[Полная спецификация](ARCHITECTURE.md) описывает 22 раздела: архитектурные принципы, компоненты, машину состояний сессий, модель памяти, evidence grading, безопасность, воспроизводимость, веб-модуль, модель данных (34 таблицы), надёжность и восстановление, наблюдаемость, стек, структуру, этапы, риски, открытые вопросы и критерии успеха.
+
+## Лицензия
+
+Лицензия будет определена при открытии репозитория.
