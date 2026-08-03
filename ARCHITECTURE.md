@@ -1,10 +1,25 @@
 # NOEZEMA — Architecture Draft
 
-> Status: draft v0.6  
+> Status: draft v0.7  
 > Language: Russian  
 > Purpose: describe the target architecture of a local-first autonomous thinker focused on curiosity, verifiable learning, persistent memory, safe action, and human-observable operation.
 
 ## 0. Что изменилось
+
+### v0.7
+
+Версия 0.7 закрывает риски, найденные в v0.6:
+
+- неопределённый исход PostgreSQL commit переводит сессию в reconciliation, а не в ложный `failed`;
+- session commit получает приоритетный writer intent, reassessment worker — durable queue и не может бесконечно менять revision во время session validation;
+- invalidation распространяется по reverse dependency closure;
+- lifecycle assessment отделён от epistemic status;
+- независимость эксперимента разделена на repeatability, reproducibility и independent replication;
+- environment fingerprint заменён структурированным versioned manifest;
+- counterevidence resolutions получили actor, audit basis, XOR/uniqueness constraints и каскадную invalidation;
+- evidence identity опирается на content/provenance hash и per-kind constraints;
+- operator transitions сведены в каноническую таблицу;
+- MVP получил отдельный FIFO Question Selector, а reassessment SLO переведён из «следующей сессии» в wall-clock.
 
 ### v0.6
 
@@ -254,32 +269,46 @@ Orchestrator недоступен для изменения из sandbox.
 - После неудачной сессии применяется экспоненциальный backoff; после нескольких неудач подряд узел переходит в `paused`.
 - Ручное «пробуждение сейчас» обходит расписание, но не условия допуска.
 
-#### 5.2.2. Граница фиксации сессии
+#### 5.2.2. Граница фиксации сессии и commit reconciliation
 
 Работа активной сессии не должна частично появляться в долговременной памяти.
 
-1. Предложения изменить questions, claims, evidence и identity пишутся только в `session_staging`. Operational rows — session state, actions, model runs и audit событий уже выполненных шагов — фиксируются сразу и явно помечаются session ID.
-2. Файлы пишутся в COW overlay. Полученные артефакты сохраняются content-addressed; до commit они недостижимы из текущего workspace и долговременной памяти.
-3. При завершении overlay замораживается, для каждого файла вычисляются path, size и SHA-256, затем создаётся неизменяемый workspace manifest.
-4. Тяжёлая валидация выполняется до commit-транзакции против snapshot с монотонным `domain_revision`. Результат сохраняет `validated_against_revision`, payload hash, rules/config hash, independence snapshot и список подготовленных claim assessments.
-5. После загрузки объектов Orchestrator открывает короткую транзакцию PostgreSQL: блокирует session row и строку `domain_revisions(scope='knowledge')`, проверяет fencing и совпадение revision, применяет подготовленные операции, проверяет FK/unique/quota, делает manifest текущим, увеличивает domain revision, записывает терминальное событие и outbox.
-6. Если revision изменилась, транзакция откатывается, staging повторно валидируется против нового snapshot. Число повторов ограничено; после исчерпания сессия завершается без публикации staging.
-7. При неудаче предыдущий snapshot остаётся текущим. Незакреплённые объекты удаляются GC только после grace period и проверки полного root set §15.3.
+1. Предложения изменить questions, claims, evidence и identity пишутся только в `session_staging`. Operational rows — session state, actions, model runs и audit выполненных шагов — фиксируются сразу.
+2. Файлы пишутся в COW overlay. Артефакты сохраняются content-addressed; до commit они недостижимы из текущего workspace и долговременной памяти.
+3. При завершении overlay замораживается и создаётся immutable workspace manifest с path, size и SHA-256 каждого объекта.
+4. До тяжёлой валидации сессия регистрирует приоритетный writer intent (§5.9.1). Валидация выполняется против snapshot с `domain_revision` и сохраняет revision, payload/rules hashes, independence snapshots и подготовленные assessments.
+5. Orchestrator создаёт host-generated `commit_attempt_id` и durable строку `commit_attempts(status='prepared')`, связанную со staging hash и workspace manifest.
+6. Финальная короткая транзакция блокирует session row и `domain_revisions(scope='knowledge')`, проверяет fencing/revision, применяет staging, обновляет workspace pointer и revision, переводит commit attempt в `committed`, записывает checkpoint, terminal session state, audit и outbox.
+7. При revision conflict staging валидируется заново. Число повторов ограничено; writer intent не позволяет фоновому worker менять revision во время session validation.
+8. Если DB однозначно отклонила или откатила транзакцию, attempt становится `aborted`, предыдущий checkpoint остаётся текущим.
+9. Если ответ COMMIT потерян или DB недоступна, исход не объявляется failure. Узел блокирует новые сессии и переходит в `reconciling_commit` до проверки `commit_attempt_id` с нового соединения.
 
-Fencing-условие коммита:
+Reconciliation:
+
+```text
+attempt=committed AND session terminal AND checkpoint exists
+    → принять committed terminal state
+
+attempt=prepared AND rollback/absence transaction confirmed
+    → attempt=aborted, session=failed, discard staging
+
+database unavailable OR records inconsistent
+    → remain reconciling_commit, alert operator, no GC
+```
+
+Fencing:
 
 ```text
 state = 'committing'
 AND lease_owner = :me
 AND lease_expires_at > now()
 AND domain_revision = :validated_against_revision
+AND commit_attempt_id = :attempt
 ```
 
-Состояния `succeeded`, `succeeded_partial`, `failed` и `cancelled` поглощающие. Recovery worker блокирует ту же session row, поэтому потерявший lease Orchestrator не может закоммитить работу задним числом.
+Терминальные `succeeded | succeeded_partial | failed | cancelled` поглощающие. `reconciling_commit` не терминален, но запрещает действия, recovery cleanup и следующий wake. Unresolved commit attempt является GC root.
 
-Если v1 сохраняет инвариант одного writer-а памяти, revision почти всегда совпадает. Тем не менее она остаётся явной частью схемы: operator migration, maintenance job или будущий второй thinker не должны молча обойти проверку.
-
-Такой порядок даёт атомарную видимость базы и workspace без распределённой транзакции с файловой системой: authoritative pointer меняется только внутри PostgreSQL.
+Такой порядок даёт атомарную видимость базы и workspace и не путает потерю ответа COMMIT с откатом.
 
 #### 5.2.3. Lease, heartbeat и progress watchdog
 
@@ -477,20 +506,28 @@ no SSH keys or host secrets
 
 Ни LLM, ни verifier не записывают `effective_grade` напрямую: они создают evidence и предложения, а grade вычисляет версионируемый rules engine.
 
-#### 5.9.1. Reassessment worker
+#### 5.9.1. Reassessment worker и writer admission
 
-Очередь переоценки (§8.6, §11.3) исполняет фоновый worker доверенного контура, а не сессия. Сессия не годится: merge independence groups может затронуть сотни claims, и переоценка внутри сессии съела бы её бюджет и попала под soft exhaustion, поставив качество памяти в зависимость от того, чем в этот момент занят мыслитель.
+Переоценку выполняет worker доверенного контура с actor `system:reassessment`. Работа хранится в durable `reassessment_jobs`, а не только выводится запросом по claims:
 
-Worker — второй writer знания, поэтому подчиняется тем же правилам, что и commit:
+```text
+claim_id, reason, priority, enqueued_at,
+attempts, lease_owner, lease_expires_at,
+last_error, next_attempt_at
+```
 
-- собственный actor `system:reassessment` во всех audit events; его записи отличимы от сессионных;
-- работает батчами с лимитом на транзакцию, а не одной длинной транзакцией на всю очередь;
-- берёт ту же блокировку `domain_revisions(scope='knowledge')` и увеличивает revision, поэтому конкурирующий commit сессии получит revision conflict и повторит валидацию по §5.2.2 п.6 — специальной синхронизации не требуется;
-- уступает: при активной commit-транзакции батч откладывается, чтобы фоновая работа не заставляла сессию терять подготовленную валидацию;
-- пересчитывает assessment только из существующих evidence по текущим rules. Он не создаёт evidence и не ходит в сеть; если для переоценки нужны новые данные, worker создаёт вопрос в реестре Curiosity Engine с высоким `coverage_gap`;
-- порядок очереди: claims, использованные как зависимость, затем `external_fact` и `temporal_fact`, затем остальные.
+Один active job на claim обеспечивается unique constraint. Worker работает ограниченными батчами, создаёт audit events, не генерирует evidence и не ходит в сеть. Если данных недостаточно, он переводит assessment lifecycle в `invalid` и создаёт вопрос Curiosity Engine.
 
-Возраст и глубина очереди — эксплуатационные метрики (§16.2); длительно непустая очередь означает, что знание в памяти держится на устаревших основаниях.
+Безопасность revision недостаточна для liveness: worker мог бы менять revision во время каждой тяжёлой session validation. Поэтому действует writer admission:
+
+1. При входе в consolidation сессия атомарно устанавливает `commit_intent_at` под живым lease до тяжёлой валидации.
+2. Пока существует живой session commit intent, worker не начинает validation или write batch.
+3. Worker получает низкоприоритетный `knowledge_write_gate` через NOWAIT; при конфликте откладывает job с jitter.
+4. Если session intent появляется во время worker validation, worker не коммитит подготовленный batch и возвращает jobs в очередь.
+5. Session commit очищает intent в своей terminal transaction; recovery очищает просроченный intent только после проверки lease/commit attempt.
+6. `domain_revision` остаётся последней защитой от гонки, но не используется как механизм планирования.
+
+Worker пересчитывает assessments по текущим rules и independence snapshots. Приоритет: reverse dependencies активных вопросов, external/temporal facts, затем остальные. Очередь имеет wall-clock SLO и метрики depth/age/attempts; длительно непустая очередь является деградацией памяти.
 
 ### 5.10. Data Store и Audit Log
 
@@ -548,11 +585,11 @@ Research Proxy:
 ```text
 created | waking | orienting | selecting_question | planning |
 exploring | verifying | stopping | consolidating | reporting |
-committing | aborting |
+committing | reconciling_commit | aborting |
 succeeded | succeeded_partial | failed | cancelled
 ```
 
-Состояние узла `sleeping | paused` хранится отдельно. Поля `stop_requested_at` и `abort_requested_at` фиксируют operator intent до достижения безопасной границы.
+Состояние узла `sleeping | paused` хранится отдельно. `stop_requested_at` и `abort_requested_at` фиксируют intent до безопасной границы.
 
 ```mermaid
 stateDiagram-v2
@@ -566,16 +603,15 @@ stateDiagram-v2
     Exploring --> Verifying
     Verifying --> Exploring: нужны данные
     Verifying --> Consolidating
-    Exploring --> Stopping: soft budget / operator stop
-    Verifying --> Stopping: soft budget / operator stop
     Stopping --> Consolidating
     Consolidating --> Reporting
     Reporting --> Committing
     Committing --> Succeeded
     Committing --> SucceededPartial
-    Created --> Aborting: operator abort
-    Exploring --> Aborting: operator abort
-    Verifying --> Aborting: operator abort
+    Committing --> ReconcilingCommit: ответ COMMIT неизвестен
+    ReconcilingCommit --> Succeeded
+    ReconcilingCommit --> SucceededPartial
+    ReconcilingCommit --> Failed
     Aborting --> Cancelled
     Succeeded --> [*]
     SucceededPartial --> [*]
@@ -583,77 +619,79 @@ stateDiagram-v2
     Cancelled --> [*]
 ```
 
-Рёбра в `failed` не показаны намеренно: они существуют из любой нетерминальной фазы, и их отрисовка скрыла бы основной цикл. `failed` присутствует как терминал. Все остальные узлы диаграммы достижимы. Терминальные состояния поглощающие.
+Диаграмма показывает основной путь. Каноническими для operator/error transitions являются таблица §6.7 и правила §5.2.2, а не отсутствие отдельного ребра на обзорной диаграмме. Терминальные состояния поглощающие.
 
 ### 6.1. Пробуждение и ориентация
 
-Orchestrator создаёт lease, фиксирует конфигурацию, монтирует последний committed snapshot и строит context manifest. Новые сообщения доставляются как данные с provenance.
+Orchestrator создаёт lease, фиксирует конфигурацию, монтирует committed snapshot и строит context manifest. Новые сообщения доставляются как данные с provenance.
 
 ### 6.2. Выбор вопроса и планирование
 
-Curiosity Engine ранжирует кандидатов. План формулирует наблюдения, которые могут изменить уверенность, критерии остановки и требуемые assessment methods.
+В MVP FIFO Question Selector выбирает первый eligible question. После этапа 4 Curiosity Engine ранжирует кандидатов. План формулирует наблюдения, способные изменить уверенность, критерии остановки и assessment methods.
 
 ### 6.3. Исследование
 
-Каждый шаг содержит краткую публичную мотивировку, одно типизированное решение, ожидаемую информацию и ссылку на наблюдение. Несколько tool calls за один ответ запрещены.
+Каждый шаг содержит публичную мотивировку, одно типизированное решение, ожидаемую информацию и ссылку на наблюдение. Несколько tool calls за ответ запрещены.
 
 ### 6.4. Верификация и assessment
 
-Отдельные evidence kinds:
+Evidence kinds:
 
-- `source_assertion` — утверждение из источника с точным source chunk;
-- `quote_integrity` — сохранённый фрагмент совпадает с источником по хешу и диапазону;
-- `experiment_run` — один запуск воспроизводимого эксперимента;
-- `computation` — результат для точных входов и алгоритма;
-- `formal_check` — результат формального инструмента в заданной модели;
-- `local_observation` — наблюдение конкретной локальной системы и времени.
+- `source_assertion` — утверждение из точного source chunk;
+- `quote_integrity` — фрагмент совпадает с источником по hash/range;
+- `experiment_run` — один запуск с environment manifest;
+- `computation` — результат для точных inputs/algorithm;
+- `formal_check` — результат формального инструмента;
+- `local_observation` — наблюдение локальной системы и времени.
 
-Claim assessment агрегирует эти записи и получает effective grade:
+Claim assessment агрегирует evidence set:
 
 ```text
 E0  unverified
 E1  integrity_checked
 E2  single_method_supported_in_scope
 E3  independently_corroborated_or_replicated_in_scope
-E4  formally_verified_or_repeatedly_replicated_in_declared_scope
+E4  formally_verified_or_repeatedly_independently_replicated
 ```
 
-Grade вычисляет rules engine по `claim_type_rules`: количество evidence, допустимые виды, independence groups, покрытие scope и counterevidence. `corroboration` и `replication` — результаты агрегации, а не значения отдельной строки evidence.
-
-Verifier ищет контрпримеры, общие первоисточники, ошибки эксперимента и несовпадение scope. Он предлагает assessment, но окончательный grade механически пересчитывает Memory Service. Operator attestation может добавить комментарий или новые данные, но не повышает grade сама по себе.
+Grade вычисляет rules engine по claim type rules, distinct evidence identities, source/environment groups, scope и counterevidence. Verifier предлагает assessment, но не назначает grade или confidence. Operator attestation без новых данных grade не повышает.
 
 ### 6.5. Консолидация, отчёт и commit
 
-Curator предлагает изменения памяти. Memory Service валидирует схему, provenance, зависимости и assessment. Затем формируются итог, открытые вопросы, handoff и публичный отчёт.
+Curator предлагает изменения. Memory Service валидирует schema, provenance, dependencies и assessment. Решение `decision.kind=complete` переводит сессию в consolidation; после staging выполняются reporting и §5.2.2.
 
-Решение модели `decision.kind=complete` переводит Orchestrator в `consolidating`. После подготовки staging Orchestrator проходит `reporting → committing` и выполняет §5.2.2. Boolean или tool с дублирующей семантикой не используется.
+Если LLM недоступна, host-generated failure/minimal report содержит причину, последнюю завершённую операцию и diagnostics.
 
-При ошибке Orchestrator создаёт host-generated failure report: причина, последняя завершённая операция, неопределённые действия и ссылки на диагностику. LLM для этого не требуется.
+### 6.6. Soft budget и резерв финализации
 
-### 6.6. Soft budget exhaustion
+Soft budgets проверяются до следующего LLM/tool call и после терминального результата action. Резерв разделён:
 
-Soft budgets проверяются только на безопасной границе: до следующего LLM/tool call и после терминального результата предыдущего action. Часть токенов и времени заранее резервируется для consolidation/report/commit.
+- cognitive reserve — curator/consolidation;
+- host reserve — deterministic validation, minimal report, commit и reconciliation; он не зависит от LLM tokens.
 
-При исчерпании soft budget:
+При soft exhaustion новые actions не запускаются, verified work проходит validation и после commit даёт `succeeded_partial`. Это допустимо только без unknown action, с валидным последним model output и непросроченным cognitive phase deadline.
 
-- новые действия не запускаются;
-- сессия переходит в `stopping` с причиной `budget_exhausted`;
-- verified work и hypotheses с выполненными проверками проходят обычную валидацию;
-- после commit терминальное состояние — `succeeded_partial`.
+Если cognitive consolidation не завершена безопасно, сессия `failed` и staging отбрасывается; operational actions/artifacts остаются в audit history для следующей сессии. Если consolidation завершена, но модельный reporting не удался, Orchestrator создаёт minimal report и продолжает commit.
 
-`succeeded_partial` допустим только если нет `ActionStarted` без терминального результата, последний model output полностью прошёл schema validation, phase deadline не был нарушен и staging успешно валидирован.
+Deadline до отправки COMMIT приводит в `failed`. Timeout после отправки COMMIT приводит только в `reconciling_commit`: исход транзакции устанавливается по §5.2.2.
 
-Обрыв генерации по `max_output_tokens`, hard timeout LLM/tool, нарушение политики, падение процесса или неопределённый исход действия не являются soft exhaustion. Они ведут в `failed` и отбрасывают staging.
+### 6.7. Остановка и канонические operator transitions
 
-Резерв тоже конечен. Превышение собственного deadline фазами `consolidating`, `reporting` или `committing` ведёт в `failed` — то есть к потере всей работы, ради предотвращения которой существует этот раздел. Поэтому размер резерва берётся из измеренной latency консолидации на целевом профиле модели, а не назначается на глаз, и `consolidation reserve overrun` выносится в отдельную метрику §16.1: рост этого счётчика означает, что резерв подобран неверно, а не что сессии стали хуже.
+```text
+команда             допустимые source states                         результат
+stop_gracefully     waking..verifying                                stopping на safe boundary
+stop_gracefully     stopping|consolidating|reporting                 idempotent accepted
+abort_session       created..reporting                               aborting на safe boundary
+stop/abort          committing|reconciling_commit|terminal           rejected
+pause               любое                                            запрет следующего wake
+```
 
-### 6.7. Остановка оператором
+Диапазон `waking..verifying` означает все перечисленные нетерминальные cognitive states, а не сравнение строк enum.
 
-- `stop_gracefully` запрещает запуск следующего действия. На ближайшей безопасной границе сессия проходит `stopping → consolidating → reporting → committing` и завершается `succeeded_partial` с причиной `operator_stop`.
-- Если в момент `stop_gracefully` есть незавершённый action, Orchestrator ждёт его терминального результата до tool deadline. При `ActionOutcomeUnknown` итог — `failed`, а не `succeeded_partial`: предусловия §6.6 действуют одинаково для operator stop и для soft exhaustion. Наивная реализация «остановиться, дождаться текущего действия, консолидировать» нарушает это молча.
-- `abort_session` запрещает новые действия и отбрасывает staging. Если активного action нет, сессия проходит `aborting → cancelled`.
-- Если во время abort есть `ActionStarted`, Orchestrator ждёт его терминального результата до tool deadline. При `ActionOutcomeUnknown` итог — `failed`, не `cancelled`.
-- Во время короткой commit-транзакции обе команды отклоняются: authoritative state уже меняется атомарно.
+- Stop ждёт текущий tool action до deadline. `ActionOutcomeUnknown` даёт `failed`.
+- Abort отменяет активную LLM generation и отбрасывает её незавершённый output: генерация не имеет внешнего эффекта. Tool action ждёт terminal result; unknown даёт `failed`.
+- Abort до commit отбрасывает staging и завершает `cancelled`.
+- Stop после safe boundary проходит consolidation/reporting/commit и даёт `succeeded_partial(operator_stop)`.
 
 ## 7. Структурированный протокол решений
 
@@ -708,12 +746,15 @@ ActionProposed → PolicyEvaluated → ActionAccepted → ActionStarted
 
 ### 8.2. Семантическая память
 
-Структурированный claim содержит:
+Claim содержит:
 
 ```text
 statement
 claim_type
-epistemic_status: hypothesis | supported | disputed | refuted | deferred | unassessed
+epistemic_status: nullable
+  hypothesis | supported | disputed | refuted | deferred
+assessment_state:
+  current | pending | invalid
 freshness_status: fresh | due | stale | unknown
 valid_from
 valid_to: nullable
@@ -727,18 +768,15 @@ counterevidence[]
 created_in_session
 ```
 
-Уверенность имеет ровно одного производителя. Она вычисляется rules engine вместе с grade и хранится только в `claim_assessments.confidence`; отдельного поля на claim нет, чтобы рядом со строго вычисленным grade не появлялось второе число неизвестного происхождения:
+`assessment_state` — workflow оценки, `epistemic_status` — вывод действующего assessment. Инварианты:
 
-```text
-confidence = f(effective_grade, count(counterevidence_unresolved),
-               scope_coverage, independence_group_count)
-```
+- `current`: current_assessment_id и epistemic_status обязательны;
+- `pending`: assessment поставлен в очередь, оба current-поля NULL;
+- `invalid`: автоматическая переоценка существующих evidence не дала действующего assessment; current-поля NULL, требуется новое исследование.
 
-Функция детерминированная, её версия входит в `rules_version`. Модель может приложить обоснование, но не может предложить или изменить число: в v1 confidence, назначаемая LLM, — это §20.2 в новом костюме. Калибровка `f` отдельно по claim types вынесена в §21.4.
+Последний исторический status доступен через revisions/UI, но не используется retrieval как текущий.
 
-Уверенность меняется при новых evidence, counterevidence, изменении independence groups или revision правил, но не уменьшается автоматически только из-за времени. `freshness_status` отдельно показывает актуальность проверки.
-
-Effective grade принадлежит `claim_assessment` и вычисляется по набору evidence. Число confidence не заменяет assessment и не сравнивается между claim types без калибровки.
+Confidence имеет одного producer: rules engine вычисляет её вместе с grade и хранит только в `claim_assessments.confidence`. Функция детерминирована и версионирована; LLM число не предлагает. Confidence меняется при новых evidence/counterevidence, dependencies, grouping или rules, но не из-за одного течения времени.
 
 ### 8.3. Процедурная память
 
@@ -759,18 +797,27 @@ Effective grade принадлежит `claim_assessment` и вычисляет�
 
 Ограниченный context pack текущей сессии. Полная история никогда не передаётся автоматически.
 
-### 8.6. Жизненный цикл знания
+### 8.6. Жизненный цикл знания и каскадная invalidation
 
-- Срок ре-верификации выводится из claim type rules, volatility, `as_of` и valid interval. Модель может предложить более короткий срок, но не более длинный.
-- Для текущего temporal fact обязательны `as_of` и scope. `valid_to` может быть NULL и означает «конец действия пока неизвестен», а не бесконечную истинность.
-- Истечение `reverify_after` переводит freshness в `due/stale`, но само по себе не меняет epistemic confidence.
-- Hypothesis не является достаточным evidence для другого claim; она может быть зависимостью или направлением поиска.
-- Эксперимент получает reproducibility capsule с кодом, входами, seed, зависимостями, hardware/backend fingerprint и scope.
-- Изменение dependency fingerprint, rules version или independence snapshot инвалидирует текущий assessment и ставит claim в очередь переоценки.
-- Инвалидация в той же транзакции обнуляет `current_assessment_id` и переводит `epistemic_status` в `unassessed`. Пока claim в этом статусе, он не может быть evidence или зависимостью другого claim, не участвует в предикатах правил и подаётся retrieval только с явной пометкой. Без этого правила существует окно, в котором supported-claim не имеет ни одного действующего доказательства, а контекст подаёт его как подтверждённое знание — то есть §3.7 перестаёт действовать незаметно.
-- `unassessed` не является суждением о ложности: после переоценки claim возвращается в статус, который даёт новый assessment, вплоть до прежнего.
-- На тему действует лимит активных claims; превышение запускает консолидацию.
-- История сохраняется в `claim_revisions`, `claim_assessments` и audit log.
+- Reverify deadline выводится из claim type, volatility, `as_of` и valid interval. `valid_to=NULL` означает неизвестный конец действия.
+- Истечение срока меняет freshness, но не confidence.
+- Hypothesis не служит достаточным evidence; она может быть исследовательской зависимостью только с явной пометкой.
+- Experiment получает reproducibility capsule и structured environment manifest.
+- Изменение dependency fingerprint, rules или independence snapshot инвалидирует assessment.
+
+Invalidation выполняется транзакционно:
+
+1. current assessment становится invalid;
+2. claim получает `assessment_state=pending`, `current_assessment_id=NULL` и `epistemic_status=NULL`;
+3. создаётся/обновляется durable reassessment job;
+4. по `claim_dependencies` вычисляется reverse dependency closure;
+5. current assessments всех downstream claims инвалидируются в той же domain revision, а jobs ставятся в топологическом порядке.
+
+Если closure велик, транзакция создаёт `dependency_invalidation_barriers` и jobs батчами. Пока barrier active, retrieval/rules проверяют ancestor closure и не считают downstream claim current. Barrier закрывается только после перевода всех затронутых claims в pending/invalid. Циклы dependency graph запрещены для evidential dependencies; обнаруженный legacy cycle целиком переводится в pending и требует operator review.
+
+Worker пересчитывает только из существующих evidence. Успех возвращает `assessment_state=current`. Недостаток данных переводит в `invalid` и создаёт вопрос с высоким coverage gap. Pending/invalid claim не может быть evidence или действующей зависимостью и подаётся retrieval только с явной меткой.
+
+История сохраняется в revisions, assessments, jobs и audit log.
 
 ### 8.7. Реестр типов утверждений
 
@@ -818,29 +865,58 @@ Finite computation не доказывает universal theorem: она созд�
 
 Тип назначается при создании claim и меняется только revision с обоснованием и новым assessment. Rules живут в `config_snapshots.claim_type_rules`; новая версия не меняет прошлые revisions молча, но ставит затронутые актуальные claims в очередь переоценки.
 
-#### 8.7.1. Независимость окружений
+#### 8.7.1. Repeatability, reproducibility и independent replication
 
-Для внешних фактов независимость источников описана versioned алгоритмом §11.3. Для локальных экспериментов нужен такой же по строгости предикат, иначе `empirical_conjecture` и `procedural` становятся дешёвым обходом: два прогона одного скрипта на одном хосте формально дают «>=2 experiment_run».
+Один opaque `environment_fingerprint` недостаточен. Каждый experiment run ссылается на versioned environment manifest:
 
-Два `experiment_run` считаются независимыми, если выполнено хотя бы одно условие:
+```text
+protocol_hash
+implementation_hash
+code_lineage
+dataset_hash
+dataset_lineage
+toolchain_hash
+dependency_hash
+runtime_hash
+hardware_hash
+seed
+data_order_hash
+normalizer_version
+```
 
-- различаются hardware или backend fingerprint (другая машина, другой accelerator, другая сборка runtime);
-- различаются реализация или toolchain при совпадающей спецификации — независимая реализация того же алгоритма, другой компилятор, другая версия интерпретатора;
-- эксперимент стохастический, и различаются seed **и** порядок обработки данных, а объявленный scope claim охватывает распределение, а не единичный прогон.
+Rules различают:
 
-Повтор с тем же `dependency_fingerprint`, тем же seed и на том же хосте — это не independent replication, а проверка воспроизводимости запуска: она даёт E2 и подтверждает, что результат не случайный артефакт одного исполнения.
+- `repeatability` — тот же protocol/implementation/data/environment; проверяет стабильность выполнения и даёт не выше E2;
+- `reproducibility` — тот же метод, но другой runtime/hardware/toolchain; проверяет переносимость в объявленном scope, но сама по себе не является независимым подтверждением гипотезы;
+- `independent_replication` — независимо реализованный protocol или implementation и, где claim зависит от данных, независимый dataset lineage; именно она может дать E3.
 
-Предикат исполняется rules engine наравне с независимостью источников, а его версия входит в `rules_version`.
+Другой GPU/backend, seed или порядок данных сами по себе никогда не создают independent group. Для стохастического эксперимента множество seeds является одним evidence family и увеличивает качество оценки внутри группы.
+
+Versioned environment-independence algorithm строит groups по protocol, implementation и data lineage. Claim assessment фиксирует snapshot и считает distinct groups, а не hashes manifests. Критерий зависит от scope: claim о переносимости между GPU может опираться на reproducibility, универсальная empirical conjecture требует independent replication.
 
 #### 8.7.2. Снятие counterevidence
 
-Предикат `counterevidence_unresolved == false` — самый дешёвый путь к завышенному grade: достаточно приложить слабое возражение и объявить его снятым. Поэтому «resolved» — не флаг, а запись:
+Resolution является отдельной аудируемой сущностью, а не флагом модели.
 
-- снятие оформляется отдельной строкой `counterevidence_resolutions` с собственным evidence или source-graph correction в качестве основания;
-- допустимые основания: показано, что контрпример вне scope claim; найдена ошибка в методе получения counterevidence; получено новое evidence, объясняющее расхождение;
-- «модель считает возражение неубедительным» основанием не является;
-- curator может предложить снятие, но `valid=true` проставляет rules engine после проверки основания; operator attestation, как и в §11.3, комментирует, но не снимает;
-- снятие аудируется и версионируется: отмена resolution инвалидирует зависимые assessments по общему правилу §8.6.
+Допустимые основания:
+
+- доказано, что counterexample вне claim scope;
+- обнаружена проверяемая ошибка метода;
+- новое evidence объясняет расхождение;
+- source-graph correction меняет provenance.
+
+Обязательные инварианты:
+
+```text
+exactly one of basis_evidence_id, basis_correction_id is set
+target evidence belongs to the same claim and participates as counter
+at most one valid resolution per target evidence
+basis is currently valid and scope-compatible
+```
+
+Curator предлагает resolution, rules engine проверяет basis. Строка хранит actor, rules version и audit event. Operator attestation комментирует, но не снимает counterevidence.
+
+Если basis или correction инвалидируется, resolution становится invalid в той же revision и каскадно инвалидирует assessments, которые считали counterevidence resolved.
 
 ## 9. Познание нового и защита от повторений
 
@@ -1017,17 +1093,17 @@ Fingerprint вызова включает также prompt version, context man
 
 ### 13.1. Query API
 
-Query API имеет read-only credentials и читает только доменные таблицы и подготовленные read models. Он предоставляет:
+Query API имеет read-only credentials и предоставляет:
 
-- состояние узла и каноническое состояние активной сессии;
-- timeline из committed audit events;
-- сессии, actions и артефакты;
-- claims, evidence, contradictions и freshness;
-- current assessments, effective grade, rules version и invalidation state, включая claims в статусе `unassessed`;
-- сообщения и ответы;
-- агрегированные метрики.
+- node/session state, включая `reconciling_commit`;
+- operational timeline и committed audit events;
+- sessions, actions, commit attempts и artifacts;
+- claims, evidence, dependencies, freshness и assessment lifecycle;
+- current assessments, rules/source/environment snapshots;
+- pending/invalid claims и reassessment queue age;
+- messages, operator commands и метрики.
 
-Live timeline получает committed события из outbox-проектора и транслирует их через SSE. Неподтверждённые staging-изменения на публичные страницы не попадают. Диагностические события могут показываться владельцу отдельно и явно помечаются как uncommitted/failed.
+SSE получает committed outbox events. Staging knowledge не публикуется как действующее; discarded/failed diagnostics доступны владельцу в отдельном visibility-классе.
 
 ### 13.2. Command API
 
@@ -1069,9 +1145,9 @@ Timeline строится из audit events и actions, а не из постф�
 
 ### 13.5. Знания
 
-Интерфейс показывает epistemic status и freshness раздельно, current assessment, effective grade, rule version, evidence set, independence snapshot, valid interval, scope, counterevidence и dependency fingerprint. Из claim можно перейти к точному source chunk, experiment run или reproducibility capsule.
+UI показывает epistemic status только при `assessment_state=current`. Для `pending | invalid` он показывает последний исторический status отдельно, причину invalidation, очередь/retry и downstream impact, но не оформляет старый вывод как действующее знание.
 
-При инвалидированном assessment UI не продолжает показывать старый grade как действующий: отображаются предыдущая оценка, причина invalidation и состояние очереди переоценки.
+Страница claim связывает current/previous assessments, confidence, rules version, evidence set, source/environment independence snapshots, dependencies, valid interval, scope, counterevidence и resolutions. Из каждой записи есть переход к source chunk, environment manifest, experiment run или reproducibility capsule.
 
 ### 13.6. Сообщения
 
@@ -1096,25 +1172,41 @@ created → queued → delivered → acknowledged → answered | expired
 
 ## 14. Модель данных v1
 
-Ниже — логическая схема; конкретные типы, FK, индексы и CHECK constraints задаются миграциями.
+Логическая схема; конкретные FK, индексы и deferred constraint triggers задаются миграциями.
 
 ```text
 sessions
   id, state, lease_owner, lease_expires_at, last_heartbeat_at,
   last_progress_at, phase_deadline, stop_requested_at, abort_requested_at,
+  commit_intent_at, commit_attempt_id,
   question_id, base_workspace_manifest_id, committed_workspace_manifest_id,
   config_snapshot_id, started_at, finished_at, termination_reason
 
 domain_revisions
   scope, revision, updated_at
 
+knowledge_write_gate
+  scope, owner_kind, owner_id, priority,
+  lease_expires_at, acquired_at
+
+commit_attempts
+  id, session_id, status, validated_against_revision,
+  staging_hash, workspace_manifest_id,
+  checkpoint_id, terminal_state, prepared_at, resolved_at, last_error
+
 session_staging
   id, session_id, aggregate_type, operation, payload, payload_hash,
   schema_version, validation_status, validated_against_revision,
-  validation_rules_hash, independence_snapshot_id, created_at
+  validation_rules_hash, source_independence_snapshot_id,
+  environment_independence_snapshot_id, created_at
 
 staging_artifacts
   staging_id, artifact_id
+
+reassessment_jobs
+  id, claim_id, status, reason, priority, enqueued_at,
+  attempts, lease_owner, lease_expires_at,
+  next_attempt_at, completed_at, last_error
 
 model_runs
   id, session_id, turn_id, phase, model_fingerprint,
@@ -1134,27 +1226,38 @@ questions
   score_components, embedding_fingerprint, created_at
 
 claims
-  id, statement, claim_type, epistemic_status, freshness_status,
+  id, statement, claim_type,
+  epistemic_status, assessment_state, freshness_status,
   valid_from, valid_to, as_of, observed_at, reverify_after,
   dependency_fingerprint, topic, current_assessment_id,
   created_in_session
+
+claim_dependencies
+  from_claim_id, to_claim_id, kind, created_in_session, created_at
+
+dependency_invalidation_barriers
+  id, root_claim_id, domain_revision, status,
+  created_at, resolved_at
 
 claim_revisions
   id, claim_id, session_id, previous_value, new_value,
   changed_at, reason_audit_event_id
 
 evidence
-  id, claim_id, relation, evidence_kind,
+  id, claim_id, relation, evidence_kind, identity_hash,
   scope, source_id, chunk_id, observation_artifact_id,
-  environment_fingerprint, created_in_session
+  environment_manifest_id, created_in_session
 
 counterevidence_resolutions
-  id, evidence_id, basis_kind, basis_evidence_id,
-  basis_correction_id, valid, created_in_session, created_at
+  id, evidence_id, basis_evidence_id, basis_correction_id,
+  actor, rules_version, reason_audit_event_id,
+  valid, created_in_session, created_at
 
 claim_assessments
   id, claim_id, effective_grade, epistemic_status,
-  rules_version, rules_hash, independence_snapshot_id,
+  rules_version, rules_hash,
+  source_independence_snapshot_id,
+  environment_independence_snapshot_id,
   evidence_set_hash, assessed_scope, confidence,
   valid, invalidation_reason, created_in_session, created_at
 
@@ -1178,6 +1281,25 @@ source_independence_members
 source_dependency_edges
   id, from_source_id, to_source_id, kind,
   basis_artifact_id, origin, created_at
+
+source_graph_corrections
+  id, actor, kind, from_source_id, to_source_id,
+  basis_artifact_id, rules_version, valid,
+  reason_audit_event_id, created_at
+
+environment_manifests
+  id, manifest_artifact_id, protocol_hash, implementation_hash,
+  code_lineage, dataset_hash, dataset_lineage,
+  toolchain_hash, dependency_hash, runtime_hash,
+  hardware_hash, seed, data_order_hash,
+  normalizer_version, created_at
+
+environment_independence_snapshots
+  id, algorithm_version, rules_hash, created_at
+
+environment_independence_members
+  snapshot_id, environment_manifest_id,
+  group_id, relation, basis
 
 artifacts
   id, sha256, media_type, size, storage_key,
@@ -1224,178 +1346,190 @@ backup_manifests
   verified_at, created_at
 ```
 
-### 14.1. Источник правды и границы видимости
+### 14.1. Источник правды и lifecycle
 
-Доменное состояние — источник правды. `audit_events` и `outbox_events` добавляются в той же транзакции, что и наблюдаемое доменное изменение. Append-only закрепляется отдельной DB role и trigger/permissions.
+Domain state — источник правды; audit/outbox добавляются в той же транзакции. Staging содержит предложения долговременной памяти. Operational state, model runs, actions и commit attempts фиксируются сразу.
 
-Staging содержит только предложения долговременной памяти и identity. Session state, model runs, actions, policy decisions и результаты уже выполненных инструментов являются operational history и фиксируются сразу: иначе live timeline и recovery были бы невозможны. Query API явно различает committed knowledge, active operational events и discarded staging diagnostics.
+Assessment lifecycle constraints:
 
-### 14.2. Host-generated causality и idempotency
+```text
+assessment_state='current'
+  ⇔ current_assessment_id IS NOT NULL
+     AND epistemic_status IS NOT NULL
+     AND referenced assessment.valid=true
 
-`model_runs.id` и `turn_id` создаёт Orchestrator. `actions.id` и `idempotency_key` создаёт Tool Broker после валидного model output.
+assessment_state IN ('pending','invalid')
+  ⇒ current_assessment_id IS NULL
+     AND epistemic_status IS NULL
+```
 
-Обязательные ограничения:
+FK «current assessment принадлежит тому же claim и valid» проверяется deferred constraint trigger. `UNIQUE(reassessment_jobs.claim_id) WHERE status IN ('queued','leased','retry')` обеспечивает один active job на claim, сохраняя завершённые jobs для истории. В `claim_dependencies` направление определено как `from_claim_id depends on to_claim_id`. Evidential dependencies образуют DAG; cycle check выполняется при commit.
+
+### 14.2. Host-generated causality и commit attempts
+
+Orchestrator создаёт turn/model/commit IDs, Tool Broker — action/idempotency IDs. LLM не управляет ими.
+
+Ограничения:
 
 ```text
 UNIQUE(model_runs.session_id, model_runs.turn_id)
 UNIQUE(actions.model_run_id)
 UNIQUE(actions.session_id, actions.idempotency_key)
+UNIQUE(commit_attempts.session_id) WHERE status IN ('prepared','reconciling')
 ```
 
-LLM не может выбрать или переиспользовать ключ. При conflict по `(session_id, idempotency_key)` Broker читает существующую строку: совпадающие tool/arguments_hash возвращают прежний result, несовпадение фиксируется как security incident. Межстрочный инвариант не моделируется CHECK constraint, потому что PostgreSQL CHECK не сравнивает разные строки. Model run без action допустим для schema failure, complete decision и backend error.
+Key conflict с теми же tool/arguments возвращает прежний result; несовпадение — security incident.
 
-### 14.3. Assessment и versioned validation
+`commit_attempts` является durable reconciliation record и GC root, пока status не `committed | aborted`. Terminal session state, checkpoint и `attempt=committed` записываются одной транзакцией.
 
-Effective grade и confidence хранятся только в `claim_assessments`. Каждая assessment ссылается через `assessment_evidence` на точный набор evidence и фиксирует rules/independence snapshot. `claims.current_assessment_id` указывает только на valid assessment того же claim; при инвалидации он обнуляется, а claim переходит в `unassessed` в той же транзакции (§8.6).
+### 14.3. Evidence identity, assessment и resolutions
 
-`assessment_evidence.role` — закрытый enum: `support`, `counter`, `scope_witness`, `context`. Он определяет, как запись участвует в предикатах правил, тогда как `evidence.relation` описывает отношение самого наблюдения к утверждению. Расхождение между ними — ошибка подготовки assessment, а не допустимое состояние: rules engine проверяет согласованность и отклоняет набор. Предикат `counterevidence_unresolved` считает записи с `role='counter'`, для которых нет valid строки в `counterevidence_resolutions`.
+`evidence.identity_hash` обязателен и вычисляется доверенным контуром из canonical content/provenance:
 
-Дублирование evidence запрещено на уровне схемы, иначе `count(...) >= 2` проходится двумя копиями одного наблюдения:
+- source evidence: source content hash, normalized range и kind;
+- experiment: observation content hash, environment manifest hash и protocol output;
+- computation/formal check: result artifact hash, exact inputs и tool fingerprint.
+
+Основная дедупликация:
 
 ```text
-UNIQUE NULLS NOT DISTINCT
-  (evidence.claim_id, evidence.evidence_kind, evidence.source_id,
-   evidence.chunk_id, evidence.observation_artifact_id)
+UNIQUE(evidence.claim_id, evidence.evidence_kind, evidence.identity_hash)
 ```
 
-`NULLS NOT DISTINCT` обязателен: при обычной уникальности PostgreSQL считает NULL-ы различными, и записи с пустым `chunk_id` дублировались бы свободно. Дополнительно правила claim types считают не строки, а различные `independence_group` для источников и различные `environment_fingerprint` для экспериментов (§8.7.1).
+Per-kind constraints требуют:
 
-`session_staging.validated_against_revision` сравнивается с `domain_revisions(scope='knowledge')` в commit-транзакции. Изменение domain revision, rules или source grouping инвалидирует подготовленный результат и требует повторной валидации.
+- `source_assertion | quote_integrity`: source_id и chunk_id;
+- `experiment_run | local_observation`: observation_artifact_id и environment_manifest_id;
+- `computation | formal_check`: observation_artifact_id и tool/environment manifest.
 
-### 14.4. События и совместимость
+Нельзя получить новый evidence count, завернув одинаковый content hash в другой artifact row. PostgreSQL 15+ рекомендуется; если используется `UNIQUE NULLS NOT DISTINCT` как дополнительная защита composite fields, это фиксируется как минимальная версия.
 
-Пара `(session_id, sequence)` уникальна. Тип события и `schema_version` обязательны. Consumers игнорируют неизвестные необязательные поля и останавливаются на неизвестной major version. Outbox projector идемпотентен по `outbox_events.id`.
+Effective grade/confidence хранятся только в assessment. Assessment фиксирует точный evidence set и оба independence snapshots. Role enum: `support | counter | scope_witness | context`. Несогласованность role/relation отклоняется rules engine.
 
-Audit log не обязан восстанавливать бизнес-состояние replay, но объясняет каждое изменение claim/assessment, action, policy decision, operator command, source grouping и session state.
+Counterevidence resolution constraints:
+
+```text
+CHECK ((basis_evidence_id IS NULL) <> (basis_correction_id IS NULL))
+UNIQUE(evidence_id) WHERE valid=true
+target evidence belongs to same claim and is used as counter
+basis is current, scope-compatible and not transitively dependent on target
+```
+
+Последние два межстрочных инварианта проверяет deferred trigger/rules engine. `basis_correction_id` ссылается на valid `source_graph_corrections`. Invalidation basis делает resolution invalid и запускает dependency closure §8.6.
+
+### 14.4. Writer admission, revisions и events
+
+Session устанавливает writer intent до validation. Worker получает `knowledge_write_gate` только через NOWAIT и не коммитит batch при появлении более приоритетного session intent. Gate защищён lease и не является долгой DB-транзакцией.
+
+`validated_against_revision` сравнивается с knowledge revision в финальной транзакции. Writer gate обеспечивает liveness, revision — correctness.
+
+Audit event имеет type/schema version и уникальную пару `(session_id, sequence)`. Outbox projector идемпотентен. Audit объясняет assessment/invalidation closure, resolution, writer admission, commit reconciliation и session state.
 
 ## 15. Надёжность, commit и восстановление
 
-- Lease имеет TTL, conditional heartbeat и progress watchdog.
-- State transitions принадлежат Orchestrator, а не модели.
-- Ошибка LLM/schema/tool не считается успехом.
-- Memory и workspace публикуются только через §5.2.2.
-- Версии модели, embeddings, prompts, tool schema, rules и policy фиксируются на сессию.
-- Tool output ограничивается в контексте, полный результат сохраняется content-addressed.
-- Retry разрешён только контрактом класса инструмента.
-- Квота проверяется перед сессией и commit.
-- Outbox повторяет доставку событий, но не бизнес-операцию.
+- Lease, heartbeat и writer intents имеют TTL/fencing.
+- State transitions принадлежат Orchestrator.
+- Memory/workspace публикуются только через §5.2.2.
+- Retry следует классу инструмента.
+- Model/rules/policy fingerprints фиксируются.
+- Commit outcome сначала reconciled, затем классифицируется.
 
-### 15.1. Crash recovery
+### 15.1. Crash recovery и reconciliation
 
-При истечении lease recovery worker:
+Recovery worker сначала ищет unresolved commit attempt.
 
-1. блокирует session row и проверяет owner/expiry;
-2. запрещает новые actions старому owner;
-3. переводит `ActionStarted` без терминального события в `ActionOutcomeUnknown`;
-4. отмечает сессию `failed` и создаёт host-generated failure report;
-5. удаляет session staging и COW overlay;
-6. оставляет последние committed domain state и workspace manifest;
-7. запускает orphan GC после grace period и расчёта root set.
+- `committed` с terminal session/checkpoint: принимает успех и не очищает объекты;
+- `prepared` при подтверждённом rollback: переводит attempt в aborted, session в failed и очищает staging;
+- DB unavailable или inconsistent records: узел остаётся `reconciling_commit/paused`, запрещает wake и GC, поднимает alert;
+- отсутствие unresolved attempt: обычный lease recovery — started action становится outcome unknown, session failed, staging/overlay очищаются после grace period.
 
-Продолжение скрытого состояния LLM «с середины» в v1 не поддерживается. Следующая сессия читает failure report и планирует заново от последнего checkpoint.
+Recovery очищает writer intent только после fencing по lease и commit attempt. Ручное вмешательство в inconsistent reconciliation создаёт operator command с audit reason; прямой UPDATE запрещён.
 
 ### 15.2. Классы повторяемости
 
-Tool contract объявляет ровно один класс:
-
-- `pure` — повтор безопасен;
-- `observation` — read-only, но новый вызов является новым наблюдением;
-- `idempotent(key)` — backend гарантирует один эффект по host-generated key;
-- `non_idempotent` — retry после `ActionStarted` запрещён.
-
-Workspace writes безопасны за счёт overlay и key binding. Shell/Python по умолчанию non-idempotent. Web search/fetch — observation: после неопределённого старта автоматического retry нет, новый осознанный вызов получает новый model run и timestamp.
-
-Complete decision не является tool action. Его state transition идемпотентен внутри Orchestrator и защищён lease/fencing.
+`pure | observation | idempotent(key) | non_idempotent` имеют семантику §5.7. Workspace writes защищены overlay/key binding; shell/python non-idempotent; web calls observation. Complete decision — идемпотентный Orchestrator transition, не tool.
 
 ### 15.3. Checkpoint, backup и GC roots
 
-Checkpoint — committed database revision плюс immutable workspace manifest. Backup независимо защищает базу и Artifact Store.
+Checkpoint — committed revision плюс workspace manifest. Backup связывает DB recovery point с content-addressed artifact inventory.
 
-Минимальная схема:
+GC roots:
 
-- PostgreSQL: base backup/`pg_dump` и WAL/PITR согласно профилю;
-- Artifact Store: versioned snapshot или репликация;
-- `backup_manifests` связывает recovery point с content-addressed artifact inventory, его hash и retention deadline;
-- restore drill выбирает случайную точку внутри retention window и проверяет все referenced hashes;
-- object retention не короче глубины backup retention.
+- актуальные domain FK, evidence, environments, context/model/tool artifacts и attestations;
+- workspace/backup manifests в retention window;
+- active staging/overlays;
+- unresolved commit attempts и их manifests;
+- reassessment/resolution basis artifacts;
+- pinned/legal-retention objects.
 
-GC удаляет объект только если он недостижим из полного набора корней:
-
-- всех актуальных FK доменной БД: evidence, chunks, experiment results, context manifests, model/tool outputs и operator attestations;
-- всех workspace manifests внутри retention window;
-- всех backup manifests до `retention_until`;
-- active session staging, `staging_artifacts` и overlays до истечения grace period;
-- pinned/legal-retention объектов.
-
-Reachability вычисляется по database snapshot/recovery catalog, а не только по текущему workspace manifest. Иначе можно удалить source artifact, на который ссылается claim, либо объект, нужный PITR в прошлую точку.
+При `reconciling_commit` GC соответствующей сессии запрещён. Restore drill выбирает случайную точку retention window и проверяет все referenced hashes.
 
 ### 15.4. Failpoint и invariant tests
 
-Процесс принудительно останавливается:
+Тесты останавливают процесс:
 
-- до/после object upload и PostgreSQL commit;
-- между `ActionStarted` и результатом;
-- до outbox publication;
-- во время staging/orphan cleanup;
-- при domain revision conflict;
-- во время stop/abort на каждой action boundary;
-- при soft budget до следующего вызова и hard timeout внутри вызова;
-- при merge independence groups, инвалидирующем assessment;
-- при гонке reassessment worker и commit сессии за `domain_revisions(scope='knowledge')`.
+- до отправки COMMIT, после server commit до client response и во время reconciliation;
+- до/после object upload, outbox и cleanup;
+- между action started/result;
+- при writer intent, worker NOWAIT conflict и worker validation;
+- при revision conflict;
+- при stop/abort на каждой boundary;
+- при cascade invalidation, dependency cycle и basis invalidation;
+- при source/environment group merge.
 
-Инварианты: виден предыдущий либо полностью новый checkpoint; LLM не задаёт idempotency key; partial success не содержит unknown action; invalid assessment не остаётся current; GC не удаляет ни один root-reachable object.
+Инварианты:
+
+- checkpoint старый либо полностью новый;
+- unknown COMMIT не становится ложным failure;
+- session validation не голодает из-за worker;
+- invalid ancestor не оставляет downstream assessment current;
+- partial success не содержит unknown action;
+- GC не удаляет root-reachable object.
 
 ## 16. Наблюдаемость и метрики
 
 ### 16.1. Технические
 
-- длительность session/phase и LLM latency/tokens;
-- schema failures и backend retries;
-- actions по классу и состоянию;
-- Policy Engine `allow | deny | require_operator`;
-- `ActionOutcomeUnknown` и возраст инцидента;
-- heartbeat age, progress age, phase deadline misses и lease recovery;
-- soft budget exhaustion отдельно от hard limit failures;
-- consolidation reserve overrun: сигнал о неверно подобранном резерве, а не о качестве сессий;
-- domain revision conflicts и validation retries;
-- commit latency/failures, outbox lag и attempts;
-- orphan bytes по retention class и root scan duration;
-- CPU, RAM, GPU/VRAM, disk и model load time;
-- возраст backup и restore drill.
+- session/phase/LLM latency и tokens;
+- actions по class/state, schema/backend retries;
+- heartbeat/progress/deadline/lease recovery;
+- soft exhaustion, cognitive reserve overrun и host finalization overrun отдельно;
+- commit attempts по status, reconciliation age и inconsistent records;
+- writer intent wait, worker NOWAIT conflicts и session validation retries;
+- domain revision conflicts, commit latency, outbox lag;
+- orphan bytes/root scan duration;
+- resources, backup и restore drill age.
 
 ### 16.2. Познавательные
 
-- новые, изменённые и переиспользованные claims;
-- распределение current assessments по effective grade и rules version;
-- invalid assessment backlog, глубина и возраст очереди reassessment worker;
-- доля claims в статусе `unassessed` и время нахождения в нём;
-- freshness distribution и overdue temporal claims;
-- внешние supported claims по числу independence groups;
-- глубина вопросов и закрытых зависимостей;
-- semantic near-duplicates вопросов/планов;
-- sessions без нового evidence или содержательного revision;
-- counterevidence found rate;
-- ручная оценка scope/provenance.
+- claims/assessments по status/state/grade/rules;
+- reassessment queue depth, oldest age, attempts и SLO violations;
+- cascade size/depth и dependency cycle incidents;
+- invalid resolution и assessment counts;
+- source/environment independence groups;
+- freshness и overdue temporal claims;
+- reuse, question depth, semantic duplicates;
+- sessions без нового evidence/revision;
+- counterevidence found/resolved rate;
+- ручная scope/provenance оценка.
 
 ### 16.3. Безопасность и взаимодействие
 
-- blocked actions по правилу;
-- forbidden path/address attempts;
-- provenance gaps и source-group corrections;
-- idempotency key mismatch attempts;
-- stop_gracefully/abort outcomes и ожидание safe boundary;
-- operator confirmations;
-- messages с императивами, похожими на команды, без попытки исполнения;
-- delivery/acknowledgment/reply latency;
-- CSRF/auth/rate-limit failures.
+- policy deny/require_operator;
+- forbidden path/address и provenance gaps;
+- idempotency mismatch;
+- source-graph corrections;
+- stop/abort outcomes;
+- command-like messages без исполнения;
+- auth/CSRF/rate-limit failures.
 
-Пороги evaluation run фиксируются до серии и не меняются после просмотра результата.
+Evaluation thresholds фиксируются до серии.
 
 ## 17. Предлагаемый стек
 
 - Python;
 - FastAPI + Pydantic;
-- PostgreSQL + optional pgvector;
+- PostgreSQL 15+ + optional pgvector;
 - SQLAlchemy + Alembic;
 - HTMX + Server-Sent Events;
 - rootless Podman или Docker;
@@ -1442,183 +1576,197 @@ noezema/
 
 ## 19. Этапы реализации
 
-Семь этапов — это полная программа, а не условие первого запуска. Минимальный жизнеспособный срез — этапы 1–3 плюс dashboard и timeline из этапа 6: узел, который просыпается по расписанию, работает в Sealed, атомарно фиксирует сессию, накапливает claims с проверяемыми assessments и показывает происходящее. В нём нет Research Proxy, Curiosity Engine работает по очереди вопросов без ранжирования, verifier отсутствует, а grade назначают правила.
+Полная программа состоит из семи этапов. MVP — этапы 1–3 плюс dashboard/timeline из этапа 6. Он работает в Sealed, использует FIFO Question Selector вместо полноценного Curiosity Engine и ежедневно выполняет атомарные сессии с assessments. Verifier-роли и Research Proxy в MVP нет: grade назначает rules engine.
 
-Этот срез стоит довести до реального ежедневного запуска прежде, чем начинать этап 4. Для проекта одного человека риск «спецификация растёт быстрее работающей системы» практичнее любого из §20: архитектурные решения здесь уже проверяемы только эксплуатацией.
+MVP должен поработать в реальном расписании до этапа 4. Риск «спецификация растёт быстрее системы» проверяется только эксплуатацией.
 
 ### Этап 1. Контракты и локальная LLM
 
-- session/decision/action/event enums и JSON Schemas;
-- host-generated turn/model/action IDs;
-- LLM Gateway и полный fingerprint;
-- compatibility suite;
-- domain schema, audit/outbox;
+- session/decision/action/event enums и schemas;
+- host-generated IDs;
+- LLM Gateway/fingerprint/compatibility suite;
+- domain/audit/outbox;
+- Orchestrator с FIFO Question Selector и seeded questions;
 - минимальные Query/Command API.
 
-Gate: модель стабильно выдаёт один валидный decision; повтор или коллизия model output не влияют на idempotency key.
+Gate: валидный decision envelope; LLM не влияет на idempotency; одна Sealed-сессия проходит основной цикл.
 
 ### Этап 2. Изоляция и атомарная сессия
 
-- rootless sandbox и capability policy;
-- Tool Broker с четырьмя retry classes;
-- COW overlay и content-addressed store;
-- staging, domain revision, fencing и conditional heartbeat;
-- soft budget, graceful stop и abort;
-- failpoint tests.
+- sandbox/capability policy;
+- Tool Broker и retry classes;
+- COW/content addressing/staging;
+- domain revision, lease, writer intent и fencing;
+- commit attempts/reconciliation;
+- budget, stop/abort;
+- failpoints.
 
-Gate: нет смешанного состояния; partial success возможен только на safe boundary; active cancellation соответствует §6.7.
+Gate: неизвестный ответ COMMIT reconciled; нет mixed state; partial success только на safe boundary.
 
 ### Этап 3. Память и доказательства
 
-- claims, revisions, evidence и source chunks;
-- executable claim type rules;
-- claim assessments и evidence sets;
-- versioned independence snapshots и предикат независимости окружений;
-- reassessment worker, статус `unassessed` и аудируемое снятие counterevidence;
-- confidence/freshness и open-ended temporal intervals;
-- hybrid retrieval/context budgets;
-- identity versions и handoff.
+- claims/evidence/dependencies/revisions;
+- assessment lifecycle и executable rules;
+- environment manifests и source/environment grouping;
+- counterevidence resolutions;
+- durable reassessment jobs и worker admission;
+- cascade invalidation;
+- confidence/freshness/context retrieval;
+- identity/handoff.
 
-Gate: claim trace ведёт к evidence set и rules version; single evidence не получает агрегатный E3/E4; invalidation снимает current assessment.
+Gate: invalid ancestor блокирует downstream claims; worker не вызывает starvation; duplicate evidence не повышает grade; assessment pending/invalid не подаётся как current.
 
 ### Этап 4. Познавательный цикл
 
-- Curiosity Engine baseline;
+- Curiosity ranking;
 - planning/explorer/verifier/curator;
 - semantic-repeat protection;
-- extraction profile для недоверенных документов;
-- long-run scenario tests.
+- untrusted extraction profile;
+- long-run scenarios.
 
-Gate: Sealed-серия работает без ручной правки БД; verifier не способен напрямую назначить grade.
+Gate: verifier не назначает grade/confidence; новый метод проверки отличим от перефразирования.
 
 ### Этап 5. Research Proxy
 
-- безопасный read-only fetch и SSRF policy;
-- search backend с явным egress;
-- source provenance и independence grouping;
-- injection/poisoning security tests.
+- SSRF-safe fetch/search и явный egress;
+- source provenance/grouping;
+- injection/poisoning tests.
 
-Gate: внешний текст не меняет capabilities, а group merge корректно переоценивает зависимые claims.
+Gate: внешний текст не меняет capabilities; group merge запускает cascade reassessment.
 
 ### Этап 6. Полный веб-модуль
 
 - dashboard/timeline;
-- sessions, knowledge и assessments;
-- messages;
-- typed operator commands;
-- stop/abort UX и эксплуатационные предупреждения.
+- claims/assessments/dependencies;
+- messages/operator commands;
+- stop/abort/reconciliation UX.
 
-Gate: сайт не пишет в domain/audit tables напрямую; свободный текст не становится operator command.
+Gate: сайт read-only к domain/audit; reconciliation и invalidation невозможно принять за success/current knowledge.
 
 ### Этап 7. Эксплуатация и оценка
 
-- backup/PITR и full-root GC;
-- restore drills;
-- retention/quotas;
+- backup/PITR/full-root GC;
+- restore drills/retention/quotas;
 - security regression;
-- evaluation run 50–100 sessions;
-- ADR по измерениям.
+- evaluation 50–100 sessions;
+- ADR по результатам.
 
-Gate: выполнены §22.1 и замороженные quality gates §22.2.
+Gate: §22.1 и замороженные §22.2 выполнены.
 
 ## 20. Риски первого уровня
 
 ### 20.1. Тривиальная новизна
 
-Система накапливает легко проверяемые, но бесполезные факты. Контроль: reuse, question depth, coverage gap и ручная оценка ценности.
+Система копит лёгкие факты. Контроль: reuse, question depth, coverage gap и ручная ценность.
 
 ### 20.2. Театр верификации
 
-Наличие evidence kind ошибочно принимается за истину. Контроль: claim assessment по evidence set, executable rules, scope, independence snapshot, уникальность evidence и аудируемое снятие counterevidence.
+Evidence kind принимается за истину. Контроль: assessment по distinct evidence identities, executable rules, scope и independence snapshots.
 
-### 20.3. Смешение уверенности и свежести
+### 20.3. Смешение confidence, freshness и lifecycle
 
-Старое знание объявляется менее истинным либо остаётся «свежим» бесконечно. Контроль: разные поля/переходы и temporal reverify queue.
+Исторический status показывается как current либо freshness меняет truth. Контроль: независимые поля, nullable current status и assessment-state constraints.
 
 ### 20.4. Наблюдаемость как нарратив
 
-Сайт показывает модельный рассказ вместо фактов. Контроль: timeline из operational/audit events; summary — отдельный артефакт.
+Модельный summary подменяет события. Контроль: operational/audit timeline; summary — отдельный artifact.
 
-### 20.5. Частичный commit
+### 20.5. Неопределённый commit
 
-База и workspace расходятся либо unsafe mid-action state публикуется как partial success. Контроль: revision/fencing, safe-boundary invariant и failpoints.
+Потеря ответа COMMIT объявляется failure, хотя транзакция состоялась. Контроль: commit attempt token, reconciliation state и запрет GC/wake до разрешения.
 
-### 20.6. Командный обход через сообщения
+### 20.6. Worker starvation
 
-Свободный текст превращается в control action. Контроль: разные endpoints/schemas/tables/auth для messages и operator commands.
+Reassessment worker постоянно меняет revision и срывает session validation. Контроль: priority writer intent, NOWAIT gate и wall-clock metrics.
 
-### 20.7. Idempotency hijack
+### 20.7. Dependency leakage
 
-LLM повторяет или подбирает key и подавляет другое действие. Контроль: все причинные IDs и keys создаёт доверенный контур и связывает с canonical arguments hash.
+Ancestor pending/invalid, но downstream claim остаётся supported. Контроль: reverse closure, barrier и retrieval invariant.
 
-### 20.8. Устаревший assessment
+### 20.8. Ложная независимость экспериментов
 
-Новая зависимость источников обнаружена, но старый E3 остаётся current. Контроль: versioned independence snapshots, invalidation queue и FK на valid current assessment.
+Два seed или hardware объявляются independent replication. Контроль: structured environment lineage и разные repeatability/reproducibility/replication rules.
 
-### 20.9. Ошибка GC
+### 20.9. Командный обход
 
-Source/evidence artifact удаляется, хотя нужен текущей БД или backup. Контроль: полный root set, retention classes и restore drills по случайной точке.
+User message превращается в operator command. Контроль: отдельные endpoints/schemas/auth.
+
+### 20.10. Idempotency hijack
+
+LLM управляет key. Контроль: host-generated IDs и canonical argument binding.
+
+### 20.11. Неверное снятие counterevidence
+
+Resolution без valid independent basis повышает grade. Контроль: XOR/partial unique, actor/audit и cascade invalidation.
+
+### 20.12. Ошибка GC
+
+Удаляется объект текущей БД, unresolved commit или backup. Контроль: полный root set и random-point restore.
 
 ## 21. Открытые архитектурные вопросы
 
-Каждый вопрос закрывается ADR с датой, альтернативами, последствиями и планом пересмотра.
+Каждый вопрос закрывается ADR.
 
-1. Может ли мыслитель менять identity document сам или только предлагать revision человеку?
-2. Нужен ли `Open Lab` в основном продукте либо только в отдельной экспериментальной сборке?
-3. Разрешать ли зависимости из локального подписанного package mirror?
-4. Как калибровать epistemic confidence отдельно для claim types и effective grades?
-5. Какие visibility-классы допустимы при публикации сайта вне локальной сети?
-6. Нужна ли будущая multi-thinker tenancy и какие aggregate IDs закладывать заранее?
-7. Какие веса novelty/coverage/reuse сохраняют содержательную новизну?
-8. Какие точные executable rules и thresholds принять для каждого claim type?
-9. Какой Artifact Store выбрать: filesystem content addressing или локальный S3-compatible backend?
-10. Какой model profile даёт приемлемый баланс schema reliability, verifier quality и latency?
-11. Какой период restore drill и retention diagnostic responses приемлемы владельцу?
-12. Какой объём и схема стратификации ручной выборки дают приемлемую статистическую мощность?
+1. Может ли мыслитель менять identity document или только предлагать revision?
+2. Нужен ли Open Lab в продукте?
+3. Разрешать ли подписанный local package mirror?
+4. Как калибровать deterministic confidence отдельно по claim types?
+5. Какие visibility classes допустимы вне LAN?
+6. Нужна ли multi-thinker tenancy?
+7. Какие novelty/coverage/reuse weights устойчивы к gaming?
+8. Какие executable rules/thresholds принять для claim types?
+9. Filesystem или локальный S3-compatible Artifact Store?
+10. Какой model profile даёт приемлемые schema reliability/quality/latency?
+11. Каковы restore/diagnostic retention periods?
+12. Какой объём ручной выборки даёт нужную статистическую мощность?
+13. Какие wall-clock SLO reassessment применить на целевом железе?
 
 ## 22. Критерии успеха первой версии
 
 ### 22.1. Техническая приёмка
 
-Первая версия технически готова, если она полностью локально:
+Первая версия технически готова, если она локально:
 
 1. пробуждается по расписанию и соблюдает pause/backoff;
-2. использует локальную LLM с полным fingerprint;
-3. создаёт turn/model/action IDs только в доверенном контуре и выполняет типизированные actions в sandbox;
-4. сохраняет claim с valid current assessment, evidence set, provenance и scope;
-5. публикует memory и workspace одним fenced `SessionCommitted` с domain revision;
-6. после каждого failpoint открывается с предыдущего либо полностью нового checkpoint;
-7. показывает operational timeline, committed knowledge и invalidation state через Query API;
-8. раздельно обрабатывает user messages, stop_gracefully, abort_session и остальные operator commands;
-9. не делает blind retry unknown, observation и non-idempotent actions;
-10. восстанавливает случайную точку backup window и проверяет полный root set объектов;
-11. фиксирует soft budget work как `succeeded_partial` только на safe boundary, а mid-call hard limit завершает как `failed`;
-12. при merge independence groups инвалидирует и пересчитывает зависимые assessments;
-13. не оставляет claim.current_assessment_id, указывающий на invalid assessment;
-14. переводит claim с инвалидированным assessment в `unassessed` и не подаёт его как evidence или зависимость до переоценки;
-15. выполняет переоценку фоновым worker-ом с собственным actor и revision, не отбирая бюджет у сессии.
-
-Crash recovery означает новую сессию от committed boundary, а не продолжение скрытого состояния модели.
+2. использует локальную LLM с fingerprint;
+3. создаёт causal/idempotency IDs только в trusted host;
+4. выполняет typed actions в sandbox;
+5. сохраняет claim только с согласованным assessment lifecycle, provenance и scope;
+6. публикует memory/workspace одним fenced commit attempt;
+7. после потери ответа COMMIT восстанавливает фактический исход через reconciliation;
+8. после остальных failpoints видит старый либо полностью новый checkpoint;
+9. показывает operational timeline, commit attempts, dependencies и assessment states;
+10. раздельно обрабатывает messages, stop, abort и controls;
+11. не retry unknown/observation/non-idempotent actions вслепую;
+12. восстанавливает random backup point и полный object root set;
+13. допускает partial success только на safe boundary;
+14. каскадно инвалидирует downstream claims;
+15. не использует pending/invalid claim как current evidence/dependency;
+16. worker соблюдает session writer priority и durable retry;
+17. отличает repeatability/reproducibility от independent replication;
+18. counterevidence resolution удовлетворяет XOR, uniqueness, valid basis и audit constraints;
+19. unresolved commit attempt блокирует wake и GC.
 
 ### 22.2. Познавательная оценка
 
-После технической приёмки запускается серия 50–100 сессий с замороженными model/config/rules и порогами.
+После приёмки запускается 50–100 eligible sessions с замороженными model/config/rules.
 
-Термины:
+Определения:
 
-- **значимый claim** — claim с valid assessment E2+ и статусом `supported | disputed | refuted` либо claim любого статуса, используемый активным вопросом или другим claim как зависимость;
-- **eligible session** — терминальная сессия, запущенная по расписанию или `wake_now`; operator abort исключается, technical failure включается;
-- **слепая ручная выборка** — минимум 50 claims либо все claims, если их меньше; стратификация по claim type/status, фиксированный seed после завершения серии, результат модели не передаётся; вместе с долями публикуется 95% confidence interval.
+- **значимый claim** — current assessment E2+ со статусом `supported | disputed | refuted` либо claim, используемый активным вопросом/claim;
+- **eligible session** — scheduled/wake_now terminal session; operator abort исключается, technical failure включается;
+- **слепая выборка** — минимум 50 claims либо все, стратификация по type/status, фиксированный seed, публикация 95% confidence interval.
 
-Стартовые quality gates:
+Стартовые gates:
 
-- не менее 80% новых `supported/refuted` claims имеют valid assessment E2+; external/temporal facts выполняют более строгий E3 rule;
-- не менее 60% eligible sessions создают новый evidence, закрывают/уточняют вопрос или содержательно пересматривают claim;
-- не более 15% выбранных вопросов — near-duplicates без нового метода проверки;
-- не менее 25% значимых claims переиспользуются, перепроверяются или становятся зависимостью в пределах 20 сессий;
-- `due/stale` среди активных time-sensitive claims ниже 20%;
-- invalid assessment не остаётся current дольше одной следующей сессии, а claim не остаётся в `unassessed` дольше того же срока;
-- отсутствуют незакрытые high-severity policy bypass, idempotency mismatch с выполненным эффектом и operator command из user message;
-- в слепой выборке не менее 90% claims имеют рабочий provenance path и не менее 80% не выходят за evidence scope.
+- ≥80% новых supported/refuted claims имеют valid E2+; external/temporal выполняют E3 rule;
+- ≥60% eligible sessions создают evidence, закрывают/уточняют вопрос или пересматривают claim;
+- ≤15% вопросов — near-duplicates без нового метода;
+- ≥25% значимых claims переиспользуются/перепроверяются в 20 сессиях;
+- due/stale time-sensitive claims <20%;
+- dependency-critical reassessment jobs укладываются в предварительно зафиксированный wall-clock SLO; остальные — в отдельный background SLO;
+- zero current assessments с pending/invalid ancestor;
+- zero unresolved high-severity policy/idempotency/command boundary incidents;
+- в слепой выборке ≥90% имеют provenance path и ≥80% не выходят за evidence scope.
 
-Порог изменяется только до нового evaluation run с новой config version. Техническая работоспособность без quality gates означает «платформа работает, исследовательская гипотеза не подтверждена».
+SLO и пороги меняются только до нового evaluation run с новой config version. Технический успех без quality gates означает, что платформа работает, а исследовательская гипотеза не подтверждена.
