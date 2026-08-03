@@ -1,10 +1,25 @@
 # NOEZEMA — Architecture Draft
 
-> Status: draft v0.5  
+> Status: draft v0.6  
 > Language: Russian  
 > Purpose: describe the target architecture of a local-first autonomous thinker focused on curiosity, verifiable learning, persistent memory, safe action, and human-observable operation.
 
 ## 0. Что изменилось
+
+### v0.6
+
+Версия 0.6 закрывает окна и неопределённости, оставшиеся после v0.5:
+
+- определено состояние claim между инвалидацией и переоценкой: статус `unassessed`, запрет использования как evidence или зависимости;
+- назван исполнитель переоценки — фоновый reassessment worker доверенного контура со своим actor, revision и правилом гонки с commit;
+- снятие counterevidence стало отдельной аудируемой записью с собственным основанием, а не полем, которое может закрыть модель;
+- независимость окружений для `empirical_conjecture` и `procedural` определена так же строго, как независимость источников;
+- у уверенности один производитель: она вычисляется из assessment и хранится только там;
+- диаграмма §6 согласована с текстом, `stop_gracefully` симметричен `abort_session` при неизвестном исходе действия;
+- добавлены уникальность evidence и предикаты различности в правилах;
+- `evidence_kind` вместо `verification_kind`, определены роли в `assessment_evidence`;
+- описано поведение при исчерпании резерва на консолидацию;
+- зафиксирован минимальный жизнеспособный срез v1.
 
 ### v0.5
 
@@ -462,6 +477,21 @@ no SSH keys or host secrets
 
 Ни LLM, ни verifier не записывают `effective_grade` напрямую: они создают evidence и предложения, а grade вычисляет версионируемый rules engine.
 
+#### 5.9.1. Reassessment worker
+
+Очередь переоценки (§8.6, §11.3) исполняет фоновый worker доверенного контура, а не сессия. Сессия не годится: merge independence groups может затронуть сотни claims, и переоценка внутри сессии съела бы её бюджет и попала под soft exhaustion, поставив качество памяти в зависимость от того, чем в этот момент занят мыслитель.
+
+Worker — второй writer знания, поэтому подчиняется тем же правилам, что и commit:
+
+- собственный actor `system:reassessment` во всех audit events; его записи отличимы от сессионных;
+- работает батчами с лимитом на транзакцию, а не одной длинной транзакцией на всю очередь;
+- берёт ту же блокировку `domain_revisions(scope='knowledge')` и увеличивает revision, поэтому конкурирующий commit сессии получит revision conflict и повторит валидацию по §5.2.2 п.6 — специальной синхронизации не требуется;
+- уступает: при активной commit-транзакции батч откладывается, чтобы фоновая работа не заставляла сессию терять подготовленную валидацию;
+- пересчитывает assessment только из существующих evidence по текущим rules. Он не создаёт evidence и не ходит в сеть; если для переоценки нужны новые данные, worker создаёт вопрос в реестре Curiosity Engine с высоким `coverage_gap`;
+- порядок очереди: claims, использованные как зависимость, затем `external_fact` и `temporal_fact`, затем остальные.
+
+Возраст и глубина очереди — эксплуатационные метрики (§16.2); длительно непустая очередь означает, что знание в памяти держится на устаревших основаниях.
+
 ### 5.10. Data Store и Audit Log
 
 PostgreSQL хранит нормализованное доменное состояние, append-only `audit_events`, transactional `outbox_events` и inbox команд. В v1 это не полный event sourcing:
@@ -536,12 +566,16 @@ stateDiagram-v2
     Exploring --> Verifying
     Verifying --> Exploring: нужны данные
     Verifying --> Consolidating
+    Exploring --> Stopping: soft budget / operator stop
+    Verifying --> Stopping: soft budget / operator stop
     Stopping --> Consolidating
     Consolidating --> Reporting
     Reporting --> Committing
     Committing --> Succeeded
     Committing --> SucceededPartial
-    Created --> Aborting
+    Created --> Aborting: operator abort
+    Exploring --> Aborting: operator abort
+    Verifying --> Aborting: operator abort
     Aborting --> Cancelled
     Succeeded --> [*]
     SucceededPartial --> [*]
@@ -549,7 +583,7 @@ stateDiagram-v2
     Cancelled --> [*]
 ```
 
-Переходы ошибки из любой нетерминальной фазы в `failed` и operator transitions показаны текстом, чтобы диаграмма не скрывала основной цикл множеством одинаковых рёбер. Терминальные состояния поглощающие.
+Рёбра в `failed` не показаны намеренно: они существуют из любой нетерминальной фазы, и их отрисовка скрыла бы основной цикл. `failed` присутствует как терминал. Все остальные узлы диаграммы достижимы. Терминальные состояния поглощающие.
 
 ### 6.1. Пробуждение и ориентация
 
@@ -611,9 +645,12 @@ Soft budgets проверяются только на безопасной гр�
 
 Обрыв генерации по `max_output_tokens`, hard timeout LLM/tool, нарушение политики, падение процесса или неопределённый исход действия не являются soft exhaustion. Они ведут в `failed` и отбрасывают staging.
 
+Резерв тоже конечен. Превышение собственного deadline фазами `consolidating`, `reporting` или `committing` ведёт в `failed` — то есть к потере всей работы, ради предотвращения которой существует этот раздел. Поэтому размер резерва берётся из измеренной latency консолидации на целевом профиле модели, а не назначается на глаз, и `consolidation reserve overrun` выносится в отдельную метрику §16.1: рост этого счётчика означает, что резерв подобран неверно, а не что сессии стали хуже.
+
 ### 6.7. Остановка оператором
 
 - `stop_gracefully` запрещает запуск следующего действия. На ближайшей безопасной границе сессия проходит `stopping → consolidating → reporting → committing` и завершается `succeeded_partial` с причиной `operator_stop`.
+- Если в момент `stop_gracefully` есть незавершённый action, Orchestrator ждёт его терминального результата до tool deadline. При `ActionOutcomeUnknown` итог — `failed`, а не `succeeded_partial`: предусловия §6.6 действуют одинаково для operator stop и для soft exhaustion. Наивная реализация «остановиться, дождаться текущего действия, консолидировать» нарушает это молча.
 - `abort_session` запрещает новые действия и отбрасывает staging. Если активного action нет, сессия проходит `aborting → cancelled`.
 - Если во время abort есть `ActionStarted`, Orchestrator ждёт его терминального результата до tool deadline. При `ActionOutcomeUnknown` итог — `failed`, не `cancelled`.
 - Во время короткой commit-транзакции обе команды отклоняются: authoritative state уже меняется атомарно.
@@ -676,8 +713,7 @@ ActionProposed → PolicyEvaluated → ActionAccepted → ActionStarted
 ```text
 statement
 claim_type
-epistemic_status: hypothesis | supported | disputed | refuted | deferred
-epistemic_confidence
+epistemic_status: hypothesis | supported | disputed | refuted | deferred | unassessed
 freshness_status: fresh | due | stale | unknown
 valid_from
 valid_to: nullable
@@ -691,7 +727,16 @@ counterevidence[]
 created_in_session
 ```
 
-`epistemic_confidence` оценивает поддержку claim текущим assessment. Она меняется при новых evidence, counterevidence, изменении independence groups или revision правил, но не уменьшается автоматически только из-за времени. `freshness_status` отдельно показывает актуальность проверки.
+Уверенность имеет ровно одного производителя. Она вычисляется rules engine вместе с grade и хранится только в `claim_assessments.confidence`; отдельного поля на claim нет, чтобы рядом со строго вычисленным grade не появлялось второе число неизвестного происхождения:
+
+```text
+confidence = f(effective_grade, count(counterevidence_unresolved),
+               scope_coverage, independence_group_count)
+```
+
+Функция детерминированная, её версия входит в `rules_version`. Модель может приложить обоснование, но не может предложить или изменить число: в v1 confidence, назначаемая LLM, — это §20.2 в новом костюме. Калибровка `f` отдельно по claim types вынесена в §21.4.
+
+Уверенность меняется при новых evidence, counterevidence, изменении independence groups или revision правил, но не уменьшается автоматически только из-за времени. `freshness_status` отдельно показывает актуальность проверки.
 
 Effective grade принадлежит `claim_assessment` и вычисляется по набору evidence. Число confidence не заменяет assessment и не сравнивается между claim types без калибровки.
 
@@ -722,6 +767,8 @@ Effective grade принадлежит `claim_assessment` и вычисляет�
 - Hypothesis не является достаточным evidence для другого claim; она может быть зависимостью или направлением поиска.
 - Эксперимент получает reproducibility capsule с кодом, входами, seed, зависимостями, hardware/backend fingerprint и scope.
 - Изменение dependency fingerprint, rules version или independence snapshot инвалидирует текущий assessment и ставит claim в очередь переоценки.
+- Инвалидация в той же транзакции обнуляет `current_assessment_id` и переводит `epistemic_status` в `unassessed`. Пока claim в этом статусе, он не может быть evidence или зависимостью другого claim, не участвует в предикатах правил и подаётся retrieval только с явной пометкой. Без этого правила существует окно, в котором supported-claim не имеет ни одного действующего доказательства, а контекст подаёт его как подтверждённое знание — то есть §3.7 перестаёт действовать незаметно.
+- `unassessed` не является суждением о ложности: после переоценки claim возвращается в статус, который даёт новый assessment, вплоть до прежнего.
 - На тему действует лимит активных claims; превышение запускает консолидацию.
 - История сохраняется в `claim_revisions`, `claim_assessments` и audit log.
 
@@ -743,8 +790,8 @@ claim_type             min assessment для supported
 local_observation      E2: >=1 local_observation, exact environment/time scope
 computed_result        E2: >=1 computation, exact inputs+algorithm scope
 formal_theorem         E4: formal_check/proof artifact, axioms/model scope
-empirical_conjecture   E3: >=2 experiment_run в независимых environments
-procedural             E3: >=2 успешных replication с dependency fingerprints
+empirical_conjecture   E3: >=2 experiment_run в независимых environments (§8.7.1)
+procedural             E3: >=2 успешных replication в независимых environments
 external_fact          E3: >=2 source_assertion из разных independence groups
 temporal_fact          E3: external_fact rule + обязательные as_of и temporal scope
 self_model             E2: локальное наблюдение config/identity state
@@ -770,6 +817,30 @@ external_fact:
 Finite computation не доказывает universal theorem: она создаёт `computed_result` либо counterexample в точном диапазоне. Operator attestation не является evidence kind и без новых данных grade не повышает.
 
 Тип назначается при создании claim и меняется только revision с обоснованием и новым assessment. Rules живут в `config_snapshots.claim_type_rules`; новая версия не меняет прошлые revisions молча, но ставит затронутые актуальные claims в очередь переоценки.
+
+#### 8.7.1. Независимость окружений
+
+Для внешних фактов независимость источников описана versioned алгоритмом §11.3. Для локальных экспериментов нужен такой же по строгости предикат, иначе `empirical_conjecture` и `procedural` становятся дешёвым обходом: два прогона одного скрипта на одном хосте формально дают «>=2 experiment_run».
+
+Два `experiment_run` считаются независимыми, если выполнено хотя бы одно условие:
+
+- различаются hardware или backend fingerprint (другая машина, другой accelerator, другая сборка runtime);
+- различаются реализация или toolchain при совпадающей спецификации — независимая реализация того же алгоритма, другой компилятор, другая версия интерпретатора;
+- эксперимент стохастический, и различаются seed **и** порядок обработки данных, а объявленный scope claim охватывает распределение, а не единичный прогон.
+
+Повтор с тем же `dependency_fingerprint`, тем же seed и на том же хосте — это не independent replication, а проверка воспроизводимости запуска: она даёт E2 и подтверждает, что результат не случайный артефакт одного исполнения.
+
+Предикат исполняется rules engine наравне с независимостью источников, а его версия входит в `rules_version`.
+
+#### 8.7.2. Снятие counterevidence
+
+Предикат `counterevidence_unresolved == false` — самый дешёвый путь к завышенному grade: достаточно приложить слабое возражение и объявить его снятым. Поэтому «resolved» — не флаг, а запись:
+
+- снятие оформляется отдельной строкой `counterevidence_resolutions` с собственным evidence или source-graph correction в качестве основания;
+- допустимые основания: показано, что контрпример вне scope claim; найдена ошибка в методе получения counterevidence; получено новое evidence, объясняющее расхождение;
+- «модель считает возражение неубедительным» основанием не является;
+- curator может предложить снятие, но `valid=true` проставляет rules engine после проверки основания; operator attestation, как и в §11.3, комментирует, но не снимает;
+- снятие аудируется и версионируется: отмена resolution инвалидирует зависимые assessments по общему правилу §8.6.
 
 ## 9. Познание нового и защита от повторений
 
@@ -952,6 +1023,7 @@ Query API имеет read-only credentials и читает только доме
 - timeline из committed audit events;
 - сессии, actions и артефакты;
 - claims, evidence, contradictions и freshness;
+- current assessments, effective grade, rules version и invalidation state, включая claims в статусе `unassessed`;
 - сообщения и ответы;
 - агрегированные метрики.
 
@@ -1062,8 +1134,7 @@ questions
   score_components, embedding_fingerprint, created_at
 
 claims
-  id, statement, claim_type, epistemic_status,
-  epistemic_confidence, freshness_status,
+  id, statement, claim_type, epistemic_status, freshness_status,
   valid_from, valid_to, as_of, observed_at, reverify_after,
   dependency_fingerprint, topic, current_assessment_id,
   created_in_session
@@ -1073,9 +1144,13 @@ claim_revisions
   changed_at, reason_audit_event_id
 
 evidence
-  id, claim_id, relation, verification_kind,
-  scope, source_id, chunk_id, verification_artifact_id,
-  created_in_session
+  id, claim_id, relation, evidence_kind,
+  scope, source_id, chunk_id, observation_artifact_id,
+  environment_fingerprint, created_in_session
+
+counterevidence_resolutions
+  id, evidence_id, basis_kind, basis_evidence_id,
+  basis_correction_id, valid, created_in_session, created_at
 
 claim_assessments
   id, claim_id, effective_grade, epistemic_status,
@@ -1171,7 +1246,19 @@ LLM не может выбрать или переиспользовать кл�
 
 ### 14.3. Assessment и versioned validation
 
-Effective grade хранится только в `claim_assessments`. Каждая assessment ссылается через `assessment_evidence` на точный набор evidence и фиксирует rules/independence snapshot. `claims.current_assessment_id` указывает только на valid assessment того же claim.
+Effective grade и confidence хранятся только в `claim_assessments`. Каждая assessment ссылается через `assessment_evidence` на точный набор evidence и фиксирует rules/independence snapshot. `claims.current_assessment_id` указывает только на valid assessment того же claim; при инвалидации он обнуляется, а claim переходит в `unassessed` в той же транзакции (§8.6).
+
+`assessment_evidence.role` — закрытый enum: `support`, `counter`, `scope_witness`, `context`. Он определяет, как запись участвует в предикатах правил, тогда как `evidence.relation` описывает отношение самого наблюдения к утверждению. Расхождение между ними — ошибка подготовки assessment, а не допустимое состояние: rules engine проверяет согласованность и отклоняет набор. Предикат `counterevidence_unresolved` считает записи с `role='counter'`, для которых нет valid строки в `counterevidence_resolutions`.
+
+Дублирование evidence запрещено на уровне схемы, иначе `count(...) >= 2` проходится двумя копиями одного наблюдения:
+
+```text
+UNIQUE NULLS NOT DISTINCT
+  (evidence.claim_id, evidence.evidence_kind, evidence.source_id,
+   evidence.chunk_id, evidence.observation_artifact_id)
+```
+
+`NULLS NOT DISTINCT` обязателен: при обычной уникальности PostgreSQL считает NULL-ы различными, и записи с пустым `chunk_id` дублировались бы свободно. Дополнительно правила claim types считают не строки, а различные `independence_group` для источников и различные `environment_fingerprint` для экспериментов (§8.7.1).
 
 `session_staging.validated_against_revision` сравнивается с `domain_revisions(scope='knowledge')` в commit-транзакции. Изменение domain revision, rules или source grouping инвалидирует подготовленный результат и требует повторной валидации.
 
@@ -1253,7 +1340,8 @@ Reachability вычисляется по database snapshot/recovery catalog, а 
 - при domain revision conflict;
 - во время stop/abort на каждой action boundary;
 - при soft budget до следующего вызова и hard timeout внутри вызова;
-- при merge independence groups, инвалидирующем assessment.
+- при merge independence groups, инвалидирующем assessment;
+- при гонке reassessment worker и commit сессии за `domain_revisions(scope='knowledge')`.
 
 Инварианты: виден предыдущий либо полностью новый checkpoint; LLM не задаёт idempotency key; partial success не содержит unknown action; invalid assessment не остаётся current; GC не удаляет ни один root-reachable object.
 
@@ -1268,6 +1356,7 @@ Reachability вычисляется по database snapshot/recovery catalog, а 
 - `ActionOutcomeUnknown` и возраст инцидента;
 - heartbeat age, progress age, phase deadline misses и lease recovery;
 - soft budget exhaustion отдельно от hard limit failures;
+- consolidation reserve overrun: сигнал о неверно подобранном резерве, а не о качестве сессий;
 - domain revision conflicts и validation retries;
 - commit latency/failures, outbox lag и attempts;
 - orphan bytes по retention class и root scan duration;
@@ -1278,7 +1367,8 @@ Reachability вычисляется по database snapshot/recovery catalog, а 
 
 - новые, изменённые и переиспользованные claims;
 - распределение current assessments по effective grade и rules version;
-- invalid assessment backlog и причины;
+- invalid assessment backlog, глубина и возраст очереди reassessment worker;
+- доля claims в статусе `unassessed` и время нахождения в нём;
 - freshness distribution и overdue temporal claims;
 - внешние supported claims по числу independence groups;
 - глубина вопросов и закрытых зависимостей;
@@ -1352,6 +1442,10 @@ noezema/
 
 ## 19. Этапы реализации
 
+Семь этапов — это полная программа, а не условие первого запуска. Минимальный жизнеспособный срез — этапы 1–3 плюс dashboard и timeline из этапа 6: узел, который просыпается по расписанию, работает в Sealed, атомарно фиксирует сессию, накапливает claims с проверяемыми assessments и показывает происходящее. В нём нет Research Proxy, Curiosity Engine работает по очереди вопросов без ранжирования, verifier отсутствует, а grade назначают правила.
+
+Этот срез стоит довести до реального ежедневного запуска прежде, чем начинать этап 4. Для проекта одного человека риск «спецификация растёт быстрее работающей системы» практичнее любого из §20: архитектурные решения здесь уже проверяемы только эксплуатацией.
+
 ### Этап 1. Контракты и локальная LLM
 
 - session/decision/action/event enums и JSON Schemas;
@@ -1379,7 +1473,8 @@ Gate: нет смешанного состояния; partial success возмо
 - claims, revisions, evidence и source chunks;
 - executable claim type rules;
 - claim assessments и evidence sets;
-- versioned independence snapshots;
+- versioned independence snapshots и предикат независимости окружений;
+- reassessment worker, статус `unassessed` и аудируемое снятие counterevidence;
 - confidence/freshness и open-ended temporal intervals;
 - hybrid retrieval/context budgets;
 - identity versions и handoff.
@@ -1434,7 +1529,7 @@ Gate: выполнены §22.1 и замороженные quality gates §22.2
 
 ### 20.2. Театр верификации
 
-Наличие verification kind ошибочно принимается за истину. Контроль: claim assessment по evidence set, executable rules, scope и independence snapshot.
+Наличие evidence kind ошибочно принимается за истину. Контроль: claim assessment по evidence set, executable rules, scope, independence snapshot, уникальность evidence и аудируемое снятие counterevidence.
 
 ### 20.3. Смешение уверенности и свежести
 
@@ -1499,7 +1594,9 @@ Source/evidence artifact удаляется, хотя нужен текущей 
 10. восстанавливает случайную точку backup window и проверяет полный root set объектов;
 11. фиксирует soft budget work как `succeeded_partial` только на safe boundary, а mid-call hard limit завершает как `failed`;
 12. при merge independence groups инвалидирует и пересчитывает зависимые assessments;
-13. не оставляет claim.current_assessment_id, указывающий на invalid assessment.
+13. не оставляет claim.current_assessment_id, указывающий на invalid assessment;
+14. переводит claim с инвалидированным assessment в `unassessed` и не подаёт его как evidence или зависимость до переоценки;
+15. выполняет переоценку фоновым worker-ом с собственным actor и revision, не отбирая бюджет у сессии.
 
 Crash recovery означает новую сессию от committed boundary, а не продолжение скрытого состояния модели.
 
@@ -1520,7 +1617,7 @@ Crash recovery означает новую сессию от committed boundary,
 - не более 15% выбранных вопросов — near-duplicates без нового метода проверки;
 - не менее 25% значимых claims переиспользуются, перепроверяются или становятся зависимостью в пределах 20 сессий;
 - `due/stale` среди активных time-sensitive claims ниже 20%;
-- invalid assessment не остаётся current дольше одной следующей сессии;
+- invalid assessment не остаётся current дольше одной следующей сессии, а claim не остаётся в `unassessed` дольше того же срока;
 - отсутствуют незакрытые high-severity policy bypass, idempotency mismatch с выполненным эффектом и operator command из user message;
 - в слепой выборке не менее 90% claims имеют рабочий provenance path и не менее 80% не выходят за evidence scope.
 
