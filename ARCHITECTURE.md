@@ -1,10 +1,21 @@
 # NOEZEMA — Architecture Draft
 
-> Status: draft v0.13  
+> Status: draft v0.14  
 > Language: Russian  
 > Purpose: describe the target architecture of a local-first autonomous thinker focused on curiosity, verifiable learning, persistent memory, safe action, and human-observable operation.
 
 ## 0. Что изменилось
+
+### v0.14
+
+Версия 0.14 убирает из MVP онлайн-активацию правил и достраивает оставшуюся 3b-машинерию:
+
+- смена rules version в MVP выполняется offline при остановленном узле: без lease, fence, activating pointer и repair runner, потому что конкурировать не с кем;
+- fenced online activation §8.7.2 целиком отнесена к 3b, где появляется reassessment worker — единственная причина её сложности;
+- repair runner получил admission, место в lock order и SLO на backlog;
+- `config_snapshots.activation_scope` удалён как дублирующий источник истины;
+- таблица lock set дополнена admission-транзакциями worker-а и repair runner;
+- критерии 24, 25 и 27 перенесены из MVP в v1, добавлен MVP-критерий offline-смены правил.
 
 ### v0.13
 
@@ -335,7 +346,7 @@ Orchestrator недоступен для изменения из sandbox.
 Расписание принадлежит доверенному контуру и недоступно из sandbox.
 
 - Базовое расписание задаётся cron-подобным выражением с минимальным интервалом между сессиями.
-- Перед запуском проверяются условия допуска: нет незавершённой сессии с живым lease, нет unresolved commit attempt, `runtime_config_heads.activating_config_snapshot_id IS NULL` для scope (§8.7.0), свободна GPU-память под профиль модели, соблюдена дисковая квота, система не на operator pause.
+- Перед запуском проверяются условия допуска: нет незавершённой сессии с живым lease, нет unresolved commit attempt, `runtime_config_heads.activating_config_snapshot_id IS NULL` для scope (§8.7.2; в MVP выполняется тривиально — смена правил идёт при остановленном узле), свободна GPU-память под профиль модели, соблюдена дисковая квота, система не на operator pause.
 - Этот список авторитетен: гарантия, заявленная в другом разделе, но не проверяемая здесь, не действует. Session creation блокирует строку runtime head, повторно проверяет admission и только затем привязывает неизменяемый `sessions.config_snapshot_id`; activation acquisition берёт ту же строку раньше session row (§5.2.2). Поэтому новая сессия не может вклиниться между проверкой и установкой activating pointer.
 - Что допуску **не** мешает: `post_publish_blocked` snapshot после обязательной terminal-cleanup, `blocked` reassessment job (§5.9.1), `blocked` или активный dependency barrier (§8.6). Локальная неисправность знания не должна останавливать познавательный цикл — защита держится на effective runtime pointer и на том, что затронутые claims не считаются current.
 - Отдельное условие: возраст старейшего **runnable dependency-critical** reassessment job ниже порога. Runnable означает `status IN ('queued','retry')`, `next_attempt_at <= now()` и неисчерпанный retry budget. Job с живым lease, будущим retry либо `blocked` не маскируется под готовую работу.
@@ -371,6 +382,8 @@ runtime_config_heads(scope)
 операция                              lock set
 ordinary session/worker write         knowledge
 session creation                      runtime_config_head → session
+worker admission check                runtime_config_head
+repair runner batch                   runtime_config_head → knowledge
 session commit with edge changes      session → knowledge → dependency_graph → attempt
 session commit without edge changes   session → knowledge → attempt
 barrier invalidation batch            knowledge → dependency_graph
@@ -1050,7 +1063,7 @@ claim_type             min assessment для supported
 local_observation      E2: >=1 local_observation, exact environment/time scope
 computed_result        E2: >=1 computation, exact inputs+algorithm scope
 formal_theorem         E4: formal_check/proof artifact, axioms/model scope
-empirical_conjecture   E3: >=2 experiment_run в независимых environments (§8.7.1)
+empirical_conjecture   E3: >=2 experiment_run в независимых environments (§8.7.3)
 procedural             E3: >=2 успешных replication в независимых environments
 external_fact          E3: >=2 source_assertion из разных independence groups
 temporal_fact          E3: external_fact rule + обязательные as_of и temporal scope
@@ -1078,9 +1091,43 @@ Finite computation не доказывает universal theorem: она созд�
 
 Тип назначается при создании claim и меняется только revision с обоснованием и новым assessment. Rules живут в `config_snapshots.claim_type_rules`; новая версия не меняет прошлые revisions молча.
 
-#### 8.7.0. Активация новой версии правил
+#### 8.7.0. Смена версии правил: два режима
 
-Смена rules version публикуется через shadow heads; батчи никогда не меняют логически действующее знание до атомарного переключения. **Effective config** для scope определяется только равенством `runtime_config_heads.active_config_snapshot_id = config_snapshot.id`. `config_snapshots.activation_state` описывает workflow публикации и не является вторым источником истины.
+Правила придётся править — это основная работа этапа 3a. Но способ их смены зависит от того, есть ли в системе конкурентные писатели знания.
+
+- **MVP (§8.7.1): offline.** Узел остановлен, работает одноразовый скрипт. Конкуренции нет, поэтому нет ни lease, ни fencing token, ни activating pointer, ни repair runner.
+- **3b и далее (§8.7.2): online.** Появляется reassessment worker, который пишет heads параллельно, — и вся сложность fenced-активации существует ради него.
+
+Общее для обоих режимов: **effective config** для scope определяется только равенством `runtime_config_heads.active_config_snapshot_id = config_snapshot.id`. `config_snapshots.activation_state` описывает workflow публикации и не является вторым источником истины. Shadow heads `(claim_id, config_snapshot_id)` готовятся заранее и невидимы, пока указатель не переключён.
+
+#### 8.7.1. Offline-смена правил (MVP)
+
+Online-активация нужна только для того, чтобы менять правила на живой системе. Такого требования у MVP нет: локальный однонодовый мыслитель переживает перезапуск, а сессии идут по расписанию, которое можно остановить.
+
+```text
+stop node (supervisor)
+  → verify: нет активной сессии, нет unresolved commit attempt,
+            узел не в reconciling_commit
+  → one-shot rules script:
+        создать candidate snapshot с base_snapshot_id = текущий active
+        пересчитать heads cohort детерминированными батчами
+        verify complete cohort и hashes
+        в одной транзакции: runtime_config_heads.active = candidate,
+                            previous = superseded, increment knowledge revision,
+                            audit + outbox
+        создать вопросы для invalid heads
+  → start node
+```
+
+Скрипт идемпотентен и перезапускаем: незавершённый прогон оставляет прежний указатель и мусорные shadow heads, которые соберёт GC. Прерывание после переключения указателя доделывается повторным запуском — вопросы создаются по deterministic idempotency keys.
+
+Что здесь отсутствует по сравнению с §8.7.2 и почему это безопасно: lease и fencing token не нужны, потому что второго активатора не существует; activating pointer не нужен, потому что admission обеспечивается остановкой узла; quiesce worker-а не нужен, потому что worker появляется только в 3b; repair runner не нужен, потому что незавершённый прогон просто повторяют.
+
+Требование к эксплуатации одно: смена правил — плановая операция с остановкой, а не действие на ходу. Для MVP это приемлемая цена за отсутствие целой машины состояний в первой вехе.
+
+#### 8.7.2. Online-активация правил (3b)
+
+Начиная с 3b знание пишет ещё и reassessment worker, поэтому смена правил обязана быть fenced-операцией на живой системе.
 
 `config_snapshots.activation_state` проходит lifecycle:
 
@@ -1098,7 +1145,16 @@ pre-publish failure: preparing_heads | ready | publishing → failed + terminal 
 
 Atomic flip переводит candidate в `post_publish`, а не в `active`. В этот момент runtime pointer уже делает его effective, corpus полностью согласован, но follow-up manifest ещё не завершён. `active` означает завершённую activation, а `superseded` — что более поздний flip заменил эту effective config.
 
-`post_publish_blocked` — admission-terminal, но repairable состояние: effective corpus консистентен, однако часть идемпотентных follow-ups — вопросы, jobs или outbox — не создана после retry budget. Terminal-cleanup освобождает activation lease, снимает activation-owned pause, возобновляет worker и позволяет wake; operator pause не затрагивается. Alert и durable manifest/cursor остаются. Trusted repair runner перед каждым батчем блокирует runtime head: пока snapshot остаётся effective, он продолжает follow-ups и условно переводит состояние в `active`; если более новая activation уже сделала snapshot `superseded`, остаток repair закрывается как superseded и не возвращает старую config в `active`.
+`post_publish_blocked` — admission-terminal, но repairable состояние: effective corpus консистентен, однако часть идемпотентных follow-ups — вопросы, jobs или outbox — не создана после retry budget. Terminal-cleanup освобождает activation lease, снимает activation-owned pause, возобновляет worker и позволяет wake; operator pause не затрагивается. Alert и durable manifest/cursor остаются.
+
+Trusted repair runner доделывает остаток manifest параллельно с обычными сессиями, поэтому он является полноценным писателем знания и подчиняется тем же правилам, что и worker:
+
+- получает `knowledge_write_gate` через NOWAIT и уступает session commit intent, возвращая незавершённый батч в manifest cursor;
+- перед каждым батчем блокирует runtime head и продолжает работу, только пока `active_config_snapshot_id=candidate`;
+- при появлении activating pointer новой активации останавливается до её terminal-cleanup;
+- условно переводит состояние в `active` тем же conditional write; если более новая activation уже сделала snapshot `superseded`, остаток закрывается как superseded и старая config в `active` не возвращается.
+
+Backlog repair — это несозданные исследовательские вопросы по invalid heads, то есть знание, которое молча не исследуется. Поэтому у него, как и у очереди worker-а, есть wall-clock SLO: превышение возраста backlog поднимает severity alert, а при дальнейшем росте включается то же условие допуска планировщика, что и для dependency-critical jobs (§5.2.1). Метрика без порога здесь только фиксировала бы деградацию.
 
 На каждый `runtime_config_heads.scope` допускается ровно один activating candidate. Runtime head хранит:
 
@@ -1117,7 +1173,7 @@ Activation acquisition:
 1. получает exclusive `knowledge_write_gate`, дожидаясь завершения уже начатого worker batch;
 2. в короткой транзакции блокирует `runtime_config_heads(scope) → sessions → commit_attempts`;
 3. проверяет отсутствие active session и unresolved commit attempt, `activating_config_snapshot_id IS NULL` и `candidate.base_snapshot_id = active_config_snapshot_id`;
-4. увеличивает монотонный `activation_fence`, записывает candidate/owner/expiry и `candidate.activation_scope`, переводит candidate `draft → preparing_heads` и создаёт audit event;
+4. увеличивает монотонный `activation_fence`, записывает candidate/owner/expiry, переводит candidate `draft → preparing_heads` и создаёт audit event;
 5. освобождает writer gate; новые worker batches и sessions видят activating pointer и не проходят admission.
 
 Каждый prepare/publish/cleanup batch блокирует runtime head первым и применяет conditional write по `(scope, activating_config_snapshot_id, activation_fence, activation_lease_owner, activation_lease_expires_at > now())`. Recovery takeover увеличивает fence; старый runner после этого не может изменить state, cursor или runtime pointer. При terminal-cleanup fence не обнуляется и остаётся монотонным для scope.
@@ -1159,7 +1215,7 @@ Human-required возникает только при hash mismatch, невоз�
 
 На период evaluation model/config/rules заморожены; новая activation начинает новый evaluation run с новым config snapshot.
 
-#### 8.7.1. Repeatability, reproducibility и independent replication
+#### 8.7.3. Repeatability, reproducibility и independent replication
 
 Один opaque `environment_fingerprint` недостаточен. Каждый experiment run ссылается на versioned environment manifest:
 
@@ -1188,7 +1244,7 @@ Rules различают:
 
 Versioned environment-independence algorithm строит groups по protocol, implementation и data lineage. Claim assessment фиксирует snapshot и считает distinct groups, а не hashes manifests. Критерий зависит от scope: claim о переносимости между GPU может опираться на reproducibility, универсальная empirical conjecture требует independent replication.
 
-#### 8.7.2. Снятие counterevidence
+#### 8.7.4. Снятие counterevidence
 
 Resolution является отдельной аудируемой сущностью, а не флагом модели.
 
@@ -1625,7 +1681,7 @@ operator_commands
   reason, created_at, finished_at, result
 
 config_snapshots
-  id, base_snapshot_id, activation_scope, activation_state, activation_cursor,
+  id, base_snapshot_id, activation_state, activation_cursor,
   activation_manifest_hash, post_publish_manifest_hash, post_publish_cursor,
   model, embeddings, prompts, policy, curiosity, token_budgets,
   session_limits, claim_type_rules, sha256, created_at
@@ -1856,7 +1912,7 @@ GC roots:
 - возраст старейшего runnable dependency-critical job, число отложенных пробуждений, эскалации `T_escalate`, blocked jobs и retry-budget exhaustion;
 - active barrier count/age/generation, closure size, cursor lag, graph-revision restarts и recovery resumes;
 - knowledge/dependency-graph revision conflicts, commit latency, outbox lag;
-- config activation state/cursor/cohort progress, activation lease age/fence takeovers/stale-write rejects, shadow-head retries, publish latency, terminal-cleanup latency и post-publish repair lag;
+- config activation state/cursor/cohort progress, activation lease age/fence takeovers/stale-write rejects, shadow-head retries, publish latency, terminal-cleanup latency, возраст post-publish repair backlog и нарушения его SLO;
 - staging budget utilization/rejections по claims/new claims/evidence и фактическое host assessment time;
 - orphan bytes/root scan duration;
 - resources, backup и restore drill age.
@@ -1939,7 +1995,9 @@ noezema/
 
 Полная программа состоит из семи этапов. **MVP — этапы 1, 2, 3a плюс минимальный web slice из этапа 6.** Он работает в Sealed, использует FIFO Question Selector и минимальный explorer/curator loop §5.3.2, поэтому действительно способен ежедневно исследовать вопрос, создать typed evidence, синхронно оценить затронутые claims и атомарно сохранить результат. Отдельного verifier-model и Research Proxy в MVP нет: grade назначает rules engine.
 
-Этап 3 разделён намеренно. Каскадная invalidation, фоновый reassessment worker, полное source/environment grouping и counterevidence resolutions решают проблемы, возникающие на сотнях claims и при merge источников. До появления корпуса их невозможно осмысленно настроить; при этом MVP уже имеет консервативное grouping локальных источников и синхронно пересчитывает claims, изменённые текущей сессией.
+Этап 3 разделён намеренно. Каскадная invalidation, фоновый reassessment worker, полное source/environment grouping, counterevidence resolutions и online-активация правил решают проблемы, возникающие на сотнях claims, при merge источников и при конкурентной записи знания.
+
+Онлайн-активация (§8.7.2) отнесена к 3b по той же логике: fenced lease, activating pointer, quiesce и repair runner существуют исключительно ради конкуренции с reassessment worker. Пока worker-а нет, конкурировать не с кем, и правила меняются offline при остановленном узле (§8.7.1). Это снимает с первой вехи целую машину состояний, не теряя ничего эксплуатационно — локальный однонодовый мыслитель переживает плановый перезапуск. До появления корпуса их невозможно осмысленно настроить; при этом MVP уже имеет консервативное grouping локальных источников и синхронно пересчитывает claims, изменённые текущей сессией.
 
 MVP должен поработать в реальном расписании до 3b и расширенного этапа 4. Риск «спецификация растёт быстрее системы» проверяется эксплуатацией, но урезание не должно удалять сам познавательный путь или исходную возможность человека написать мыслителю.
 
@@ -1975,10 +2033,10 @@ Gate: неизвестный ответ COMMIT reconciled; нет mixed state; p
 - confidence/freshness;
 - консервативные source independence groups для локального корпуса;
 - context retrieval с токенными бюджетами и обработкой pending claims;
-- maintenance runner активации rules version §8.7.0;
+- offline-смена rules version §8.7.1 одноразовым скриптом при остановленном узле;
 - identity/handoff.
 
-Фонового пересчёта в MVP нет, но assessment не является одноразовым: staged-операция, меняющая evidence set, синхронно обновляет head effective config snapshot в пределах session limits (§6.6). Rules version заморожена между атомарными activations §8.7.0; shadow heads не видны до runtime-head flip, а invalid после publish получает исследовательский вопрос.
+Фонового пересчёта в MVP нет, но assessment не является одноразовым: staged-операция, меняющая evidence set, синхронно обновляет head effective config snapshot в пределах session limits (§6.6). Rules version заморожена между offline-сменами §8.7.1; shadow heads не видны до переключения указателя, а invalid после него получает исследовательский вопрос.
 
 Gate: duplicate evidence не повышает grade; новое counterevidence меняет active head в том же session commit; atomic rules activation не создаёт mixed-version corpus; неизвестная source lineage не создаёт ложную независимость; pending/invalid claim не подаётся как current; grade назначает только rules engine.
 
@@ -1987,6 +2045,7 @@ Gate: duplicate evidence не повышает grade; новое counterevidence
 - `claim_dependencies` и cycle check;
 - cascade invalidation, closure вне блокировки и barriers;
 - durable reassessment jobs, worker admission и эскалация;
+- online-активация правил §8.7.2: fenced lease, activating pointer, quiesce, terminal-cleanup и repair runner;
 - environment manifests, полный source graph, merge/correction и environment grouping;
 - counterevidence resolutions.
 
@@ -2137,10 +2196,11 @@ Resolution без valid independent basis повышает grade. Контрол
 21. `[MVP]` изменение evidence set синхронно обновляет head effective config snapshot, а rules activation публикует полный shadow cohort одним runtime-head flip;
 22. `[v1]` dependency barrier после crash продолжает immutable closure manifest с durable cursor и закрывается только после проверки актуального graph revision;
 23. `[MVP]` session limits покрывают новые/существующие claims и evidence, отклоняют превышение до записи staging-команды и гарантируют host reserve;
-24. `[MVP]` rules activation публикует полный shadow cohort переходом `publishing → post_publish`, завершает durable follow-up manifest и восстанавливается после crash без mixed-version knowledge;
-25. `[MVP]` непустой activating slot блокирует пробуждение; terminal-cleanup очищает его и activation-owned pause как для `active`, так и для `post_publish_blocked`, тогда как `blocked` job/barrier wake не запрещают;
+24. `[v1]` online rules activation публикует полный shadow cohort переходом `publishing → post_publish`, завершает durable follow-up manifest и восстанавливается после crash без mixed-version knowledge;
+25. `[v1]` непустой activating slot блокирует пробуждение; terminal-cleanup очищает его и activation-owned pause как для `active`, так и для `post_publish_blocked`, тогда как `blocked` job/barrier wake не запрещают;
 26. `[v1]` activation acquisition через общий writer gate подтверждает quiesce до freeze cohort, и ни один опубликованный head не ссылается на инвалидированный assessment;
-27. `[MVP]` recovery корректно разрешает crash в каждом activation state по runtime pointer tuple; runner со stale fencing token не меняет state/cursor/pointer, а repair не возвращает superseded snapshot в `active`.
+27. `[v1]` recovery корректно разрешает crash в каждом activation state по runtime pointer tuple; runner со stale fencing token не меняет state/cursor/pointer, а repair не возвращает superseded snapshot в `active`;
+28. `[MVP]` offline-смена правил при остановленном узле переключает указатель одной транзакцией, идемпотентно перезапускается после прерывания и не оставляет claims без вопросов по invalid heads.
 
 ### 22.2. Познавательная оценка
 
