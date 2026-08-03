@@ -1,10 +1,23 @@
 # NOEZEMA — Architecture Draft
 
-> Status: draft v0.8  
+> Status: draft v0.9  
 > Language: Russian  
 > Purpose: describe the target architecture of a local-first autonomous thinker focused on curiosity, verifiable learning, persistent memory, safe action, and human-observable operation.
 
 ## 0. Что изменилось
+
+### v0.9
+
+Версия 0.9 устраняет оставшиеся гонки восстановления и делает заявленный MVP действительно исполнимым:
+
+- reconciliation использует блокировки строк и fencing, поэтому живой финальный commit нельзя ошибочно принять за rollback;
+- после длительной недоступности БД редкие автоматические probes продолжаются; человек требуется для несогласованных записей, а не для обычного восстановления сервиса;
+- poison reassessment job переводится в `blocked` и не останавливает несвязанные сессии;
+- dependency barrier получил immutable closure manifest, durable progress cursor и crash-resume protocol;
+- MVP включает минимальный explorer/curator loop, синхронную переоценку затронутых claims и консервативное source grouping;
+- минимальный веб-срез MVP включает status, timeline, messages и безопасные controls;
+- требование PostgreSQL 15 отделено от конкретных инвариантов partial unique indexes;
+- acceptance criteria и failpoints проверяют новые concurrency/liveness гарантии.
 
 ### v0.8
 
@@ -279,10 +292,11 @@ Orchestrator недоступен для изменения из sandbox.
 
 - Базовое расписание задаётся cron-подобным выражением с минимальным интервалом между сессиями.
 - Перед запуском проверяются условия допуска: нет незавершённой сессии с живым lease, нет unresolved commit attempt, свободна GPU-память под профиль модели, соблюдена дисковая квота, система не на паузе.
-- Отдельное условие: возраст старейшего dependency-critical reassessment job ниже порога. Иначе пробуждение откладывается до тех пор, пока worker не разгребёт очередь. Без этого условия §22.2 требует SLO, который система не в состоянии обеспечить: writer admission §5.9.1 всегда отдаёт приоритет сессии, и при плотном расписании worker не получает gate никогда.
+- Отдельное условие: возраст старейшего **runnable dependency-critical** reassessment job ниже порога. Runnable означает `status IN ('queued','retry')`, `next_attempt_at <= now()` и неисчерпанный retry budget. Job с живым lease, будущим retry либо `blocked` не маскируется под готовую работу.
+- Если runnable dependency-critical job превысил порог, пробуждение откладывается, пока worker не получит окно. Poison job после исчерпания попыток становится `blocked`, оставляет claim в `invalid`, поднимает alert и больше не блокирует несвязанные сессии.
 - Если условия не выполнены, пробуждение пропускается с записью причины, а не ставится в очередь.
 - После неудачной сессии применяется экспоненциальный backoff; после нескольких неудач подряд узел переходит в `paused`.
-- Ручное «пробуждение сейчас» обходит расписание, но не условия допуска.
+- Обычное `wake_now` обходит расписание, но не admission. Отдельный `wake_now(bypass_worker_gate=true, reason=...)` доступен оператору, аудируется и обходит только worker-age gate; lease, unresolved commit, quota, pause и fencing он не обходит.
 
 #### 5.2.2. Граница фиксации сессии и commit reconciliation
 
@@ -293,46 +307,56 @@ Orchestrator недоступен для изменения из sandbox.
 3. При завершении overlay замораживается и создаётся immutable workspace manifest с path, size и SHA-256 каждого объекта.
 4. До тяжёлой валидации сессия регистрирует приоритетный writer intent (§5.9.1). Валидация выполняется против snapshot с `domain_revision` и сохраняет revision, payload/rules hashes, independence snapshots и подготовленные assessments.
 5. Orchestrator создаёт host-generated `commit_attempt_id` и durable строку `commit_attempts(status='prepared')`, связанную со staging hash и workspace manifest.
-6. Финальная короткая транзакция блокирует session row и `domain_revisions(scope='knowledge')`, проверяет fencing/revision, применяет staging, обновляет workspace pointer и revision, переводит commit attempt в `committed`, записывает checkpoint, terminal session state, audit и outbox.
+6. Финальная короткая транзакция берёт блокировки в каноническом порядке `sessions → domain_revisions(scope='knowledge') → commit_attempts`, проверяет fencing/revision и условие `attempt.status='prepared'`, применяет staging, обновляет workspace pointer и revision, переводит attempt в `committed`, записывает checkpoint, terminal session state, audit и outbox.
 7. При revision conflict staging валидируется заново. Число повторов ограничено; writer intent не позволяет фоновому worker менять revision во время session validation.
 8. Если DB однозначно отклонила или откатила транзакцию, attempt становится `aborted`, предыдущий checkpoint остаётся текущим.
-9. Если ответ COMMIT потерян или DB недоступна, исход не объявляется failure. Attempt переходит в `reconciling`, узел блокирует новые сессии и переходит в `reconciling_commit` до проверки `commit_attempt_id` с нового соединения.
+9. Если ответ COMMIT потерян или DB недоступна, исход не объявляется failure. Узел блокирует новые сессии и переходит в `reconciling_commit`; если БД доступна, attempt условно переводится `prepared → reconciling`. Невозможность записать этот переход не является доказательством исхода: `prepared` уже считается unresolved.
 
 Статусы attempt: `prepared | reconciling | committed | aborted`. Первые два — unresolved.
 
 Исход определяется существованием durable записи, а не таймингом сети. Клиент не может надёжно узнать, ушёл ли пакет COMMIT, поэтому дискриминатор такой:
 
 ```text
-prepared attempt отсутствует  → любой сбой даёт failed
-prepared attempt существует   → любой сбой, таймаут или разрыв
+prepared attempt отсутствует  → сбой до commit boundary даёт failed
+prepared attempt существует   → сбой, таймаут или разрыв
                                 даёт reconciling_commit
 ```
 
-Именно ради этого строка `commit_attempts` пишется durable до финальной транзакции (п.5): она превращает неразрешимый вопрос «дошёл ли COMMIT» в обычный запрос к базе.
+Durable attempt устраняет вопрос «существует ли commit boundary», но простой `SELECT` не доказывает rollback: под MVCC он может увидеть старую committed-версию `prepared`, пока финальная транзакция ещё выполняется. Поэтому reconciliation является fenced locking protocol.
 
-Reconciliation:
+Reconciliation-транзакция использует тот же порядок блокировок:
 
 ```text
-attempt=committed AND session terminal AND checkpoint exists
-    → принять committed terminal state
+BEGIN
+  SELECT session ... FOR UPDATE
+  verify: original owner fenced AND no live lease
+  SELECT attempt ... FOR UPDATE
 
-attempt IN (prepared, reconciling) AND rollback/absence confirmed
-    → attempt=aborted, session=failed, discard staging
+  attempt=committed AND session terminal AND checkpoint exists
+      → принять committed terminal state
 
-database unavailable
-    → transient: ограниченный retry пробы (см. ниже)
+  attempt IN (prepared, reconciling)
+  AND session/checkpoint terminal records absent
+  AND original owner fenced
+      → atomically attempt=aborted, session=failed, discard staging
 
-records inconsistent
-    → remain reconciling_commit, alert severity=critical,
-      no GC, no wake, требуется человек
+  lock timeout / finalizer still in progress
+      → rollback reconciliation transaction; transient retry
+
+  records inconsistent
+      → remain reconciling_commit, alert severity=critical,
+        no GC, no wake, требуется человек
+COMMIT
 ```
 
-Недоступность базы и несогласованность записей — разные события, и сводить их в одну ветку нельзя. Рестарт PostgreSQL, failover или давление на диск транзиентны и разрешаются сами; несогласованные записи означают порчу и требуют оператора. Для узла, который просыпается по расписанию без присмотра, объединение этих случаев означает, что тридцатисекундный рестарт базы паркует систему до тех пор, пока владелец не заметит.
+`SELECT ... FOR UPDATE` ждёт незавершённый UPDATE attempt и после завершения исходной транзакции возвращает committed-версию либо прежний `prepared` после rollback. `lock_timeout` не превращается в `aborted`: это состояние `finalizer_in_progress` и новая проба. Finalizer и reconciler обязаны соблюдать единый порядок блокировок; условные UPDATE не позволяют fenced-процессу опубликовать результат после решения reconciler-а.
 
-- Проба reconciliation повторяется с экспоненциальным backoff и jitter, каждая попытка — с нового соединения.
-- В `reconciling_commit` узел остаётся, но alert имеет severity `warning`, пока причина `database_unavailable`.
-- После `N` попыток либо `T` wall-clock (оба в конфигурации) состояние переходит в human-required с severity `critical`, и автоматические попытки прекращаются.
-- Wake и GC запрещены на всём протяжении, независимо от причины: транзиентность влияет на порядок эскалации, но не на безопасность.
+Недоступность базы и несогласованность записей — разные события. Рестарт PostgreSQL или давление на диск транзиентны и должны разрешаться автоматически; несогласованные записи означают нарушение инвариантов и требуют оператора.
+
+- Проба reconciliation повторяется с экспоненциальным backoff и jitter, каждая попытка — с нового соединения и отдельными `connect_timeout`, `lock_timeout` и `statement_timeout`.
+- В `reconciling_commit` узел остаётся, но alert имеет severity `warning`, пока причина `database_unavailable | finalizer_in_progress`.
+- После `N` попыток либо `T` wall-clock состояние получает `human_attention_required` и severity `critical`, но read-only probes продолжаются с редким ограниченным интервалом. Согласованный committed/aborted исход автоматически снимает эскалацию; только `records_inconsistent` останавливает автоматическое разрешение.
+- Wake и GC запрещены на всём протяжении, независимо от причины: частота probes влияет на liveness, но не ослабляет безопасность.
 
 Fencing:
 
@@ -403,6 +427,27 @@ score(q) =
 - Противоречие или слабое место в уже используемом знании получает положительный `coverage_gap`, поэтому система не убегает только в новые темы.
 - С вероятностью `1 - ε` выбирается максимум. С вероятностью `ε` выбор делается среди верхних `M` допустимых кандидатов или кандидатов в пределах `δ` от максимума, а не среди всего реестра.
 - Веса, пороги нормализации, `ε`, `M`, embedding fingerprint и набор рассмотренных кандидатов входят в конфигурационный snapshot сессии.
+
+#### 5.3.2. Минимальный познавательный цикл MVP
+
+FIFO Question Selector заменяет только ранжирование Curiosity Engine, но не сам исследовательский цикл. Чтобы MVP мог ежедневно создавать проверяемое знание, он включает минимальные explorer и curator protocols, которые может выполнять одна локальная LLM с разными prompt snapshots:
+
+```text
+seeded/message question → FIFO selection → context pack
+→ explorer decision (bounded tool loop)
+→ typed observations/artifacts
+→ curator staging proposal
+→ deterministic rules assessment
+→ fenced commit
+```
+
+- Explorer получает один текущий вопрос и ограниченное число действий; отдельного verifier-model в MVP нет.
+- Tool Broker превращает результаты действий в typed observations с provenance; текст модели сам по себе evidence не создаёт.
+- Minimal curator предлагает claims/evidence и handoff через staging schemas. Memory Service синхронно строит replacement assessment для каждого затронутого claim.
+- Rules engine, а не explorer/curator, назначает grade, status и confidence.
+- Неуспешное исследование всё равно создаёт audit trail и handoff; claim без достаточного evidence не становится current supported knowledge.
+
+Расширенное планирование, специализированный verifier, Curiosity ranking и защита от семантических повторов появляются на этапе 4.
 
 ### 5.4. Context Builder
 
@@ -558,12 +603,20 @@ no SSH keys or host secrets
 Переоценку выполняет worker доверенного контура с actor `system:reassessment`. Работа хранится в durable `reassessment_jobs`, а не только выводится запросом по claims:
 
 ```text
-claim_id, reason, priority, enqueued_at,
-attempts, lease_owner, lease_expires_at,
-last_error, next_attempt_at
+claim_id, status, reason, priority, enqueued_at,
+attempts, max_attempts, error_class,
+lease_owner, lease_expires_at,
+last_error, next_attempt_at, blocked_at
 ```
 
-Один active job на claim обеспечивается unique constraint. Worker работает ограниченными батчами, создаёт audit events, не генерирует evidence и не ходит в сеть. Если данных недостаточно, он переводит assessment lifecycle в `invalid` и создаёт вопрос Curiosity Engine.
+Статусы: `queued | leased | retry | blocked | completed`. Один active job (`queued | leased | retry`) на claim обеспечивается unique constraint. Worker работает ограниченными батчами, создаёт audit events, не генерирует evidence и не ходит в сеть. Если данных недостаточно, он переводит assessment lifecycle в `invalid` и создаёт исследовательский вопрос.
+
+Ошибки worker классифицируются доверенным кодом:
+
+- transient error переводит job в `retry` с backoff/jitter до `max_attempts`;
+- deterministic/permanent error либо исчерпанный retry budget переводит job в `blocked`, сохраняет claim как `invalid` и создаёт critical alert;
+- `blocked` не считается runnable и не блокирует глобальный wake: безопасность обеспечивается тем, что invalid claim нельзя использовать как current evidence/dependency;
+- повторный запуск blocked job требует новой config/rules version, устранения причины либо audited operator command; он создаёт новую попытку, не стирая историю.
 
 Безопасность revision недостаточна для liveness: worker мог бы менять revision во время каждой тяжёлой session validation. Поэтому действует writer admission:
 
@@ -578,11 +631,13 @@ Worker пересчитывает assessments по текущим rules и indep
 
 Правила 1–6 однонаправленны: сессия всегда выигрывает, worker отступает. Сами по себе они гарантируют отсутствие гонки, но не прогресс worker-а — при плотном расписании он может не получить gate никогда. Поэтому liveness обеспечивается снаружи, планировщиком:
 
-- пробуждение не начинается, пока возраст dependency-critical job выше порога (§5.2.1); очередь получает окно между сессиями, а не отбирает время у активной;
-- после превышения возраста `T_escalate` job поднимается до dependency-critical независимо от исходной причины, чтобы фоновые задачи не оставались вечно позади;
-- порог допуска и `T_escalate` выводятся из wall-clock SLO §22.2 и фиксируются в конфигурации.
+- пробуждение не начинается, пока возраст runnable dependency-critical job выше порога (§5.2.1); очередь получает окно между сессиями, а не отбирает время у активной;
+- после превышения возраста `T_escalate` runnable job поднимается до dependency-critical независимо от исходной причины, чтобы фоновая работа не оставалась вечно позади;
+- job с будущим `next_attempt_at` не блокирует сессию до наступления срока; job с живым lease наблюдается отдельно;
+- `blocked` job не участвует в admission и не создаёт глобальный deadlock;
+- порог допуска, `T_escalate`, retry budget и SLO фиксируются в конфигурации.
 
-Измерение без этого механизма показывало бы нарушение SLO, но не позволяло его устранить.
+Таким образом, планировщик выделяет worker-у окно для выполнимой работы, но неисправность одного claim не останавливает весь познавательный цикл.
 
 ### 5.10. Data Store и Audit Log
 
@@ -860,22 +915,28 @@ Confidence имеет одного producer: rules engine вычисляет е�
 - Experiment получает reproducibility capsule и structured environment manifest.
 - Изменение dependency fingerprint, rules или independence snapshot инвалидирует assessment.
 
-Reverse dependency closure вычисляется **до** транзакции, против snapshot с `domain_revision`, — по той же причине, по которой из commit-транзакции вынесена тяжёлая валидация (§5.2.2). Обход графа внутри блокировки означал бы, что одна source-graph correction, задевшая хабовый claim, удерживает knowledge write gate на всё время обхода.
+Reverse dependency closure вычисляется **до** транзакции против `domain_revisions(scope='dependency_graph')`. Эта revision меняется только при изменении evidential edges; обычная запись assessment не делает графовый snapshot устаревшим. Результат обхода сериализуется в immutable content-addressed closure manifest: root, graph revision, упорядоченные claim IDs, depth/topological rank, count и SHA-256.
 
 Invalidation выполняется так:
 
-1. вне транзакции: по `claim_dependencies` вычисляется closure против snapshot, определяется его размер и топологический порядок;
-2. в транзакции: current assessment становится invalid;
-3. claim получает `assessment_state=pending`, `current_assessment_id=NULL` и `epistemic_status=NULL`;
-4. создаётся/обновляется durable reassessment job;
-5. если closure укладывается в лимит батча — downstream assessments инвалидируются в той же domain revision, jobs ставятся в топологическом порядке, и транзакция закрывается;
-6. если не укладывается — в той же транзакции создаётся `dependency_invalidation_barriers` и первый батч; остальные батчи обрабатываются отдельными короткими транзакциями.
+1. вне транзакции: вычислить closure и closure manifest против graph revision;
+2. в короткой транзакции взять writer gate, проверить graph revision и инвалидировать root;
+3. root получает `assessment_state=pending`, `current_assessment_id=NULL`, `epistemic_status=NULL` и durable reassessment job;
+4. если closure укладывается в лимит, инвалидировать downstream claims и создать jobs в топологическом порядке;
+5. если closure велик, атомарно создать barrier со ссылкой на manifest, `next_offset=0`, применить первый батч и в той же транзакции сдвинуть cursor;
+6. barrier processor читает immutable manifest и обрабатывает следующие батчи; invalidation, создание job и изменение `next_offset` фиксируются одной транзакцией.
 
-Если `domain_revision` изменилась между расчётом closure и транзакцией, closure пересчитывается: барьер, поставленный по устаревшему графу, защищал бы не тот набор claims. Пока barrier active, retrieval/rules проверяют ancestor closure и не считают downstream claim current. Barrier закрывается только после перевода всех затронутых claims в pending/invalid. Циклы dependency graph запрещены для evidential dependencies; обнаруженный legacy cycle целиком переводится в pending и требует operator review.
+Активный barrier является самостоятельной durable work item и GC root. После crash recovery worker сканирует `discovering | active | closing` barriers и продолжает с сохранённого cursor; отдельная session для этого не нужна. Повтор батча идемпотентен: уже pending/invalid claim пропускается, а unique active-job constraint не создаёт дубль.
 
-Worker пересчитывает только из существующих evidence. Успех возвращает `assessment_state=current`. Недостаток данных переводит в `invalid` и создаёт вопрос с высоким coverage gap. Pending/invalid claim не может быть evidence или действующей зависимостью и подаётся retrieval только с явной меткой.
+Если graph revision изменилась, processor переводит barrier в `discovering`, вне блокировки строит новый manifest актуального closure и через CAS публикует новую generation с `next_offset=0`. Уже обработанные claims безопасно пропускаются. Пока barrier не resolved, retrieval/rules выполняют ancestor check и не считают его downstream claims current.
 
-История сохраняется в revisions, assessments, jobs и audit log.
+Перед закрытием barrier processor повторно читает актуальный graph revision и проверяет два условия: manifest полностью пройден и в текущем closure нет `assessment_state=current`. Если revision снова изменилась либо найден current descendant, начинается новая generation. Только после успешной проверки barrier становится `resolved`.
+
+Статусы barrier: `discovering | active | closing | resolved | blocked`. Транзиентная ошибка processor-а даёт retry с backoff. Hash mismatch manifest-а, невозможный cursor или нарушение closure-инварианта переводят barrier в `blocked`, сохраняют ancestor protection и требуют audited operator recovery; такой barrier никогда не закрывается автоматически как успешный.
+
+Циклы dependency graph запрещены для evidential dependencies; обнаруженный legacy cycle целиком переводится в pending и требует operator review. Worker пересчитывает только из существующих evidence. Успех возвращает `assessment_state=current`; недостаток данных переводит в `invalid` и создаёт вопрос с высоким coverage gap. Pending/invalid claim не может быть evidence или действующей зависимостью и подаётся retrieval только с явной меткой.
+
+История сохраняется в revisions, assessments, barrier manifests, jobs и audit log.
 
 ### 8.7. Реестр типов утверждений
 
@@ -922,6 +983,8 @@ external_fact:
 Finite computation не доказывает universal theorem: она создаёт `computed_result` либо counterexample в точном диапазоне. Operator attestation не является evidence kind и без новых данных grade не повышает.
 
 Тип назначается при создании claim и меняется только revision с обоснованием и новым assessment. Rules живут в `config_snapshots.claim_type_rules`; новая версия не меняет прошлые revisions молча, но ставит затронутые актуальные claims в очередь переоценки.
+
+В MVP действует консервативное source grouping локального корпуса. Independence group назначает trusted host по canonical origin и объявленной lineage; одинаковый content parent, зеркало, экспорт или неизвестное происхождение считаются одной группой. Если host не может доказать две разные группы, `external_fact | temporal_fact` не получает E3 и не становится `supported` по базовому правилу. Полный source graph, merge/correction и каскадная переоценка появляются в 3b/этапе 5.
 
 #### 8.7.1. Repeatability, reproducibility и independent replication
 
@@ -1263,8 +1326,9 @@ staging_artifacts
 
 reassessment_jobs
   id, claim_id, status, reason, priority, enqueued_at,
-  attempts, lease_owner, lease_expires_at,
-  next_attempt_at, completed_at, last_error
+  attempts, max_attempts, error_class,
+  lease_owner, lease_expires_at,
+  next_attempt_at, blocked_at, completed_at, last_error
 
 model_runs
   id, session_id, turn_id, phase, model_fingerprint,
@@ -1294,8 +1358,9 @@ claim_dependencies
   from_claim_id, to_claim_id, kind, created_in_session, created_at
 
 dependency_invalidation_barriers
-  id, root_claim_id, domain_revision, status,
-  created_at, resolved_at
+  id, root_claim_id, graph_revision, generation, status,
+  closure_manifest_id, member_count, next_offset,
+  created_at, updated_at, resolved_at, last_error
 
 claim_revisions
   id, claim_id, session_id, previous_value, new_value,
@@ -1421,7 +1486,7 @@ assessment_state IN ('pending','invalid')
      AND epistemic_status IS NULL
 ```
 
-FK «current assessment принадлежит тому же claim и valid» проверяется deferred constraint trigger. `UNIQUE(reassessment_jobs.claim_id) WHERE status IN ('queued','leased','retry')` обеспечивает один active job на claim, сохраняя завершённые jobs для истории. В `claim_dependencies` направление определено как `from_claim_id depends on to_claim_id`. Evidential dependencies образуют DAG; cycle check выполняется при commit.
+FK «current assessment принадлежит тому же claim и valid» проверяется deferred constraint trigger. `UNIQUE(reassessment_jobs.claim_id) WHERE status IN ('queued','leased','retry')` обеспечивает один active job на claim, сохраняя `blocked/completed` jobs для истории. В `claim_dependencies` направление определено как `from_claim_id depends on to_claim_id`. Evidential dependencies образуют DAG; cycle check выполняется при commit. `domain_revisions(scope='dependency_graph')` увеличивается только при изменении evidential edges. Cursor barrier-а может двигаться только в той же транзакции, что и соответствующий idempotent invalidation batch.
 
 ### 14.2. Host-generated causality и commit attempts
 
@@ -1460,7 +1525,7 @@ Per-kind constraints требуют:
 - `experiment_run | local_observation`: observation_artifact_id и environment_manifest_id;
 - `computation | formal_check`: observation_artifact_id и tool/environment manifest.
 
-Нельзя получить новый evidence count, завернув одинаковый content hash в другой artifact row. PostgreSQL 15 — минимальная требуемая версия, а не рекомендация: схема опирается на `UNIQUE NULLS NOT DISTINCT` и на частичные уникальные индексы (`reassessment_jobs`, `commit_attempts`, `counterevidence_resolutions`), без которых перечисленные инварианты пришлось бы переносить в триггеры.
+Нельзя получить новый evidence count, завернув одинаковый content hash в другой artifact row. PostgreSQL 15 — минимальный поддерживаемый и тестируемый operational baseline для миграций и эксплуатации. Показанные инварианты используют обязательный `identity_hash`, CHECK/deferred constraints и partial unique indexes; partial indexes сами по себе не являются причиной требования версии 15. Если конкретная миграция использует `UNIQUE NULLS NOT DISTINCT`, она обязана содержать явный DDL и тест, а не опираться на неуказанное допущение логической схемы.
 
 Effective grade/confidence хранятся только в assessment. Assessment фиксирует точный evidence set и оба independence snapshots. Role enum: `support | counter | scope_witness | context`. Несогласованность role/relation отклоняется rules engine.
 
@@ -1494,14 +1559,17 @@ Audit event имеет type/schema version и уникальную пару `(se
 
 ### 15.1. Crash recovery и reconciliation
 
-Recovery worker сначала ищет unresolved commit attempt.
+Recovery worker сначала ищет unresolved commit attempt, затем active dependency barriers.
 
-- `committed` с terminal session/checkpoint: принимает успех и не очищает объекты;
-- `prepared` при подтверждённом rollback: переводит attempt в aborted, session в failed и очищает staging;
-- DB unavailable или inconsistent records: узел остаётся `reconciling_commit/paused`, запрещает wake и GC, поднимает alert;
+- Для unresolved attempt он блокирует session и attempt в каноническом порядке §5.2.2; простой read не является подтверждением rollback.
+- `committed` с terminal session/checkpoint: принимает успех и не очищает объекты.
+- `prepared | reconciling` после row-lock wait, fencing исходного владельца и подтверждённого отсутствия terminal/checkpoint: атомарно переводит attempt в `aborted`, session в `failed` и очищает staging.
+- `database_unavailable | finalizer_in_progress`: узел остаётся `reconciling_commit/paused`, запрещает wake/GC и продолжает probes по политике §5.2.2.
+- inconsistent records: автоматическое разрешение останавливается, поднимается critical alert.
 - отсутствие unresolved attempt: обычный lease recovery — started action становится outcome unknown, session failed, staging/overlay очищаются после grace period.
+- `discovering | active | closing` dependency barrier возобновляется по closure manifest, generation и `next_offset`; перед resolved всегда выполняется актуальная closure-проверка.
 
-Recovery очищает writer intent только после fencing по lease и commit attempt. Ручное вмешательство в inconsistent reconciliation создаёт operator command с audit reason; прямой UPDATE запрещён.
+Recovery очищает writer intent только после fencing по lease и commit attempt. Ручное вмешательство в inconsistent reconciliation или blocked barrier создаёт operator command с audit reason; прямой UPDATE запрещён.
 
 ### 15.2. Классы повторяемости
 
@@ -1518,6 +1586,7 @@ GC roots:
 - active staging/overlays;
 - unresolved commit attempts и их manifests;
 - reassessment/resolution basis artifacts;
+- closure manifests активных и retention-window dependency barriers;
 - pinned/legal-retention objects.
 
 При `reconciling_commit` GC соответствующей сессии запрещён. Restore drill выбирает случайную точку retention window и проверяет все referenced hashes.
@@ -1527,11 +1596,15 @@ GC roots:
 Тесты останавливают процесс:
 
 - до отправки COMMIT, после server commit до client response и во время reconciliation;
+- при запуске reconciler, пока final transaction ещё открыта: row-lock wait/timeout не должен дать ложный `aborted`;
+- после fencing reconciler-а, когда старый finalizer пытается продолжить conditional commit;
 - до/после object upload, outbox и cleanup;
 - между action started/result;
 - при writer intent, worker NOWAIT conflict и worker validation;
+- при transient retry, исчерпании worker retry budget и переводе poison job в `blocked`; несвязанный wake должен продолжаться;
 - при revision conflict;
 - при stop/abort на каждой boundary;
+- после публикации closure manifest, между barrier batches, после cursor update и при смене graph revision;
 - при cascade invalidation, dependency cycle и basis invalidation;
 - при source/environment group merge.
 
@@ -1552,18 +1625,19 @@ GC roots:
 - actions по class/state, schema/backend retries;
 - heartbeat/progress/deadline/lease recovery;
 - soft exhaustion, cognitive reserve overrun и host finalization overrun отдельно;
-- commit attempts по status; reconciliation age и число проб отдельно для `database_unavailable` (warning) и `records_inconsistent` (critical);
+- commit attempts по status; reconciliation age, row-lock wait/timeout и probes отдельно для `database_unavailable | finalizer_in_progress` и `records_inconsistent`;
 - writer intent wait, worker NOWAIT conflicts и session validation retries;
-- возраст старейшего dependency-critical job, число отложенных из-за него пробуждений и число эскалаций `T_escalate`;
-- domain revision conflicts, commit latency, outbox lag;
+- возраст старейшего runnable dependency-critical job, число отложенных пробуждений, эскалации `T_escalate`, blocked jobs и retry-budget exhaustion;
+- active barrier count/age/generation, closure size, cursor lag, graph-revision restarts и recovery resumes;
+- knowledge/dependency-graph revision conflicts, commit latency, outbox lag;
 - orphan bytes/root scan duration;
 - resources, backup и restore drill age.
 
 ### 16.2. Познавательные
 
 - claims/assessments по status/state/grade/rules;
-- reassessment queue depth, oldest age, attempts и SLO violations;
-- cascade size/depth и dependency cycle incidents;
+- reassessment runnable/leased/retry/blocked depth, oldest runnable age, attempts и SLO violations;
+- cascade size/depth, barrier completion time и dependency cycle incidents;
 - invalid resolution и assessment counts;
 - source/environment independence groups;
 - freshness и overdue temporal claims;
@@ -1635,11 +1709,11 @@ noezema/
 
 ## 19. Этапы реализации
 
-Полная программа состоит из семи этапов. **MVP — этапы 1, 2, 3a плюс dashboard/timeline из этапа 6.** Он работает в Sealed, использует FIFO Question Selector вместо полноценного Curiosity Engine и ежедневно выполняет атомарные сессии с assessments. Verifier-роли и Research Proxy в MVP нет: grade назначает rules engine.
+Полная программа состоит из семи этапов. **MVP — этапы 1, 2, 3a плюс минимальный web slice из этапа 6.** Он работает в Sealed, использует FIFO Question Selector и минимальный explorer/curator loop §5.3.2, поэтому действительно способен ежедневно исследовать вопрос, создать typed evidence, синхронно оценить затронутые claims и атомарно сохранить результат. Отдельного verifier-model и Research Proxy в MVP нет: grade назначает rules engine.
 
-Этап 3 разделён намеренно. Каскадная invalidation, reassessment worker, environment grouping и counterevidence resolutions решают проблемы, возникающие на сотнях claims и при merge источников. До появления корпуса их невозможно осмысленно ни протестировать, ни настроить: пороги, размер резерва и wall-clock SLO (§21.13) записаны как решения, но фактически являются гипотезами о нагрузке, которой ещё нет.
+Этап 3 разделён намеренно. Каскадная invalidation, фоновый reassessment worker, полное source/environment grouping и counterevidence resolutions решают проблемы, возникающие на сотнях claims и при merge источников. До появления корпуса их невозможно осмысленно настроить; при этом MVP уже имеет консервативное grouping локальных источников и синхронно пересчитывает claims, изменённые текущей сессией.
 
-MVP должен поработать в реальном расписании до 3b и этапа 4. Риск «спецификация растёт быстрее системы» проверяется только эксплуатацией и для проекта одного человека практичнее любого из §20.
+MVP должен поработать в реальном расписании до 3b и расширенного этапа 4. Риск «спецификация растёт быстрее системы» проверяется эксплуатацией, но урезание не должно удалять сам познавательный путь или исходную возможность человека написать мыслителю.
 
 ### Этап 1. Контракты и локальная LLM
 
@@ -1647,10 +1721,12 @@ MVP должен поработать в реальном расписании �
 - host-generated IDs;
 - LLM Gateway/fingerprint/compatibility suite;
 - domain/audit/outbox;
-- Orchestrator с FIFO Question Selector и seeded questions;
+- Orchestrator с FIFO Question Selector и seeded/message questions;
+- минимальные explorer/curator prompt protocols §5.3.2;
+- adapter typed observations → evidence proposals;
 - минимальные Query/Command API.
 
-Gate: валидный decision envelope; LLM не влияет на idempotency; одна Sealed-сессия проходит основной цикл.
+Gate: валидный decision envelope; LLM не влияет на idempotency; одна Sealed-сессия проходит полный путь `question → action → evidence → assessment → commit`.
 
 ### Этап 2. Изоляция и атомарная сессия
 
@@ -1669,34 +1745,35 @@ Gate: неизвестный ответ COMMIT reconciled; нет mixed state; p
 - claims/evidence/revisions и evidence identity;
 - assessment lifecycle `current | pending | invalid` и executable claim type rules;
 - confidence/freshness;
+- консервативные source independence groups для локального корпуса;
 - context retrieval с токенными бюджетами и обработкой pending claims;
 - identity/handoff.
 
-Assessment здесь одноразовый: он вычисляется при консолидации и инвалидируется только изменением rules version. Ни зависимостей между claims, ни фонового пересчёта в MVP нет.
+Фонового пересчёта в MVP нет, но assessment не является одноразовым: любая staged-операция, меняющая evidence set существующего claim, синхронно создаёт replacement assessment во время validation текущей сессии. Rules version на период работающего MVP заморожена. Её смена выполняется maintenance-процедурой `pause → batch reassessment → atomic rules activation → resume`, поэтому claims не остаются pending без worker.
 
-Gate: duplicate evidence не повышает grade; pending/invalid claim не подаётся как current; grade назначает только rules engine.
+Gate: duplicate evidence не повышает grade; новое counterevidence меняет assessment в том же session commit; неизвестная source lineage не создаёт ложную независимость; pending/invalid claim не подаётся как current; grade назначает только rules engine.
 
 ### Этап 3b. Зависимости и переоценка
 
 - `claim_dependencies` и cycle check;
 - cascade invalidation, closure вне блокировки и barriers;
 - durable reassessment jobs, worker admission и эскалация;
-- environment manifests и source/environment grouping;
+- environment manifests, полный source graph, merge/correction и environment grouping;
 - counterevidence resolutions.
 
 Начинается после того, как MVP отработал серию реальных сессий: пороги очереди, размер батча и SLO выводятся из измеренной нагрузки, а не назначаются заранее.
 
 Gate: invalid ancestor блокирует downstream claims; worker не вызывает starvation и сам не голодает; group merge запускает корректный пересчёт.
 
-### Этап 4. Познавательный цикл
+### Этап 4. Расширенный познавательный цикл
 
-- Curiosity ranking;
-- planning/explorer/verifier/curator;
+- Curiosity ranking вместо FIFO;
+- многошаговое planning и специализированные explorer/verifier/curator profiles поверх MVP-протокола;
 - semantic-repeat protection;
 - untrusted extraction profile;
 - long-run scenarios.
 
-Gate: verifier не назначает grade/confidence; новый метод проверки отличим от перефразирования.
+Gate: расширенный цикл сохраняет host-owned evidence/assessment boundary; verifier не назначает grade/confidence; новый метод проверки отличим от перефразирования.
 
 ### Этап 5. Research Proxy
 
@@ -1708,12 +1785,15 @@ Gate: внешний текст не меняет capabilities; group merge за
 
 ### Этап 6. Полный веб-модуль
 
-- dashboard/timeline;
-- claims/assessments/dependencies;
-- messages/operator commands;
-- stop/abort/reconciliation UX.
+Минимальный slice поставляется вместе с MVP: authenticated status page, SSE timeline, форма сообщения, очередь delivery/answer и controls `wake_now | pause | resume | stop_gracefully | abort_session` через Command API с CSRF, idempotency и audit.
 
-Gate: сайт read-only к domain/audit; reconciliation и invalidation невозможно принять за success/current knowledge.
+Полный этап добавляет:
+
+- claims/assessments/dependencies и provenance navigation;
+- расширенный reconciliation/invalidation UX;
+- operator diagnostics, retry/blocked-job и barrier views.
+
+Gate MVP-slice: человек видит статус/хронологию, может написать мыслителю и безопасно управлять сессией. Gate полного этапа: сайт read-only к domain/audit; reconciliation и invalidation невозможно принять за success/current knowledge.
 
 ### Этап 7. Эксплуатация и оценка
 
@@ -1745,15 +1825,15 @@ Evidence kind принимается за истину. Контроль: assess
 
 ### 20.5. Неопределённый commit
 
-Потеря ответа COMMIT объявляется failure, хотя транзакция состоялась. Контроль: commit attempt token, reconciliation state и запрет GC/wake до разрешения.
+Потеря ответа COMMIT объявляется failure либо живой finalizer ошибочно принимается за rollback. Контроль: durable commit attempt, единый lock order, session/attempt `FOR UPDATE`, fencing, lock timeout как transient и запрет GC/wake до разрешения.
 
 ### 20.6. Worker starvation
 
-Симметричная пара. Worker срывает session validation, меняя revision, — либо, наоборот, никогда не получает gate при плотном расписании, и память тихо держится на устаревших основаниях. Контроль первого: priority writer intent и NOWAIT gate. Контроль второго: условие допуска планировщика по возрасту очереди и эскалация `T_escalate` (§5.2.1, §5.9.1). Метрики wall-clock только обнаруживают дисбаланс.
+Симметричная пара. Worker срывает session validation, никогда не получает gate либо один poison job навсегда блокирует wake. Контроль: priority writer intent/NOWAIT, admission только по runnable age, `T_escalate`, ограниченный retry budget и терминальное состояние `blocked`. Invalid claim остаётся безопасно исключённым, но несвязанный познавательный цикл продолжает работу.
 
 ### 20.7. Dependency leakage
 
-Ancestor pending/invalid, но downstream claim остаётся supported. Контроль: reverse closure, barrier и retrieval invariant.
+Ancestor pending/invalid, но downstream claim остаётся supported; либо crash между barrier batches теряет остаток closure. Контроль: graph-specific revision, immutable closure manifest, transactional cursor, recovery active barriers, final актуальный closure scan и retrieval invariant.
 
 ### 20.8. Ложная независимость экспериментов
 
@@ -1807,19 +1887,22 @@ Resolution без valid independent basis повышает grade. Контрол
 4. `[MVP]` выполняет typed actions в sandbox;
 5. `[MVP]` сохраняет claim только с согласованным assessment lifecycle, provenance и scope;
 6. `[MVP]` публикует memory/workspace одним fenced commit attempt;
-7. `[MVP]` после потери ответа COMMIT восстанавливает фактический исход через reconciliation, различая транзиентную недоступность БД и порчу записей;
+7. `[MVP]` после потери ответа COMMIT восстанавливает фактический исход через fenced row-lock reconciliation; параллельный живой finalizer даёт wait/retry, а не ложный rollback;
 8. `[MVP]` после остальных failpoints видит старый либо полностью новый checkpoint;
-9. `[MVP]` показывает operational timeline, commit attempts и assessment states; dependencies — `[v1]`;
+9. `[MVP]` показывает status, operational timeline, commit attempts и assessment states и принимает authenticated messages/controls; dependencies — `[v1]`;
 10. `[MVP]` раздельно обрабатывает messages, stop, abort и controls;
 11. `[MVP]` не retry unknown/observation/non-idempotent actions вслепую;
 12. `[v1]` восстанавливает random backup point и полный object root set;
 13. `[MVP]` допускает partial success только на safe boundary;
 14. `[v1]` каскадно инвалидирует downstream claims;
-15. `[MVP]` не использует pending/invalid claim как current evidence/dependency и не подаёт его в context pack без метки;
-16. `[v1]` worker соблюдает session writer priority, durable retry и сам не голодает при плотном расписании;
+15. `[MVP]` не использует pending/invalid claim как current evidence и не подаёт его в context pack без метки; запрет действующих dependencies проверяется на `[v1]`;
+16. `[v1]` worker соблюдает session writer priority, durable retry и сам не голодает при плотном расписании; poison job становится blocked и не запрещает несвязанный wake;
 17. `[v1]` отличает repeatability/reproducibility от independent replication;
 18. `[v1]` counterevidence resolution удовлетворяет XOR, uniqueness, valid basis и audit constraints;
-19. `[MVP]` unresolved commit attempt блокирует wake и GC.
+19. `[MVP]` unresolved commit attempt блокирует wake и GC;
+20. `[MVP]` FIFO-вопрос проходит минимальный путь `explorer → typed evidence → curator staging → rules assessment → commit`;
+21. `[MVP]` изменение evidence set существующего claim синхронно заменяет его assessment, а rules activation не оставляет claims без исполнителя переоценки;
+22. `[v1]` dependency barrier после crash продолжает immutable closure manifest с durable cursor и закрывается только после проверки актуального graph revision.
 
 ### 22.2. Познавательная оценка
 
@@ -1838,7 +1921,7 @@ Resolution без valid independent basis повышает grade. Контрол
 - ≤15% вопросов — near-duplicates без нового метода;
 - ≥25% значимых claims переиспользуются/перепроверяются в 20 сессиях;
 - due/stale time-sensitive claims <20%;
-- dependency-critical reassessment jobs укладываются в предварительно зафиксированный wall-clock SLO; остальные — в отдельный background SLO;
+- runnable dependency-critical reassessment jobs укладываются в предварительно зафиксированный wall-clock SLO; blocked jobs имеют alert и не учитываются как runnable backlog; остальные — в отдельный background SLO;
 - zero current assessments с pending/invalid ancestor;
 - zero unresolved high-severity policy/idempotency/command boundary incidents;
 - в слепой выборке ≥90% имеют provenance path и ≥80% не выходят за evidence scope.

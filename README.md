@@ -4,7 +4,7 @@
 
 | Параметр | Значение |
 |----------|----------|
-| Статус | Архитектурный draft v0.8 |
+| Статус | Архитектурный draft v0.9 |
 | Язык | Python |
 | Бэкенд | Локальная LLM (OpenAI-compatible API) |
 | База данных | PostgreSQL 15+ |
@@ -37,6 +37,9 @@ NOEZEMA — автономный локальный мыслитель. Кажд
 - ✅ Каждое утверждение связано с доказательствами и статусом проверки
 - ✅ История событий неизменяема
 - ✅ Локальная LLM — штатный режим, а не дополнительный
+- ✅ Unknown COMMIT разрешается fenced row-lock reconciliation, а не догадкой по сетевому ответу
+- ✅ Durable worker/barrier recovery не позволяет одному poison job или crash потерять прогресс
+- ✅ MVP уже содержит минимальный explorer/curator loop, messages и безопасные controls
 - ✅ Наблюдаемость через веб-интерфейс
 
 ## Архитектура
@@ -172,16 +175,16 @@ noezema/
 
 | Этап | Что | Gate |
 |------|-----|------|
-| **1. Контракты и LLM** | Enums, schemas, host-generated IDs, LLM Gateway, FIFO Question Selector | Валидный decision envelope, одна Sealed-сессия |
-| **2. Изоляция и commit** | Sandbox, capability policy, Tool Broker, COW/staging, reconciliation | Unknown COMMIT reconciled, нет mixed state |
-| **3a. Память и доказательства** | Claims/evidence/assessments, rules engine, evidence identity | Duplicate evidence не повышает grade; pending не подаётся как current |
-| **3b. Зависимости и переоценка** | Cascade invalidation, reassessment worker, grouping, resolutions | Invalid ancestor блокирует downstream; worker не голодает |
-| **4. Познавательный цикл** | Curiosity ranking, verifier/curator, защита от повторений | Verifier не назначает grade |
+| **1. Контракты и LLM** | Enums, schemas, host-generated IDs, LLM Gateway, FIFO Selector, minimal explorer/curator | Sealed-путь question → evidence → assessment → commit |
+| **2. Изоляция и commit** | Sandbox, capability policy, Tool Broker, COW/staging, fenced reconciliation | Unknown COMMIT reconciled, живой finalizer не принят за rollback |
+| **3a. Память и доказательства** | Claims/evidence, synchronous replacement assessments, rules, conservative source grouping | Counterevidence обновляет assessment в том же commit; pending не current |
+| **3b. Зависимости и переоценка** | Closure manifests, resumable barriers, reassessment worker, full grouping, resolutions | Invalid ancestor блокирует downstream; poison job не останавливает wake |
+| **4. Расширенный познавательный цикл** | Curiosity ranking, planning, specialized verifier/curator, защита от повторений | Verifier не назначает grade |
 | **5. Research Proxy** | SSRF-safe fetch/search, provenance, injection tests | Внешний текст не меняет capabilities |
-| **6. Веб-модуль** | Dashboard, timeline, knowledge graph, messages, controls | Сайт read-only к domain/audit |
+| **6. Веб-модуль** | MVP: status/timeline/messages/controls; затем knowledge graph и diagnostics | Сайт read-only к domain/audit |
 | **7. Эксплуатация** | Backup/PITR, GC, security regression, 50–100 сессий | Техническая + познавательная приёмка |
 
-MVP — этапы 1, 2, 3a + dashboard/timeline из этапа 6. Этап 3b начинается после того, как MVP отработает серию реальных сессий: пороги очереди и SLO выводятся из измеренной нагрузки.
+MVP — этапы 1, 2, 3a + минимальный web slice: status, SSE timeline, messages и controls. Он уже выполняет полный минимальный познавательный путь с локальной LLM. Этап 3b начинается после серии реальных сессий: пороги очереди и SLO выводятся из измеренной нагрузки.
 
 ## Не-цели первой версии
 
@@ -194,7 +197,7 @@ MVP — этапы 1, 2, 3a + dashboard/timeline из этапа 6. Этап 3b 
 
 ## Статус
 
-📝 Архитектурный draft v0.8 — документация без кода.
+📝 Архитектурный draft v0.9 — документация без кода.
 
 [Полная спецификация](ARCHITECTURE.md) описывает 22 раздела: архитектурные принципы, компоненты, машину состояний сессий, модель памяти, evidence grading, безопасность, воспроизводимость, веб-модуль, модель данных (38 таблиц), надёжность и восстановление, наблюдаемость, стек, структуру, этапы, риски, открытые вопросы и критерии успеха.
 
