@@ -4,7 +4,7 @@
 
 | Параметр | Значение |
 |----------|----------|
-| Статус | Архитектурный draft v0.12 |
+| Статус | Архитектурный draft v0.13 |
 | Язык | Python |
 | Бэкенд | Локальная LLM (OpenAI-compatible API) |
 | База данных | PostgreSQL 15+ |
@@ -47,7 +47,7 @@ NOEZEMA — автономный локальный мыслитель. Кажд
 - Durable worker и barrier recovery: ни один poison job, ни падение между батчами не теряют прогресс и не парализуют систему
 - Транзиентная недоступность БД восстанавливается сама; человек нужен только для несогласованных записей
 - Knowledge и dependency graph защищены revision vector и единым частичным lock order
-- Новая rules/config version готовится в shadow heads и публикуется одним atomic runtime-head flip
+- Новая rules/config version готовится в shadow heads и публикуется fenced activation с одним atomic runtime-head flip
 
 ## Архитектура
 
@@ -184,7 +184,7 @@ noezema/
 |------|-----|------|
 | **1. Контракты и LLM** | Enums, schemas, host-generated IDs, LLM Gateway, FIFO Selector, minimal explorer/curator | Sealed-путь question → evidence → assessment → commit |
 | **2. Изоляция и commit** | Sandbox, capability policy, Tool Broker, COW/staging, revision vector, fenced reconciliation | Unknown COMMIT reconciled, живой finalizer не принят за rollback |
-| **3a. Память и доказательства** | Claims/evidence, versioned assessment heads, atomic rules activation, conservative source grouping | Нет mixed rules versions; counterevidence обновляет active head |
+| **3a. Память и доказательства** | Claims/evidence, versioned assessment heads, fenced atomic rules activation, conservative source grouping | Нет mixed rules versions; crash/stale activator не оставляет admission заблокированным |
 | **3b. Зависимости и переоценка** | Closure manifests, resumable barriers, reassessment worker, full grouping, resolutions | Invalid ancestor блокирует downstream; poison job не останавливает wake |
 | **4. Расширенный познавательный цикл** | Curiosity ranking, planning, specialized verifier/curator, защита от повторений | Verifier не назначает grade |
 | **5. Research Proxy** | SSRF-safe fetch/search, provenance, injection tests | Внешний текст не меняет capabilities |
@@ -204,7 +204,7 @@ MVP — этапы 1, 2, 3a + минимальный web slice: status, SSE time
 
 ## Статус
 
-📝 Архитектурный draft v0.12 — документация без кода.
+📝 Архитектурный draft v0.13 — документация без кода.
 
 [Полная спецификация](ARCHITECTURE.md) описывает 22 раздела: архитектурные принципы, компоненты, машину состояний сессий, модель памяти, evidence grading, безопасность, воспроизводимость, веб-модуль, модель данных (40 таблиц), надёжность и восстановление, наблюдаемость, стек, структуру, этапы, риски, открытые вопросы и критерии успеха.
 
