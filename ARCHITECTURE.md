@@ -1,10 +1,24 @@
 # NOEZEMA — Architecture Draft
 
-> Status: draft v0.7  
+> Status: draft v0.8  
 > Language: Russian  
 > Purpose: describe the target architecture of a local-first autonomous thinker focused on curiosity, verifiable learning, persistent memory, safe action, and human-observable operation.
 
 ## 0. Что изменилось
+
+### v0.8
+
+Версия 0.8 закрывает liveness-дыры v0.7 и приводит объём первого шага в соответствие с заявленным MVP:
+
+- reconciliation получила ограниченный автоматический retry: недоступность БД перестала быть равной порче записей;
+- исход коммита определяется существованием prepared attempt, а не таймингом отправки COMMIT;
+- голодание reassessment worker предотвращается условием допуска планировщика, а не только измеряется;
+- reverse dependency closure вычисляется вне блокировки; внутрь транзакции попадают барьер и первый батч;
+- определено поведение pending/invalid claims в context pack и переживание метки при усечении;
+- статус `reconciling` внесён в жизненный цикл commit attempt;
+- PostgreSQL 15 объявлен требованием, а не рекомендацией;
+- этап 3 разделён на 3a и 3b: MVP не включает каскад, worker и resolutions;
+- критерии §22.1 размечены на MVP-blocking и full-v1.
 
 ### v0.7
 
@@ -264,7 +278,8 @@ Orchestrator недоступен для изменения из sandbox.
 Расписание принадлежит доверенному контуру и недоступно из sandbox.
 
 - Базовое расписание задаётся cron-подобным выражением с минимальным интервалом между сессиями.
-- Перед запуском проверяются условия допуска: нет незавершённой сессии с живым lease, свободна GPU-память под профиль модели, соблюдена дисковая квота, система не на паузе.
+- Перед запуском проверяются условия допуска: нет незавершённой сессии с живым lease, нет unresolved commit attempt, свободна GPU-память под профиль модели, соблюдена дисковая квота, система не на паузе.
+- Отдельное условие: возраст старейшего dependency-critical reassessment job ниже порога. Иначе пробуждение откладывается до тех пор, пока worker не разгребёт очередь. Без этого условия §22.2 требует SLO, который система не в состоянии обеспечить: writer admission §5.9.1 всегда отдаёт приоритет сессии, и при плотном расписании worker не получает gate никогда.
 - Если условия не выполнены, пробуждение пропускается с записью причины, а не ставится в очередь.
 - После неудачной сессии применяется экспоненциальный backoff; после нескольких неудач подряд узел переходит в `paused`.
 - Ручное «пробуждение сейчас» обходит расписание, но не условия допуска.
@@ -281,7 +296,19 @@ Orchestrator недоступен для изменения из sandbox.
 6. Финальная короткая транзакция блокирует session row и `domain_revisions(scope='knowledge')`, проверяет fencing/revision, применяет staging, обновляет workspace pointer и revision, переводит commit attempt в `committed`, записывает checkpoint, terminal session state, audit и outbox.
 7. При revision conflict staging валидируется заново. Число повторов ограничено; writer intent не позволяет фоновому worker менять revision во время session validation.
 8. Если DB однозначно отклонила или откатила транзакцию, attempt становится `aborted`, предыдущий checkpoint остаётся текущим.
-9. Если ответ COMMIT потерян или DB недоступна, исход не объявляется failure. Узел блокирует новые сессии и переходит в `reconciling_commit` до проверки `commit_attempt_id` с нового соединения.
+9. Если ответ COMMIT потерян или DB недоступна, исход не объявляется failure. Attempt переходит в `reconciling`, узел блокирует новые сессии и переходит в `reconciling_commit` до проверки `commit_attempt_id` с нового соединения.
+
+Статусы attempt: `prepared | reconciling | committed | aborted`. Первые два — unresolved.
+
+Исход определяется существованием durable записи, а не таймингом сети. Клиент не может надёжно узнать, ушёл ли пакет COMMIT, поэтому дискриминатор такой:
+
+```text
+prepared attempt отсутствует  → любой сбой даёт failed
+prepared attempt существует   → любой сбой, таймаут или разрыв
+                                даёт reconciling_commit
+```
+
+Именно ради этого строка `commit_attempts` пишется durable до финальной транзакции (п.5): она превращает неразрешимый вопрос «дошёл ли COMMIT» в обычный запрос к базе.
 
 Reconciliation:
 
@@ -289,12 +316,23 @@ Reconciliation:
 attempt=committed AND session terminal AND checkpoint exists
     → принять committed terminal state
 
-attempt=prepared AND rollback/absence transaction confirmed
+attempt IN (prepared, reconciling) AND rollback/absence confirmed
     → attempt=aborted, session=failed, discard staging
 
-database unavailable OR records inconsistent
-    → remain reconciling_commit, alert operator, no GC
+database unavailable
+    → transient: ограниченный retry пробы (см. ниже)
+
+records inconsistent
+    → remain reconciling_commit, alert severity=critical,
+      no GC, no wake, требуется человек
 ```
+
+Недоступность базы и несогласованность записей — разные события, и сводить их в одну ветку нельзя. Рестарт PostgreSQL, failover или давление на диск транзиентны и разрешаются сами; несогласованные записи означают порчу и требуют оператора. Для узла, который просыпается по расписанию без присмотра, объединение этих случаев означает, что тридцатисекундный рестарт базы паркует систему до тех пор, пока владелец не заметит.
+
+- Проба reconciliation повторяется с экспоненциальным backoff и jitter, каждая попытка — с нового соединения.
+- В `reconciling_commit` узел остаётся, но alert имеет severity `warning`, пока причина `database_unavailable`.
+- После `N` попыток либо `T` wall-clock (оба в конфигурации) состояние переходит в human-required с severity `critical`, и автоматические попытки прекращаются.
+- Wake и GC запрещены на всём протяжении, независимо от причины: транзиентность влияет на порядок эскалации, но не на безопасность.
 
 Fencing:
 
@@ -406,6 +444,15 @@ input_budget = min(model_context_window, backend_context_limit)
 ```
 
 Hard-секции протокола резервируются первыми. Остальные ранжируются по полезности и усекаются до вызова LLM. Событие `ContextPacked` хранит фактические token counts, список включённых chunk ID, причины исключения и tokenizer fingerprint.
+
+#### 5.4.2. Claims без действующего assessment
+
+§8.6 обещает, что pending/invalid claim подаётся retrieval только с явной меткой. Ранжирование и усечение — тот шов, где эта гарантия протекает: усечённый до одного утверждения pending-claim выглядит в контексте как обычное знание.
+
+- Pending и invalid claims не тратят бюджет секции claims. Для них выделен отдельный небольшой лимит, и вытеснить действующее знание они не могут.
+- Метка входит в ту же строку, что и утверждение, и в токенную оценку самой метки: усечение может убрать обоснование и evidence, но не признак отсутствия действующего assessment. Если бюджета не хватает даже на помеченное утверждение, claim исключается целиком, а не подаётся без метки.
+- В контекст попадают только те pending-claims, которые прямо относятся к текущему вопросу; фоновый backlog переоценки в context pack не подаётся — это работа worker-а, а не мыслителя.
+- `ContextPacked` фиксирует их отдельным списком, чтобы по журналу было видно, что модель видела непроверенное знание в момент решения.
 
 ### 5.5. LLM Gateway
 
@@ -528,6 +575,14 @@ last_error, next_attempt_at
 6. `domain_revision` остаётся последней защитой от гонки, но не используется как механизм планирования.
 
 Worker пересчитывает assessments по текущим rules и independence snapshots. Приоритет: reverse dependencies активных вопросов, external/temporal facts, затем остальные. Очередь имеет wall-clock SLO и метрики depth/age/attempts; длительно непустая очередь является деградацией памяти.
+
+Правила 1–6 однонаправленны: сессия всегда выигрывает, worker отступает. Сами по себе они гарантируют отсутствие гонки, но не прогресс worker-а — при плотном расписании он может не получить gate никогда. Поэтому liveness обеспечивается снаружи, планировщиком:
+
+- пробуждение не начинается, пока возраст dependency-critical job выше порога (§5.2.1); очередь получает окно между сессиями, а не отбирает время у активной;
+- после превышения возраста `T_escalate` job поднимается до dependency-critical независимо от исходной причины, чтобы фоновые задачи не оставались вечно позади;
+- порог допуска и `T_escalate` выводятся из wall-clock SLO §22.2 и фиксируются в конфигурации.
+
+Измерение без этого механизма показывало бы нарушение SLO, но не позволяло его устранить.
 
 ### 5.10. Data Store и Audit Log
 
@@ -673,7 +728,7 @@ Soft budgets проверяются до следующего LLM/tool call и �
 
 Если cognitive consolidation не завершена безопасно, сессия `failed` и staging отбрасывается; operational actions/artifacts остаются в audit history для следующей сессии. Если consolidation завершена, но модельный reporting не удался, Orchestrator создаёт minimal report и продолжает commit.
 
-Deadline до отправки COMMIT приводит в `failed`. Timeout после отправки COMMIT приводит только в `reconciling_commit`: исход транзакции устанавливается по §5.2.2.
+Классификация сбоя финализации опирается на наличие prepared attempt, а не на то, успел ли уйти пакет COMMIT: сбой до создания записи даёт `failed`, сбой при существующей записи — `reconciling_commit`. Исход транзакции устанавливается по §5.2.2.
 
 ### 6.7. Остановка и канонические operator transitions
 
@@ -805,15 +860,18 @@ Confidence имеет одного producer: rules engine вычисляет е�
 - Experiment получает reproducibility capsule и structured environment manifest.
 - Изменение dependency fingerprint, rules или independence snapshot инвалидирует assessment.
 
-Invalidation выполняется транзакционно:
+Reverse dependency closure вычисляется **до** транзакции, против snapshot с `domain_revision`, — по той же причине, по которой из commit-транзакции вынесена тяжёлая валидация (§5.2.2). Обход графа внутри блокировки означал бы, что одна source-graph correction, задевшая хабовый claim, удерживает knowledge write gate на всё время обхода.
 
-1. current assessment становится invalid;
-2. claim получает `assessment_state=pending`, `current_assessment_id=NULL` и `epistemic_status=NULL`;
-3. создаётся/обновляется durable reassessment job;
-4. по `claim_dependencies` вычисляется reverse dependency closure;
-5. current assessments всех downstream claims инвалидируются в той же domain revision, а jobs ставятся в топологическом порядке.
+Invalidation выполняется так:
 
-Если closure велик, транзакция создаёт `dependency_invalidation_barriers` и jobs батчами. Пока barrier active, retrieval/rules проверяют ancestor closure и не считают downstream claim current. Barrier закрывается только после перевода всех затронутых claims в pending/invalid. Циклы dependency graph запрещены для evidential dependencies; обнаруженный legacy cycle целиком переводится в pending и требует operator review.
+1. вне транзакции: по `claim_dependencies` вычисляется closure против snapshot, определяется его размер и топологический порядок;
+2. в транзакции: current assessment становится invalid;
+3. claim получает `assessment_state=pending`, `current_assessment_id=NULL` и `epistemic_status=NULL`;
+4. создаётся/обновляется durable reassessment job;
+5. если closure укладывается в лимит батча — downstream assessments инвалидируются в той же domain revision, jobs ставятся в топологическом порядке, и транзакция закрывается;
+6. если не укладывается — в той же транзакции создаётся `dependency_invalidation_barriers` и первый батч; остальные батчи обрабатываются отдельными короткими транзакциями.
+
+Если `domain_revision` изменилась между расчётом closure и транзакцией, closure пересчитывается: барьер, поставленный по устаревшему графу, защищал бы не тот набор claims. Пока barrier active, retrieval/rules проверяют ancestor closure и не считают downstream claim current. Barrier закрывается только после перевода всех затронутых claims в pending/invalid. Циклы dependency graph запрещены для evidential dependencies; обнаруженный legacy cycle целиком переводится в pending и требует operator review.
 
 Worker пересчитывает только из существующих evidence. Успех возвращает `assessment_state=current`. Недостаток данных переводит в `invalid` и создаёт вопрос с высоким coverage gap. Pending/invalid claim не может быть evidence или действующей зависимостью и подаётся retrieval только с явной меткой.
 
@@ -1402,7 +1460,7 @@ Per-kind constraints требуют:
 - `experiment_run | local_observation`: observation_artifact_id и environment_manifest_id;
 - `computation | formal_check`: observation_artifact_id и tool/environment manifest.
 
-Нельзя получить новый evidence count, завернув одинаковый content hash в другой artifact row. PostgreSQL 15+ рекомендуется; если используется `UNIQUE NULLS NOT DISTINCT` как дополнительная защита composite fields, это фиксируется как минимальная версия.
+Нельзя получить новый evidence count, завернув одинаковый content hash в другой artifact row. PostgreSQL 15 — минимальная требуемая версия, а не рекомендация: схема опирается на `UNIQUE NULLS NOT DISTINCT` и на частичные уникальные индексы (`reassessment_jobs`, `commit_attempts`, `counterevidence_resolutions`), без которых перечисленные инварианты пришлось бы переносить в триггеры.
 
 Effective grade/confidence хранятся только в assessment. Assessment фиксирует точный evidence set и оба independence snapshots. Role enum: `support | counter | scope_witness | context`. Несогласованность role/relation отклоняется rules engine.
 
@@ -1494,8 +1552,9 @@ GC roots:
 - actions по class/state, schema/backend retries;
 - heartbeat/progress/deadline/lease recovery;
 - soft exhaustion, cognitive reserve overrun и host finalization overrun отдельно;
-- commit attempts по status, reconciliation age и inconsistent records;
+- commit attempts по status; reconciliation age и число проб отдельно для `database_unavailable` (warning) и `records_inconsistent` (critical);
 - writer intent wait, worker NOWAIT conflicts и session validation retries;
+- возраст старейшего dependency-critical job, число отложенных из-за него пробуждений и число эскалаций `T_escalate`;
 - domain revision conflicts, commit latency, outbox lag;
 - orphan bytes/root scan duration;
 - resources, backup и restore drill age.
@@ -1576,9 +1635,11 @@ noezema/
 
 ## 19. Этапы реализации
 
-Полная программа состоит из семи этапов. MVP — этапы 1–3 плюс dashboard/timeline из этапа 6. Он работает в Sealed, использует FIFO Question Selector вместо полноценного Curiosity Engine и ежедневно выполняет атомарные сессии с assessments. Verifier-роли и Research Proxy в MVP нет: grade назначает rules engine.
+Полная программа состоит из семи этапов. **MVP — этапы 1, 2, 3a плюс dashboard/timeline из этапа 6.** Он работает в Sealed, использует FIFO Question Selector вместо полноценного Curiosity Engine и ежедневно выполняет атомарные сессии с assessments. Verifier-роли и Research Proxy в MVP нет: grade назначает rules engine.
 
-MVP должен поработать в реальном расписании до этапа 4. Риск «спецификация растёт быстрее системы» проверяется только эксплуатацией.
+Этап 3 разделён намеренно. Каскадная invalidation, reassessment worker, environment grouping и counterevidence resolutions решают проблемы, возникающие на сотнях claims и при merge источников. До появления корпуса их невозможно осмысленно ни протестировать, ни настроить: пороги, размер резерва и wall-clock SLO (§21.13) записаны как решения, но фактически являются гипотезами о нагрузке, которой ещё нет.
+
+MVP должен поработать в реальном расписании до 3b и этапа 4. Риск «спецификация растёт быстрее системы» проверяется только эксплуатацией и для проекта одного человека практичнее любого из §20.
 
 ### Этап 1. Контракты и локальная LLM
 
@@ -1603,18 +1664,29 @@ Gate: валидный decision envelope; LLM не влияет на idempotency
 
 Gate: неизвестный ответ COMMIT reconciled; нет mixed state; partial success только на safe boundary.
 
-### Этап 3. Память и доказательства
+### Этап 3a. Память и доказательства (MVP)
 
-- claims/evidence/dependencies/revisions;
-- assessment lifecycle и executable rules;
-- environment manifests и source/environment grouping;
-- counterevidence resolutions;
-- durable reassessment jobs и worker admission;
-- cascade invalidation;
-- confidence/freshness/context retrieval;
+- claims/evidence/revisions и evidence identity;
+- assessment lifecycle `current | pending | invalid` и executable claim type rules;
+- confidence/freshness;
+- context retrieval с токенными бюджетами и обработкой pending claims;
 - identity/handoff.
 
-Gate: invalid ancestor блокирует downstream claims; worker не вызывает starvation; duplicate evidence не повышает grade; assessment pending/invalid не подаётся как current.
+Assessment здесь одноразовый: он вычисляется при консолидации и инвалидируется только изменением rules version. Ни зависимостей между claims, ни фонового пересчёта в MVP нет.
+
+Gate: duplicate evidence не повышает grade; pending/invalid claim не подаётся как current; grade назначает только rules engine.
+
+### Этап 3b. Зависимости и переоценка
+
+- `claim_dependencies` и cycle check;
+- cascade invalidation, closure вне блокировки и barriers;
+- durable reassessment jobs, worker admission и эскалация;
+- environment manifests и source/environment grouping;
+- counterevidence resolutions.
+
+Начинается после того, как MVP отработал серию реальных сессий: пороги очереди, размер батча и SLO выводятся из измеренной нагрузки, а не назначаются заранее.
+
+Gate: invalid ancestor блокирует downstream claims; worker не вызывает starvation и сам не голодает; group merge запускает корректный пересчёт.
 
 ### Этап 4. Познавательный цикл
 
@@ -1677,7 +1749,7 @@ Evidence kind принимается за истину. Контроль: assess
 
 ### 20.6. Worker starvation
 
-Reassessment worker постоянно меняет revision и срывает session validation. Контроль: priority writer intent, NOWAIT gate и wall-clock metrics.
+Симметричная пара. Worker срывает session validation, меняя revision, — либо, наоборот, никогда не получает gate при плотном расписании, и память тихо держится на устаревших основаниях. Контроль первого: priority writer intent и NOWAIT gate. Контроль второго: условие допуска планировщика по возрасту очереди и эскалация `T_escalate` (§5.2.1, §5.9.1). Метрики wall-clock только обнаруживают дисбаланс.
 
 ### 20.7. Dependency leakage
 
@@ -1725,27 +1797,29 @@ Resolution без valid independent basis повышает grade. Контрол
 
 ### 22.1. Техническая приёмка
 
+Пункты помечены `[MVP]` — блокируют запуск MVP (этапы 1, 2, 3a) — и `[v1]` — проверяются на полной приёмке. Разметка нужна, чтобы критерии, требующие полного стека, не откладывали первый реальный запуск.
+
 Первая версия технически готова, если она локально:
 
-1. пробуждается по расписанию и соблюдает pause/backoff;
-2. использует локальную LLM с fingerprint;
-3. создаёт causal/idempotency IDs только в trusted host;
-4. выполняет typed actions в sandbox;
-5. сохраняет claim только с согласованным assessment lifecycle, provenance и scope;
-6. публикует memory/workspace одним fenced commit attempt;
-7. после потери ответа COMMIT восстанавливает фактический исход через reconciliation;
-8. после остальных failpoints видит старый либо полностью новый checkpoint;
-9. показывает operational timeline, commit attempts, dependencies и assessment states;
-10. раздельно обрабатывает messages, stop, abort и controls;
-11. не retry unknown/observation/non-idempotent actions вслепую;
-12. восстанавливает random backup point и полный object root set;
-13. допускает partial success только на safe boundary;
-14. каскадно инвалидирует downstream claims;
-15. не использует pending/invalid claim как current evidence/dependency;
-16. worker соблюдает session writer priority и durable retry;
-17. отличает repeatability/reproducibility от independent replication;
-18. counterevidence resolution удовлетворяет XOR, uniqueness, valid basis и audit constraints;
-19. unresolved commit attempt блокирует wake и GC.
+1. `[MVP]` пробуждается по расписанию и соблюдает pause/backoff;
+2. `[MVP]` использует локальную LLM с fingerprint;
+3. `[MVP]` создаёт causal/idempotency IDs только в trusted host;
+4. `[MVP]` выполняет typed actions в sandbox;
+5. `[MVP]` сохраняет claim только с согласованным assessment lifecycle, provenance и scope;
+6. `[MVP]` публикует memory/workspace одним fenced commit attempt;
+7. `[MVP]` после потери ответа COMMIT восстанавливает фактический исход через reconciliation, различая транзиентную недоступность БД и порчу записей;
+8. `[MVP]` после остальных failpoints видит старый либо полностью новый checkpoint;
+9. `[MVP]` показывает operational timeline, commit attempts и assessment states; dependencies — `[v1]`;
+10. `[MVP]` раздельно обрабатывает messages, stop, abort и controls;
+11. `[MVP]` не retry unknown/observation/non-idempotent actions вслепую;
+12. `[v1]` восстанавливает random backup point и полный object root set;
+13. `[MVP]` допускает partial success только на safe boundary;
+14. `[v1]` каскадно инвалидирует downstream claims;
+15. `[MVP]` не использует pending/invalid claim как current evidence/dependency и не подаёт его в context pack без метки;
+16. `[v1]` worker соблюдает session writer priority, durable retry и сам не голодает при плотном расписании;
+17. `[v1]` отличает repeatability/reproducibility от independent replication;
+18. `[v1]` counterevidence resolution удовлетворяет XOR, uniqueness, valid basis и audit constraints;
+19. `[MVP]` unresolved commit attempt блокирует wake и GC.
 
 ### 22.2. Познавательная оценка
 
