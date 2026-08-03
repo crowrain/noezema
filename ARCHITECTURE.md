@@ -1,10 +1,20 @@
 # NOEZEMA — Architecture Draft
 
-> Status: draft v0.11  
+> Status: draft v0.12  
 > Language: Russian  
 > Purpose: describe the target architecture of a local-first autonomous thinker focused on curiosity, verifiable learning, persistent memory, safe action, and human-observable operation.
 
 ## 0. Что изменилось
+
+### v0.12
+
+Версия 0.12 закрывает последние расхождения между заявленными гарантиями и компонентами, которые их обеспечивают. Дальнейшее уточнение спекулятивных подсистем откладывается до появления работающего MVP:
+
+- reassessment worker останавливается на время activation, что снимает гонку между подготовкой shadow head и инвалидацией assessment;
+- условия допуска планировщика знают про незавершённую activation, `reconciling_commit` и `blocked` barrier;
+- у activation появилось терминальное состояние отказа после flip, не парализующее узел;
+- определены `prepared_by` и `runtime_config_heads.scope`;
+- исход evaluation run разведён на `passed | failed | insufficient_sample`.
 
 ### v0.11
 
@@ -314,7 +324,9 @@ Orchestrator недоступен для изменения из sandbox.
 Расписание принадлежит доверенному контуру и недоступно из sandbox.
 
 - Базовое расписание задаётся cron-подобным выражением с минимальным интервалом между сессиями.
-- Перед запуском проверяются условия допуска: нет незавершённой сессии с живым lease, нет unresolved commit attempt, свободна GPU-память под профиль модели, соблюдена дисковая квота, система не на паузе.
+- Перед запуском проверяются условия допуска: нет незавершённой сессии с живым lease, нет unresolved commit attempt, нет незавершённой config activation (§8.7.0), свободна GPU-память под профиль модели, соблюдена дисковая квота, система не на паузе.
+- Этот список авторитетен: гарантия, заявленная в другом разделе, но не проверяемая здесь, не действует. В частности, отсутствие активной сессии между publish и post-publish recovery обеспечивается именно условием про activation, а не только утверждением §14.1.
+- Что допуску **не** мешает: `blocked` reassessment job (§5.9.1), `blocked` или активный dependency barrier (§8.6). Локальная неисправность знания не должна останавливать познавательный цикл — защита держится на том, что затронутые claims не считаются current.
 - Отдельное условие: возраст старейшего **runnable dependency-critical** reassessment job ниже порога. Runnable означает `status IN ('queued','retry')`, `next_attempt_at <= now()` и неисчерпанный retry budget. Job с живым lease, будущим retry либо `blocked` не маскируется под готовую работу.
 - Если runnable dependency-critical job превысил порог, пробуждение откладывается, пока worker не получит окно. Poison job после исчерпания попыток становится `blocked`, оставляет claim в `invalid`, поднимает alert и больше не блокирует несвязанные сессии.
 - Если условия не выполнены, пробуждение пропускается с записью причины, а не ставится в очередь.
@@ -678,6 +690,7 @@ last_error, next_attempt_at, blocked_at
 4. Если session intent появляется во время worker validation, worker не коммитит подготовленный batch и возвращает jobs в очередь.
 5. Session commit очищает intent в своей terminal transaction; recovery очищает просроченный intent только после проверки lease/commit attempt.
 6. Knowledge revision остаётся последней защитой обычной переоценки; если job читает dependency graph, он также проверяет graph revision. Revision vector не используется как механизм планирования.
+7. При нетерминальном `config_snapshots.activation_state` worker находится в quiesce: новые батчи не начинаются, незавершённый возвращает jobs в очередь, остановка подтверждается audit event. Это предусловие активации (§8.7.0), а не оптимизация.
 
 Worker пересчитывает assessment head для `target_config_snapshot_id` по его rules и independence snapshots; запись разрешена только если target snapshot active. Приоритет: reverse dependencies активных вопросов, external/temporal facts, затем остальные. Очередь имеет wall-clock SLO и метрики depth/age/attempts; длительно непустая очередь является деградацией памяти.
 
@@ -1051,7 +1064,28 @@ Finite computation не доказывает universal theorem: она созд�
 
 #### 8.7.0. Активация новой версии правил
 
-Смена rules version публикуется через shadow heads; батчи никогда не меняют логически действующее знание до атомарного переключения. `config_snapshots` проходит lifecycle `draft → preparing_heads → ready → active | superseded | failed`, а единственным глобальным указателем служит `runtime_config_heads.active_config_snapshot_id`.
+Смена rules version публикуется через shadow heads; батчи никогда не меняют логически действующее знание до атомарного переключения. Единственным глобальным указателем служит `runtime_config_heads.active_config_snapshot_id`.
+
+`config_snapshots.activation_state` проходит lifecycle:
+
+```text
+draft → preparing_heads → ready → publishing → post_publish → active
+                                                            → superseded
+
+отказы:
+  failed                — до flip; прежний runtime head сохраняется,
+                          shadow heads остаются мусором для GC
+  post_publish_blocked  — после flip; корпус консистентен и работоспособен,
+                          но вопросы/jobs для invalid heads не созданы
+```
+
+`failed` и `post_publish_blocked` — разные события. Первое означает, что активация не состоялась и система работает по прежним правилам. Второе означает, что новая версия уже действует и знание согласовано, не хватает лишь исследовательских задач по invalid heads. Поэтому `post_publish_blocked` поднимает alert и остаётся видимым оператору, но **не** блокирует пробуждение: по тому же принципу, что `blocked` job и `blocked` barrier, локальная недоделка не должна останавливать познавательный цикл. Незавершённые состояния `preparing_heads | ready | publishing | post_publish` пробуждение блокируют (§5.2.1) — там корпус ещё может оказаться в промежуточном виде.
+
+Предусловия активации:
+
+- активной сессии нет и pause установлен;
+- нет unresolved commit attempt, узел не в `reconciling_commit`: исход прошлой сессии обязан быть известен до смены правил, иначе reconciliation придётся разрешать против уже изменившейся конфигурации;
+- reassessment worker (§5.9.1) переведён в quiesce и подтвердил остановку.
 
 Для каждого claim существует head `(claim_id, config_snapshot_id)`, содержащий `assessment_state`, nullable `current_assessment_id` и nullable `epistemic_status`. Query/Memory Service всегда читает head активного config snapshot. Поэтому подготовка тысяч heads невидима пользователю, а UPDATE одного runtime head атомарно переключает весь корпус.
 
@@ -1059,6 +1093,7 @@ Finite computation не доказывает universal theorem: она созд�
 
 ```text
 pause / maintenance lease
+  → quiesce reassessment worker (дождаться подтверждения)
   → freeze claim cohort и activation manifest
   → prepare shadow heads ограниченными идемпотентными батчами
   → verify complete cohort, hashes и lifecycle constraints
@@ -1074,7 +1109,11 @@ pause / maintenance lease
 - **MVP без worker.** Maintenance runner с actor `system:rules_activation` детерминированно пересчитывает затронутые claims. Для неизменившегося claim-type rule head может ссылаться на прежний valid assessment; для изменившегося создаётся новый assessment либо head `invalid`. После publish runner ограниченными батчами создаёт высокоприоритетные исследовательские вопросы для invalid heads и только затем снимает pause.
 - **3b и далее.** Для затронутых claims заранее создаются heads `pending` и durable reassessment jobs с `target_config_snapshot_id`; job не runnable, пока snapshot не active. Неизменившиеся heads переносятся как выше. После atomic publish worker постепенно заменяет pending heads current/invalid.
 
-Уникальность `(claim_id, config_snapshot_id)` делает prepare идемпотентным. Activation manifest содержит полный cohort и ожидаемый head count; publish запрещён, пока для каждого claim нет совместимого shadow head. Прерывание до publish оставляет прежний runtime head. Прерывание после publish восстанавливается по `activation_state` и заканчивает вопросы/jobs до resume.
+Quiesce worker-а обязателен, а не желателен. Быстрый путь подготовки — head неизменившегося claim-type rule ссылается на прежний valid assessment — берёт ссылку на строку, которую работающий worker вправе инвалидировать между prepare и publish. Тогда после flip active head указывает на `valid=false`, что прямо нарушает инвариант §14.1, причём обнаружится это уже на действующем корпусе. Альтернатива — перепроверять валидность всех referenced assessments в publish-транзакции — превращает короткий flip в проход по всему cohort, то есть возвращает ровно ту массовую операцию, ради устранения которой введены shadow heads.
+
+Worker не начинает новый батч, пока `activation_state` не терминален, а незавершённый батч возвращает jobs в очередь. Подтверждение quiesce фиксируется audit event.
+
+Уникальность `(claim_id, config_snapshot_id)` делает prepare идемпотентным. Activation manifest содержит полный cohort и ожидаемый head count; publish запрещён, пока для каждого claim нет совместимого shadow head. Прерывание до publish оставляет прежний runtime head и переводит activation в `failed`. Прерывание после publish восстанавливается по `activation_state` и заканчивает вопросы/jobs до resume; устойчивая невозможность их создать даёт `post_publish_blocked` с alert, но не блокирует пробуждение.
 
 Runner подчиняется writer admission, revision vector и append-only audit, не создаёт evidence и не вызывает LLM. Human-required возникает только при hash mismatch, невозможном lifecycle или другой несогласованности. Обычный недостаток evidence является познавательной задачей и создаёт вопрос, а не требует ручного ремонта.
 
@@ -1595,6 +1634,10 @@ assessment_state IN ('pending','invalid')
 UNIQUE(claim_id, config_snapshot_id)
 ```
 
+`claim_assessment_heads.prepared_by` — закрытый enum актора, создавшего head: `session | rules_activation | reassessment_worker`. Он нужен для аудита происхождения lifecycle и для отладки активаций: head, подготовленный runner-ом по быстрому пути, и head, пересчитанный worker-ом, различаются по стоимости доверия к ним.
+
+`runtime_config_heads.scope` в v1 имеет единственное значение `'global'`. Колонка существует, потому что на ней держится инвариант единственного указателя через `UNIQUE(scope)`, и потому что multi-thinker tenancy (§21.6) при появлении сделает указатель per-thinker без миграции формы таблицы.
+
 `claims` хранит стабильную сущность и freshness; current lifecycle разрешается join-ом через `runtime_config_heads`. Это позволяет атомарно переключить rules/config version одним head update. Materialized projections могут дублировать lifecycle ради чтения, но не являются источником истины и обязаны быть rebuildable.
 
 `UNIQUE(runtime_config_heads.scope)` обеспечивает один active pointer на scope. Session creation в одной короткой транзакции читает этот pointer и записывает `sessions.config_snapshot_id`; после этого config сессии неизменяем. Activation требует pause и отсутствия active session, поэтому новая сессия не может стартовать между publish и post-publish recovery.
@@ -1719,6 +1762,8 @@ GC roots:
 - при конфликте каждой компоненты revision vector и при попытке barrier batch изменить knowledge без knowledge lock;
 - при превышении staging limits до записи команды и при повторной финальной проверке immutable manifest;
 - до/после каждого shadow-head batch, после `ready`, непосредственно до/после runtime config-head flip и во время post-publish question/job creation;
+- при попытке worker-а начать батч во время нетерминальной activation и при инвалидации assessment, на который ссылается подготовленный shadow head;
+- при устойчивом отказе post-publish создания вопросов: узел обязан продолжать пробуждаться с `post_publish_blocked`;
 - при stop/abort на каждой boundary;
 - после публикации closure manifest, между barrier batches, после cursor update и при смене graph revision;
 - при cascade invalidation, dependency cycle и basis invalidation;
@@ -2029,7 +2074,9 @@ Resolution без valid independent basis повышает grade. Контрол
 21. `[MVP]` изменение evidence set синхронно обновляет head активного config snapshot, а rules activation публикует полный shadow cohort одним runtime-head flip;
 22. `[v1]` dependency barrier после crash продолжает immutable closure manifest с durable cursor и закрывается только после проверки актуального graph revision;
 23. `[MVP]` session limits покрывают новые/существующие claims и evidence, отклоняют превышение до записи staging-команды и гарантируют host reserve;
-24. `[MVP]` rules activation после publish создаёт вопросы для invalid heads и восстанавливается после crash без mixed-version knowledge.
+24. `[MVP]` rules activation после publish создаёт вопросы для invalid heads и восстанавливается после crash без mixed-version knowledge;
+25. `[MVP]` незавершённая activation блокирует пробуждение, а `post_publish_blocked`, `blocked` job и `blocked` barrier — нет;
+26. `[v1]` reassessment worker подтверждает quiesce до freeze cohort, и ни один опубликованный head не ссылается на инвалидированный assessment.
 
 ### 22.2. Познавательная оценка
 
@@ -2042,12 +2089,22 @@ Resolution без valid independent basis повышает grade. Контрол
 - **значимый claim** — current assessment E2+ со статусом `supported | disputed | refuted` либо claim, используемый активным вопросом/claim;
 - **eligible session** — scheduled/wake_now terminal session; operator abort исключается, technical failure включается;
 - **слепая выборка** — минимум 50 claims либо все, стратификация по type/status, фиксированный seed, публикация 95% confidence interval;
-- **достаточная type-specific выборка** — минимум 20 evaluated claims требуемого типа/группы. Меньший denominator даёт `insufficient_sample`, а не `passed`; run продлевается либо claim type заранее исключается отдельным ADR до freeze.
+- **достаточная type-specific выборка** — минимум 20 evaluated claims требуемого типа/группы.
+
+Каждый gate имеет один из трёх исходов, и они требуют разной реакции:
+
+```text
+passed              порог выполнен на достаточной выборке
+failed              порог не выполнен на достаточной выборке
+insufficient_sample denominator < 20; о качестве ничего не известно
+```
+
+`insufficient_sample` — не провал и не успех: он означает, что измерение не состоялось. Реакция на него — продлить run либо заранее, до freeze, исключить claim type отдельным ADR; реакция на `failed` — работа над системой. Смешивать их нельзя: если недобор выборки закрывать как отказ, любой редкий тип утверждений будет вечно «проваливать» приёмку, и появится стимул исключать его из оценки задним числом. Full v1 acceptance требует, чтобы ни один gate не был `failed` и ни один не остался `insufficient_sample`.
 
 Стартовые gates:
 
 - ≥80% новых supported/refuted claims имеют valid E2+;
-- каждый supported/refuted `external_fact | temporal_fact` в достаточной выборке выполняет E3 rule; при N<20 gate не пройден;
+- каждый supported/refuted `external_fact | temporal_fact` в достаточной выборке выполняет E3 rule; при N<20 gate получает `insufficient_sample`;
 - ≥60% eligible sessions создают evidence, закрывают/уточняют вопрос или пересматривают claim;
 - ≤15% вопросов — near-duplicates без нового метода;
 - ≥25% значимых claims переиспользуются/перепроверяются в 20 сессиях;
