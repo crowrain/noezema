@@ -1,10 +1,19 @@
 # NOEZEMA — Architecture Draft
 
-> Status: draft v0.22  
+> Status: draft v0.23  
 > Language: Russian  
 > Purpose: describe the target architecture of a local-first autonomous thinker focused on curiosity, verifiable learning, persistent memory, safe action, and human-observable operation.
 
 ## 0. Что изменилось
+
+### v0.23
+
+Версия 0.23 делает host recovery однозначным и проверяемым даже при retained history, падениях между fsync и неточной диспетчеризации systemd:
+
+- введён единственный durable `host-transition-head.json`: он сериализует незавершённый переход, служит O(1)-индикатором scheduler-а и восстанавливается из журнала после crash;
+- host recovery policy получила единственный root-owned источник, versioned schema, канонический hash и явный протокол безопасного изменения; DB snapshot больше не может неявно менять её;
+- короткий retry получения flock ограничен конкретными числами, а flock удерживается только на host-journal critical sections;
+- retry и unit-state timers получили явные `AccuracySec=1s`/`RandomizedDelaySec=0`, failpoints, метрики и критерии приёмки.
 
 ### v0.22
 
@@ -1201,8 +1210,9 @@ draft → preparing_heads → ready → active
 
 ```text
 start noezema-offline-rules.service (ровно один active instance)
-  → unit acquires exclusive /run/lock/noezema-host-transition.lock flock
-  → create fsync-safe host-transition attempt record
+  → unit acquires /run/lock/noezema-host-transition.lock (bounded ≤2s)
+  → reconcile active head; atomically create initial event + current record + single active head
+  → publish maintenance marker and release flock
   → systemd creates private RuntimeDirectory
   → atomically publish owner-bound /run/noezema-offline-rules/active marker
   → stop noezema-runtime.target
@@ -1242,7 +1252,9 @@ start noezema-offline-rules.service (ровно один active instance)
 
 Crash до final transaction оставляет прежний effective pointer. Повторный запуск захватывает advisory lock и продолжает тот же candidate/manifest. Если между попытками узел работал и knowledge revision изменилась, cohort пересобирается до `ready`. Потерянный ответ после DB commit безопасен: повтор видит requested `payload_sha256` уже effective и возвращает success; вопросы уже находятся в той же транзакции.
 
-Host maintenance принадлежит `noezema-offline-rules.service`, а не произвольному процессу. Unit первым получает `flock` на стабильном `/run/lock/noezema-host-transition.lock` — с коротким ограниченным ретраем, а не одной неблокирующей попыткой (§8.7.1.1), чтобы housekeeping-тик scheduler-а не давал ложного отказа; lockfile может жить весь boot, ownership определяется только удерживаемым file descriptor. Затем `RuntimeDirectory=noezema-offline-rules` создаёт private каталог, и unit атомарным rename публикует owner-bound marker `/run/noezema-offline-rules/active`. Второй запуск завершается до изменения marker; helper напрямую вне unit запускать запрещено. Только владеющий unit может снять marker.
+Host maintenance принадлежит `noezema-offline-rules.service`, а не произвольному процессу. Unit получает `flock` на стабильном `/run/lock/noezema-host-transition.lock` с общим deadline 2 секунды: первая пауза 50 ms, затем exponential backoff с cap 250 ms и jitter ±10%. Timeout до захвата возвращает временный exit `75` и не меняет marker, current record или active head. После захвата helper сначала reconciles active head (§8.7.1.1): существующий unresolved transition даёт typed `host_transition_in_progress`, а не новый retry. Только при свободном head создаются initial event/current/head и owner-bound marker.
+
+Flock защищает лишь короткие чтения и fsync-safe изменения host journal; сетевые вызовы, PostgreSQL и `systemctl` под ним не выполняются. После публикации head и marker lock освобождается, а единственность долгой операции обеспечивает active head вместе с systemd ownership marker. `RuntimeDirectory=noezema-offline-rules` создаёт private каталог, marker публикуется atomic rename как `/run/noezema-offline-rules/active`. Второй запуск завершается до изменения marker; helper напрямую вне unit запускать запрещено. Только владеющий unit может снять marker.
 
 `noezema-runtime.target` объединяет Orchestrator и все процессы, способные писать knowledge/session state; web в target не входит и описан ниже как observer. Каждый member является прямым `Requires=` либо `Wants=` target-а и объявляет `PartOf=noezema-runtime.target`, поэтому stop/restart target-а распространяется на member. Сам target и каждый member имеют `ConditionPathExists=!/run/noezema-offline-rules/active` как быстрый admission guard. Marker публикуется **до** `systemctl stop noezema-runtime.target`; maintenance продолжает DB work только после подтверждения `inactive` всех members.
 
@@ -1252,7 +1264,11 @@ Condition не является correctness-проверкой: systemd може
 
 ##### 8.7.1.1. Host-transition journal и resume
 
-До публикации marker maintenance создаёт current record `/var/lib/noezema/host-transitions/<attempt_id>.json` с mode `0640`, owner `root:noezema-observer`. Запись использует temporary file → `fsync(file)` → atomic rename → `fsync(directory)`. Record содержит `attempt_id`, operation, candidate/base snapshot IDs, observed pointer tuple, `state`, `attempts_total`, `current_attempt_seq`, `consecutive_unclassified_failures`, `backoff_step`, `error_class`, `last_probe_started_at`, `last_probe_classified_at`, `next_attempt_at`, `dispatch_id`, `dispatch_deadline`, `last_event_seq`, `replayed_through_seq` и `replayed_at`. Конечного `max_attempts` для транзиентного recovery нет.
+До публикации marker maintenance под host-transition flock создаёт current record `/var/lib/noezema/host-transitions/<attempt_id>.json` с mode `0640`, owner `root:noezema-observer`. Запись использует temporary file → `fsync(file)` → atomic rename → `fsync(directory)`. Record содержит `attempt_id`, operation, candidate/base snapshot IDs, observed pointer tuple, `state`, `attempts_total`, `current_attempt_seq`, `consecutive_unclassified_failures`, `backoff_step`, `error_class`, `last_probe_started_at`, `last_probe_classified_at`, `next_attempt_at`, `dispatch_id`, `dispatch_deadline`, `last_event_seq`, `replayed_through_seq`, `replayed_at` и материализованный host-policy contract ниже. Конечного `max_attempts` для транзиентного recovery нет.
+
+Единственный authoritative индекс незавершённого перехода — `/var/lib/noezema/host-transition-head.json` с теми же owner/mode и fsync-safe publication. Он содержит `schema_version`, `attempt_id`, `record_identity_sha256`, `created_at` и `creation_boot_id`; identity hash вычисляется только по immutable header `{schema_version, attempt_id, operation, created_at, initial_event_sha256}` и не меняется при обновлении mutable current state. Наличие head означает, что новый host transition запрещён; retained `resolved` records и каталоги events не влияют на fast path scheduler-а.
+
+Создание выполняется под одним flock в порядке initial event → current record → active head → marker. После crash между current и head initial resume/admission один раз сканирует records: ноль unresolved оставляет head отсутствующим, один восстанавливает его, больше одного фиксирует permanent inconsistency и запрещает runtime start. Head на отсутствующий, повреждённый или другой record также даёт `resume_blocked`; head на уже resolved record завершается проверкой полного replay и удаляется. Этот reconciliation выполняется при boot и перед созданием перехода, но не на каждом пустом timer tick.
 
 Каждый доменный переход дополнительно создаёт immutable event `/var/lib/noezema/host-transition-events/<attempt_id>/<event_seq>.json` с теми же ownership/mode и fsync-safe publication. Event содержит from/to state, attempt/dispatch IDs, reason/error class, actor и host timestamp. Под host-transition flock сначала публикуется event, затем current record; extra event после crash безопасен — recovery восстанавливает snapshot по максимальной непрерывной последовательности и дедуплицирует `(attempt_id, event_seq)`. Это даёт web настоящую host chronology, а не только последний mutable state.
 
@@ -1271,21 +1287,42 @@ resume_degraded → checking                       # автоматически�
 - **Permanent/inconsistent** — inconsistent pointer tuple, hash mismatch, недопустимый lifecycle. Wrapper fsync-safe переводит record в `resume_blocked`, затем выходит `78`; автоматические попытки прекращаются, выход — audited `noezemactl resume-runtime`.
 - **Неклассифицированный failure** — crash, signal, timeout либо ненулевой выход до durable `last_probe_classified_at` для текущего `attempt_seq`. Только этот класс использует быстрый `Restart=on-failure`. Если его burst исчерпан, failure handler переводит `checking | ready_to_start → resume_degraded`, поднимает critical alert и назначает slow retry. Успешная последующая классификация закрывает деградацию без участия человека.
 
-Durable backoff policy: `resume_retry_initial=30s`, multiplier `2`, `resume_retry_max=30min`, jitter `±10%`. `attempts_total` не ограничен; warning поднимается после `resume_retry_escalate_after=15min`, но retry продолжается. Backoff сбрасывается после согласованного admission. Часы для due-check монотонные внутри boot; record также хранит wall-clock deadline, а после reboot scheduler немедленно выполняет один probe и пересчитывает monotonic deadline.
+Durable backoff policy задаётся отдельно от БД. Packaged baseline `/usr/lib/noezema/host-recovery.defaults.toml` устанавливается вместе с юнитами и проверяется в CI; необязательный override — `/etc/noezema/host-recovery.toml`. Оба файла имеют `schema_version=1`, являются обычными non-symlink файлами `root:root 0644` без secrets, не могут быть group/world-writable и читаются через descriptor с проверкой owner/mode/inode. Отсутствие override означает packaged baseline, но отсутствие либо невалидность baseline является ошибкой установки.
 
-Эти параметры **host-local и не читаются из PostgreSQL**. Иначе scheduler обращался бы к базе, чтобы узнать, как долго ждать базу, — а это единственная ситуация, ради которой он написан. Холодный старт делает зависимость невозможной вовсе: узел, загрузившийся с лежащей БД, создаёт `operation=runtime_start`, и никакого config snapshot для чтения ещё нет.
+Минимальная схема policy:
 
-- Действующие значения лежат в host config-файле рядом с юнитами и читаются scheduler-ом напрямую.
-- Каждая host-transition запись материализует применённые значения в момент создания, поэтому уже идущее восстановление не меняет политику на ходу и остаётся воспроизводимым по журналу.
-- Значения в config snapshot, если они есть, считаются источником для следующей материализации в host config, а не runtime-зависимостью: их изменение вступает в силу со следующего transition, а не с текущего.
+```toml
+schema_version = 1
+resume_retry_initial = "30s"
+resume_retry_multiplier = 2.0
+resume_retry_max = "30min"
+resume_retry_jitter = 0.10
+resume_retry_escalate_after = "15min"
+retry_timer_period = "30s"
+retry_timer_accuracy = "1s"
+maintenance_flock_deadline = "2s"
+```
 
-То же правило распространяется на всё, что нужно scheduler-у и admission до первого успешного соединения: host recovery не может зависеть от состояния, живущего в восстанавливаемой системе.
+Trusted helper парсит durations в целые nanoseconds, проверяет диапазоны (`initial > 0`, `multiplier >= 1`, `max >= initial`, `0 <= jitter <= 0.25`, `timer_period <= initial`, `0 < timer_accuracy < timer_period`), строит канонический JCS JSON и вычисляет `host_policy_sha256`. Каждая новая host-transition запись один раз материализует `host_policy_schema_version`, source kind/path/hash, canonical hash и все применённые значения; уже идущее восстановление не меняет policy на ходу. `attempts_total` не ограничен; warning поднимается после `resume_retry_escalate_after`, retry продолжается, а backoff сбрасывается после согласованного admission. Часы due-check монотонные внутри boot; record также хранит wall-clock deadline, а после reboot scheduler немедленно выполняет один probe и пересчитывает monotonic deadline.
 
-`noezema-runtime-resume-retry.timer` запускает `noezema-runtime-resume-retry.service` каждые 30 секунд. Период таймера не может превышать `resume_retry_initial`: backoff квантуется тиком, поэтому при равных значениях первая повторная попытка наступает в интервале одного периода после расчётного срока. Это допустимо, но должно быть выбрано осознанно, а не получиться случайно.
+Present-but-invalid override не откатывается молча: helper использует заведомо валидный packaged baseline только как emergency envelope для fsync-safe записи `resume_blocked/error_class=host_policy_invalid`, сохраняет hash и validation errors override, не запускает автоматические DB probes и поднимает host alert. После исправления operator выполняет audited `noezemactl resume-runtime --reason ...`.
 
-Scheduler сначала проверяет **без блокировки**, есть ли незавершённая запись — `stat` каталога host-transitions. Если её нет, тик завершается, не касаясь flock. Только при наличии записи scheduler получает `/run/lock/noezema-host-transition.lock`, проверяет unresolved record и `next_attempt_at`; для due attempt атомарно создаёт `dispatch_id` с deadline, освобождает flock и запускает `noezema-runtime-resume.service`.
+Policy меняется только root-командой `noezemactl install-host-recovery-policy --file ... --reason ...`. Под коротким host flock она валидирует файл и сначала fsync-safe публикует immutable `prepared` event `/var/lib/noezema/host-policy-events/<change_id>/1.json` с actor, reason, old/new source и canonical hashes. Затем выполняет temporary file в `/etc/noezema` → `fsync` → rename → `fsync(directory)` и публикует terminal `committed` event. Если процесс падает между шагами, следующий boot/вызов сравнивает фактический hash override с old/new и дописывает ровно один `committed | aborted` event; неоднозначность даёт host-policy inconsistency и блокирует новый transition. Events идемпотентно replay-ятся в DB audit после восстановления. Config snapshots могут хранить наблюдаемый hash для диагностики, но **не являются источником** и автоматически не продвигаются в host policy. Изменение вступает в силу только для следующего transition.
 
-Без этой проверки housekeeping-тик каждые 30 секунд боролся бы за тот же flock, который maintenance берёт неблокирующе, и запуск смены правил мог бы упасть просто из-за совпадения по времени — необъяснимо для человека за терминалом. По той же причине maintenance unit берёт flock не одной попыткой, а с коротким ограниченным ретраем: это плановая ручная операция, и подождать секунду ничего не стоит, тогда как ложный отказ стоит доверия к процедуре. Resume service под flock потребляет только текущий dispatch. Потерянный start или crash scheduler-а безопасен: после `dispatch_deadline` следующий tick переиспользует тот же attempt, но создаёт новый dispatch ID; одновременно действителен не более чем один dispatch.
+`noezema-runtime-resume-retry.timer` имеет явную точность; domain jitter уже вычислен в record, поэтому systemd jitter отключён. В MVP `retry_timer_period=30s` и `retry_timer_accuracy=1s` pin-ятся unit-файлом: policy validator сверяет их с `systemctl show` при boot/admission, а override с другими значениями отклоняется. Их изменение требует согласованного package/unit upgrade, не редактирования DB:
+
+```ini
+[Timer]
+OnBootSec=30s
+OnUnitInactiveSec=30s
+AccuracySec=1s
+RandomizedDelaySec=0
+Unit=noezema-runtime-resume-retry.service
+```
+
+Backoff квантуется `retry_timer_period` и дополнительно запаздывает не более чем на `retry_timer_accuracy` при исправном scheduler-е. Scheduler сначала делает без блокировки `stat("/var/lib/noezema/host-transition-head.json")`. `ENOENT` завершает тик без flock и без сканирования retained history. При наличии head service получает flock, валидирует head/current/event prefix и `next_attempt_at`; только state `retry_wait | resume_degraded` с due deadline может атомарно получить новый `dispatch_id`. Затем lock освобождается и запускается `noezema-runtime-resume.service`.
+
+Maintenance и scheduler используют один короткий lock protocol. Scheduler не держит flock при `systemctl start`; maintenance ждёт его не более 2 секунд. Потерянный start или crash scheduler-а безопасен: после `dispatch_deadline` следующий tick переиспользует тот же attempt, но создаёт новый dispatch ID; одновременно действителен не более чем один dispatch.
 
 При success, crash, signal или timeout systemd завершает maintenance unit и удаляет private RuntimeDirectory. `OnSuccess` и `OnFailure` maintenance unit (systemd 249+, §17) запускают `noezema-runtime-resume.service` после cleanup. Resume получает host-transition flock, начинает новый `attempt_seq` и классифицирует DB outcome: старый pointer — безопасный pre-publish crash; новый pointer плюс `candidate.active` — committed success; inconsistent tuple — permanent block; DB unavailable — classified transient. Перед start target resume освобождает flock; target admission повторяет проверки и закрывает TOCTOU-окно.
 
@@ -1309,9 +1346,9 @@ RestartPreventExitStatus=78
 
 Idempotent `noezema-resume-failure@.service` получает тот же flock и читает current record вместе с `systemctl show Result,ExecMainCode,ExecMainStatus,NRestarts`. Если текущий `attempt_seq` уже durable-classified как `resume_blocked`, handler только гарантирует priority-2 journald event и host notification. Если unit достиг `start-limit-hit`, а `last_probe_classified_at` отсутствует для текущего attempt, handler сохраняет `resume_degraded`, назначает `next_attempt_at=now+resume_retry_max`, публикует alert и выполняет `systemctl reset-failed noezema-runtime-resume.service`; slow retry затем делает scheduler. Stale result с несовпадающим attempt/dispatch ID ничего не меняет.
 
-`noezema-runtime.target` напрямую при boot не enable-ится: `multi-user.target` запускает web, unit-state timer, retry timer и один initial resume probe; уже успешный resume активирует cognitive runtime target. При отсутствии незавершённого record probe создаёт `operation=runtime_start`, поэтому cold boot использует тот же journal/audit protocol.
+`noezema-runtime.target` напрямую при boot не enable-ится: `multi-user.target` запускает web, unit-state timer, retry timer и один initial resume probe; уже успешный resume активирует cognitive runtime target. После boot reconciliation отсутствие active head позволяет probe создать `operation=runtime_start`; retained resolved records этому не мешают, поэтому cold boot использует тот же journal/audit protocol.
 
-Admission/resume replay-ит immutable host events в `audit_events` с unique key `(attempt_id, event_seq)` и в той же DB-транзакции создаёт terminal resolution audit event. После подтверждённого commit current record получает `replayed_through_seq`, `replayed_at` и `resolved`; потерянный commit response безопасно разрешается повторным чтением unique keys. Current record и event directory являются recovery/GC roots до `resolved + complete replay + retention`.
+Admission/resume replay-ит immutable host events в `audit_events` с unique key `(attempt_id, event_seq)` и в той же DB-транзакции создаёт terminal resolution audit event. После подтверждённого commit current record fsync-safe получает `replayed_through_seq=last_event_seq`, `replayed_at` и `resolved`. Затем под flock проверяются identity hash/current и active head удаляется через `unlink → fsync(parent directory)`. Падение после `resolved`, но до удаления head безопасно: следующий resume видит terminal record и завершает cleanup; удаление head до полного replay запрещено. Current record и event directory остаются recovery/GC roots до `resolved + complete replay + retention`, active head — до этого terminal cleanup.
 
 Поддерживаемый ручной путь — `noezemactl resume-runtime --reason ...`: он получает host-transition flock и переводит `resume_blocked → checking`. Raw `systemctl start noezema-runtime.target` также безопасен, потому что admission обязателен; при согласованной БД admission сначала завершает idempotent audit replay и только затем разрешает start, при ошибке target остаётся inactive. Web показывает current record и immutable host events независимо от DB, но не выполняет host transition.
 
@@ -1656,11 +1693,22 @@ Fingerprint вызова включает также prompt version, context man
 
 Отдельный SPA, WebSocket и Redis первой версии не требуются.
 
-`noezema-web.service` не входит в `noezema-runtime.target`, не имеет `Requires/PartOf` на cognitive runtime или PostgreSQL и продолжает работать во время offline maintenance. DB connector инициализируется lazy. Web переходит в read-only degraded mode и закрывает Command API при любом unresolved host transition (`checking | retry_wait | ready_to_start | resume_degraded | resume_blocked`), active maintenance marker, неактивном/нездоровом runtime target/member, недоступной DB либо missing/stale unit-state snapshot. Доступная DB projection при host degradation остаётся read-only и явно отделяется от локального host status; недоступная projection маркируется как unavailable. ACL даёт web-процессу только чтение current records и immutable host events; менять state либо запускать units через сайт запрещено.
+`noezema-web.service` не входит в `noezema-runtime.target`, не имеет `Requires/PartOf` на cognitive runtime или PostgreSQL и продолжает работать во время offline maintenance. DB connector инициализируется lazy. Web переходит в read-only degraded mode и закрывает Command API при active head с состоянием `checking | retry_wait | ready_to_start | resume_degraded | resume_blocked`, любой обнаруженной head/journal inconsistency, active maintenance marker, неактивном/нездоровом runtime target/member, недоступной DB либо missing/stale unit-state snapshot. Доступная DB projection при host degradation остаётся read-only и явно отделяется от локального host status; недоступная projection маркируется как unavailable. ACL даёт web-процессу только чтение active head, current records и immutable host events; менять state либо запускать units через сайт запрещено.
 
-Состояние юнитов web не читает с system bus напрямую: песочница веб-сервиса не имеет доступа к `org.freedesktop.systemd1`. `noezema-unit-state.timer` каждые 5 секунд активирует отдельный `noezema-unit-state.service`; только service выполняет `systemctl show --property=ActiveState,SubState,Result` для target и его непустого `ConsistsOf`. Publisher создаёт `/run/noezema/unit-state.json` через temporary file → `fsync(file)` → rename → `fsync(directory)`, owner `root:noezema-observer`, mode `0640`.
+Состояние юнитов web не читает с system bus напрямую: песочница веб-сервиса не имеет доступа к `org.freedesktop.systemd1`. Отдельный publisher запускается коротким timer с явной точностью:
 
-Snapshot содержит `schema_version`, `boot_id`, `observed_at`, `publisher_result`, target state, отсортированный member list, `inventory_sha256` и состояние каждого unit. Web принимает его только при совпадающем `boot_id`, корректном schema/inventory и age ≤15 секунд; иначе показывает `unknown`, закрывает Command API и поднимает degraded banner. Так stale `active` нельзя принять за живой runtime, а канал остаётся односторонним по построению, не по договорённости.
+```ini
+[Timer]
+OnBootSec=5s
+OnUnitInactiveSec=5s
+AccuracySec=1s
+RandomizedDelaySec=0
+Unit=noezema-unit-state.service
+```
+
+Только `noezema-unit-state.service` выполняет `systemctl show --property=ActiveState,SubState,Result` для target и его непустого `ConsistsOf`. Publisher создаёт `/run/noezema/unit-state.json` через temporary file → `fsync(file)` → rename → `fsync(directory)`, owner `root:noezema-observer`, mode `0640`.
+
+Snapshot содержит `schema_version`, `boot_id`, `observed_at`, `publisher_result`, target state, отсортированный member list, `inventory_sha256` и состояние каждого unit. Web принимает его только при совпадающем `boot_id`, корректном schema/inventory и age ≤15 секунд; нормативно TTL должен быть не меньше `2 × period + 2 × AccuracySec` (для defaults это 12 секунд). Иначе web показывает `unknown`, закрывает Command API и поднимает degraded banner. Метрика timer lateness сравнивает фактический monotonic start с ожидаемым deadline; `AccuracySec=1s` не заменяет эту проверку.
 
 ### 13.1. Query API
 
@@ -2087,7 +2135,7 @@ DB recovery worker сначала ищет unresolved commit attempt, затем
 - Для `post_publish` нормальна только пара `active_config_snapshot_id=candidate` и `activating_config_snapshot_id=candidate`. Recovery захватывает просроченный lease новым fence и идемпотентно продолжает manifest. Успех переводит candidate в `active`; исчерпание retry — в `post_publish_blocked`. В обоих случаях terminal-cleanup атомарно очищает activating slot/lease и activation-owned pause до возобновления admission.
 - `post_publish_blocked` не удерживает activation slot. Trusted repair runner использует отдельный post-cleanup CAS по active pointer, online mode, state и expected cursor; activation lease/fence в repair predicate не входят. Если snapshot уже `superseded`, repair закрывает остаток manifest без возврата старой config в `active`.
 - `failed | active | post_publish_blocked` с оставшимся activating pointer нарушает атомарность terminal-cleanup и является inconsistent record. К тому же классу относятся несовпадение base/candidate pointers, два effective pointers на scope или effective snapshot без полного cohort.
-- Current host-transition record в `checking | retry_wait | ready_to_start | resume_degraded | resume_blocked`, его immutable events и незавершённый dispatch являются recovery/GC roots. Recovery под host flock восстанавливает current snapshot по непрерывному `event_seq`, инвалидирует просроченный dispatch и продолжает classification. При согласованной БД admission/resume идемпотентно replay-ит events в `audit_events` по `(attempt_id, event_seq)`, добавляет terminal resolution event и только затем переводит local record в `resolved`; cleanup разрешён после полного `replayed_through_seq`, `replayed_at` и retention.
+- Active head и связанный current host-transition record в `checking | retry_wait | ready_to_start | resume_degraded | resume_blocked`, его immutable events и незавершённый dispatch являются recovery/GC roots. Recovery под host flock сначала reconciles head: восстанавливает его при единственном orphan unresolved record, очищает только terminal fully-replayed head и блокирует start при множественных/несогласованных records. Затем current snapshot восстанавливается по непрерывному `event_seq`, просроченный dispatch инвалидируется и classification продолжается. При согласованной БД admission/resume идемпотентно replay-ит events в `audit_events` по `(attempt_id, event_seq)`, добавляет terminal resolution event, fsync-safe переводит local record в `resolved` и только после этого удаляет active head.
 
 Recovery очищает writer intent только после fencing по lease и commit attempt. Ручное вмешательство в inconsistent reconciliation или blocked barrier создаёт operator command с audit reason; прямой UPDATE запрещён.
 
@@ -2097,7 +2145,7 @@ Recovery очищает writer intent только после fencing по lease
 
 ### 15.3. Checkpoint, backup и GC roots
 
-Checkpoint — committed `{knowledge_revision, dependency_graph_revision}` плюс workspace manifest. Backup связывает DB recovery point с content-addressed artifact inventory и включает unresolved host-transition current records вместе с immutable event directories либо явное доказательство их отсутствия. Restore до старта cognitive runtime запускает admission; незавершённый record открывает web в degraded mode и проходит обычную resume-классификацию.
+Checkpoint — committed `{knowledge_revision, dependency_graph_revision}` плюс workspace manifest. Backup связывает DB recovery point с content-addressed artifact inventory и включает active head, все unresolved host-transition current records вместе с immutable event directories, host-policy files, их hashes и незавершённые/retention-window host-policy event streams либо явное доказательство отсутствия active transition. Restore до старта cognitive runtime запускает boot reconciliation/admission; active head либо обнаруженный orphan unresolved record открывает web в degraded mode и проходит обычную resume-классификацию.
 
 GC roots:
 
@@ -2108,7 +2156,7 @@ GC roots:
 - reassessment/resolution basis artifacts;
 - closure manifests активных и retention-window dependency barriers;
 - manifests и shadow heads offline/online config attempts в `preparing_heads | ready | publishing | post_publish | post_publish_blocked`; после audited `failed | superseded` — до retention window;
-- host-transition current records, immutable events и live dispatch metadata до `resolved + replayed_through_seq=last_event_seq + replayed_at + retention`;
+- active host-transition head до terminal cleanup; current records, immutable events и live dispatch metadata — до `resolved + replayed_through_seq=last_event_seq + replayed_at + retention`; prepared/terminal host-policy event streams — до audit replay + retention;
 - pinned/legal-retention objects.
 
 При `reconciling_commit` GC соответствующей сессии запрещён. Restore drill выбирает случайную точку retention window и проверяет все referenced hashes.
@@ -2127,7 +2175,7 @@ GC roots:
 - при конфликте каждой компоненты revision vector и при попытке barrier batch изменить knowledge без knowledge lock;
 - при превышении staging limits до записи команды и при повторной финальной проверке immutable manifest;
 - offline: параллельный второй maintenance start, попытка runtime start после marker и до stop, kill/timeout владельца без reboot, reboot в середине прогона, после candidate upsert, между shadow-head batches, mutation head после `ready`, после durable verify seal и непосредственно до/после atomic pointer+questions transaction; только owner снимает marker, resume стартует runtime лишь по однозначному pointer tuple, rerun выбирает тот же payload candidate и не создаёт дублей вопросов;
-- host resume/admission: crash до/после current/event file `fsync/rename`, DB probe, dispatch publication и audit replay; `PartOf` stop propagation; start target при marker; skipped child при active target; пустой/mismatched `ConsistsOf`; classified DB outage дольше start-limit window остаётся `retry_wait` и не увеличивает fast restart counter; unclassified crash/signal/timeout исчерпывает burst и даёт `resume_degraded`; permanent exit 78 даёт только `resume_blocked`; retry scheduler crash, потерянный dispatch, reboot и stale `Result` не создают параллельных attempts; scheduler tick без незавершённой записи не берёт flock, а maintenance start во время тика не получает ложного отказа; scheduler и admission работают при недоступной БД, не читая из неё backoff policy; raw/manual start после `resume_blocked`; runtime не стартует без admission, journal/events не теряются, terminal handler создаёт out-of-band alert;
+- host resume/admission: crash до/после initial event, current record и active-head `fsync/rename`, а также до/после удаления terminal head; retained resolved records не создают ложный active transition; единственный orphan unresolved record восстанавливает head, два unresolved records либо head/identity mismatch дают permanent inconsistency; concurrent maintenance не создаёт второй attempt; `PartOf` stop propagation; start target при marker; skipped child при active target; пустой/mismatched `ConsistsOf`; classified DB outage дольше start-limit window остаётся `retry_wait` и не увеличивает fast restart counter; unclassified crash/signal/timeout исчерпывает burst и даёт `resume_degraded`; permanent exit 78 даёт только `resume_blocked`; retry scheduler crash, потерянный dispatch, reboot и stale `Result` не создают параллельных attempts; timer tick без active head не берёт flock и не сканирует retained history; maintenance lock wait ограничен 2 секундами и timeout не меняет host state; scheduler/admission работают при недоступной БД; missing override выбирает packaged baseline, malformed/unsafe override даёт `host_policy_invalid` без автоматического probe, crash до/после policy-file rename восстанавливается по prepared old/new hashes, смена policy не меняет текущий transition; фактическое запаздывание retry/unit-state timers проверяется относительно period+`AccuracySec`; raw/manual start после `resume_blocked`; runtime не стартует без admission, journal/events не теряются, terminal handler создаёт out-of-band alert;
 - online: до/после каждого shadow-head batch, после `ready → publishing`, непосредственно до/после runtime config-head flip, в каждом post-publish batch и до/после terminal-cleanup;
 - когда worker держит gate до activation acquisition, когда stale activator после recovery takeover пытается изменить cursor/state/pointer и когда repair `post_publish_blocked` конкурирует со следующим flip;
 - при crash в каждом activation state: recovery обязан классифицировать исход по pointer tuple, а не по одному state;
@@ -2147,7 +2195,8 @@ GC roots:
 - non-bootstrap rules candidate в pre-publish `ready | publishing` имеет полный immutable verification seal, expected/verified counts равны, а shadow heads не изменяются до flip; final publish не сканирует cohort, после flip effective writes увеличивают knowledge revision;
 - active maintenance marker имеет одного systemd owner-а; все `ConsistsOf` members через `PartOf` подтверждены inactive до DB work;
 - target/member start всегда проходит required admission; cleanly skipped condition не оставляет target active без cognitive services;
-- незавершённый host transition имеет fsync-safe current record и непрерывный immutable event stream; classified transient остаётся `retry_wait`, unclassified crash-loop виден как `resume_degraded`, permanent — как `resume_blocked`, а `resolved` допустим только после полного идемпотентного DB audit replay по `(attempt_id, event_seq)`;
+- каждое изменение host policy имеет fsync-safe prepared event и ровно один terminal `committed | aborted`, а DB config не является источником policy;
+- незавершённый host transition имеет ровно один active head, fsync-safe current record и непрерывный immutable event stream; zero head означает zero unresolved records после boot reconciliation, more-than-one unresolved — permanent inconsistency; classified transient остаётся `retry_wait`, unclassified crash-loop виден как `resume_degraded`, permanent — как `resume_blocked`, а удаление head допустимо только после `resolved` и полного идемпотентного DB audit replay по `(attempt_id, event_seq)`;
 - online runtime config head старый либо полностью новый; effective config определяется только pointer equality, один activating slot существует на scope, stale fence не меняет state/cursor/pointer, а repair CAS не возвращает superseded snapshot в `active`;
 - staging limit никогда не обнаруживается впервые после начала commit boundary;
 - partial success не содержит unknown action;
@@ -2166,7 +2215,7 @@ GC roots:
 - возраст старейшего runnable dependency-critical job, число отложенных пробуждений, эскалации `T_escalate`, blocked jobs и retry-budget exhaustion;
 - active barrier count/age/generation, closure size, cursor lag, graph-revision restarts и recovery resumes;
 - knowledge/dependency-graph revision conflicts, commit latency, outbox lag;
-- offline config attempts/resumes/rebuilds/limit rejects, maintenance owner conflicts, marker lifetime, target membership mismatch и admission rejects; host-transition state/age/attempts, classified-transient duration, unclassified crash burst, backoff step, scheduler/dispatch lag, event-sequence gaps, audit replay lag, `resume_degraded`/`resume_blocked` alerts, unit-state snapshot age/inventory mismatch; verification duration/digest mismatch и atomic publish latency; online activation state/cursor/cohort progress, lease age/fence takeovers/stale-write rejects, shadow-head retries, publish/terminal-cleanup latency, effective repair backlog age и нарушения `T_repair_admission`;
+- offline config attempts/resumes/rebuilds/limit rejects, maintenance owner conflicts/flock wait/timeouts, marker lifetime, target membership mismatch и admission rejects; active-head presence/age, head-record identity mismatch, orphan/multiple-unresolved repairs, host-policy schema/hash/source/drift/validation errors, host-transition state/age/attempts, classified-transient duration, unclassified crash burst, backoff step, scheduler/dispatch lag и timer lateness против `period+AccuracySec`, event-sequence gaps, audit replay lag, `resume_degraded`/`resume_blocked` alerts, unit-state snapshot age/inventory mismatch/lateness; verification duration/digest mismatch и atomic publish latency; online activation state/cursor/cohort progress, lease age/fence takeovers/stale-write rejects, shadow-head retries, publish/terminal-cleanup latency, effective repair backlog age и нарушения `T_repair_admission`;
 - staging budget utilization/rejections по claims/new claims/evidence и фактическое host assessment time;
 - orphan bytes/root scan duration;
 - resources, backup и restore drill age.
@@ -2204,7 +2253,7 @@ Evaluation thresholds фиксируются до серии.
 - SQLAlchemy + Alembic;
 - HTMX + Server-Sent Events;
 - rootless Podman или Docker;
-- systemd 249+ (`OnSuccess=` требует 249; `PartOf=`, `ConsistsOf`, `RuntimeDirectory=`, `ConditionPathExists=`, `RestartPreventExitStatus=` и start limits используются в host protocol §8.7.1);
+- systemd 249+ (`OnSuccess=` требует 249; `PartOf=`, `ConsistsOf`, `RuntimeDirectory=`, `ConditionPathExists=`, `RestartPreventExitStatus=`, `AccuracySec=`, `RandomizedDelaySec=` и start limits используются в host protocol §8.7.1);
 - llama.cpp, Ollama или vLLM;
 - локальная embedding model;
 - pytest для unit, scenario и security tests.
@@ -2239,6 +2288,7 @@ noezema/
 ├── infra/
 │   ├── compose.yaml
 │   └── systemd/
+│       ├── host-recovery.defaults.toml
 │       ├── noezema-runtime.target
 │       ├── noezema-runtime-admission.service
 │       ├── noezema-offline-rules.service
@@ -2297,12 +2347,12 @@ Gate: неизвестный ответ COMMIT reconciled; нет mixed state; p
 - confidence/freshness;
 - консервативные source independence groups для локального корпуса;
 - context retrieval с токенными бюджетами и обработкой pending claims;
-- offline-смена rules version §8.7.1 через systemd-owned maintenance unit, `PartOf/ConsistsOf` target graph, required runtime admission, fsync-safe current+event host journal, retry scheduler, durable verification seal и атомарный pointer+questions publish;
+- offline-смена rules version §8.7.1 через systemd-owned maintenance unit, `PartOf/ConsistsOf` target graph, required runtime admission, single active head + fsync-safe current/event host journal, root-owned materialized recovery policy, точные retry/unit-state timers, durable verification seal и атомарный pointer+questions publish;
 - identity/handoff.
 
 Фонового пересчёта в MVP нет, но assessment не является одноразовым: staged-операция, меняющая evidence set, синхронно обновляет head effective config snapshot в пределах session limits (§6.6). Rules version заморожена между offline-сменами §8.7.1; shadow heads не видны до переключения указателя, а invalid после него получает исследовательский вопрос.
 
-Gate: duplicate evidence не повышает grade; новое counterevidence меняет effective head в том же session commit; offline rules publish оставляет старую либо полностью новую config вместе с invalid-вопросами; target stop quiesce-ит все `PartOf` members, любой start проходит admission, classified outage остаётся `retry_wait`, crash-loop виден как `resume_degraded`, permanent inconsistency — как durable `resume_blocked`; неизвестная source lineage не создаёт ложную независимость; pending/invalid claim не подаётся как current; grade назначает только rules engine.
+Gate: duplicate evidence не повышает grade; новое counterevidence меняет effective head в том же session commit; offline rules publish оставляет старую либо полностью новую config вместе с invalid-вопросами; target stop quiesce-ит все `PartOf` members, любой start проходит admission, classified outage остаётся `retry_wait`, crash-loop виден как `resume_degraded`, retained history не выглядит active, permanent inconsistency/policy mismatch — как durable `resume_blocked`; неизвестная source lineage не создаёт ложную независимость; pending/invalid claim не подаётся как current; grade назначает только rules engine.
 
 ### Этап 3b. Зависимости и переоценка
 
@@ -2413,7 +2463,7 @@ Resolution без valid independent basis повышает grade. Контрол
 
 ### 20.14. Слепая зона host recovery
 
-Target считается active при skipped members, writer не остановился вместе с target, start обошёл DB admission, classified DB outage ошибочно стал crash-loop, `resume_degraded | resume_blocked` потерян между local events и audit либо web принял stale unit snapshot за живой runtime. Контроль: `PartOf/ConsistsOf` graph, hard-failing shared admission, раздельные classified/unclassified paths, fsync-safe current+event journal, fenced retry dispatch, idempotent event replay, out-of-band alerts и TTL-проверяемый degraded observer вне cognitive runtime target.
+Target считается active при skipped members, writer не остановился вместе с target, start обошёл DB admission, retained history выглядит как active transition, два последовательных writer-а создали два unresolved attempts, policy незаметно изменилась из DB snapshot, короткий systemd timer сработал с минутной точностью, `resume_degraded | resume_blocked` потерян между local events и audit либо web принял stale unit snapshot за живой runtime. Контроль: `PartOf/ConsistsOf` graph, hard-failing shared admission, единственный fsync-safe active head с boot reconciliation, root-owned hash-pinned host policy, короткие flock critical sections, явные `AccuracySec=1s` timers, раздельные classified/unclassified paths, fenced retry dispatch, idempotent event replay, out-of-band alerts и TTL-проверяемый degraded observer вне cognitive runtime target.
 
 ## 21. Открытые архитектурные вопросы
 
@@ -2472,8 +2522,9 @@ Target считается active при skipped members, writer не остан�
 29. `[v1]` repair runner использует отдельный post-cleanup CAS, уступает session intent и получает окно через `T_repair_admission`; superseded backlog не возвращает старую config в `active`.
 30. `[MVP]` первая migration атомарно создаёт hash-pinned bootstrap snapshot и единственный global runtime head; startup/restore fail-closed при нарушении tuple, а kill maintenance owner-а очищает marker и возобновляет runtime только после однозначной DB-проверки;
 31. `[MVP]` `noezema-runtime.target` quiesce-ит каждый непустой `ConsistsOf` member через `PartOf`; target и direct member start требуют один fail-closed admission check, поэтому condition skip, ручной start или отсутствующий writer membership не обходят DB/marker invariants;
-32. `[MVP]` каждый host transition имеет fsync-safe current record, immutable event sequence и явную retry/backoff policy: classified DB outage любой длительности выходит `0`, остаётся `retry_wait` и не расходует fast start limit; только unclassified crash-loop даёт auto-recovering `resume_degraded`, permanent/inconsistent exit 78 — operator-required `resume_blocked`, а `resolved` достигается после полного idempotent DB audit replay по `(attempt_id, event_seq)`; backoff policy host-local, поэтому холодный старт с недоступной БД восстанавливается без чтения config snapshot;
-33. `[MVP]` web остаётся вне cognitive runtime target, не имеет system-bus access и fail-closed отключает Command API при любом unresolved host transition, unhealthy runtime, DB outage либо missing/stale/mismatched unit-state snapshot; current/event chronology не выдаётся за committed DB audit и после replay дедуплицируется по event key.
+32. `[MVP]` каждый host transition имеет ровно один fsync-safe active head, current record и immutable event sequence: boot reconciliation восстанавливает единственный orphan, но блокирует runtime при множественных unresolved records/identity mismatch; classified DB outage любой длительности остаётся `retry_wait` без расхода fast start limit, только unclassified crash-loop даёт `resume_degraded`, permanent/inconsistent — `resume_blocked`, а head удаляется лишь после `resolved` и полного DB audit replay;
+33. `[MVP]` recovery policy читается только из versioned root-owned host files, валидируется и hash-ируется до materialization; missing override использует packaged baseline, invalid override fail-closed блокирует автоматический probe, DB snapshot не меняет policy, retry/unit-state timers имеют явные `AccuracySec=1s` и тестируемую lateness;
+34. `[MVP]` web остаётся вне cognitive runtime target, не имеет system-bus access и fail-closed отключает Command API при любом unresolved host transition, unhealthy runtime, DB outage либо missing/stale/mismatched unit-state snapshot; current/event chronology не выдаётся за committed DB audit и после replay дедуплицируется по event key.
 
 ### 22.2. Познавательная оценка
 

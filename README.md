@@ -4,7 +4,7 @@
 
 | Параметр | Значение |
 |----------|----------|
-| Статус | Архитектурный draft v0.22 |
+| Статус | Архитектурный draft v0.23 |
 | Язык | Python |
 | Бэкенд | Локальная LLM (OpenAI-compatible API) |
 | База данных | PostgreSQL 15+ |
@@ -49,6 +49,9 @@ NOEZEMA — автономный локальный мыслитель. Кажд
 - Knowledge и dependency graph защищены revision vector и единым частичным lock order
 - В MVP rules/config меняется offline внутри systemd-owned maintenance scope: target membership проверяется через `PartOf/ConsistsOf`, current state и immutable host events журналируются fsync-safe, а pointer+questions публикуются одной транзакцией; fenced online activation появляется в 3b
 - Классифицированный DB outage остаётся в durable `retry_wait` и не расходует systemd crash budget; неклассифицированный crash-loop виден как auto-recovering `resume_degraded`, permanent inconsistency — как operator-required `resume_blocked`
+- Единственный fsync-safe active head отделяет незавершённый host transition от retained history; boot reconciliation восстанавливает один orphan и блокирует runtime при множественных unresolved records
+- Recovery policy берётся только из versioned root-owned host files, hash-ируется и материализуется в transition; DB snapshot не может неявно изменить backoff
+- Retry и unit-state timers имеют явные `AccuracySec=1s`, отключённый systemd jitter и измеряемую lateness
 
 ## Архитектура
 
@@ -172,7 +175,7 @@ noezema/
 ├── migrations/              # Alembic миграции
 ├── infra/
 │   ├── compose.yaml         # Локальная разработка
-│   └── systemd/             # Production supervisor
+│   └── systemd/             # Production supervisor + host-recovery.defaults.toml
 └── tests/
     ├── scenarios/           # Сценарные тесты сессий
     ├── security/            # Invariant и failpoint-тесты
@@ -185,7 +188,7 @@ noezema/
 |------|-----|------|
 | **1. Контракты и LLM** | Enums, schemas, host-generated IDs, LLM Gateway, FIFO Selector, minimal explorer/curator | Sealed-путь question → evidence → assessment → commit |
 | **2. Изоляция и commit** | Sandbox, capability policy, Tool Broker, COW/staging, revision vector, fenced reconciliation | Unknown COMMIT reconciled, живой finalizer не принят за rollback |
-| **3a. Память и доказательства** | Claims/evidence, versioned assessment heads, systemd-owned offline rules change с verification seal, current+event host journal и durable retry scheduler, conservative source grouping | Старый либо полный новый pointer+questions; DB outage остаётся `retry_wait`, crash-loop — `resume_degraded`, permanent — `resume_blocked`, ни один start не обходит admission |
+| **3a. Память и доказательства** | Claims/evidence, versioned assessment heads, systemd-owned offline rules change с verification seal, single active head + current/event journal, root-owned recovery policy и точные durable retry timers, conservative source grouping | Старый либо полный новый pointer+questions; один unresolved transition, DB outage — `retry_wait`, crash-loop — `resume_degraded`, inconsistency/policy error — `resume_blocked`, ни один start не обходит admission |
 | **3b. Зависимости и переоценка** | Closure manifests, resumable barriers, reassessment worker, fenced online rules activation, full grouping, resolutions | Invalid ancestor блокирует downstream; stale activator/repair не меняет effective config |
 | **4. Расширенный познавательный цикл** | Curiosity ranking, planning, specialized verifier/curator, защита от повторений | Verifier не назначает grade |
 | **5. Research Proxy** | SSRF-safe fetch/search, provenance, injection tests | Внешний текст не меняет capabilities |
@@ -205,7 +208,7 @@ MVP — этапы 1, 2, 3a + минимальный web slice: status, SSE time
 
 ## Статус
 
-📝 Архитектурный draft v0.22 — документация без кода.
+📝 Архитектурный draft v0.23 — документация без кода.
 
 [Полная спецификация](ARCHITECTURE.md) описывает 22 раздела: архитектурные принципы, компоненты, машину состояний сессий, модель памяти, evidence grading, безопасность, воспроизводимость, веб-модуль, модель данных (40 таблиц), надёжность и восстановление, наблюдаемость, стек, структуру, этапы, риски, открытые вопросы и критерии успеха.
 
