@@ -1,10 +1,18 @@
 # NOEZEMA — Architecture Draft
 
-> Status: draft v0.21  
+> Status: draft v0.22  
 > Language: Russian  
 > Purpose: describe the target architecture of a local-first autonomous thinker focused on curiosity, verifiable learning, persistent memory, safe action, and human-observable operation.
 
 ## 0. Что изменилось
+
+### v0.22
+
+Версия 0.22 убирает зависимости host recovery от того, что в момент восстановления недоступно:
+
+- backoff policy стала host-local: scheduler не читает PostgreSQL, чтобы узнать, как долго ждать PostgreSQL;
+- retry scheduler не трогает host-transition flock, пока нет незавершённой записи, а maintenance берёт его с коротким ограниченным ретраем;
+- зафиксировано, что backoff квантуется периодом таймера, и период не может быть больше минимального шага.
 
 ### v0.21
 
@@ -1234,7 +1242,7 @@ start noezema-offline-rules.service (ровно один active instance)
 
 Crash до final transaction оставляет прежний effective pointer. Повторный запуск захватывает advisory lock и продолжает тот же candidate/manifest. Если между попытками узел работал и knowledge revision изменилась, cohort пересобирается до `ready`. Потерянный ответ после DB commit безопасен: повтор видит requested `payload_sha256` уже effective и возвращает success; вопросы уже находятся в той же транзакции.
 
-Host maintenance принадлежит `noezema-offline-rules.service`, а не произвольному процессу. Unit первым получает неблокирующий `flock` на стабильном `/run/lock/noezema-host-transition.lock`; lockfile может жить весь boot, ownership определяется только удерживаемым file descriptor. Затем `RuntimeDirectory=noezema-offline-rules` создаёт private каталог, и unit атомарным rename публикует owner-bound marker `/run/noezema-offline-rules/active`. Второй запуск завершается до изменения marker; helper напрямую вне unit запускать запрещено. Только владеющий unit может снять marker.
+Host maintenance принадлежит `noezema-offline-rules.service`, а не произвольному процессу. Unit первым получает `flock` на стабильном `/run/lock/noezema-host-transition.lock` — с коротким ограниченным ретраем, а не одной неблокирующей попыткой (§8.7.1.1), чтобы housekeeping-тик scheduler-а не давал ложного отказа; lockfile может жить весь boot, ownership определяется только удерживаемым file descriptor. Затем `RuntimeDirectory=noezema-offline-rules` создаёт private каталог, и unit атомарным rename публикует owner-bound marker `/run/noezema-offline-rules/active`. Второй запуск завершается до изменения marker; helper напрямую вне unit запускать запрещено. Только владеющий unit может снять marker.
 
 `noezema-runtime.target` объединяет Orchestrator и все процессы, способные писать knowledge/session state; web в target не входит и описан ниже как observer. Каждый member является прямым `Requires=` либо `Wants=` target-а и объявляет `PartOf=noezema-runtime.target`, поэтому stop/restart target-а распространяется на member. Сам target и каждый member имеют `ConditionPathExists=!/run/noezema-offline-rules/active` как быстрый admission guard. Marker публикуется **до** `systemctl stop noezema-runtime.target`; maintenance продолжает DB work только после подтверждения `inactive` всех members.
 
@@ -1263,9 +1271,21 @@ resume_degraded → checking                       # автоматически�
 - **Permanent/inconsistent** — inconsistent pointer tuple, hash mismatch, недопустимый lifecycle. Wrapper fsync-safe переводит record в `resume_blocked`, затем выходит `78`; автоматические попытки прекращаются, выход — audited `noezemactl resume-runtime`.
 - **Неклассифицированный failure** — crash, signal, timeout либо ненулевой выход до durable `last_probe_classified_at` для текущего `attempt_seq`. Только этот класс использует быстрый `Restart=on-failure`. Если его burst исчерпан, failure handler переводит `checking | ready_to_start → resume_degraded`, поднимает critical alert и назначает slow retry. Успешная последующая классификация закрывает деградацию без участия человека.
 
-Durable backoff policy задаётся config snapshot: `resume_retry_initial=30s`, multiplier `2`, `resume_retry_max=30min`, jitter `±10%`. `attempts_total` не ограничен; warning поднимается после `resume_retry_escalate_after=15min`, но retry продолжается. Backoff сбрасывается после согласованного admission. Часы для due-check монотонные внутри boot; record также хранит wall-clock deadline, а после reboot scheduler немедленно выполняет один probe и пересчитывает monotonic deadline.
+Durable backoff policy: `resume_retry_initial=30s`, multiplier `2`, `resume_retry_max=30min`, jitter `±10%`. `attempts_total` не ограничен; warning поднимается после `resume_retry_escalate_after=15min`, но retry продолжается. Backoff сбрасывается после согласованного admission. Часы для due-check монотонные внутри boot; record также хранит wall-clock deadline, а после reboot scheduler немедленно выполняет один probe и пересчитывает monotonic deadline.
 
-`noezema-runtime-resume-retry.timer` запускает `noezema-runtime-resume-retry.service` каждые 30 секунд. Scheduler service получает `/run/lock/noezema-host-transition.lock`, проверяет unresolved record и `next_attempt_at`; для due attempt атомарно создаёт `dispatch_id` с deadline, освобождает flock и запускает `noezema-runtime-resume.service`. Resume service под flock потребляет только текущий dispatch. Потерянный start или crash scheduler-а безопасен: после `dispatch_deadline` следующий tick переиспользует тот же attempt, но создаёт новый dispatch ID; одновременно действителен не более чем один dispatch.
+Эти параметры **host-local и не читаются из PostgreSQL**. Иначе scheduler обращался бы к базе, чтобы узнать, как долго ждать базу, — а это единственная ситуация, ради которой он написан. Холодный старт делает зависимость невозможной вовсе: узел, загрузившийся с лежащей БД, создаёт `operation=runtime_start`, и никакого config snapshot для чтения ещё нет.
+
+- Действующие значения лежат в host config-файле рядом с юнитами и читаются scheduler-ом напрямую.
+- Каждая host-transition запись материализует применённые значения в момент создания, поэтому уже идущее восстановление не меняет политику на ходу и остаётся воспроизводимым по журналу.
+- Значения в config snapshot, если они есть, считаются источником для следующей материализации в host config, а не runtime-зависимостью: их изменение вступает в силу со следующего transition, а не с текущего.
+
+То же правило распространяется на всё, что нужно scheduler-у и admission до первого успешного соединения: host recovery не может зависеть от состояния, живущего в восстанавливаемой системе.
+
+`noezema-runtime-resume-retry.timer` запускает `noezema-runtime-resume-retry.service` каждые 30 секунд. Период таймера не может превышать `resume_retry_initial`: backoff квантуется тиком, поэтому при равных значениях первая повторная попытка наступает в интервале одного периода после расчётного срока. Это допустимо, но должно быть выбрано осознанно, а не получиться случайно.
+
+Scheduler сначала проверяет **без блокировки**, есть ли незавершённая запись — `stat` каталога host-transitions. Если её нет, тик завершается, не касаясь flock. Только при наличии записи scheduler получает `/run/lock/noezema-host-transition.lock`, проверяет unresolved record и `next_attempt_at`; для due attempt атомарно создаёт `dispatch_id` с deadline, освобождает flock и запускает `noezema-runtime-resume.service`.
+
+Без этой проверки housekeeping-тик каждые 30 секунд боролся бы за тот же flock, который maintenance берёт неблокирующе, и запуск смены правил мог бы упасть просто из-за совпадения по времени — необъяснимо для человека за терминалом. По той же причине maintenance unit берёт flock не одной попыткой, а с коротким ограниченным ретраем: это плановая ручная операция, и подождать секунду ничего не стоит, тогда как ложный отказ стоит доверия к процедуре. Resume service под flock потребляет только текущий dispatch. Потерянный start или crash scheduler-а безопасен: после `dispatch_deadline` следующий tick переиспользует тот же attempt, но создаёт новый dispatch ID; одновременно действителен не более чем один dispatch.
 
 При success, crash, signal или timeout systemd завершает maintenance unit и удаляет private RuntimeDirectory. `OnSuccess` и `OnFailure` maintenance unit (systemd 249+, §17) запускают `noezema-runtime-resume.service` после cleanup. Resume получает host-transition flock, начинает новый `attempt_seq` и классифицирует DB outcome: старый pointer — безопасный pre-publish crash; новый pointer плюс `candidate.active` — committed success; inconsistent tuple — permanent block; DB unavailable — classified transient. Перед start target resume освобождает flock; target admission повторяет проверки и закрывает TOCTOU-окно.
 
@@ -2107,7 +2127,7 @@ GC roots:
 - при конфликте каждой компоненты revision vector и при попытке barrier batch изменить knowledge без knowledge lock;
 - при превышении staging limits до записи команды и при повторной финальной проверке immutable manifest;
 - offline: параллельный второй maintenance start, попытка runtime start после marker и до stop, kill/timeout владельца без reboot, reboot в середине прогона, после candidate upsert, между shadow-head batches, mutation head после `ready`, после durable verify seal и непосредственно до/после atomic pointer+questions transaction; только owner снимает marker, resume стартует runtime лишь по однозначному pointer tuple, rerun выбирает тот же payload candidate и не создаёт дублей вопросов;
-- host resume/admission: crash до/после current/event file `fsync/rename`, DB probe, dispatch publication и audit replay; `PartOf` stop propagation; start target при marker; skipped child при active target; пустой/mismatched `ConsistsOf`; classified DB outage дольше start-limit window остаётся `retry_wait` и не увеличивает fast restart counter; unclassified crash/signal/timeout исчерпывает burst и даёт `resume_degraded`; permanent exit 78 даёт только `resume_blocked`; retry scheduler crash, потерянный dispatch, reboot и stale `Result` не создают параллельных attempts; raw/manual start после `resume_blocked`; runtime не стартует без admission, journal/events не теряются, terminal handler создаёт out-of-band alert;
+- host resume/admission: crash до/после current/event file `fsync/rename`, DB probe, dispatch publication и audit replay; `PartOf` stop propagation; start target при marker; skipped child при active target; пустой/mismatched `ConsistsOf`; classified DB outage дольше start-limit window остаётся `retry_wait` и не увеличивает fast restart counter; unclassified crash/signal/timeout исчерпывает burst и даёт `resume_degraded`; permanent exit 78 даёт только `resume_blocked`; retry scheduler crash, потерянный dispatch, reboot и stale `Result` не создают параллельных attempts; scheduler tick без незавершённой записи не берёт flock, а maintenance start во время тика не получает ложного отказа; scheduler и admission работают при недоступной БД, не читая из неё backoff policy; raw/manual start после `resume_blocked`; runtime не стартует без admission, journal/events не теряются, terminal handler создаёт out-of-band alert;
 - online: до/после каждого shadow-head batch, после `ready → publishing`, непосредственно до/после runtime config-head flip, в каждом post-publish batch и до/после terminal-cleanup;
 - когда worker держит gate до activation acquisition, когда stale activator после recovery takeover пытается изменить cursor/state/pointer и когда repair `post_publish_blocked` конкурирует со следующим flip;
 - при crash в каждом activation state: recovery обязан классифицировать исход по pointer tuple, а не по одному state;
@@ -2452,7 +2472,7 @@ Target считается active при skipped members, writer не остан�
 29. `[v1]` repair runner использует отдельный post-cleanup CAS, уступает session intent и получает окно через `T_repair_admission`; superseded backlog не возвращает старую config в `active`.
 30. `[MVP]` первая migration атомарно создаёт hash-pinned bootstrap snapshot и единственный global runtime head; startup/restore fail-closed при нарушении tuple, а kill maintenance owner-а очищает marker и возобновляет runtime только после однозначной DB-проверки;
 31. `[MVP]` `noezema-runtime.target` quiesce-ит каждый непустой `ConsistsOf` member через `PartOf`; target и direct member start требуют один fail-closed admission check, поэтому condition skip, ручной start или отсутствующий writer membership не обходят DB/marker invariants;
-32. `[MVP]` каждый host transition имеет fsync-safe current record, immutable event sequence и явную retry/backoff policy: classified DB outage любой длительности выходит `0`, остаётся `retry_wait` и не расходует fast start limit; только unclassified crash-loop даёт auto-recovering `resume_degraded`, permanent/inconsistent exit 78 — operator-required `resume_blocked`, а `resolved` достигается после полного idempotent DB audit replay по `(attempt_id, event_seq)`;
+32. `[MVP]` каждый host transition имеет fsync-safe current record, immutable event sequence и явную retry/backoff policy: classified DB outage любой длительности выходит `0`, остаётся `retry_wait` и не расходует fast start limit; только unclassified crash-loop даёт auto-recovering `resume_degraded`, permanent/inconsistent exit 78 — operator-required `resume_blocked`, а `resolved` достигается после полного idempotent DB audit replay по `(attempt_id, event_seq)`; backoff policy host-local, поэтому холодный старт с недоступной БД восстанавливается без чтения config snapshot;
 33. `[MVP]` web остаётся вне cognitive runtime target, не имеет system-bus access и fail-closed отключает Command API при любом unresolved host transition, unhealthy runtime, DB outage либо missing/stale/mismatched unit-state snapshot; current/event chronology не выдаётся за committed DB audit и после replay дедуплицируется по event key.
 
 ### 22.2. Познавательная оценка
