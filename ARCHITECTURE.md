@@ -1210,11 +1210,10 @@ draft → preparing_heads → ready → active
 
 ```text
 start noezema-offline-rules.service (ровно один active instance)
+  → systemd creates private RuntimeDirectory
   → unit acquires /run/lock/noezema-host-transition.lock (bounded ≤2s)
   → reconcile active head; atomically create initial event + current record + single active head
-  → publish maintenance marker and release flock
-  → systemd creates private RuntimeDirectory
-  → atomically publish owner-bound /run/noezema-offline-rules/active marker
+  → atomically publish owner-bound /run/noezema-offline-rules/active marker and release flock
   → stop noezema-runtime.target
   → enumerate target.ConsistsOf and verify every cognitive-runtime member inactive
   → web remains up in read-only degraded observer mode
