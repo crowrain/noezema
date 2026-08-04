@@ -1,10 +1,19 @@
 # NOEZEMA — Architecture Draft
 
-> Status: draft v0.17  
+> Status: draft v0.18  
 > Language: Russian  
 > Purpose: describe the target architecture of a local-first autonomous thinker focused on curiosity, verifiable learning, persistent memory, safe action, and human-observable operation.
 
 ## 0. Что изменилось
+
+### v0.18
+
+Версия 0.18 закрывает последнее место, где отказ восстановителя останавливал всю систему:
+
+- resume unit перезапускается ограниченное число раз и при исчерпании попыток переходит в `resume_blocked` с critical alert вместо молчаливо лежащего узла;
+- корректность старта перенесена в сами runtime-юниты: resume unit только триггер, поэтому ручной старт не обходит проверки;
+- зафиксирован baseline systemd 249 с перечислением зависящих конструкций;
+- список knowledge-writer units выводится из `noezema-runtime.target`, а не держится отдельно.
 
 ### v0.17
 
@@ -1197,7 +1206,18 @@ Host maintenance принадлежит `noezema-offline-rules.service`, а не
 
 `noezema-runtime.target` объединяет Orchestrator, web и все knowledge-writer units. Каждый unit имеет `ConditionPathExists=!/run/noezema-offline-rules/active`, но condition считается только admission-защитой: уже работающие процессы он не останавливает. Поэтому marker публикуется **до** `systemctl stop noezema-runtime.target`, после чего скрипт обязан проверить `inactive` каждого writer-а и только затем брать DB advisory lock.
 
-При success, crash, signal или timeout systemd завершает maintenance unit и удаляет его private RuntimeDirectory; обычное падение не оставляет stale path. `OnSuccess` и `OnFailure` запускают отдельный resume unit с `After=noezema-offline-rules.service` и обязательным отсутствием marker уже после cleanup. Resume unit перед DB-проверкой получает тот же `/run/lock/noezema-host-transition.lock`; это сериализует его с новым maintenance start, при конфликте применяется bounded retry/backoff. Только владелец host-transition flock читает pointer tuple и candidate state. Старый effective pointer означает безопасный pre-publish crash, новый pointer вместе с `candidate.active` — committed success; в обоих случаях runtime можно поднять, а candidate при необходимости продолжить следующим прогоном. При недоступной БД или inconsistent tuple resume остаётся fail-closed и поднимает critical alert. Reboot также очищает `/run`, но не является штатным способом снятия marker.
+Список проверяемых юнитов выводится из самого target — `systemctl list-dependencies` по его `Wants=`/`Requires=` — и никогда не держится отдельным литералом в скрипте. Иначе добавление нового knowledge writer в target оставит его непроверенным, и это не проявится до первой смены правил на живом писателе. Пустой результат обхода зависимостей считается ошибкой конфигурации, а не «писателей нет».
+
+При success, crash, signal или timeout systemd завершает maintenance unit и удаляет его private RuntimeDirectory; обычное падение не оставляет stale path. `OnSuccess` и `OnFailure` (systemd 249+, §17) запускают отдельный resume unit с `After=noezema-offline-rules.service` и обязательным отсутствием marker уже после cleanup. Resume unit перед DB-проверкой получает тот же `/run/lock/noezema-host-transition.lock`; это сериализует его с новым maintenance start, при конфликте применяется bounded retry/backoff. Только владелец host-transition flock читает pointer tuple и candidate state. Старый effective pointer означает безопасный pre-publish crash, новый pointer вместе с `candidate.active` — committed success; в обоих случаях runtime можно поднять, а candidate при необходимости продолжить следующим прогоном. При недоступной БД или inconsistent tuple resume остаётся fail-closed и поднимает critical alert. Reboot также очищает `/run`, но не является штатным способом снятия marker.
+
+У самого resume unit тоже должен быть исход, иначе его отказ — единственное место в системе, где локальная неисправность останавливает всё: marker уже удалён вместе с RuntimeDirectory, maintenance unit завершён, а runtime лежит и поднять его некому.
+
+- Resume unit имеет `Restart=on-failure` с ограниченным `StartLimitBurst` и backoff; транзиентная недоступность БД разрешается сама.
+- Исчерпание попыток — терминальное состояние `resume_blocked`: critical alert, durable audit record, узел остаётся выключенным осознанно, а не молча.
+- Корректность старта обеспечивает не resume unit, а сами runtime-юниты: проверка pointer tuple, единственности global head и bootstrap seed hash выполняется при их старте (§14.1) и fail-closed. Resume unit — только триггер.
+- Поэтому оператор может поднять `noezema-runtime.target` вручную после `resume_blocked`, не обходя ни одной проверки безопасности: юниты либо стартуют на согласованном состоянии, либо откажутся сами.
+
+Разделение ответственности здесь то же, что и везде в документе: восстановитель отвечает за liveness, а корректность живёт в инварианте, который проверяет тот, кто его использует.
 
 Идентификаторы invalid-вопросов детерминированы: `uuid5(c0e3d3b6-dd7b-557d-a4d8-6e41049f8468, canonical(candidate_snapshot_id) || ':' || canonical(claim_id))`. Namespace однажды получен как UUIDv5 от URL проекта, закреплён ADR и bootstrap migration и не входит в изменяемый config payload. `canonical(uuid)` — lowercase RFC 9562 text без surrounding whitespace, name кодируется UTF-8. Backup/restore и новая установка используют тот же literal. Это делает вставку вопросов идемпотентной при повторе прогона и не зависящей от порядка обхода cohort.
 
@@ -1998,6 +2018,7 @@ GC roots:
 - при конфликте каждой компоненты revision vector и при попытке barrier batch изменить knowledge без knowledge lock;
 - при превышении staging limits до записи команды и при повторной финальной проверке immutable manifest;
 - offline: параллельный второй maintenance start, попытка runtime start после marker и до stop, kill/timeout владельца без reboot, reboot в середине прогона, после candidate upsert, между shadow-head batches, mutation head после `ready`, после durable verify seal и непосредственно до/после atomic pointer+questions transaction; только owner снимает marker, resume стартует runtime лишь по однозначному pointer tuple, rerun выбирает тот же payload candidate и не создаёт дублей вопросов;
+- resume: падение самого resume unit до и после DB-проверки, исчерпание `StartLimitBurst` и ручной старт target после `resume_blocked`; узел не остаётся выключенным без alert, а ручной старт не обходит startup-проверки §14.1;
 - online: до/после каждого shadow-head batch, после `ready → publishing`, непосредственно до/после runtime config-head flip, в каждом post-publish batch и до/после terminal-cleanup;
 - когда worker держит gate до activation acquisition, когда stale activator после recovery takeover пытается изменить cursor/state/pointer и когда repair `post_publish_blocked` конкурирует со следующим flip;
 - при crash в каждом activation state: recovery обязан классифицировать исход по pointer tuple, а не по одному state;
@@ -2072,7 +2093,7 @@ Evaluation thresholds фиксируются до серии.
 - SQLAlchemy + Alembic;
 - HTMX + Server-Sent Events;
 - rootless Podman или Docker;
-- systemd;
+- systemd 249+ (`OnSuccess=` в resume unit §8.7.1; `RuntimeDirectory=`, `ConditionPathExists=` и `StartLimitBurst=` доступны и раньше);
 - llama.cpp, Ollama или vLLM;
 - локальная embedding model;
 - pytest для unit, scenario и security tests.
@@ -2327,7 +2348,8 @@ Resolution без valid independent basis повышает grade. Контрол
 27. `[v1]` recovery корректно разрешает crash в каждом activation state по runtime pointer tuple; runner со stale fencing token не меняет state/cursor/pointer, а repair не возвращает superseded snapshot в `active`;
 28. `[MVP]` offline-смена правил внутри systemd-owned maintenance scope повторно выбирает candidate по `(base_snapshot_id, payload_sha256)`, записывает immutable verification seal и одной транзакцией делает полный shadow cohort effective вместе с pointer и deterministic invalid-вопросами; потерянный commit response не создаёт следующую config;
 29. `[v1]` repair runner использует отдельный post-cleanup CAS, уступает session intent и получает окно через `T_repair_admission`; superseded backlog не возвращает старую config в `active`.
-30. `[MVP]` первая migration атомарно создаёт hash-pinned bootstrap snapshot и единственный global runtime head; startup/restore fail-closed при нарушении tuple, а kill maintenance owner-а очищает marker и возобновляет runtime только после однозначной DB-проверки.
+30. `[MVP]` первая migration атомарно создаёт hash-pinned bootstrap snapshot и единственный global runtime head; startup/restore fail-closed при нарушении tuple, а kill maintenance owner-а очищает marker и возобновляет runtime только после однозначной DB-проверки;
+31. `[MVP]` отказ resume unit не оставляет узел молча выключенным: исчерпание попыток даёт `resume_blocked` с critical alert, а ручной старт target проходит те же startup-проверки, что и автоматический.
 
 ### 22.2. Познавательная оценка
 
