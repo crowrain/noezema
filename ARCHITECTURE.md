@@ -1,10 +1,20 @@
 # NOEZEMA — Architecture Draft
 
-> Status: draft v0.18  
+> Status: draft v0.19  
 > Language: Russian  
 > Purpose: describe the target architecture of a local-first autonomous thinker focused on curiosity, verifiable learning, persistent memory, safe action, and human-observable operation.
 
 ## 0. Что изменилось
+
+### v0.19
+
+Версия 0.19 превращает host resume из набора unit-настроек в проверяемый протокол:
+
+- runtime target получил явные `PartOf=` semantics, обязательный admission checker и безопасный повторный start;
+- machine-readable `ConsistsOf` стал единственным inventory runtime members вместо разбора `list-dependencies`;
+- retry budget задан полностью, а start limit используется как circuit breaker, не как скрытая машина состояний;
+- host transitions получили fsync-safe локальный журнал, terminal handler, out-of-band alert и audited `resume_blocked → resolved`;
+- web остаётся доступным в read-only degraded mode и показывает host recovery даже при остановленном cognitive runtime.
 
 ### v0.18
 
@@ -350,7 +360,7 @@ flowchart TB
     DomainDB --> Orchestrator
 ```
 
-Сайт не имеет прямого write-доступа к доменным и audit-таблицам. Query API читает проекции, а Command API валидирует сообщения и операторские команды, записывает их в inbox с idempotency key и передаёт исполнение Orchestrator.
+Сайт не имеет прямого write-доступа к доменным и audit-таблицам. Query API читает проекции, Command API валидирует сообщения и операторские команды, а read-only Host Status Adapter показывает локальный recovery journal, когда cognitive runtime или DB недоступны.
 
 ## 5. Компоненты
 
@@ -364,7 +374,7 @@ flowchart TB
 - передачу минимальной конфигурации;
 - health checks.
 
-Предпочтительная реализация для одного узла — `systemd`.
+Предпочтительная реализация для одного узла — `systemd`. Lifecycle разделён: `noezema-runtime.target` управляет cognitive writers, а `noezema-web.service` остаётся отдельным observer plane и при остановленном runtime переходит в read-only degraded mode.
 
 ### 5.2. Session Orchestrator
 
@@ -1165,10 +1175,12 @@ draft → preparing_heads → ready → active
 ```text
 start noezema-offline-rules.service (ровно один active instance)
   → unit acquires exclusive /run/lock/noezema-host-transition.lock flock
+  → create fsync-safe host-transition attempt record
   → systemd creates private RuntimeDirectory
   → atomically publish owner-bound /run/noezema-offline-rules/active marker
   → stop noezema-runtime.target
-  → verify Orchestrator, web и все knowledge-writer units inactive
+  → enumerate target.ConsistsOf and verify every cognitive-runtime member inactive
+  → web remains up in read-only degraded observer mode
   → acquire pg_advisory_lock('noezema:offline_rules:' || scope)
   → verify: нет активной сессии, unresolved commit attempt или reconciling_commit
   → if effective.payload_sha256 == requested.payload_sha256: success
@@ -1189,7 +1201,8 @@ start noezema-offline-rules.service (ровно один active instance)
        increment knowledge revision; audit + outbox
   → release PostgreSQL advisory lock
   → maintenance unit exits; systemd removes RuntimeDirectory and marker
-  → resume unit verifies pointer tuple and starts noezema-runtime.target
+  → resume classifies pointer tuple and releases host-transition flock
+  → noezema-runtime.target start passes the same admission check again
 ```
 
 Финальная транзакция не содержит cohort: shadow heads подготовлены заранее батчами и невидимы до переключения указателя. Поэтому размер корпуса на её длительность не влияет, и ограничивать её числом claims нечем — такой лимит запирал бы единственную операцию, ради которой существует этап 3a: корпус растёт с каждой сессией, и рано или поздно любое изменение правил задело бы больше claims, чем порог.
@@ -1204,20 +1217,47 @@ Crash до final transaction оставляет прежний effective pointer
 
 Host maintenance принадлежит `noezema-offline-rules.service`, а не произвольному процессу. Unit первым получает неблокирующий `flock` на стабильном `/run/lock/noezema-host-transition.lock`; lockfile может жить весь boot, ownership определяется только удерживаемым file descriptor. Затем `RuntimeDirectory=noezema-offline-rules` создаёт private каталог, и unit атомарным rename публикует owner-bound marker `/run/noezema-offline-rules/active`. Второй запуск завершается до изменения marker; helper напрямую вне unit запускать запрещено. Только владеющий unit может снять marker.
 
-`noezema-runtime.target` объединяет Orchestrator, web и все knowledge-writer units. Каждый unit имеет `ConditionPathExists=!/run/noezema-offline-rules/active`, но condition считается только admission-защитой: уже работающие процессы он не останавливает. Поэтому marker публикуется **до** `systemctl stop noezema-runtime.target`, после чего скрипт обязан проверить `inactive` каждого writer-а и только затем брать DB advisory lock.
+`noezema-runtime.target` объединяет Orchestrator и все процессы, способные писать knowledge/session state; web в target не входит и описан ниже как observer. Каждый member является прямым `Requires=` либо `Wants=` target-а и объявляет `PartOf=noezema-runtime.target`, поэтому stop/restart target-а распространяется на member. Сам target и каждый member имеют `ConditionPathExists=!/run/noezema-offline-rules/active` как быстрый admission guard. Marker публикуется **до** `systemctl stop noezema-runtime.target`; maintenance продолжает DB work только после подтверждения `inactive` всех members.
 
-Список проверяемых юнитов выводится из самого target — `systemctl list-dependencies` по его `Wants=`/`Requires=` — и никогда не держится отдельным литералом в скрипте. Иначе добавление нового knowledge writer в target оставит его непроверенным, и это не проявится до первой смены правил на живом писателе. Пустой результат обхода зависимостей считается ошибкой конфигурации, а не «писателей нет».
+Condition не является correctness-проверкой: systemd может cleanly skip unit, а уже запущенный процесс condition не остановит. Поэтому target и каждый напрямую запускаемый member также имеют `Requires=noezema-runtime-admission.service` и `After=noezema-runtime-admission.service`. Это `Type=oneshot`, `RemainAfterExit=no`: один coalesced start job получает `/run/lock/noezema-host-transition.lock`, проверяет отсутствие marker, global runtime-head tuple, bootstrap seed hash и host-transition state, при необходимости replay-ит/закрывает record и затем освобождает flock. Любая ошибка возвращает non-zero, поэтому required target/member не стартует. Прямой `systemctl start` отдельного member-а запускает тот же admission и не создаёт обхода.
 
-При success, crash, signal или timeout systemd завершает maintenance unit и удаляет его private RuntimeDirectory; обычное падение не оставляет stale path. `OnSuccess` и `OnFailure` (systemd 249+, §17) запускают отдельный resume unit с `After=noezema-offline-rules.service` и обязательным отсутствием marker уже после cleanup. Resume unit перед DB-проверкой получает тот же `/run/lock/noezema-host-transition.lock`; это сериализует его с новым maintenance start, при конфликте применяется bounded retry/backoff. Только владелец host-transition flock читает pointer tuple и candidate state. Старый effective pointer означает безопасный pre-publish crash, новый pointer вместе с `candidate.active` — committed success; в обоих случаях runtime можно поднять, а candidate при необходимости продолжить следующим прогоном. При недоступной БД или inconsistent tuple resume остаётся fail-closed и поднимает critical alert. Reboot также очищает `/run`, но не является штатным способом снятия marker.
+Канонический inventory — inverse dependency `ConsistsOf`, а не человекочитаемый `list-dependencies`: `systemctl show --property=ConsistsOf --value noezema-runtime.target`. Maintenance требует непустой набор `.service`, проверяет, что каждый `ConsistsOf` member присутствует в direct `Requires/Wants`, а каждый direct application member кроме явно выделенного admission unit имеет обратный `PartOf`/`ConsistsOf`, и затем требует `ActiveState=inactive` для всего набора. Unit files проходят `systemd-analyze verify` в CI; добавление writer-а без target membership и `PartOf=` является build failure.
 
-У самого resume unit тоже должен быть исход, иначе его отказ — единственное место в системе, где локальная неисправность останавливает всё: marker уже удалён вместе с RuntimeDirectory, maintenance unit завершён, а runtime лежит и поднять его некому.
+#### Host-transition journal и resume
 
-- Resume unit имеет `Restart=on-failure` с ограниченным `StartLimitBurst` и backoff; транзиентная недоступность БД разрешается сама.
-- Исчерпание попыток — терминальное состояние `resume_blocked`: critical alert, durable audit record, узел остаётся выключенным осознанно, а не молча.
-- Корректность старта обеспечивает не resume unit, а сами runtime-юниты: проверка pointer tuple, единственности global head и bootstrap seed hash выполняется при их старте (§14.1) и fail-closed. Resume unit — только триггер.
-- Поэтому оператор может поднять `noezema-runtime.target` вручную после `resume_blocked`, не обходя ни одной проверки безопасности: юниты либо стартуют на согласованном состоянии, либо откажутся сами.
+До публикации marker maintenance создаёт `/var/lib/noezema/host-transitions/<attempt_id>.json` с mode `0640`, owner `root:noezema-observer`. Запись использует temporary file → `fsync(file)` → atomic rename → `fsync(directory)`. Record содержит `attempt_id`, operation, candidate/base snapshot IDs, observed pointer tuple, `state`, attempt/max attempts, error class, timestamps, next attempt и `replayed_at`.
 
-Разделение ответственности здесь то же, что и везде в документе: восстановитель отвечает за liveness, а корректность живёт в инварианте, который проверяет тот, кто его использует.
+```text
+checking → retry_wait → checking
+checking → ready_to_start → resolved
+checking → resume_blocked → checking     # audited operator retry
+```
+
+Host journal — источник истины recovery, пока PostgreSQL недоступна, и GC root до `resolved + replayed_at + retention`. Когда БД снова согласована, admission/resume идемпотентно создаёт `audit_event` по `attempt_id`, записывает `replayed_at` и только затем разрешает retention cleanup. Поэтому обещание durable audit не зависит от доступности DB в момент отказа.
+
+При success, crash, signal или timeout systemd завершает maintenance unit и удаляет private RuntimeDirectory. `OnSuccess` и `OnFailure` maintenance unit (systemd 249+, §17) запускают `noezema-runtime-resume.service` после cleanup. Resume получает `/run/lock/noezema-host-transition.lock`, атомарно увеличивает durable attempt counter и классифицирует DB outcome: старый pointer — безопасный pre-publish crash; новый pointer плюс `candidate.active` — committed success; inconsistent tuple — permanent block; DB unavailable — transient retry. Перед start target resume освобождает flock; target admission повторяет проверки и закрывает TOCTOU-окно.
+
+Нормативный default retry budget:
+
+```ini
+[Unit]
+StartLimitIntervalSec=5min
+StartLimitBurst=6
+OnFailure=noezema-resume-failure@%n.service
+
+[Service]
+Type=oneshot
+Restart=on-failure
+RestartSec=30s
+TimeoutStartSec=20s
+RestartPreventExitStatus=78
+```
+
+Exit `75` означает transient retry, `78` — permanent/inconsistent outcome или исчерпанный durable budget. Wrapper записывает попытку **до** DB probe; `StartLimitBurst` остаётся последним circuit breaker для crash-loop, а не источником доменного state. `noezema-runtime.target` напрямую при boot не enable-ится: `multi-user.target` запускает web и resume unit, а уже успешный resume активирует cognitive runtime target. При отсутствии незавершённого record resume создаёт обычный `operation=runtime_start` attempt, поэтому cold boot использует тот же retry/audit protocol. Idempotent failure handler после завершения resume получает тот же host-transition flock, читает journal и `systemctl show Result/NRestarts`: при permanent result, достигнутом budget либо `start-limit-hit` он гарантированно фиксирует `resume_blocked`, пишет priority-2 journald event и активирует настроенный host notification. Фиксированный `RestartSec` называется retry delay; exponential backoff на baseline 249 не предполагается.
+
+Поддерживаемый ручной путь — `noezemactl resume-runtime --reason ...`: он получает host-transition flock и переводит `resume_blocked → checking`. Raw `systemctl start noezema-runtime.target` также безопасен, потому что admission обязателен; при согласованной БД он после idempotent audit replay закрывает record как `resolved` с actor `host-systemd/manual-start`, при ошибке target остаётся inactive. Web показывает journal независимо от DB, но не выполняет host transition.
+
+Разделение ответственности: target graph гарантирует quiesce, admission — correctness каждого start, resume — liveness, host journal — durability/observability вне DB.
 
 Идентификаторы invalid-вопросов детерминированы: `uuid5(c0e3d3b6-dd7b-557d-a4d8-6e41049f8468, canonical(candidate_snapshot_id) || ':' || canonical(claim_id))`. Namespace однажды получен как UUIDv5 от URL проекта, закреплён ADR и bootstrap migration и не входит в изменяемый config payload. `canonical(uuid)` — lowercase RFC 9562 text без surrounding whitespace, name кодируется UTF-8. Backup/restore и новая установка используют тот же literal. Это делает вставку вопросов идемпотентной при повторе прогона и не зависящей от порядка обхода cohort.
 
@@ -1553,9 +1593,12 @@ Fingerprint вызова включает также prompt version, context man
 - Server-Sent Events для live timeline;
 - PostgreSQL;
 - локальная аутентификация администратора;
-- отдельные Query API и Command API.
+- отдельные Query API и Command API;
+- read-only Host Status Adapter к `/var/lib/noezema/host-transitions`.
 
 Отдельный SPA, WebSocket и Redis первой версии не требуются.
+
+`noezema-web.service` не входит в `noezema-runtime.target`, не имеет `Requires/PartOf` на cognitive runtime или PostgreSQL и продолжает работать во время offline maintenance. DB connector инициализируется lazy: в normal mode web читает PostgreSQL projections; при active marker, `resume_blocked` или недоступной DB переходит в read-only degraded mode, закрывает Command API и показывает host journal и доступное read-only состояние systemd units, явно помечая DB projection недоступной. ACL даёт web-процессу только чтение host records; менять state либо запускать units через сайт запрещено.
 
 ### 13.1. Query API
 
@@ -1567,13 +1610,14 @@ Query API имеет read-only credentials и предоставляет:
 - claims, evidence, dependencies, freshness и assessment lifecycle;
 - current assessments, rules/source/environment snapshots;
 - pending/invalid claims и reassessment queue age;
-- messages, operator commands и метрики.
+- messages, operator commands и метрики;
+- host transitions `checking | retry_wait | ready_to_start | resume_blocked | resolved`, attempts, last error и next retry.
 
-SSE получает committed outbox events. Staging knowledge не публикуется как действующее; discarded/failed diagnostics доступны владельцу в отдельном visibility-классе.
+SSE получает committed outbox events и отдельные host-transition notifications без представления локального record как DB audit до replay. Staging knowledge не публикуется как действующее; discarded/failed diagnostics доступны владельцу в отдельном visibility-классе.
 
 ### 13.2. Command API
 
-Command API не вызывает Tool Broker и не меняет память напрямую. Он выполняет authentication, CSRF protection, schema validation, rate limit и записывает команду в durable inbox с host-generated idempotency key. Orchestrator применяет её относительно текущего session state и публикует результат.
+Command API не вызывает Tool Broker и не меняет память напрямую. Он выполняет authentication, CSRF protection, schema validation, rate limit и записывает команду в durable inbox с host-generated idempotency key. Orchestrator применяет её относительно текущего session state и публикует результат. При degraded host state все mutating endpoints, включая messages и controls, возвращают typed `runtime_unavailable`; host recovery выполняется только локальным `noezemactl`/systemd.
 
 Входы разделены:
 
@@ -1594,7 +1638,8 @@ Command API не вызывает Tool Broker и не меняет память 
 - fingerprint модели в компактном виде;
 - CPU, RAM, GPU и диск;
 - ближайшее пробуждение;
-- незакрытые предупреждения: stale knowledge, outcome unknown, outbox lag, backup age.
+- незакрытые предупреждения: stale knowledge, outcome unknown, outbox lag, backup age;
+- maintenance/resume state, попытку, next retry и постоянный banner для `resume_blocked`.
 
 ### 13.4. Хронология и страница сессии
 
@@ -1859,7 +1904,7 @@ UNIQUE(claim_id, config_snapshot_id)
 
 Bootstrap создаётся первой PostgreSQL-транзакционной миграцией, а не кодом приложения. Migration содержит immutable seed payload и ожидаемый `payload_sha256` как literals, перед вставкой пересчитывает hash и при mismatch прекращается. В одной транзакции она вставляет ровно один `config_snapshots` с `activation_mode='bootstrap'`, `base_snapshot_id=NULL`, `activation_state='active'`, а затем одну строку `runtime_config_heads(scope='global')`, указывающую на него. Та же migration закрепляет literal UUIDv5 namespace вопросов.
 
-Обычные runtime-роли не имеют `INSERT/DELETE` на `runtime_config_heads`; разрешённые pointer/state transitions выполняются только trusted stored procedures активации. Payload/hash/base bootstrap snapshot неизменяемы, но activation procedure может выполнить единственный lifecycle-переход его state `active → superseded`. Startup и recovery до запуска scheduler-а требуют ровно одну строку `scope='global'`, ненулевой active pointer, допустимый pointer tuple и совпадение bootstrap seed hash. Отсутствие строки, второй global head или hash mismatch — `inconsistent_record`, fail-closed и critical alert, а не «ещё не настроено». Restore drill выполняет ту же проверку. Это снимает вопрос о первом `base_snapshot_id`: первая offline-смена строится поверх bootstrap как обычная revision.
+Обычные runtime-роли не имеют `INSERT/DELETE` на `runtime_config_heads`; разрешённые pointer/state transitions выполняются только trusted stored procedures активации. Payload/hash/base bootstrap snapshot неизменяемы, но activation procedure может выполнить единственный lifecycle-переход его state `active → superseded`. `noezema-runtime-admission.service` перед каждым target/direct member start требует ровно одну строку `scope='global'`, ненулевой active pointer, допустимый pointer tuple, совпадение bootstrap seed hash и разрешимый host-transition record; scheduler не запускается раньше. Отсутствие строки, второй global head или hash mismatch — `inconsistent_record`, fail-closed и critical alert, а не «ещё не настроено». Web при этом не читает недоверенную DB projection и остаётся в host-only degraded mode. Restore drill выполняет ту же admission-проверку. Это снимает вопрос о первом `base_snapshot_id`: первая offline-смена строится поверх bootstrap как обычная revision.
 
 `payload_sha256` считается по immutable model/embeddings/prompts/policy/curiosity, budgets, session/activation limits и claim-type rules. `sha256 = H(base_snapshot_id, payload_sha256)` идентифицирует revision. `activation_mode/state`, verification seal, cursors/manifests/retry fields и timestamps в hashes не входят; payload candidate неизменяем после создания. Verification seal nullable в `draft | preparing_heads`, полностью заполнен в `ready` и после выхода из `ready` не изменяется. Partial unique `(base_snapshot_id, payload_sha256) WHERE activation_mode='offline' AND activation_state <> 'failed'` обеспечивает один незавершённый offline candidate; online mutual exclusion обеспечивает activating slot.
 
@@ -1965,7 +2010,7 @@ Audit event имеет type/schema version и уникальную пару `(se
 
 ### 15.1. Crash recovery и reconciliation
 
-Recovery worker сначала ищет unresolved commit attempt, затем active dependency barriers и online runtime heads с activating pointer либо effective online snapshots в `post_publish_blocked`. Offline candidate продолжает только новый запуск `noezema-offline-rules.service` §8.7.1; systemd resume unit не меняет candidate и решает лишь безопасный возврат runtime после terminal maintenance outcome.
+DB recovery worker сначала ищет unresolved commit attempt, затем active dependency barriers и online runtime heads с activating pointer либо effective online snapshots в `post_publish_blocked`. Offline candidate продолжает только новый запуск `noezema-offline-rules.service` §8.7.1. Host recovery — отдельный контур: resume/admission читают fsync-safe host-transition journal, не меняют candidate и решают только классификацию outcome, replay audit и безопасный возврат cognitive runtime.
 
 - Для unresolved attempt он блокирует session и attempt в каноническом порядке §5.2.2; простой read не является подтверждением rollback.
 - `committed` с terminal session/checkpoint: принимает успех и не очищает объекты.
@@ -1974,12 +2019,13 @@ Recovery worker сначала ищет unresolved commit attempt, затем ac
 - inconsistent records: автоматическое разрешение останавливается, поднимается critical alert.
 - отсутствие unresolved attempt: обычный lease recovery — started action становится outcome unknown, session failed, staging/overlay очищаются после grace period.
 - `discovering | active | closing` dependency barrier возобновляется по closure manifest, generation и `next_offset`; перед resolved всегда выполняется актуальная closure-проверка.
-- Offline candidate в `preparing_heads | ready` без effective pointer безопасен: runtime продолжает старую config. Новый maintenance run под теми же host/DB locks возобновляет manifest. При изменившейся knowledge revision он CAS-переходит в `preparing_heads`, атомарно очищает verification seal и пересобирает cohort; head writes при `ready` запрещены. Resume unit после crash запускает runtime только при однозначном старом pointer либо committed tuple нового pointer; DB unavailable/inconsistent остаётся fail-closed. Effective offline snapshot обязан иметь `activation_state='active'` и полный seal, иначе это inconsistent record.
+- Offline candidate в `preparing_heads | ready` без effective pointer безопасен: runtime продолжает старую config. Новый maintenance run под теми же host/DB locks возобновляет manifest. При изменившейся knowledge revision он CAS-переходит в `preparing_heads`, атомарно очищает verification seal и пересобирает cohort; head writes при `ready` запрещены. Resume/admission запускают runtime только при однозначном старом pointer либо committed tuple нового pointer; DB unavailable остаётся `retry_wait`, inconsistent — `resume_blocked`. Effective offline snapshot обязан иметь `activation_state='active'` и полный seal, иначе это inconsistent record.
 - Для online candidate в `preparing_heads | ready` recovery под runtime-head lock захватывает просроченный lease, увеличивает `activation_fence` и продолжает prepare/verify. Старый owner fenced и не может двигать cursor.
 - Для `publishing` base active pointer означает, что atomic flip не состоялся и publish можно повторить под новым fence. Candidate active pointer при всё ещё `publishing` невозможен: pointer и переход в `post_publish` коммитятся одной транзакцией, поэтому такая пара, как и любой третий pointer, является inconsistent record.
 - Для `post_publish` нормальна только пара `active_config_snapshot_id=candidate` и `activating_config_snapshot_id=candidate`. Recovery захватывает просроченный lease новым fence и идемпотентно продолжает manifest. Успех переводит candidate в `active`; исчерпание retry — в `post_publish_blocked`. В обоих случаях terminal-cleanup атомарно очищает activating slot/lease и activation-owned pause до возобновления admission.
 - `post_publish_blocked` не удерживает activation slot. Trusted repair runner использует отдельный post-cleanup CAS по active pointer, online mode, state и expected cursor; activation lease/fence в repair predicate не входят. Если snapshot уже `superseded`, repair закрывает остаток manifest без возврата старой config в `active`.
 - `failed | active | post_publish_blocked` с оставшимся activating pointer нарушает атомарность terminal-cleanup и является inconsistent record. К тому же классу относятся несовпадение base/candidate pointers, два effective pointers на scope или effective snapshot без полного cohort.
+- Host-transition record в `checking | retry_wait | ready_to_start | resume_blocked` является recovery/GC root. Runtime admission при согласованной БД идемпотентно replay-ит его в `audit_events` по `attempt_id`, переводит в `resolved` и фиксирует actor/reason; local cleanup разрешён только после `replayed_at` и retention.
 
 Recovery очищает writer intent только после fencing по lease и commit attempt. Ручное вмешательство в inconsistent reconciliation или blocked barrier создаёт operator command с audit reason; прямой UPDATE запрещён.
 
@@ -1989,7 +2035,7 @@ Recovery очищает writer intent только после fencing по lease
 
 ### 15.3. Checkpoint, backup и GC roots
 
-Checkpoint — committed `{knowledge_revision, dependency_graph_revision}` плюс workspace manifest. Backup связывает DB recovery point с content-addressed artifact inventory.
+Checkpoint — committed `{knowledge_revision, dependency_graph_revision}` плюс workspace manifest. Backup связывает DB recovery point с content-addressed artifact inventory и включает unresolved host-transition records либо явное доказательство их отсутствия. Restore до старта cognitive runtime запускает admission; незавершённый record открывает web в degraded mode и проходит обычную resume-классификацию.
 
 GC roots:
 
@@ -2000,6 +2046,7 @@ GC roots:
 - reassessment/resolution basis artifacts;
 - closure manifests активных и retention-window dependency barriers;
 - manifests и shadow heads offline/online config attempts в `preparing_heads | ready | publishing | post_publish | post_publish_blocked`; после audited `failed | superseded` — до retention window;
+- host-transition records до `resolved + replayed_at + retention`;
 - pinned/legal-retention objects.
 
 При `reconciling_commit` GC соответствующей сессии запрещён. Restore drill выбирает случайную точку retention window и проверяет все referenced hashes.
@@ -2018,7 +2065,7 @@ GC roots:
 - при конфликте каждой компоненты revision vector и при попытке barrier batch изменить knowledge без knowledge lock;
 - при превышении staging limits до записи команды и при повторной финальной проверке immutable manifest;
 - offline: параллельный второй maintenance start, попытка runtime start после marker и до stop, kill/timeout владельца без reboot, reboot в середине прогона, после candidate upsert, между shadow-head batches, mutation head после `ready`, после durable verify seal и непосредственно до/после atomic pointer+questions transaction; только owner снимает marker, resume стартует runtime лишь по однозначному pointer tuple, rerun выбирает тот же payload candidate и не создаёт дублей вопросов;
-- resume: падение самого resume unit до и после DB-проверки, исчерпание `StartLimitBurst` и ручной старт target после `resume_blocked`; узел не остаётся выключенным без alert, а ручной старт не обходит startup-проверки §14.1;
+- host resume/admission: crash до/после каждого file `fsync/rename`, DB probe и audit replay; `PartOf` stop propagation; start target при marker; skipped child при active target; пустой/mismatched `ConsistsOf`; transient exits, permanent exit 78, budget exhaustion и `start-limit-hit`; raw/manual start после `resume_blocked`; runtime не стартует без admission, journal не теряется, web показывает degraded state, terminal handler создаёт out-of-band alert;
 - online: до/после каждого shadow-head batch, после `ready → publishing`, непосредственно до/после runtime config-head flip, в каждом post-publish batch и до/после terminal-cleanup;
 - когда worker держит gate до activation acquisition, когда stale activator после recovery takeover пытается изменить cursor/state/pointer и когда repair `post_publish_blocked` конкурирует со следующим flip;
 - при crash в каждом activation state: recovery обязан классифицировать исход по pointer tuple, а не по одному state;
@@ -2036,7 +2083,9 @@ GC roots:
 - invalid ancestor не оставляет downstream assessment current;
 - offline publish оставляет либо прежний pointer, либо новый pointer вместе со всеми deterministic invalid-вопросами; effective offline snapshot всегда `active`;
 - non-bootstrap rules candidate в pre-publish `ready | publishing` имеет полный immutable verification seal, expected/verified counts равны, а shadow heads не изменяются до flip; final publish не сканирует cohort, после flip effective writes увеличивают knowledge revision;
-- active maintenance marker имеет одного systemd owner-а; runtime target до DB work подтверждён как inactive, а terminal resume при неизвестном DB outcome остаётся fail-closed;
+- active maintenance marker имеет одного systemd owner-а; все `ConsistsOf` members через `PartOf` подтверждены inactive до DB work;
+- target/member start всегда проходит required admission; cleanly skipped condition не оставляет target active без cognitive services;
+- незавершённый host transition имеет один fsync-safe record; `resume_blocked` виден через web/journald, а `resolved` допустим только после идемпотентного DB audit replay по `attempt_id`;
 - online runtime config head старый либо полностью новый; effective config определяется только pointer equality, один activating slot существует на scope, stale fence не меняет state/cursor/pointer, а repair CAS не возвращает superseded snapshot в `active`;
 - staging limit никогда не обнаруживается впервые после начала commit boundary;
 - partial success не содержит unknown action;
@@ -2055,7 +2104,7 @@ GC roots:
 - возраст старейшего runnable dependency-critical job, число отложенных пробуждений, эскалации `T_escalate`, blocked jobs и retry-budget exhaustion;
 - active barrier count/age/generation, closure size, cursor lag, graph-revision restarts и recovery resumes;
 - knowledge/dependency-graph revision conflicts, commit latency, outbox lag;
-- offline config attempts/resumes/rebuilds/limit rejects, maintenance owner conflicts, marker lifetime, fail-closed resumes, verification duration/digest mismatch и atomic publish latency; online activation state/cursor/cohort progress, lease age/fence takeovers/stale-write rejects, shadow-head retries, publish/terminal-cleanup latency, effective repair backlog age и нарушения `T_repair_admission`;
+- offline config attempts/resumes/rebuilds/limit rejects, maintenance owner conflicts, marker lifetime, target membership mismatch, admission rejects, host-transition state/age/attempts, audit replay lag, resume terminal alerts, verification duration/digest mismatch и atomic publish latency; online activation state/cursor/cohort progress, lease age/fence takeovers/stale-write rejects, shadow-head retries, publish/terminal-cleanup latency, effective repair backlog age и нарушения `T_repair_admission`;
 - staging budget utilization/rejections по claims/new claims/evidence и фактическое host assessment time;
 - orphan bytes/root scan duration;
 - resources, backup и restore drill age.
@@ -2093,7 +2142,7 @@ Evaluation thresholds фиксируются до серии.
 - SQLAlchemy + Alembic;
 - HTMX + Server-Sent Events;
 - rootless Podman или Docker;
-- systemd 249+ (`OnSuccess=` в resume unit §8.7.1; `RuntimeDirectory=`, `ConditionPathExists=` и `StartLimitBurst=` доступны и раньше);
+- systemd 249+ (`OnSuccess=` требует 249; `PartOf=`, `ConsistsOf`, `RuntimeDirectory=`, `ConditionPathExists=`, `RestartPreventExitStatus=` и start limits используются в host protocol §8.7.1);
 - llama.cpp, Ollama или vLLM;
 - локальная embedding model;
 - pytest для unit, scenario и security tests.
@@ -2129,8 +2178,11 @@ noezema/
 │   ├── compose.yaml
 │   └── systemd/
 │       ├── noezema-runtime.target
+│       ├── noezema-runtime-admission.service
 │       ├── noezema-offline-rules.service
-│       └── noezema-runtime-resume.service
+│       ├── noezema-runtime-resume.service
+│       ├── noezema-resume-failure@.service
+│       └── noezema-web.service
 └── tests/
     ├── scenarios/
     ├── security/
@@ -2179,12 +2231,12 @@ Gate: неизвестный ответ COMMIT reconciled; нет mixed state; p
 - confidence/freshness;
 - консервативные source independence groups для локального корпуса;
 - context retrieval с токенными бюджетами и обработкой pending claims;
-- offline-смена rules version §8.7.1 через systemd-owned maintenance unit, durable verification seal и атомарный pointer+questions publish;
+- offline-смена rules version §8.7.1 через systemd-owned maintenance unit, `PartOf/ConsistsOf` target graph, required runtime admission, fsync-safe host journal, durable verification seal и атомарный pointer+questions publish;
 - identity/handoff.
 
 Фонового пересчёта в MVP нет, но assessment не является одноразовым: staged-операция, меняющая evidence set, синхронно обновляет head effective config snapshot в пределах session limits (§6.6). Rules version заморожена между offline-сменами §8.7.1; shadow heads не видны до переключения указателя, а invalid после него получает исследовательский вопрос.
 
-Gate: duplicate evidence не повышает grade; новое counterevidence меняет effective head в том же session commit; offline rules publish оставляет старую либо полностью новую config вместе с invalid-вопросами; неизвестная source lineage не создаёт ложную независимость; pending/invalid claim не подаётся как current; grade назначает только rules engine.
+Gate: duplicate evidence не повышает grade; новое counterevidence меняет effective head в том же session commit; offline rules publish оставляет старую либо полностью новую config вместе с invalid-вопросами; target stop quiesce-ит все `PartOf` members, любой start проходит admission, а `resume_blocked` durable и видим; неизвестная source lineage не создаёт ложную независимость; pending/invalid claim не подаётся как current; grade назначает только rules engine.
 
 ### Этап 3b. Зависимости и переоценка
 
@@ -2219,7 +2271,7 @@ Gate: внешний текст не меняет capabilities; group merge за
 
 ### Этап 6. Полный веб-модуль
 
-Минимальный slice поставляется вместе с MVP: authenticated status page, SSE timeline, форма сообщения, очередь delivery/answer и controls `wake_now | pause | resume | stop_gracefully | abort_session` через Command API с CSRF, idempotency и audit.
+Минимальный slice поставляется вместе с MVP: authenticated status page, SSE timeline, форма сообщения, очередь delivery/answer и controls `wake_now | pause | resume | stop_gracefully | abort_session` через Command API с CSRF, idempotency и audit. Web не входит в cognitive runtime target: во время maintenance/DB outage он остаётся доступен в read-only degraded mode и показывает host-transition journal.
 
 Полный этап добавляет:
 
@@ -2293,6 +2345,10 @@ Resolution без valid independent basis повышает grade. Контрол
 
 Часть claims публикуется по новой rules version, конкурентные activators перезаписывают pointer либо crash после flip оставляет admission на pause. Контроль: полный shadow-head cohort, единственный effective/activating pointer на scope, fenced lease, atomic `publishing → post_publish` flip, обязательная terminal-cleanup, pointer-tuple recovery и invariant «effective claim разрешается только через effective runtime snapshot».
 
+### 20.14. Слепая зона host recovery
+
+Target считается active при skipped members, writer не остановился вместе с target, start обошёл DB admission либо `resume_blocked` потерян между локальным journal и audit. Контроль: `PartOf/ConsistsOf` graph, hard-failing shared admission для target/direct starts, fsync-safe host record, idempotent audit replay, out-of-band journald alert и web degraded observer вне cognitive runtime target.
+
 ## 21. Открытые архитектурные вопросы
 
 Каждый вопрос закрывается ADR.
@@ -2349,7 +2405,9 @@ Resolution без valid independent basis повышает grade. Контрол
 28. `[MVP]` offline-смена правил внутри systemd-owned maintenance scope повторно выбирает candidate по `(base_snapshot_id, payload_sha256)`, записывает immutable verification seal и одной транзакцией делает полный shadow cohort effective вместе с pointer и deterministic invalid-вопросами; потерянный commit response не создаёт следующую config;
 29. `[v1]` repair runner использует отдельный post-cleanup CAS, уступает session intent и получает окно через `T_repair_admission`; superseded backlog не возвращает старую config в `active`.
 30. `[MVP]` первая migration атомарно создаёт hash-pinned bootstrap snapshot и единственный global runtime head; startup/restore fail-closed при нарушении tuple, а kill maintenance owner-а очищает marker и возобновляет runtime только после однозначной DB-проверки;
-31. `[MVP]` отказ resume unit не оставляет узел молча выключенным: исчерпание попыток даёт `resume_blocked` с critical alert, а ручной старт target проходит те же startup-проверки, что и автоматический.
+31. `[MVP]` `noezema-runtime.target` quiesce-ит каждый непустой `ConsistsOf` member через `PartOf`; target и direct member start требуют один fail-closed admission check, поэтому condition skip, ручной start или отсутствующий writer membership не обходят DB/marker invariants;
+32. `[MVP]` каждый host transition имеет fsync-safe record и явный retry budget; permanent/budget/start-limit outcome становится `resume_blocked` с journald/host alert, а `resolved` достигается только после согласованного admission и idempotent DB audit replay;
+33. `[MVP]` web остаётся вне cognitive runtime target, при maintenance/DB outage отключает Command API и показывает host-transition state/attempt/error без выдачи локального record за committed DB audit.
 
 ### 22.2. Познавательная оценка
 
