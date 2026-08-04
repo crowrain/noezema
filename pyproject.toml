@@ -17,6 +17,7 @@ dependencies = []
 [project.optional-dependencies]
 dev = [
   "pytest>=8.3,<9",
+  "ruff>=0.12,<0.13",
 ]
 
 [tool.setuptools]
@@ -31,3 +32,11 @@ minversion = "8.3"
 addopts = "-ra --strict-config --strict-markers"
 testpaths = ["tests"]
 pythonpath = ["."]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+extend-exclude = [".venv"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "UP"]
