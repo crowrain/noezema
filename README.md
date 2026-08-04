@@ -4,7 +4,7 @@
 
 | Параметр | Значение |
 |----------|----------|
-| Статус | Архитектурный draft v0.16 |
+| Статус | Архитектурный draft v0.17 |
 | Язык | Python |
 | Бэкенд | Локальная LLM (OpenAI-compatible API) |
 | База данных | PostgreSQL 15+ |
@@ -47,7 +47,7 @@ NOEZEMA — автономный локальный мыслитель. Кажд
 - Durable worker и barrier recovery: ни один poison job, ни падение между батчами не теряют прогресс и не парализуют систему
 - Транзиентная недоступность БД восстанавливается сама; человек нужен только для несогласованных записей
 - Knowledge и dependency graph защищены revision vector и единым частичным lock order
-- В MVP rules/config меняется offline под advisory lock одним pointer+questions commit; fenced online activation появляется в 3b
+- В MVP rules/config меняется offline внутри systemd-owned maintenance scope: shadow cohort получает durable verification seal, а pointer+questions публикуются одной транзакцией; fenced online activation появляется в 3b
 
 ## Архитектура
 
@@ -184,7 +184,7 @@ noezema/
 |------|-----|------|
 | **1. Контракты и LLM** | Enums, schemas, host-generated IDs, LLM Gateway, FIFO Selector, minimal explorer/curator | Sealed-путь question → evidence → assessment → commit |
 | **2. Изоляция и commit** | Sandbox, capability policy, Tool Broker, COW/staging, revision vector, fenced reconciliation | Unknown COMMIT reconciled, живой finalizer не принят за rollback |
-| **3a. Память и доказательства** | Claims/evidence, versioned assessment heads, offline atomic rules change, conservative source grouping | Старый либо полный новый pointer+questions; retry не создаёт новую config |
+| **3a. Память и доказательства** | Claims/evidence, versioned assessment heads, systemd-owned offline rules change с verification seal, conservative source grouping | Старый либо полный новый pointer+questions; retry не создаёт новую config, stale marker не оставляет runtime выключенным |
 | **3b. Зависимости и переоценка** | Closure manifests, resumable barriers, reassessment worker, fenced online rules activation, full grouping, resolutions | Invalid ancestor блокирует downstream; stale activator/repair не меняет effective config |
 | **4. Расширенный познавательный цикл** | Curiosity ranking, planning, specialized verifier/curator, защита от повторений | Verifier не назначает grade |
 | **5. Research Proxy** | SSRF-safe fetch/search, provenance, injection tests | Внешний текст не меняет capabilities |
@@ -204,7 +204,7 @@ MVP — этапы 1, 2, 3a + минимальный web slice: status, SSE time
 
 ## Статус
 
-📝 Архитектурный draft v0.16 — документация без кода.
+📝 Архитектурный draft v0.17 — документация без кода.
 
 [Полная спецификация](ARCHITECTURE.md) описывает 22 раздела: архитектурные принципы, компоненты, машину состояний сессий, модель памяти, evidence grading, безопасность, воспроизводимость, веб-модуль, модель данных (40 таблиц), надёжность и восстановление, наблюдаемость, стек, структуру, этапы, риски, открытые вопросы и критерии успеха.
 

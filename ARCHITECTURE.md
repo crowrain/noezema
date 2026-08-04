@@ -1,10 +1,19 @@
 # NOEZEMA — Architecture Draft
 
-> Status: draft v0.16  
+> Status: draft v0.17  
 > Language: Russian  
 > Purpose: describe the target architecture of a local-first autonomous thinker focused on curiosity, verifiable learning, persistent memory, safe action, and human-observable operation.
 
 ## 0. Что изменилось
+
+### v0.17
+
+Версия 0.17 закрывает эксплуатационные и verification-пробелы offline-смены правил:
+
+- maintenance оформлен как systemd-owned scope с exclusive ownership, marker до остановки runtime и fail-closed recovery;
+- результат полной проверки cohort сохраняется как immutable verification seal; финальная транзакция сравнивает только его O(1)-поля;
+- UUIDv5 namespace и каноническая сериализация invalid-вопросов стали неизменяемой частью system identity;
+- bootstrap migration стала атомарной, hash-pinned и защищённой startup/role invariants.
 
 ### v0.16
 
@@ -1119,14 +1128,14 @@ Finite computation не доказывает universal theorem: она созд�
 
 Правила придётся править — это основная работа этапа 3a. Но способ их смены зависит от того, есть ли в системе конкурентные писатели знания.
 
-- **MVP (§8.7.1): offline.** Узел остановлен, работает одноразовый скрипт. Конкуренции нет, поэтому нет ни lease, ни fencing token, ни activating pointer, ни repair runner.
+- **MVP (§8.7.1): offline.** Runtime остановлен, одну смену выполняет systemd-owned maintenance unit. Конкуренции knowledge writers нет, поэтому DB-протоколу не нужны lease, fencing token, activating pointer или repair runner; host exclusivity обеспечивает maintenance scope.
 - **3b и далее (§8.7.2): online.** Появляется reassessment worker, который пишет heads параллельно, — и вся сложность fenced-активации существует ради него.
 
 Общее для обоих режимов: **effective config** для scope определяется только равенством `runtime_config_heads.active_config_snapshot_id = config_snapshot.id`. `config_snapshots.activation_state` описывает workflow публикации и не является вторым источником истины. Shadow heads `(claim_id, config_snapshot_id)` готовятся заранее и невидимы, пока указатель не переключён.
 
 #### 8.7.1. Offline-смена правил (MVP)
 
-Online-активация нужна только для живой системы с конкурентными писателями. В MVP узел остановлен, но одноразовый скрипт всё равно обязан быть mutually exclusive и crash-idempotent. Для этого используется session-level PostgreSQL advisory lock на scope; это не lease и не fencing protocol.
+Online-активация нужна только для живой системы с конкурентными писателями. В MVP runtime остановлен, но maintenance unit всё равно обязан быть mutually exclusive и crash-idempotent. Host ownership обеспечивает systemd scope, а DB ownership — session-level PostgreSQL advisory lock на scope; это не lease и не fencing protocol.
 
 Config snapshot хранит два разных hash:
 
@@ -1145,8 +1154,12 @@ draft → preparing_heads → ready → active
 `post_publish` и repair runner offline-режиму не нужны: все research questions для invalid heads публикуются в той же транзакции, что и runtime pointer.
 
 ```text
-stop node (supervisor)
-  → acquire host maintenance lock checked by service startup
+start noezema-offline-rules.service (ровно один active instance)
+  → unit acquires exclusive /run/lock/noezema-host-transition.lock flock
+  → systemd creates private RuntimeDirectory
+  → atomically publish owner-bound /run/noezema-offline-rules/active marker
+  → stop noezema-runtime.target
+  → verify Orchestrator, web и все knowledge-writer units inactive
   → acquire pg_advisory_lock('noezema:offline_rules:' || scope)
   → verify: нет активной сессии, unresolved commit attempt или reconciling_commit
   → if effective.payload_sha256 == requested.payload_sha256: success
@@ -1154,34 +1167,41 @@ stop node (supervisor)
   → freeze cohort + activation manifest against knowledge revision
   → prepare shadow heads детерминированными батчами
   → verify complete cohort: каждый claim манифеста имеет совместимый head,
-                            пересчитать manifest hash и head count
-  → candidate.activation_state = ready
+                            вычислить canonical heads digest и counts
+  → atomically persist immutable verification seal + state=ready
   → atomic publish (runtime_config_head → knowledge):
        verify advisory lock, active pointer = candidate.base_snapshot_id,
-              candidate ready, manifest hash + expected head count,
-              knowledge revision
+              candidate ready, complete verification seal,
+              current knowledge revision = seal.cohort_revision
        insert invalid-head questions with deterministic UUIDv5 IDs
        runtime_config_head.active_config_snapshot_id = candidate.id
        candidate.activation_state = active
        previous.activation_state = superseded
        increment knowledge revision; audit + outbox
-  → release advisory + host maintenance locks
-  → start node only after script success
+  → release PostgreSQL advisory lock
+  → maintenance unit exits; systemd removes RuntimeDirectory and marker
+  → resume unit verifies pointer tuple and starts noezema-runtime.target
 ```
 
 Финальная транзакция не содержит cohort: shadow heads подготовлены заранее батчами и невидимы до переключения указателя. Поэтому размер корпуса на её длительность не влияет, и ограничивать её числом claims нечем — такой лимит запирал бы единственную операцию, ради которой существует этап 3a: корпус растёт с каждой сессией, и рано или поздно любое изменение правил задело бы больше claims, чем порог.
 
-Внутри транзакции остаются только O(1)-проверки: manifest hash, ожидаемый head count и knowledge revision. Полнота cohort — попарное соответствие claim ↔ head — проверяется до неё, на шаге verify, по той же причине, по которой из commit-транзакции вынесена тяжёлая валидация (§5.2.2): O(cohort) чтение под блокировкой runtime head и knowledge revision недопустимо независимо от того, что узел остановлен.
+Полная O(cohort)-проверка завершается отдельной verification transaction. Она повторно проверяет knowledge revision, строит `activation_heads_sha256 = SHA256(JCS(heads))`, где `heads` — RFC 8785 JSON-array записей `{claim_id, assessment_state, current_assessment_id, epistemic_status, prepared_by}` с явными `null`, отсортированный по lowercase canonical UUID `claim_id`, и одной записью фиксирует immutable seal: `activation_manifest_hash`, `activation_cohort_revision`, `activation_expected_head_count`, `activation_verified_head_count`, `activation_heads_sha256`, `activation_verified_at`, одновременно переводя candidate в `ready`. Переход разрешён только при равенстве expected/verified count и полном попарном соответствии manifest claim ↔ compatible head; один count сам по себе доказательством полноты не считается.
+
+В pre-publish sealed interval `ready` (для online также `publishing`) `INSERT | UPDATE | DELETE` shadow heads candidate запрещены activation write predicate и DB trigger. Пересборка до flip сначала условно возвращает `ready → preparing_heads`, очищает весь seal и только затем меняет heads. Поэтому final transaction не выполняет `COUNT(*)` и не сканирует cohort: под runtime-head и knowledge locks она сравнивает только сохранённые seal-поля, state, base pointer и текущую knowledge revision. Atomic flip завершает sealed interval: heads становятся effective и дальше могут изменяться только обычными session/worker paths с увеличением knowledge revision; seal остаётся неизменяемым историческим доказательством состояния на момент публикации. Тяжёлая валидация вынесена из commit boundary по той же причине, что и в §5.2.2.
 
 Единственный оставшийся лимит — `config_snapshots.activation_limits.offline_activation_max_invalid_questions`: он ограничивает то, что действительно пишется в финальной транзакции. Превышение оставляет прежний указатель и означает, что изменение правил инвалидирует слишком много знания за один шаг; правила сужаются или дробятся на несколько последовательных смен.
 
 Crash до final transaction оставляет прежний effective pointer. Повторный запуск захватывает advisory lock и продолжает тот же candidate/manifest. Если между попытками узел работал и knowledge revision изменилась, cohort пересобирается до `ready`. Потерянный ответ после DB commit безопасен: повтор видит requested `payload_sha256` уже effective и возвращает success; вопросы уже находятся в той же транзакции.
 
-Host maintenance lock — файл `/run/noezema/maintenance.lock`, создаваемый скриптом. Юниты Orchestrator и web несут `ConditionPathExists=!/run/noezema/maintenance.lock`, поэтому Supervisor не поднимет сервисы, пока он существует. Каталог в `/run` даёт нужное свойство: после перезагрузки файл исчезает сам, и остановленный посреди прогона узел не остаётся заблокированным навсегда. Такой перезапуск безопасен — прежний указатель остаётся эффективным, а брошенный candidate подхватит повторный запуск скрипта.
+Host maintenance принадлежит `noezema-offline-rules.service`, а не произвольному процессу. Unit первым получает неблокирующий `flock` на стабильном `/run/lock/noezema-host-transition.lock`; lockfile может жить весь boot, ownership определяется только удерживаемым file descriptor. Затем `RuntimeDirectory=noezema-offline-rules` создаёт private каталог, и unit атомарным rename публикует owner-bound marker `/run/noezema-offline-rules/active`. Второй запуск завершается до изменения marker; helper напрямую вне unit запускать запрещено. Только владеющий unit может снять marker.
 
-Идентификаторы invalid-вопросов детерминированы: `uuid5(namespace_noezema_questions, candidate_snapshot_id || ':' || claim_id)`, где namespace фиксирован в конфигурации. Это делает вставку вопросов идемпотентной при повторе прогона и не зависящей от порядка обхода cohort.
+`noezema-runtime.target` объединяет Orchestrator, web и все knowledge-writer units. Каждый unit имеет `ConditionPathExists=!/run/noezema-offline-rules/active`, но condition считается только admission-защитой: уже работающие процессы он не останавливает. Поэтому marker публикуется **до** `systemctl stop noezema-runtime.target`, после чего скрипт обязан проверить `inactive` каждого writer-а и только затем брать DB advisory lock.
 
-Advisory lock удерживается одним DB connection; потеря connection немедленно завершает скрипт. Автоматический reconnect без повторного host+DB locks запрещён. Параллельный второй скрипт locks не получает. Отказ от изменения оформляется audited transition в `failed`; только после него и retention window abandoned manifest/shadow heads перестают быть GC roots.
+При success, crash, signal или timeout systemd завершает maintenance unit и удаляет его private RuntimeDirectory; обычное падение не оставляет stale path. `OnSuccess` и `OnFailure` запускают отдельный resume unit с `After=noezema-offline-rules.service` и обязательным отсутствием marker уже после cleanup. Resume unit перед DB-проверкой получает тот же `/run/lock/noezema-host-transition.lock`; это сериализует его с новым maintenance start, при конфликте применяется bounded retry/backoff. Только владелец host-transition flock читает pointer tuple и candidate state. Старый effective pointer означает безопасный pre-publish crash, новый pointer вместе с `candidate.active` — committed success; в обоих случаях runtime можно поднять, а candidate при необходимости продолжить следующим прогоном. При недоступной БД или inconsistent tuple resume остаётся fail-closed и поднимает critical alert. Reboot также очищает `/run`, но не является штатным способом снятия marker.
+
+Идентификаторы invalid-вопросов детерминированы: `uuid5(c0e3d3b6-dd7b-557d-a4d8-6e41049f8468, canonical(candidate_snapshot_id) || ':' || canonical(claim_id))`. Namespace однажды получен как UUIDv5 от URL проекта, закреплён ADR и bootstrap migration и не входит в изменяемый config payload. `canonical(uuid)` — lowercase RFC 9562 text без surrounding whitespace, name кодируется UTF-8. Backup/restore и новая установка используют тот же literal. Это делает вставку вопросов идемпотентной при повторе прогона и не зависящей от порядка обхода cohort.
+
+Advisory lock удерживается одним DB connection; потеря connection немедленно завершает скрипт и передаёт решение resume unit. Автоматический reconnect без повторного systemd maintenance ownership, `flock` и DB lock запрещён. Параллельный второй прогон не получает даже host ownership и не трогает marker. Отказ от изменения оформляется audited transition в `failed`; только после него и retention window abandoned manifest/shadow heads перестают быть GC roots.
 
 #### 8.7.2. Online-активация правил (3b)
 
@@ -1260,10 +1280,11 @@ acquire fenced activation lease + quiesce worker
   → freeze claim cohort и activation manifest
   → prepare shadow heads ограниченными идемпотентными батчами
   → verify complete cohort, hashes и lifecycle constraints
+  → atomically persist immutable verification seal + state=ready
   → candidate.activation_state = publishing
   → atomic publish:
        lock runtime_config_head → knowledge revision
-       verify activation fence/lease, base pointer, cohort и revision
+       verify activation fence/lease, base pointer, complete seal и revision
        runtime_config_head.active_config_snapshot_id = candidate.id
        candidate.activation_state = post_publish; post_publish_started_at = now()
        previous.activation_state = superseded
@@ -1284,7 +1305,7 @@ acquire fenced activation lease + quiesce worker
 
 Quiesce worker-а обязателен. Быстрый путь ссылается на прежний valid assessment, который работающий worker иначе мог бы инвалидировать между prepare и flip. Общий writer gate плюс fenced activating pointer закрывают это окно без массовой перепроверки cohort внутри publish-транзакции.
 
-Уникальность `(claim_id, config_snapshot_id)` делает prepare идемпотентным. Activation manifest содержит полный cohort и ожидаемый head count; post-publish manifest содержит deterministic idempotency keys follow-ups. Publish запрещён, пока для каждого claim нет совместимого shadow head. Runner подчиняется revision vector и append-only audit, не создаёт evidence и не вызывает LLM.
+Уникальность `(claim_id, config_snapshot_id)` делает prepare идемпотентным. Activation manifest содержит полный cohort и ожидаемый head count; verification transaction сохраняет тот же immutable seal, что и offline protocol, а shadow heads неизменяемы в `ready | publishing` до atomic flip. После flip reassessment worker меняет уже effective heads обычными revisioned writes. Post-publish manifest содержит deterministic idempotency keys follow-ups. Publish запрещён без полного seal и совпадающей revision. Runner подчиняется revision vector и append-only audit, не создаёт evidence и не вызывает LLM.
 
 Human-required возникает только при hash mismatch, невозможном lifecycle/pointer tuple или другой несогласованности. Обычный недостаток evidence является познавательной задачей и создаёт вопрос, а не требует ручного ремонта.
 
@@ -1758,7 +1779,10 @@ operator_commands
 config_snapshots
   id, base_snapshot_id, payload_sha256, sha256,
   activation_mode, activation_state, activation_cursor,
-  activation_manifest_hash, post_publish_manifest_hash, post_publish_cursor,
+  activation_manifest_hash, activation_cohort_revision,
+  activation_expected_head_count, activation_verified_head_count,
+  activation_heads_sha256, activation_verified_at,
+  post_publish_manifest_hash, post_publish_cursor,
   post_publish_attempts, post_publish_next_attempt_at,
   post_publish_started_at, post_publish_blocked_at, post_publish_last_error,
   model, embeddings, prompts, policy, curiosity, token_budgets,
@@ -1813,7 +1837,11 @@ UNIQUE(claim_id, config_snapshot_id)
 
 `config_snapshots.activation_mode` — закрытый enum `bootstrap | offline | online`; bootstrap snapshot сразу имеет `activation_state='active'`.
 
-Bootstrap создаётся первой миграцией, а не кодом приложения: она вставляет один `config_snapshots` с `activation_mode='bootstrap'`, `base_snapshot_id=NULL`, `activation_state='active'` и payload из версионируемого seed-файла, и одну строку `runtime_config_heads(scope='global')`, указывающую на него. Пустых `runtime_config_heads` не существует ни в одном состоянии системы: отсутствие строки для scope — inconsistent record, а не «ещё не настроено». Это же снимает вопрос о первом `base_snapshot_id`: первая offline-смена строится поверх bootstrap как обычная revision. `payload_sha256` считается по immutable model/embeddings/prompts/policy/curiosity, budgets, session/activation limits и claim-type rules. `sha256 = H(base_snapshot_id, payload_sha256)` идентифицирует revision. `activation_mode/state`, cursors/manifests/retry fields и timestamps в hashes не входят; payload candidate неизменяем после создания. Partial unique `(base_snapshot_id, payload_sha256) WHERE activation_mode='offline' AND activation_state <> 'failed'` обеспечивает один незавершённый offline candidate; online mutual exclusion обеспечивает activating slot.
+Bootstrap создаётся первой PostgreSQL-транзакционной миграцией, а не кодом приложения. Migration содержит immutable seed payload и ожидаемый `payload_sha256` как literals, перед вставкой пересчитывает hash и при mismatch прекращается. В одной транзакции она вставляет ровно один `config_snapshots` с `activation_mode='bootstrap'`, `base_snapshot_id=NULL`, `activation_state='active'`, а затем одну строку `runtime_config_heads(scope='global')`, указывающую на него. Та же migration закрепляет literal UUIDv5 namespace вопросов.
+
+Обычные runtime-роли не имеют `INSERT/DELETE` на `runtime_config_heads`; разрешённые pointer/state transitions выполняются только trusted stored procedures активации. Payload/hash/base bootstrap snapshot неизменяемы, но activation procedure может выполнить единственный lifecycle-переход его state `active → superseded`. Startup и recovery до запуска scheduler-а требуют ровно одну строку `scope='global'`, ненулевой active pointer, допустимый pointer tuple и совпадение bootstrap seed hash. Отсутствие строки, второй global head или hash mismatch — `inconsistent_record`, fail-closed и critical alert, а не «ещё не настроено». Restore drill выполняет ту же проверку. Это снимает вопрос о первом `base_snapshot_id`: первая offline-смена строится поверх bootstrap как обычная revision.
+
+`payload_sha256` считается по immutable model/embeddings/prompts/policy/curiosity, budgets, session/activation limits и claim-type rules. `sha256 = H(base_snapshot_id, payload_sha256)` идентифицирует revision. `activation_mode/state`, verification seal, cursors/manifests/retry fields и timestamps в hashes не входят; payload candidate неизменяем после создания. Verification seal nullable в `draft | preparing_heads`, полностью заполнен в `ready` и после выхода из `ready` не изменяется. Partial unique `(base_snapshot_id, payload_sha256) WHERE activation_mode='offline' AND activation_state <> 'failed'` обеспечивает один незавершённый offline candidate; online mutual exclusion обеспечивает activating slot.
 
 `runtime_config_heads.scope` в v1 имеет единственное значение `'global'`. `UNIQUE(scope)` обеспечивает один effective pointer и один activating slot на scope. Multi-thinker tenancy (§21.6) сможет сделать эту строку per-thinker без изменения формы указателя.
 
@@ -1917,7 +1945,7 @@ Audit event имеет type/schema version и уникальную пару `(se
 
 ### 15.1. Crash recovery и reconciliation
 
-Recovery worker сначала ищет unresolved commit attempt, затем active dependency barriers и online runtime heads с activating pointer либо effective online snapshots в `post_publish_blocked`. Offline attempts восстанавливает только one-shot script §8.7.1.
+Recovery worker сначала ищет unresolved commit attempt, затем active dependency barriers и online runtime heads с activating pointer либо effective online snapshots в `post_publish_blocked`. Offline candidate продолжает только новый запуск `noezema-offline-rules.service` §8.7.1; systemd resume unit не меняет candidate и решает лишь безопасный возврат runtime после terminal maintenance outcome.
 
 - Для unresolved attempt он блокирует session и attempt в каноническом порядке §5.2.2; простой read не является подтверждением rollback.
 - `committed` с terminal session/checkpoint: принимает успех и не очищает объекты.
@@ -1926,8 +1954,8 @@ Recovery worker сначала ищет unresolved commit attempt, затем ac
 - inconsistent records: автоматическое разрешение останавливается, поднимается critical alert.
 - отсутствие unresolved attempt: обычный lease recovery — started action становится outcome unknown, session failed, staging/overlay очищаются после grace period.
 - `discovering | active | closing` dependency barrier возобновляется по closure manifest, generation и `next_offset`; перед resolved всегда выполняется актуальная closure-проверка.
-- Offline candidate в `preparing_heads | ready` без effective pointer безопасен: runtime продолжает старую config. One-shot script под advisory lock возобновляет тот же manifest; при изменившейся knowledge revision пересобирает cohort. Effective offline snapshot обязан иметь `activation_state='active'`, иначе это inconsistent record.
-- Для `preparing_heads | ready` recovery под runtime-head lock захватывает просроченный lease, увеличивает `activation_fence` и продолжает prepare/verify. Старый owner fenced и не может двигать cursor.
+- Offline candidate в `preparing_heads | ready` без effective pointer безопасен: runtime продолжает старую config. Новый maintenance run под теми же host/DB locks возобновляет manifest. При изменившейся knowledge revision он CAS-переходит в `preparing_heads`, атомарно очищает verification seal и пересобирает cohort; head writes при `ready` запрещены. Resume unit после crash запускает runtime только при однозначном старом pointer либо committed tuple нового pointer; DB unavailable/inconsistent остаётся fail-closed. Effective offline snapshot обязан иметь `activation_state='active'` и полный seal, иначе это inconsistent record.
+- Для online candidate в `preparing_heads | ready` recovery под runtime-head lock захватывает просроченный lease, увеличивает `activation_fence` и продолжает prepare/verify. Старый owner fenced и не может двигать cursor.
 - Для `publishing` base active pointer означает, что atomic flip не состоялся и publish можно повторить под новым fence. Candidate active pointer при всё ещё `publishing` невозможен: pointer и переход в `post_publish` коммитятся одной транзакцией, поэтому такая пара, как и любой третий pointer, является inconsistent record.
 - Для `post_publish` нормальна только пара `active_config_snapshot_id=candidate` и `activating_config_snapshot_id=candidate`. Recovery захватывает просроченный lease новым fence и идемпотентно продолжает manifest. Успех переводит candidate в `active`; исчерпание retry — в `post_publish_blocked`. В обоих случаях terminal-cleanup атомарно очищает activating slot/lease и activation-owned pause до возобновления admission.
 - `post_publish_blocked` не удерживает activation slot. Trusted repair runner использует отдельный post-cleanup CAS по active pointer, online mode, state и expected cursor; activation lease/fence в repair predicate не входят. Если snapshot уже `superseded`, repair закрывает остаток manifest без возврата старой config в `active`.
@@ -1969,7 +1997,7 @@ GC roots:
 - при transient retry, исчерпании worker retry budget и переводе poison job в `blocked`; несвязанный wake должен продолжаться;
 - при конфликте каждой компоненты revision vector и при попытке barrier batch изменить knowledge без knowledge lock;
 - при превышении staging limits до записи команды и при повторной финальной проверке immutable manifest;
-- offline: попытка Supervisor start при живом host maintenance lock, перезагрузка хоста в середине прогона, после candidate upsert, между shadow-head batches, после verify cohort и непосредственно до/после atomic pointer+questions transaction; rerun обязан выбрать тот же payload candidate и не создать дублей вопросов;
+- offline: параллельный второй maintenance start, попытка runtime start после marker и до stop, kill/timeout владельца без reboot, reboot в середине прогона, после candidate upsert, между shadow-head batches, mutation head после `ready`, после durable verify seal и непосредственно до/после atomic pointer+questions transaction; только owner снимает marker, resume стартует runtime лишь по однозначному pointer tuple, rerun выбирает тот же payload candidate и не создаёт дублей вопросов;
 - online: до/после каждого shadow-head batch, после `ready → publishing`, непосредственно до/после runtime config-head flip, в каждом post-publish batch и до/после terminal-cleanup;
 - когда worker держит gate до activation acquisition, когда stale activator после recovery takeover пытается изменить cursor/state/pointer и когда repair `post_publish_blocked` конкурирует со следующим flip;
 - при crash в каждом activation state: recovery обязан классифицировать исход по pointer tuple, а не по одному state;
@@ -1986,6 +2014,8 @@ GC roots:
 - session validation не голодает из-за worker;
 - invalid ancestor не оставляет downstream assessment current;
 - offline publish оставляет либо прежний pointer, либо новый pointer вместе со всеми deterministic invalid-вопросами; effective offline snapshot всегда `active`;
+- non-bootstrap rules candidate в pre-publish `ready | publishing` имеет полный immutable verification seal, expected/verified counts равны, а shadow heads не изменяются до flip; final publish не сканирует cohort, после flip effective writes увеличивают knowledge revision;
+- active maintenance marker имеет одного systemd owner-а; runtime target до DB work подтверждён как inactive, а terminal resume при неизвестном DB outcome остаётся fail-closed;
 - online runtime config head старый либо полностью новый; effective config определяется только pointer equality, один activating slot существует на scope, stale fence не меняет state/cursor/pointer, а repair CAS не возвращает superseded snapshot в `active`;
 - staging limit никогда не обнаруживается впервые после начала commit boundary;
 - partial success не содержит unknown action;
@@ -2004,7 +2034,7 @@ GC roots:
 - возраст старейшего runnable dependency-critical job, число отложенных пробуждений, эскалации `T_escalate`, blocked jobs и retry-budget exhaustion;
 - active barrier count/age/generation, closure size, cursor lag, graph-revision restarts и recovery resumes;
 - knowledge/dependency-graph revision conflicts, commit latency, outbox lag;
-- offline config attempts/resumes/rebuilds/limit rejects и atomic publish latency; online activation state/cursor/cohort progress, lease age/fence takeovers/stale-write rejects, shadow-head retries, publish/terminal-cleanup latency, effective repair backlog age и нарушения `T_repair_admission`;
+- offline config attempts/resumes/rebuilds/limit rejects, maintenance owner conflicts, marker lifetime, fail-closed resumes, verification duration/digest mismatch и atomic publish latency; online activation state/cursor/cohort progress, lease age/fence takeovers/stale-write rejects, shadow-head retries, publish/terminal-cleanup latency, effective repair backlog age и нарушения `T_repair_admission`;
 - staging budget utilization/rejections по claims/new claims/evidence и фактическое host assessment time;
 - orphan bytes/root scan duration;
 - resources, backup и restore drill age.
@@ -2077,6 +2107,9 @@ noezema/
 ├── infra/
 │   ├── compose.yaml
 │   └── systemd/
+│       ├── noezema-runtime.target
+│       ├── noezema-offline-rules.service
+│       └── noezema-runtime-resume.service
 └── tests/
     ├── scenarios/
     ├── security/
@@ -2125,7 +2158,7 @@ Gate: неизвестный ответ COMMIT reconciled; нет mixed state; p
 - confidence/freshness;
 - консервативные source independence groups для локального корпуса;
 - context retrieval с токенными бюджетами и обработкой pending claims;
-- offline-смена rules version §8.7.1 одноразовым скриптом при остановленном узле;
+- offline-смена rules version §8.7.1 через systemd-owned maintenance unit, durable verification seal и атомарный pointer+questions publish;
 - identity/handoff.
 
 Фонового пересчёта в MVP нет, но assessment не является одноразовым: staged-операция, меняющая evidence set, синхронно обновляет head effective config snapshot в пределах session limits (§6.6). Rules version заморожена между offline-сменами §8.7.1; shadow heads не видны до переключения указателя, а invalid после него получает исследовательский вопрос.
@@ -2292,8 +2325,9 @@ Resolution без valid independent basis повышает grade. Контрол
 25. `[v1]` непустой activating slot блокирует пробуждение; terminal-cleanup очищает его и activation-owned pause как для `active`, так и для `post_publish_blocked`, тогда как `blocked` job/barrier wake не запрещают;
 26. `[v1]` activation acquisition через общий writer gate подтверждает quiesce до freeze cohort, и ни один опубликованный head не ссылается на инвалидированный assessment;
 27. `[v1]` recovery корректно разрешает crash в каждом activation state по runtime pointer tuple; runner со stale fencing token не меняет state/cursor/pointer, а repair не возвращает superseded snapshot в `active`;
-28. `[MVP]` offline-смена правил под advisory lock повторно выбирает candidate по `(base_snapshot_id, payload_sha256)` и одной транзакцией публикует pointer, heads и deterministic invalid-вопросы; потерянный commit response не создаёт следующую config;
+28. `[MVP]` offline-смена правил внутри systemd-owned maintenance scope повторно выбирает candidate по `(base_snapshot_id, payload_sha256)`, записывает immutable verification seal и одной транзакцией делает полный shadow cohort effective вместе с pointer и deterministic invalid-вопросами; потерянный commit response не создаёт следующую config;
 29. `[v1]` repair runner использует отдельный post-cleanup CAS, уступает session intent и получает окно через `T_repair_admission`; superseded backlog не возвращает старую config в `active`.
+30. `[MVP]` первая migration атомарно создаёт hash-pinned bootstrap snapshot и единственный global runtime head; startup/restore fail-closed при нарушении tuple, а kill maintenance owner-а очищает marker и возобновляет runtime только после однозначной DB-проверки.
 
 ### 22.2. Познавательная оценка
 
