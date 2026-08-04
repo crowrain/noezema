@@ -13,8 +13,11 @@ authors = [
   { name = "NOEZEMA contributors" },
 ]
 dependencies = [
+  "alembic>=1.15,<2",
   "httpx>=0.28,<0.29",
+  "psycopg[binary]>=3.2,<4",
   "pydantic>=2.11,<3",
+  "sqlalchemy>=2.0,<2.1",
 ]
 
 [project.optional-dependencies]
@@ -37,6 +40,7 @@ testpaths = ["tests"]
 pythonpath = ["."]
 markers = [
   "model_compatibility: opt-in checks against a real local LLM backend",
+  "postgresql_integration: opt-in checks against a disposable PostgreSQL database",
 ]
 
 [tool.ruff]

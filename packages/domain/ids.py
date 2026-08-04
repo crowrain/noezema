@@ -49,3 +49,11 @@ class CommitAttemptId(_UuidIdentifier):
 
 class AuditEventId(_UuidIdentifier):
     """Identity of one immutable audit event."""
+
+
+class ConfigSnapshotId(_UuidIdentifier):
+    """Identity of one immutable runtime configuration snapshot."""
+
+
+class OutboxEventId(_UuidIdentifier):
+    """Identity of one event awaiting delivery from the transactional outbox."""

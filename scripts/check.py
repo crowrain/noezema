@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SOURCE_PATHS = ("apps", "packages", "scripts", "tests")
+SOURCE_PATHS = ("apps", "migrations", "packages", "scripts", "tests")
 
 
 def _run(*arguments: str) -> None:

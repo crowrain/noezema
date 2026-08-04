@@ -13,6 +13,7 @@ PUBLIC_MODULES = (
     "packages.domain",
     "packages.llm_gateway",
     "packages.memory",
+    "packages.persistence",
 )
 
 
