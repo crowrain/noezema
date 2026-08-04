@@ -4,7 +4,7 @@
 
 | Параметр | Значение |
 |----------|----------|
-| Статус | Архитектурный draft v0.24 |
+| Статус | Архитектурный draft v0.25 |
 | Язык | Python |
 | Бэкенд | Локальная LLM (OpenAI-compatible API) |
 | База данных | PostgreSQL 15+ |
@@ -50,8 +50,8 @@ NOEZEMA — автономный локальный мыслитель. Кажд
 - В MVP rules/config меняется offline внутри systemd-owned maintenance scope: target membership проверяется через `PartOf/ConsistsOf`, current state и immutable host events журналируются fsync-safe, а pointer+questions публикуются одной транзакцией; fenced online activation появляется в 3b
 - Классифицированный DB outage остаётся в durable `retry_wait` и не расходует systemd crash budget; неклассифицированный crash-loop виден как auto-recovering `resume_degraded`, permanent inconsistency — как operator-required `resume_blocked`
 - Единственный fsync-safe active head отделяет незавершённый host transition от retained history; boot reconciliation восстанавливает один orphan и блокирует runtime при множественных unresolved records
-- Recovery policy берётся только из versioned root-owned host files, hash-ируется и материализуется в transition; DB snapshot не может неявно изменить backoff
-- Retry и unit-state timers имеют явные `AccuracySec=1s`, отключённый systemd jitter и измеряемую lateness
+- Recovery policy берётся только из versioned root-owned host files, hash-ируется и материализуется в transition; её смена имеет отдельный fsync-safe active head и terminal `effective_hash`, а DB snapshot не может неявно изменить backoff
+- Single-node schema v1 фиксирует recovery jitter в `0`; retry и unit-state timers имеют явные `AccuracySec=1s`, отключённый systemd jitter и измеряемую lateness
 
 ## Архитектура
 
@@ -188,11 +188,11 @@ noezema/
 |------|-----|------|
 | **1. Контракты и LLM** | Enums, schemas, host-generated IDs, LLM Gateway, FIFO Selector, minimal explorer/curator | Sealed-путь question → evidence → assessment → commit |
 | **2. Изоляция и commit** | Sandbox, capability policy, Tool Broker, COW/staging, revision vector, fenced reconciliation | Unknown COMMIT reconciled, живой finalizer не принят за rollback |
-| **3a. Память и доказательства** | Claims/evidence, versioned assessment heads, systemd-owned offline rules change с verification seal, single active head + current/event journal, root-owned recovery policy и точные durable retry timers, conservative source grouping | Старый либо полный новый pointer+questions; один unresolved transition, DB outage — `retry_wait`, crash-loop — `resume_degraded`, inconsistency/policy error — `resume_blocked`, ни один start не обходит admission |
+| **3a. Память и доказательства** | Claims/evidence, versioned assessment heads, systemd-owned offline rules change с verification seal, отдельные active heads для transition/policy change, root-owned recovery policy и точные durable retry timers, conservative source grouping | Старый либо полный новый pointer+questions; по одной unresolved host operation, DB outage — `retry_wait`, crash-loop — `resume_degraded`, inconsistency/policy error — `resume_blocked`, ни один start не обходит admission |
 | **3b. Зависимости и переоценка** | Closure manifests, resumable barriers, reassessment worker, fenced online rules activation, full grouping, resolutions | Invalid ancestor блокирует downstream; stale activator/repair не меняет effective config |
 | **4. Расширенный познавательный цикл** | Curiosity ranking, planning, specialized verifier/curator, защита от повторений | Verifier не назначает grade |
 | **5. Research Proxy** | SSRF-safe fetch/search, provenance, injection tests | Внешний текст не меняет capabilities |
-| **6. Веб-модуль** | MVP: status/timeline/messages/controls и read-only degraded host status; затем knowledge graph и diagnostics | Без system-bus access; stale snapshot или любой unresolved host transition fail-closed закрывает Command API |
+| **6. Веб-модуль** | MVP: status/timeline/messages/controls и read-only degraded host status; затем knowledge graph и diagnostics | Без system-bus access; stale snapshot или любой unresolved host transition/policy change fail-closed закрывает Command API |
 | **7. Эксплуатация** | Backup/PITR, GC, security regression, 50–100 сессий | §22.1 → frozen evaluation → §22.2 full acceptance |
 
 MVP — этапы 1, 2, 3a + минимальный web slice: status, SSE timeline, messages, controls и degraded host recovery view. Он уже выполняет полный минимальный познавательный путь с локальной LLM. Этап 3b начинается после серии реальных сессий: пороги очереди и SLO выводятся из измеренной нагрузки.
@@ -208,7 +208,7 @@ MVP — этапы 1, 2, 3a + минимальный web slice: status, SSE time
 
 ## Статус
 
-📝 Архитектурный draft v0.24 — документация без кода.
+📝 Архитектурный draft v0.25 — документация без кода.
 
 [Полная спецификация](ARCHITECTURE.md) описывает 22 раздела: архитектурные принципы, компоненты, машину состояний сессий, модель памяти, evidence grading, безопасность, воспроизводимость, веб-модуль, модель данных (40 таблиц), надёжность и восстановление, наблюдаемость, стек, структуру, этапы, риски, открытые вопросы и критерии успеха.
 
