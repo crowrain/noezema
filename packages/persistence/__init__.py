@@ -10,15 +10,22 @@ from packages.persistence.bootstrap import (
     validate_bootstrap_constants,
 )
 from packages.persistence.database import create_session_factory
-from packages.persistence.operations import CreatedSession, create_session_with_audit
+from packages.persistence.operations import (
+    AppendedAudit,
+    CreatedSession,
+    append_session_audit,
+    create_session_with_audit,
+)
 
 __all__ = [
     "BOOTSTRAP_CONFIG_SNAPSHOT_ID",
     "BOOTSTRAP_PAYLOAD_SHA256",
     "BOOTSTRAP_REVISION_SHA256",
+    "AppendedAudit",
     "Base",
     "CreatedSession",
     "INVALID_QUESTION_NAMESPACE",
+    "append_session_audit",
     "bootstrap_payload",
     "create_session_factory",
     "create_session_with_audit",

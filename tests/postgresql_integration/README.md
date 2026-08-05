@@ -1,7 +1,7 @@
 # PostgreSQL integration check
 
-The regular suite uses SQLite only to exercise transaction boundaries. The first
-migration itself is PostgreSQL-specific and can be verified against a disposable
+The regular suite uses SQLite only to exercise transaction boundaries. The
+PostgreSQL-specific migration chain can be verified against a disposable
 PostgreSQL 15+ database explicitly:
 
 ```powershell

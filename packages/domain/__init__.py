@@ -9,6 +9,8 @@ from packages.domain.enums import (
     IdempotencyClass,
     NodeState,
     PolicyDecision,
+    QuestionOrigin,
+    QuestionState,
     SessionState,
     ToolName,
 )
@@ -21,9 +23,11 @@ from packages.domain.ids import (
     IdempotencyKey,
     ModelRunId,
     OutboxEventId,
+    QuestionId,
     SessionId,
     TurnId,
 )
+from packages.domain.questions import QuestionDraft
 
 __all__ = [
     "ActionId",
@@ -43,6 +47,10 @@ __all__ = [
     "NodeState",
     "OutboxEventId",
     "PolicyDecision",
+    "QuestionDraft",
+    "QuestionId",
+    "QuestionOrigin",
+    "QuestionState",
     "SessionId",
     "SessionState",
     "ToolDecision",

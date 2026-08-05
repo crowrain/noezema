@@ -39,6 +39,24 @@ class NodeState(StrEnum):
     PAUSED = "paused"
 
 
+class QuestionOrigin(StrEnum):
+    SEEDED = "seeded"
+    MESSAGE = "message"
+    CONTRADICTION = "contradiction"
+    UNKNOWN_TERM = "unknown_term"
+    UNVERIFIED_CLAIM = "unverified_claim"
+    EXPERIMENT_RESULT = "experiment_result"
+    LOCAL_CORPUS = "local_corpus"
+    MODEL = "model"
+    INVALID_ASSESSMENT = "invalid_assessment"
+
+
+class QuestionState(StrEnum):
+    QUEUED = "queued"
+    ANSWERED = "answered"
+    DISCARDED = "discarded"
+
+
 class DecisionKind(StrEnum):
     TOOL = "tool"
     COMPLETE = "complete"
@@ -83,6 +101,7 @@ class ActionState(StrEnum):
 
 class EventType(StrEnum):
     SESSION_STATE_CHANGED = "SessionStateChanged"
+    QUESTION_SELECTED = "QuestionSelected"
     MODEL_RUN_COMPLETED = "ModelRunCompleted"
     ACTION_PROPOSED = "ActionProposed"
     POLICY_EVALUATED = "PolicyEvaluated"

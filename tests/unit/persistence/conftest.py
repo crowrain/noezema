@@ -16,7 +16,7 @@ from packages.persistence import (
     Base,
     bootstrap_payload,
 )
-from packages.persistence.models import ConfigSnapshotRecord
+from packages.persistence.models import ConfigSnapshotRecord, RuntimeConfigHeadRecord
 
 
 @pytest.fixture
@@ -50,6 +50,18 @@ def session_factory(sqlite_engine: Engine) -> sessionmaker[Session]:
                 activation_mode="bootstrap",
                 activation_state="active",
                 created_at=datetime(2026, 1, 1, tzinfo=UTC),
+            )
+        )
+        db.flush()
+        db.add(
+            RuntimeConfigHeadRecord(
+                scope="global",
+                active_config_snapshot_id=BOOTSTRAP_CONFIG_SNAPSHOT_ID,
+                activating_config_snapshot_id=None,
+                activation_fence=0,
+                lease_owner=None,
+                lease_expires_at=None,
+                updated_at=datetime(2026, 1, 1, tzinfo=UTC),
             )
         )
     return factory

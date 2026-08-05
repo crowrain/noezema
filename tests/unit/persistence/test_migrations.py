@@ -9,6 +9,7 @@ import pytest
 from alembic import command
 from alembic.config import Config
 
+from packages.domain import EventType, QuestionOrigin, QuestionState
 from packages.persistence import (
     BOOTSTRAP_CONFIG_SNAPSHOT_ID,
     BOOTSTRAP_PAYLOAD_SHA256,
@@ -20,8 +21,9 @@ from packages.persistence import (
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
-MIGRATION = importlib.import_module("migrations.versions.0001_operational_foundation")
-EXPECTED_TABLES = {
+FOUNDATION_MIGRATION = importlib.import_module("migrations.versions.0001_operational_foundation")
+QUESTION_MIGRATION = importlib.import_module("migrations.versions.0002_fifo_questions")
+FOUNDATION_TABLES = {
     "actions",
     "audit_events",
     "config_snapshots",
@@ -32,15 +34,22 @@ EXPECTED_TABLES = {
     "sessions",
     "system_constants",
 }
+EXPECTED_TABLES = FOUNDATION_TABLES | {"questions"}
 
 
 def test_application_and_immutable_migration_literals_match() -> None:
     validate_bootstrap_constants()
 
-    assert MIGRATION.BOOTSTRAP_CONFIG_SNAPSHOT_ID == str(BOOTSTRAP_CONFIG_SNAPSHOT_ID)
-    assert MIGRATION.INVALID_QUESTION_NAMESPACE == str(INVALID_QUESTION_NAMESPACE)
-    assert MIGRATION.BOOTSTRAP_PAYLOAD_SHA256 == BOOTSTRAP_PAYLOAD_SHA256
-    assert MIGRATION.BOOTSTRAP_REVISION_SHA256 == BOOTSTRAP_REVISION_SHA256
+    assert FOUNDATION_MIGRATION.BOOTSTRAP_CONFIG_SNAPSHOT_ID == str(BOOTSTRAP_CONFIG_SNAPSHOT_ID)
+    assert FOUNDATION_MIGRATION.INVALID_QUESTION_NAMESPACE == str(INVALID_QUESTION_NAMESPACE)
+    assert FOUNDATION_MIGRATION.BOOTSTRAP_PAYLOAD_SHA256 == BOOTSTRAP_PAYLOAD_SHA256
+    assert FOUNDATION_MIGRATION.BOOTSTRAP_REVISION_SHA256 == BOOTSTRAP_REVISION_SHA256
+
+
+def test_question_migration_literals_match_domain_enums() -> None:
+    assert QUESTION_MIGRATION.QUESTION_ORIGINS == tuple(item.value for item in QuestionOrigin)
+    assert QUESTION_MIGRATION.QUESTION_STATES == tuple(item.value for item in QuestionState)
+    assert QUESTION_MIGRATION.AUDIT_EVENT_TYPES_V2 == tuple(item.value for item in EventType)
 
 
 def test_bootstrap_payload_has_no_shared_mutable_state() -> None:
@@ -66,7 +75,7 @@ def test_online_migration_requires_an_explicit_database_url(
         command.upgrade(config, "head")
 
 
-def test_first_migration_renders_valid_pinned_bootstrap_sql(
+def test_migrations_render_valid_bootstrap_and_fifo_sql(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     config = Config(str(PROJECT_ROOT / "alembic.ini"))
@@ -82,3 +91,13 @@ def test_first_migration_renders_valid_pinned_bootstrap_sql(
     assert BOOTSTRAP_PAYLOAD_SHA256 in sql
     assert '"embeddings":null' in sql
     assert '"embeddings"NULL' not in sql
+    assert "ALTER TABLE sessions ADD COLUMN question_id UUID" in sql
+    assert "CREATE INDEX ix_questions_fifo" in sql
+    assert "DROP CONSTRAINT ck_audit_events_type_allowed" in sql
+    assert "ck_audit_events_ck_audit_events_type_allowed" not in sql
+
+    command.downgrade(config, "head:base", sql=True)
+    downgrade_sql = capsys.readouterr().out
+    assert "DROP TABLE questions" in downgrade_sql
+    assert "DROP COLUMN question_id" in downgrade_sql
+    assert "DROP CONSTRAINT ck_audit_events_type_allowed" in downgrade_sql

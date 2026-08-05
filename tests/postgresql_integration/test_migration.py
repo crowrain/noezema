@@ -46,10 +46,20 @@ def test_upgrade_seeds_exactly_one_global_head(monkeypatch: pytest.MonkeyPatch) 
                     "WHERE key = 'invalid_question_uuid5_namespace'"
                 )
             )
+            questions_table = connection.scalar(text("SELECT to_regclass('questions')::text"))
+            session_question_column = connection.scalar(
+                text(
+                    "SELECT count(*) FROM information_schema.columns "
+                    "WHERE table_schema = current_schema() "
+                    "AND table_name = 'sessions' AND column_name = 'question_id'"
+                )
+            )
 
         assert global_heads == 1
         assert active_snapshot == str(BOOTSTRAP_CONFIG_SNAPSHOT_ID)
         assert invalid_question_namespace == str(INVALID_QUESTION_NAMESPACE)
+        assert questions_table == "questions"
+        assert session_question_column == 1
     finally:
         engine.dispose()
         command.downgrade(config, "base")

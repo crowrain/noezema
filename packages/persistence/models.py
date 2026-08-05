@@ -23,7 +23,15 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
-from packages.domain import ActionState, EventType, IdempotencyClass, PolicyDecision, SessionState
+from packages.domain import (
+    ActionState,
+    EventType,
+    IdempotencyClass,
+    PolicyDecision,
+    QuestionOrigin,
+    QuestionState,
+    SessionState,
+)
 from packages.persistence.base import Base
 
 JsonType = JSON().with_variant(JSONB(), "postgresql")
@@ -121,6 +129,38 @@ class DomainRevisionRecord(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
+class QuestionRecord(Base):
+    __tablename__ = "questions"
+    __table_args__ = (
+        CheckConstraint("length(text) BETWEEN 1 AND 4096", name="text_length"),
+        CheckConstraint(
+            _allowed_values("origin", [origin.value for origin in QuestionOrigin]),
+            name="origin_allowed",
+        ),
+        CheckConstraint(
+            _allowed_values("state", [state.value for state in QuestionState]),
+            name="state_allowed",
+        ),
+        CheckConstraint("priority BETWEEN -1000 AND 1000", name="priority_range"),
+        Index("ix_questions_fifo", "state", "created_at", "id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    text: Mapped[str] = mapped_column(Text)
+    origin: Mapped[str] = mapped_column(String(32))
+    origin_config_snapshot_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("config_snapshots.id")
+    )
+    state: Mapped[str] = mapped_column(String(16))
+    priority: Mapped[int] = mapped_column(Integer, default=0)
+    parent_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("questions.id"), nullable=True
+    )
+    score_components: Mapped[dict[str, Any]] = mapped_column(JsonType)
+    embedding_fingerprint: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 class SessionRecord(Base):
     __tablename__ = "sessions"
     __table_args__ = (
@@ -140,6 +180,9 @@ class SessionRecord(Base):
     state: Mapped[str] = mapped_column(String(32))
     config_snapshot_id: Mapped[UUID] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("config_snapshots.id")
+    )
+    question_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("questions.id"), nullable=True
     )
     lease_owner: Mapped[str | None] = mapped_column(String(128), nullable=True)
     lease_expires_at: Mapped[datetime | None] = mapped_column(

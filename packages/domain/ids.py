@@ -57,3 +57,7 @@ class ConfigSnapshotId(_UuidIdentifier):
 
 class OutboxEventId(_UuidIdentifier):
     """Identity of one event awaiting delivery from the transactional outbox."""
+
+
+class QuestionId(_UuidIdentifier):
+    """Identity of one durable research question."""
