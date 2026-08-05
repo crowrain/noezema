@@ -12,7 +12,6 @@ jobs:
     strategy:
       matrix:
         python-version: ["3.11"]
-
     services:
       postgres:
         image: postgres:15-alpine
@@ -23,46 +22,20 @@ jobs:
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U noezema"
+          --health-cmd pg_isready
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
-
     steps:
       - uses: actions/checkout@v4
-
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-
+          cache: pip
       - name: Install uv
-        run: |
-          pip install --upgrade pip
-          pip install uv
-
+        run: pip install --upgrade uv
       - name: Install dependencies
-        run: |
-          uv pip install --system ".[dev]"
-
-      - name: Lint (ruff)
-        run: |
-          python -m ruff check packages/ apps/ tests/ || true
-          python -m ruff format --check packages/ apps/ tests/ || true
-
-      - name: Type check (pyright)
-        run: |
-          python -m pyright packages/ apps/ --output json || true
-
+        run: uv pip install --system ".[dev]" aiosqlite
       - name: Run tests
-        env:
-          DATABASE_URL: postgresql+asyncpg://noezema:noezema_dev@localhost:5432/noezema
-          LLM_API_BASE: http://localhost:9999/v1
-        run: |
-          python -m pytest tests/ -v --tb=short -x
-
-      - name: Run alembic check
-        env:
-          DATABASE_URL: postgresql+asyncpg://noezema:noezema_dev@localhost:5432/noezema
-        run: |
-          python -m alembic -c alembic.ini check || true
+        run: python -m pytest tests/ -v --tb=short

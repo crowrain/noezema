@@ -15,6 +15,18 @@ services:
       timeout: 3s
       retries: 5
 
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
   alembic:
     build:
       context: ..
@@ -35,15 +47,39 @@ services:
     command: ["uvicorn", "apps.web.app:app", "--host", "0.0.0.0", "--port", "8000"]
     environment:
       DATABASE_URL: postgresql+asyncpg://noezema:noezema_dev@db:5432/noezema
+      REDIS_URL: redis://redis:6379/0
       NOEZEMA_ENV: dev
     ports:
       - "8000:8000"
     depends_on:
       alembic:
         condition: service_completed_successfully
+      redis:
+        condition: service_healthy
     volumes:
       - ./workspace:/app/workspace
 
+  worker:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    command: ["python", "-m", "apps.rq.worker"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://noezema:noezema_dev@db:5432/noezema
+      REDIS_URL: redis://redis:6379/0
+      LLM_API_BASE: ${LLM_API_BASE:-http://host.docker.internal:8080/v1}
+      LLM_MODEL: ${LLM_MODEL:-qwen3.6-27b}
+    depends_on:
+      alembic:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./workspace:/app/workspace
+
+  # Alternative: orchestrator standalone loop (no Redis needed)
   orchestrator:
     build:
       context: ..
@@ -52,14 +88,16 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://noezema:noezema_dev@db:5432/noezema
       NOEZEMA_ENV: prod
-      LLM_API_BASE: ${LLM_API_BASE:-http://llm:8000/v1}
-      LLM_API_KEY: ${LLM_API_KEY:-sk-local}
+      LLM_API_BASE: ${LLM_API_BASE:-http://host.docker.internal:8080/v1}
       LLM_MODEL: ${LLM_MODEL:-qwen3.6-27b}
     depends_on:
       alembic:
         condition: service_completed_successfully
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./workspace:/app/workspace
 
 volumes:
   pgdata:
+  redisdata:

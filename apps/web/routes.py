@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import uuid
 from datetime import datetime
 
@@ -307,10 +308,10 @@ async def list_questions(
 @router.post("/api/questions")
 async def create_question(
     statement: str,
-    source: str = "seeded",
+    source: str = "operator",
     db: AsyncSession = Depends(get_session),
 ) -> dict:
-    """Add a research question to the queue."""
+    """Create a new question and enqueue orchestrator session via RQ."""
     question = ORMQuestion(
         statement=statement,
         source=source,
@@ -318,5 +319,23 @@ async def create_question(
     )
     db.add(question)
     await db.commit()
+
+    # Enqueue orchestrator session in RQ
+    try:
+        from redis import Redis
+        from rq import Queue
+        redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+        redis_conn = Redis.from_url(redis_url)
+        rq_queue = Queue("default", connection=redis_conn)
+        rq_queue.enqueue(
+            "apps.rq.tasks.run_session_task",
+            args=[str(question.id)],
+            job_id=f"session-{question.id}",
+            result_ttl=86400,
+        )
+    except Exception:
+        # Redis not available — session can be picked up manually later
+        pass
+
     return {"id": str(question.id), "state": "queued"}
 
