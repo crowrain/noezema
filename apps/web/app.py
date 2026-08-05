@@ -1,45 +1,45 @@
-"""FastAPI app — status page, timeline API, message inbox, operator commands."""
+"""FastAPI app — status page, timeline API, message inbox, operator commands.
+
+DB-aware: connects to PostgreSQL via SQLAlchemy on startup.
+"""
 
 from __future__ import annotations
 
-import uuid
+import logging
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-app = FastAPI(title="NOEZEMA")
+from apps.web.db import init_db, create_tables, shutdown_db
+from apps.web.routes import router
+
+logger = logging.getLogger("noezema.web")
 
 
-@app.get("/")
-async def status_page() -> dict:
-    """MVP status — returns JSON (HTML page later)."""
-    return {
-        "name": "noezema",
-        "version": "0.1.0-dev",
-        "status": "running",
-        "claims_count": 0,
-        "pending_questions": 0,
-        "unresolved_commits": 0,
-    }
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """App lifecycle: init DB on startup, dispose on shutdown."""
+    logger.info("Web API starting — initializing DB")
+    await init_db()
+
+    # Auto-create tables in dev (use Alembic in prod)
+    import os
+    if os.environ.get("NOEZEMA_ENV", "dev") == "dev":
+        await create_tables()
+        logger.info("Tables created/verified")
+
+    yield
+
+    await shutdown_db()
+    logger.info("Web API shutdown — DB disposed")
 
 
-@app.get("/api/timeline")
-async def timeline(limit: int = 50) -> list[dict]:
-    """SSE-compatible audit timeline."""
-    return []  # MVP: no DB yet
+app = FastAPI(
+    title="NOEZEMA",
+    version="0.1.0-dev",
+    description="Autonomous local thinker — Web API",
+    lifespan=lifespan,
+)
 
-
-@app.post("/api/message")
-async def send_message(sender: str, body: str, priority: str = "normal") -> dict:
-    """Send a message to the thinker (stored in inbox)."""
-    mid = uuid.uuid4()
-    return {"id": str(mid), "state": "queued"}
-
-
-@app.post("/api/command")
-async def operator_command(actor: str, type: str, arguments: dict | None = None) -> dict:
-    """Typed operator command with idempotency."""
-    idem = uuid.uuid4()
-    allowed = {"wake_now", "pause", "resume", "stop_gracefully", "abort_session"}
-    if type not in allowed:
-        return {"error": f"Unknown command: {type}"}
-    return {"id": str(idem), "state": "accepted"}
+# Mount API routes
+app.include_router(router, prefix="")

@@ -20,6 +20,21 @@ class DatabaseConfig(BaseModel):
     max_overflow: int = 10
     echo: bool = False
 
+    def get_database_url(self) -> str:
+        return self.url
+
+
+def get_db_settings() -> DatabaseConfig:
+    """Get database config from environment or defaults."""
+    import os
+    return DatabaseConfig(
+        url=os.environ.get(
+            "DATABASE_URL",
+            "postgresql+asyncpg://noezema:noezema_dev@localhost:5432/noezema"
+        ),
+        echo=os.environ.get("DB_ECHO", "0") == "1",
+    )
+
 
 class Database:
     """Async database singleton with session factory."""
