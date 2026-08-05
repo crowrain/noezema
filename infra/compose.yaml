@@ -15,5 +15,51 @@ services:
       timeout: 3s
       retries: 5
 
+  alembic:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    command: ["alembic", "-c", "alembic.ini", "upgrade", "head"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://noezema:noezema_dev@db:5432/noezema
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./workspace:/app/workspace
+
+  web:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    command: ["uvicorn", "apps.web.app:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://noezema:noezema_dev@db:5432/noezema
+      NOEZEMA_ENV: dev
+    ports:
+      - "8000:8000"
+    depends_on:
+      alembic:
+        condition: service_completed_successfully
+    volumes:
+      - ./workspace:/app/workspace
+
+  orchestrator:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    command: ["python", "-m", "apps.orchestrator.main"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://noezema:noezema_dev@db:5432/noezema
+      NOEZEMA_ENV: prod
+      LLM_API_BASE: ${LLM_API_BASE:-http://llm:8000/v1}
+      LLM_API_KEY: ${LLM_API_KEY:-sk-local}
+      LLM_MODEL: ${LLM_MODEL:-qwen3.6-27b}
+    depends_on:
+      alembic:
+        condition: service_completed_successfully
+    volumes:
+      - ./workspace:/app/workspace
+
 volumes:
   pgdata:
