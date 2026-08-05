@@ -28,5 +28,5 @@ class TimestampMixin:
 class UUIDPrimaryKeyMixin:
     """Auto-generated UUIDv4 primary key."""
     id: Mapped[uuid.UUID] = mapped_column(
-        Uuid, primary_key=True, default=uuid.uuid4, default_callable=uuid.uuid4
+        Uuid, primary_key=True, default=uuid.uuid4
     )

@@ -94,10 +94,10 @@ class MemoryService:
             })
 
         # Compute assessment via rules engine
-        assessment = self.rules.assess_claim(
+        assessment = self.rules.assess_from_dicts(
             claim_statement=claim.statement,
-            evidence=evidence_dicts,
             claim_type=claim.claim_type,
+            evidence_dicts=evidence_dicts,
         )
 
         # Persist

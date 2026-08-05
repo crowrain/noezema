@@ -62,13 +62,14 @@ class ORMMessage(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     """Message from human to the thinker."""
     __tablename__ = "messages"
 
+    session_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, ForeignKey("sessions.id"), nullable=True)
     sender: Mapped[str] = mapped_column(String(128), nullable=False)
     body: Mapped[str] = mapped_column(Text, nullable=False)
     priority: Mapped[str] = mapped_column(String(16), default="normal")
     state: Mapped[str] = mapped_column(String(16), default="queued")
 
     # Relations
-    session: Mapped["ORMSession"] = relationship(back_populates="messages")
+    session: Mapped["ORMSession | None"] = relationship(back_populates="messages")
 
 
 class ORMCommitAttempt(Base, UUIDPrimaryKeyMixin, TimestampMixin):

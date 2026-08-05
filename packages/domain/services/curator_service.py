@@ -125,12 +125,14 @@ class CuratorService:
             if stmt_hash in seen_hashes:
                 # Merge: delete duplicate, keep original
                 existing = seen_hashes[stmt_hash]
-                # Move evidence from duplicate to existing
+                # Move evidence from duplicate to existing (direct UPDATE)
                 ev_result = await self.session.execute(
                     select(ORMEvidence).where(ORMEvidence.claim_id == claim.id)
                 )
-                for ev in ev_result.scalars().all():
+                evidences = ev_result.scalars().all()
+                for ev in evidences:
                     ev.claim_id = existing.id
+                await self.session.flush()  # persist evidence moves first
                 await self.session.delete(claim)
                 report["duplicates_merged"] += 1
             else:
