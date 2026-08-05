@@ -20,6 +20,7 @@ from packages.domain.models.session import Session
 from packages.domain.models.enums import SessionState, AuditEventType, ClaimType
 from packages.domain.models.decision import ModelResponse
 from packages.domain.services.memory_service import MemoryService
+from packages.domain.services.curator_llm import CuratorLLM
 from packages.llm_gateway.client import LLMMiddleware
 from packages.llm_gateway.config import LLMGatewayConfig
 from packages.cognition.question_selector import FIFOQuestionSelector
@@ -155,7 +156,7 @@ class Orchestrator:
     async def _curator_commit(
         self, db: AsyncSession, session_id: uuid.UUID, evidence: list[dict]
     ):
-        """Create claim from explored evidence, run rules engine assessment."""
+        """Create claim from explored evidence via LLM curator, run rules assessment."""
         orm_session = await SessionRepository.get_by_id(db, session_id)
         if orm_session is None:
             return
@@ -164,48 +165,57 @@ class Orchestrator:
         await db.flush()
 
         memory_service = MemoryService(db, self.rules_engine)
+        curator_llm = CuratorLLM(self.llm)
 
-        # Build claim statement from evidence summary
-        if evidence:
-            claim_statement = (
-                f"Based on {len(evidence)} exploration steps, "
-                f"evidence gathered via: {', '.join(e['tool'] for e in evidence[:5])}"
+        # Get question for context
+        question_statement = "unknown"
+        if orm_session.question_id:
+            question = await db.get(ORMQuestion, orm_session.question_id)
+            if question:
+                question_statement = question.statement
+
+        # Generate claims via LLM (with fallback)
+        try:
+            curator_result, run_record = await curator_llm.generate_claims(
+                db, question_statement, evidence, session_id
             )
-        else:
-            claim_statement = "No evidence gathered — exploratory session completed without findings."
+        except Exception:
+            # Fallback to heuristic claims
+            curator_result = curator_llm.fallback_claims(evidence, question_statement)
 
-        # Create claim
-        claim = await memory_service.create_claim(
-            statement=claim_statement,
-            claim_type=ClaimType.EMPIRICAL_CONJECTURE.value,
-            session_id=session_id,
-        )
-
-        # Attach evidence
-        for ev in evidence:
-            import hashlib
-            identity_hash = hashlib.sha256(
-                f"{ev['tool']}:{str(ev['result'])}".encode()
-            ).hexdigest()
-            await memory_service.add_evidence(
-                claim_id=claim.id,
-                relation="supports",
-                evidence_kind=ev.get("tool", "unknown"),
-                identity_hash=identity_hash,
+        # Persist claims from LLM response
+        for claim_proposal in curator_result.claims:
+            claim = await memory_service.create_claim(
+                statement=claim_proposal.statement,
+                claim_type=claim_proposal.claim_type,
                 session_id=session_id,
             )
 
-        # Assess
-        assessment = await memory_service.assess_claim(claim.id, session_id=session_id)
+            # Attach evidence to claim
+            for ev in evidence:
+                import hashlib
+                identity_hash = hashlib.sha256(
+                    f"{ev['tool']}:{str(ev['result'])}".encode()
+                ).hexdigest()
+                await memory_service.add_evidence(
+                    claim_id=claim.id,
+                    relation="supports",
+                    evidence_kind=ev.get("tool", "unknown"),
+                    identity_hash=identity_hash,
+                    session_id=session_id,
+                )
 
-        await self._audit(
-            db, session_id, AuditEventType.CLAIM_ASSESSED,
-            payload={
-                "claim_id": str(claim.id),
-                "grade": assessment.effective_grade,
-                "evidence_count": len(evidence),
-            },
-        )
+            # Assess claim via rules engine
+            assessment = await memory_service.assess_claim(claim.id, session_id=session_id)
+
+            await self._audit(
+                db, session_id, AuditEventType.CLAIM_ASSESSED,
+                payload={
+                    "claim_id": str(claim.id),
+                    "grade": assessment.effective_grade,
+                    "evidence_count": len(evidence),
+                },
+            )
 
     def _explorer_prompt(self, question: str) -> str:
         return (

@@ -99,16 +99,20 @@ async def run_loop(orchestrator: Orchestrator, interval: int) -> None:
 async def main() -> None:
     args = parse_args()
 
-    # Init DB
+    # Init DB from env or CLI args
     db_config = DatabaseConfig(url=args.db_url)
     Database.init(db_config)
     log.info("Database initialized: %s", args.db_url.replace("noezema_dev", "***"))
 
-    # Init Orchestrator
-    llm_config = LLMGatewayConfig(
-        base_url=args.llm_base_url,
-        model=args.llm_model,
-    )
+    # Init LLM from env or CLI args (CLI overrides env)
+    llm_config = LLMGatewayConfig.from_env()
+    if args.llm_base_url != "http://localhost:8080/v1":
+        llm_config.base_url = args.llm_base_url
+    if args.llm_model != "qwen3.6-27b-q6":
+        llm_config.model = args.llm_model
+
+    log.info("LLM: %s @ %s", llm_config.model, llm_config.base_url)
+
     orchestrator = Orchestrator(llm_config)
 
     try:
