@@ -306,12 +306,13 @@ async def list_questions(
 
 
 @router.post("/api/questions")
-async def create_question(
-    statement: str,
-    source: str = "operator",
-    db: AsyncSession = Depends(get_session),
-) -> dict:
+async def create_question(body: dict, db: AsyncSession = Depends(get_session)) -> dict:
     """Create a new question and enqueue orchestrator session via RQ."""
+    statement = body.get("statement", "")
+    source = body.get("source", "operator")
+    if not statement:
+        from fastapi import HTTPException
+        raise HTTPException(400, "Missing 'statement' in request body")
     question = ORMQuestion(
         statement=statement,
         source=source,

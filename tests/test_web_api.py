@@ -81,7 +81,7 @@ async def test_create_and_list_questions():
     try:
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as ac:
-            resp = await ac.post("/api/questions", params={
+            resp = await ac.post("/api/questions", json={
                 "statement": "Why is the sky blue?",
                 "source": "seeded",
             })

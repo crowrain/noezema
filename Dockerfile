@@ -12,6 +12,7 @@ RUN pip install --no-cache-dir uv
 
 # Copy project
 COPY pyproject.toml .
+COPY README.md .
 COPY packages/ packages/
 COPY apps/ apps/
 COPY migrations/ migrations/
