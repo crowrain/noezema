@@ -1,0 +1,23 @@
+[Unit]
+Description=Nuezema Orchestrator — autonomous local thinker
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%i
+Group=%i
+WorkingDirectory=%h/noezema-dev
+ExecStart=%h/.venv/bin/python -m apps.orchestrator.main \
+    --db-url postgresql+asyncpg://noezema:noezema_dev@localhost:5432/noezema \
+    --llm-base-url http://localhost:8080/v1 \
+    --llm-model qwen3.6-27b-q6 \
+    --loop-interval 30
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=noezema-orchestrator
+
+[Install]
+WantedBy=multi-user.target
