@@ -25,17 +25,19 @@ from packages.llm_gateway.client import LLMMiddleware
 from packages.llm_gateway.config import LLMGatewayConfig
 from packages.cognition.question_selector import FIFOQuestionSelector
 from packages.tool_broker.sandbox import SandboxExecutor
+from packages.tool_broker.broker import ToolBroker
 from packages.memory.rules_engine import RulesEngine
 
 
 class Orchestrator:
     """DB-backed orchestrator for cognitive sessions."""
 
-    def __init__(self, llm_config: LLMGatewayConfig):
+    def __init__(self, llm_config: LLMGatewayConfig, workspace_dir: str = "/tmp/noezema-workspace"):
         self.llm = LLMMiddleware(llm_config)
         self.llm_config = llm_config
         self.selector = FIFOQuestionSelector()
-        self.sandbox = SandboxExecutor()
+        self.sandbox = SandboxExecutor(workspace_dir=workspace_dir)
+        self.broker = ToolBroker(workspace_dir=workspace_dir)
         self.rules_engine = RulesEngine()
 
     async def run_session(self, question_id: uuid.UUID | None = None) -> uuid.UUID:
@@ -218,21 +220,35 @@ class Orchestrator:
             )
 
     def _explorer_prompt(self, question: str) -> str:
+        tools_list = "\n".join(
+            f"- {t['name']}: {t['description']}"
+            for t in self.broker.list_tools()
+        )
         return (
             "You are an autonomous researcher. Investigate:\n\n"
             f"Question: {question}\n\n"
             "Return a structured decision for each step. Use tools to gather evidence.\n"
             "When done, return decision.kind = 'complete' with reason = 'goal_reached'.\n\n"
-            "Available tools: workspace.read, workspace.list, workspace.write, "
-            "memory.search, shell.execute, python.execute\n\n"
+            f"Available tools:\n{tools_list}\n\n"
             "Respond in JSON with public_rationale and decision fields."
         )
 
     async def _execute_tool(self, decision) -> dict:
-        """Execute a tool action (MVP: workspace operations + sandbox)."""
+        """Execute a tool action via ToolBroker (real execution, not dry-run)."""
         tool = decision.tool
         args = decision.arguments or {}
 
+        # Map old tool names to broker names
+        tool_map = {
+            "shell.execute": "bash",
+            "python.execute": "python",
+            "web_fetch": "web_fetch",
+            "search": "search",
+        }
+
+        broker_tool = tool_map.get(tool)
+
+        # Workspace tools still use sandbox directly
         if tool == "workspace.read":
             content = self.sandbox.read_file(args.get("path", ""))
             return {"content": content}
@@ -246,12 +262,25 @@ class Orchestrator:
             return {"written": written}
         elif tool == "memory.search":
             return {"results": [], "note": "memory empty — first session"}
-        elif tool == "shell.execute":
-            return {"output": "", "note": "sandbox shell not available yet — dry run"}
-        elif tool == "python.execute":
-            return {"output": "", "note": "sandbox python not available yet — dry run"}
+
+        # Real tool execution via broker
+        if broker_tool == "bash":
+            result = self.broker.call("bash", command=args.get("command", "echo 'no command'"))
+        elif broker_tool == "python":
+            result = self.broker.call("python", code=args.get("code", "pass"))
+        elif broker_tool == "web_fetch":
+            result = self.broker.call("web_fetch", url=args.get("url", ""))
+        elif broker_tool == "search":
+            result = self.broker.call("search", query=args.get("query", ""), limit=args.get("limit", 5))
         else:
             return {"error": f"unknown tool: {tool}"}
+
+        return {
+            "output": result.output,
+            "success": result.success,
+            "error": result.error,
+            "duration_ms": result.duration_ms,
+        }
 
     async def _resolve_question(
         self, db: AsyncSession, question_id: uuid.UUID | None
