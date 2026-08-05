@@ -1,0 +1,19 @@
+# Sealed profile — no network, read-only rootfs
+security:
+  network: none
+  read_only_rootfs: true
+  capabilities: []
+  no_new_privileges: true
+  seccomp: default
+resource_limits:
+  cpu_seconds: 300
+  memory_mb: 512
+  max_processes: 10
+  max_file_size_mb: 50
+  timeout_seconds: 60
+allowed_tools:
+  - workspace.read
+  - workspace.list
+  - workspace.write
+  - shell.execute
+  - python.execute
