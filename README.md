@@ -208,9 +208,100 @@ MVP — этапы 1, 2, 3a + минимальный web slice: status, SSE time
 
 ## Статус
 
-📝 Архитектурный draft v0.25 — документация без кода.
+🚀 **MVP v0.1 (2026-08)** — полный познавательный цикл: вопрос → исследование (LLM + инструменты) → claim → оценка → commit. 57 тестов. Docker Compose.
 
-[Полная спецификация](ARCHITECTURE.md) описывает 22 раздела: архитектурные принципы, компоненты, машину состояний сессий, модель памяти, evidence grading, безопасность, воспроизводимость, веб-модуль, модель данных (40 таблиц), надёжность и восстановление, наблюдаемость, стек, структуру, этапы, риски, открытые вопросы и критерии успеха.
+**Что работает:**
+- SQLAlchemy ORM (16 таблиц) + Alembic миграции
+- DB-backed orchestrator с explorer loop (LLM proposes → tool executes → DB persists)
+- Curator LLM с Pydantic schemas и rules engine
+- Tool Broker: bash, python, web_fetch, search (реальное исполнение)
+- Web API (8 эндпоинтов) + Web UI (SPA на `/ui`)
+- RQ Worker (Redis-backed с graceful degradation)
+- Docker Compose (6 сервисов: postgres, redis, web, worker, orchestrator, alembic)
+- GitHub Actions CI
+
+**Как запустить:** [Quick Start](#quick-start)
+
+[Полная спецификация](ARCHITECTURE.md) описывает 22 раздела.
+
+---
+
+## Quick Start
+
+### Требования
+
+- Python 3.11+
+- Docker + Docker Compose
+- Локальная LLM с OpenAI-compatible API (llama.cpp, Ollama, vLLM)
+
+### 1. Клонировать и настроить окружение
+
+```bash
+git clone https://github.com/crowrain/noezema.git
+cd noezema
+cp .env.example .env
+# Отредактируйте .env — минимум LLM_API_BASE и LLM_MODEL
+```
+
+### 2. Поднять стек
+
+```bash
+docker compose -f infra/compose.yaml up -d
+```
+
+Это запустит:
+- **PostgreSQL** (`:5432`) — основная БД
+- **Redis** (`:6379`) — очередь задач RQ
+- **Web API** (`:8000`) — FastAPI + SPA на `/ui`
+- **Worker** — RQ worker для фоновых задач
+- **Orchestrator** — познавательный цикл (запускает сессии)
+- **Alembic** — автозапуск миграций
+
+### 3. Проверить
+
+```bash
+curl http://localhost:8000/
+# {"status":"ok","version":"0.1.0"}
+```
+
+Откройте **Web UI**: http://localhost:8000/ui
+
+### 4. Создать вопрос и запустить сессию
+
+```bash
+curl -X POST http://localhost:8000/api/v1/questions \
+  -H "Content-Type: application/json" \
+  -d '{"statement":"What is the current price of Bitcoin?"}'
+```
+
+Orchestrator подхватит вопрос и начнёт исследование. Прогресс виден в Web UI.
+
+### 5. Локальная разработка (без Docker)
+
+```bash
+# Установить uv
+pip install uv
+
+# Создать виртуалку и зависимости
+uv venv
+uv pip install -e '.[dev]'
+
+# Настроить переменные
+cp .env.example .env
+source .env
+
+# Запустить миграции
+alembic upgrade head
+
+# Запустить Web API
+uvicorn apps.web.app:create_app --factory --port 8000
+
+# Запустить Worker (в другом терминале)
+python -m apps.rq.worker
+
+# Тесты
+pytest tests/ -v
+```
 
 ## License
 
