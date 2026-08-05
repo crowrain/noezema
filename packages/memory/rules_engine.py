@@ -100,3 +100,55 @@ class RulesEngine:
         return hashlib.sha256(
             json.dumps(cls.CLAIM_TYPE_RULES, default=str, sort_keys=True).encode()
         ).hexdigest()
+
+    @classmethod
+    def assess_from_dicts(
+        cls,
+        claim_statement: str,
+        claim_type: str,
+        evidence_dicts: list[dict],
+    ) -> dict:
+        """Assess a claim from raw dicts (no Pydantic models needed).
+
+        Returns dict with: grade (EffectiveGrade), status (EpistemicStatus),
+        confidence (float), rules_hash, evidence_set_hash.
+        """
+        # Build pseudo-Evidence objects for grade computation
+        from collections import namedtuple
+        _Ev = namedtuple("_Ev", ["identity_hash", "evidence_kind", "relation"])
+
+        supports = []
+        counters = []
+        for ed in evidence_dicts:
+            ev = _Ev(
+                identity_hash=ed.get("hash", ed.get("identity_hash", "")),
+                evidence_kind=ed.get("kind", ed.get("evidence_kind", "unknown")),
+                relation=ed.get("relation", "supports"),
+            )
+            if ed.get("relation") == EvidenceRelation.COUNTERS:
+                counters.append(ev)
+            else:
+                supports.append(ev)
+
+        # Compute grade
+        try:
+            ct = ClaimType(claim_type)
+        except ValueError:
+            ct = ClaimType.EXTERNAL_FACT  # default
+        grade = cls._compute_grade(supports, counters, ct)
+        status = cls._compute_epistemic_status(grade, counters)
+        confidence = cls._compute_confidence(grade)
+
+        # Evidence set hash
+        items = sorted(
+            [(e.identity_hash, e.evidence_kind, e.relation) for e in supports + counters]
+        )
+        evidence_set_hash = hashlib.sha256(json.dumps(items).encode()).hexdigest()
+
+        return {
+            "grade": grade,
+            "status": status,
+            "confidence": confidence,
+            "rules_hash": cls._rules_hash(),
+            "evidence_set_hash": evidence_set_hash,
+        }
