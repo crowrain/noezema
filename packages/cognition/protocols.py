@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import json
 from enum import StrEnum
-from typing import Annotated
 
-from pydantic import Field, StringConstraints, model_validator
+from pydantic import Field, model_validator
 
 from packages.cognition.prompts import PromptBundle, PromptKind
 from packages.domain import (
     ClaimReference,
+    ClaimType,
     ComputationObservation,
     DecisionEnvelope,
     EvidenceKind,
@@ -32,11 +32,6 @@ from packages.llm_gateway import (
     ModelPhase,
     ModelRole,
 )
-
-ClaimTypeName = Annotated[
-    str,
-    StringConstraints(strip_whitespace=True, min_length=1, max_length=64),
-]
 
 
 class ProtocolQuestion(ContractModel):
@@ -114,7 +109,7 @@ class CuratorContext(ContractModel):
     question: ProtocolQuestion
     prior_summary: NonEmptyText | None = None
     observations: tuple[ProtocolObservation, ...] = Field(max_length=128)
-    allowed_claim_types: tuple[ClaimTypeName, ...] = Field(min_length=1, max_length=32)
+    allowed_claim_types: tuple[ClaimType, ...] = Field(min_length=1, max_length=32)
     remaining_claim_budget: int = Field(ge=0, le=100)
     remaining_evidence_link_budget: int = Field(ge=0, le=1000)
     remaining_handoff_budget: int = Field(ge=0, le=100)
@@ -145,7 +140,7 @@ class CuratorClaimProposal(ContractModel):
 
     ref: ClaimReference
     statement: NonEmptyText
-    claim_type: ClaimTypeName
+    claim_type: ClaimType
     topic: ShortReason
     evidence: tuple[EvidenceReference, ...] = Field(min_length=1, max_length=16)
 

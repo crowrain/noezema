@@ -33,6 +33,7 @@ from packages.cognition import (
 )
 from packages.domain import (
     ActionId,
+    ClaimType,
     DecisionEnvelope,
     EvidenceKind,
     ObservationId,
@@ -175,12 +176,33 @@ def test_curator_schema_cannot_assign_host_assessment_fields() -> None:
         )
 
 
+def test_curator_claim_type_comes_from_the_closed_registry() -> None:
+    observation = _observation()
+
+    with pytest.raises(ValidationError, match="claim_type"):
+        CuratorClaimProposal.model_validate(
+            {
+                "ref": "claim_1",
+                "statement": "An unregistered type must not cross the protocol boundary.",
+                "claim_type": "fact",
+                "topic": "architecture",
+                "evidence": [
+                    {
+                        "observation_id": str(observation.id),
+                        "relation": "supports",
+                        "scope": "The supplied source.",
+                    }
+                ],
+            }
+        )
+
+
 def test_curator_proposal_must_reference_available_evidence_and_allowed_types() -> None:
     available = _observation()
     context = CuratorContext(
         question=_question(),
         observations=(available,),
-        allowed_claim_types=("fact",),
+        allowed_claim_types=(ClaimType.EXTERNAL_FACT,),
         remaining_claim_budget=2,
         remaining_evidence_link_budget=2,
         remaining_handoff_budget=1,
@@ -192,7 +214,7 @@ def test_curator_proposal_must_reference_available_evidence_and_allowed_types() 
             CuratorClaimProposal(
                 ref="claim_1",
                 statement="NOEZEMA is local-first.",
-                claim_type="hypothesis",
+                claim_type=ClaimType.LOCAL_OBSERVATION,
                 topic="architecture",
                 evidence=(
                     EvidenceReference(
@@ -217,7 +239,7 @@ def test_curator_proposal_respects_host_budgets() -> None:
     context = CuratorContext(
         question=_question(),
         observations=(observation,),
-        allowed_claim_types=("fact",),
+        allowed_claim_types=(ClaimType.EXTERNAL_FACT,),
         remaining_claim_budget=0,
         remaining_evidence_link_budget=0,
         remaining_handoff_budget=0,
@@ -229,7 +251,7 @@ def test_curator_proposal_respects_host_budgets() -> None:
             CuratorClaimProposal(
                 ref="claim_1",
                 statement="NOEZEMA is local-first.",
-                claim_type="fact",
+                claim_type=ClaimType.EXTERNAL_FACT,
                 topic="architecture",
                 evidence=(
                     EvidenceReference(
@@ -253,7 +275,7 @@ def test_curator_request_uses_consolidation_role() -> None:
     context = CuratorContext(
         question=_question(),
         observations=(),
-        allowed_claim_types=("fact",),
+        allowed_claim_types=(ClaimType.EXTERNAL_FACT,),
         remaining_claim_budget=0,
         remaining_evidence_link_budget=0,
         remaining_handoff_budget=1,

@@ -17,6 +17,7 @@ from packages.domain import (
     ActionId,
     ArtifactId,
     ArtifactReference,
+    ClaimType,
     EnvironmentManifestId,
     EnvironmentManifestReference,
     EvidenceAdapterBudget,
@@ -74,7 +75,7 @@ def _proposal(*references: EvidenceReference) -> CuratorProposal:
             CuratorClaimProposal(
                 ref="claim_1",
                 statement="The observed behavior is reproducible in this environment.",
-                claim_type="local_observation",
+                claim_type=ClaimType.LOCAL_OBSERVATION,
                 topic="runtime",
                 evidence=references,
             ),

@@ -1,6 +1,18 @@
 """Trusted domain contracts and invariants."""
 
 from packages.domain.actions import BoundAction, bind_action, canonical_json_sha256
+from packages.domain.assessments import (
+    ClaimAssessment,
+    ClaimAssessmentInput,
+    ClaimType,
+    ClaimTypeRule,
+    ClaimTypeRulesSnapshot,
+    ConfidencePolicy,
+    EpistemicStatus,
+    EvidenceGrade,
+    RuleEvidenceFacts,
+    ScopeDimension,
+)
 from packages.domain.decisions import CompleteDecision, DecisionEnvelope, ToolDecision
 from packages.domain.enums import (
     ActionState,
@@ -64,9 +76,15 @@ __all__ = [
     "CommitAttemptId",
     "ChunkId",
     "ClaimReference",
+    "ClaimAssessment",
+    "ClaimAssessmentInput",
+    "ClaimType",
+    "ClaimTypeRule",
+    "ClaimTypeRulesSnapshot",
     "ComputationObservation",
     "ConfigSnapshotId",
     "CompleteDecision",
+    "ConfidencePolicy",
     "DecisionEnvelope",
     "DecisionKind",
     "DuplicateEvidenceReference",
@@ -77,6 +95,8 @@ __all__ = [
     "EvidenceKind",
     "EvidenceProposal",
     "EvidenceUse",
+    "EpistemicStatus",
+    "EvidenceGrade",
     "EventType",
     "ExperimentObservation",
     "IdempotencyClass",
@@ -91,8 +111,10 @@ __all__ = [
     "QuestionId",
     "QuestionOrigin",
     "QuestionState",
+    "RuleEvidenceFacts",
     "SessionId",
     "SessionState",
+    "ScopeDimension",
     "SourceId",
     "SourceObservation",
     "SourceRange",
