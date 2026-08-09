@@ -1,5 +1,26 @@
 """Host-owned cognition components."""
 
+from packages.cognition.prompts import PromptBundle, PromptKind, PromptSnapshot
+from packages.cognition.protocols import (
+    CuratorClaimProposal,
+    CuratorContext,
+    CuratorOutcome,
+    CuratorProposal,
+    CuratorProposalValidationError,
+    EvidenceReference,
+    EvidenceRelation,
+    ExplorerContext,
+    ExplorerDecisionValidationError,
+    HandoffProposal,
+    ObservationProvenance,
+    ProtocolObservation,
+    ProtocolQuestion,
+    RelevantClaim,
+    build_curator_request,
+    build_explorer_request,
+    validate_curator_proposal,
+    validate_explorer_decision,
+)
 from packages.cognition.questions import (
     QuestionIdentityConflictError,
     enqueue_question,
@@ -8,8 +29,29 @@ from packages.cognition.questions import (
 )
 
 __all__ = [
+    "CuratorClaimProposal",
+    "CuratorContext",
+    "CuratorOutcome",
+    "CuratorProposal",
+    "CuratorProposalValidationError",
+    "EvidenceReference",
+    "EvidenceRelation",
+    "ExplorerDecisionValidationError",
+    "ExplorerContext",
+    "HandoffProposal",
+    "ObservationProvenance",
+    "PromptBundle",
+    "PromptKind",
+    "PromptSnapshot",
+    "ProtocolObservation",
+    "ProtocolQuestion",
     "QuestionIdentityConflictError",
+    "RelevantClaim",
+    "build_curator_request",
+    "build_explorer_request",
     "enqueue_question",
     "fifo_question_statement",
     "select_fifo_question_for_update",
+    "validate_curator_proposal",
+    "validate_explorer_decision",
 ]

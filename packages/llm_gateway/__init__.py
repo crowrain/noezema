@@ -20,6 +20,7 @@ from packages.llm_gateway.errors import (
 from packages.llm_gateway.fingerprint import (
     InvocationFingerprint,
     model_fingerprint_sha256,
+    response_schema_sha256,
     tool_schema_sha256,
 )
 from packages.llm_gateway.gateway import LLMGateway
@@ -31,6 +32,7 @@ from packages.llm_gateway.models import (
     ModelRole,
     ModelRunResult,
     RetryPolicy,
+    StructuredRunResult,
     TokenUsage,
 )
 from packages.llm_gateway.transport import OpenAICompatibleTransport
@@ -57,9 +59,11 @@ __all__ = [
     "RuntimeSettings",
     "SamplingSettings",
     "StructuredOutputSettings",
+    "StructuredRunResult",
     "TokenUsage",
     "TransientBackendError",
     "TransportConfig",
     "model_fingerprint_sha256",
+    "response_schema_sha256",
     "tool_schema_sha256",
 ]

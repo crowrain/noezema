@@ -8,6 +8,7 @@ from collections.abc import Callable
 import httpx
 import pytest
 
+from packages.cognition import CuratorOutcome, CuratorProposal
 from packages.domain import ToolDecision, ToolName
 from packages.llm_gateway import (
     BackendProtocolError,
@@ -24,6 +25,7 @@ from packages.llm_gateway import (
     PermanentBackendError,
     RetryExhaustedError,
     RetryPolicy,
+    response_schema_sha256,
 )
 
 
@@ -36,6 +38,7 @@ def _request() -> GatewayRequest:
         role=ModelRole.EXPLORER,
         phase=ModelPhase.EXPLORATION,
         prompt_version="explorer/v1",
+        prompt_sha256="6" * 64,
         context_manifest_sha256="5" * 64,
         policy_version="policy/v1",
     )
@@ -98,6 +101,41 @@ def test_gateway_sends_json_schema_and_parses_one_decision(model_profile: ModelP
     assert isinstance(schema, dict)
     assert schema["strict"] is True
     assert "idempotency_key" not in json.dumps(schema)
+
+
+def test_gateway_accepts_a_caller_selected_curator_schema(model_profile: ModelProfile) -> None:
+    captured: dict[str, object] = {}
+    content = json.dumps(
+        {
+            "public_summary": "Evidence remains insufficient.",
+            "outcome": "insufficient_evidence",
+            "claims": [],
+            "handoffs": [],
+        }
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content))
+        return httpx.Response(200, json=_provider_response(content=content))
+
+    gateway = _gateway(model_profile, handler)
+    request = _request().model_copy(
+        update={"role": ModelRole.CURATOR, "phase": ModelPhase.CONSOLIDATION}
+    )
+    result = gateway.generate_structured(
+        request,
+        response_model=CuratorProposal,
+        schema_name="noezema_curator_proposal_v1",
+    )
+
+    assert result.output.outcome is CuratorOutcome.INSUFFICIENT_EVIDENCE
+    assert result.output_schema_sha256 == response_schema_sha256(CuratorProposal)
+    response_format = captured["response_format"]
+    assert isinstance(response_format, dict)
+    schema = response_format["json_schema"]
+    assert isinstance(schema, dict)
+    assert schema["name"] == "noezema_curator_proposal_v1"
+    assert schema["schema"] == CuratorProposal.model_json_schema()
 
 
 def test_gateway_retries_only_transient_backend_failures(model_profile: ModelProfile) -> None:

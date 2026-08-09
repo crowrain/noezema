@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
+from packages.cognition import CuratorProposal
 from packages.llm_gateway import (
     ChatMessage,
     ChatRole,
@@ -23,6 +24,7 @@ def _request() -> GatewayRequest:
         role=ModelRole.EXPLORER,
         phase=ModelPhase.EXPLORATION,
         prompt_version="explorer/v1",
+        prompt_sha256="6" * 64,
         context_manifest_sha256="5" * 64,
         policy_version="policy/v1",
     )
@@ -62,3 +64,25 @@ def test_invocation_fingerprint_covers_context_and_protocol(model_profile: Model
 
     assert first.sha256 != second.sha256
     assert first.tool_schema_sha256
+
+
+def test_invocation_fingerprint_covers_exact_prompt_bytes(model_profile: ModelProfile) -> None:
+    first = InvocationFingerprint.create(profile=model_profile, request=_request())
+    changed_request = _request().model_copy(update={"prompt_sha256": "7" * 64})
+    second = InvocationFingerprint.create(profile=model_profile, request=changed_request)
+
+    assert first.sha256 != second.sha256
+
+
+def test_invocation_fingerprint_covers_the_selected_output_schema(
+    model_profile: ModelProfile,
+) -> None:
+    decision_run = InvocationFingerprint.create(profile=model_profile, request=_request())
+    curator_run = InvocationFingerprint.create(
+        profile=model_profile,
+        request=_request(),
+        response_model=CuratorProposal,
+    )
+
+    assert decision_run.sha256 != curator_run.sha256
+    assert decision_run.tool_schema_sha256 != curator_run.tool_schema_sha256

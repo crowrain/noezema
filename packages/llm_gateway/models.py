@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Annotated
+from typing import Annotated, Generic, TypeVar
 
-from pydantic import Field, NonNegativeInt, StringConstraints, model_validator
+from pydantic import BaseModel, Field, NonNegativeInt, StringConstraints, model_validator
 
 from packages.domain import DecisionEnvelope
 from packages.domain._base import ContractModel, Sha256Hex
@@ -18,6 +18,7 @@ VersionText = Annotated[
     str,
     StringConstraints(strip_whitespace=True, min_length=1, max_length=256),
 ]
+StructuredOutputT = TypeVar("StructuredOutputT", bound=BaseModel)
 
 
 class ChatRole(StrEnum):
@@ -48,6 +49,7 @@ class GatewayRequest(ContractModel):
     role: ModelRole
     phase: ModelPhase
     prompt_version: VersionText
+    prompt_sha256: Sha256Hex
     context_manifest_sha256: Sha256Hex
     policy_version: VersionText
 
@@ -88,3 +90,17 @@ class ModelRunResult(ContractModel):
     model_fingerprint_sha256: Sha256Hex
     invocation_fingerprint_sha256: Sha256Hex
     tool_schema_sha256: Sha256Hex
+
+
+class StructuredRunResult(ContractModel, Generic[StructuredOutputT]):
+    """Validated result for a caller-selected strict output contract."""
+
+    output: StructuredOutputT
+    finish_reason: str
+    backend_model: str
+    usage: TokenUsage
+    latency_ms: NonNegativeInt
+    attempts: int = Field(ge=1)
+    model_fingerprint_sha256: Sha256Hex
+    invocation_fingerprint_sha256: Sha256Hex
+    output_schema_sha256: Sha256Hex

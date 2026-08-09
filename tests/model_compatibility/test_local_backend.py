@@ -87,6 +87,7 @@ def test_local_backend_returns_schema_valid_tool_decision() -> None:
         role=ModelRole.EXPLORER,
         phase=ModelPhase.EXPLORATION,
         prompt_version="compatibility/explorer-v1",
+        prompt_sha256="0" * 64,
         context_manifest_sha256="0" * 64,
         policy_version="compatibility/policy-v1",
     )

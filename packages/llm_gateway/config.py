@@ -35,7 +35,7 @@ class BackendMetadata(_ConfigModel):
 
 class StructuredOutputSettings(_ConfigModel):
     mode: Literal["json_schema"] = "json_schema"
-    schema_version: Literal["action-envelope/v1"] = "action-envelope/v1"
+    schema_version: Literal["structured-output/v1", "action-envelope/v1"] = "structured-output/v1"
     grammar_sha256: Sha256Hex
 
 

@@ -61,3 +61,7 @@ class OutboxEventId(_UuidIdentifier):
 
 class QuestionId(_UuidIdentifier):
     """Identity of one durable research question."""
+
+
+class ObservationId(_UuidIdentifier):
+    """Identity assigned to one typed tool observation by the trusted host."""
