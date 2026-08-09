@@ -6,16 +6,23 @@ import json
 from enum import StrEnum
 from typing import Annotated
 
-from pydantic import AwareDatetime, Field, StringConstraints, model_validator
+from pydantic import Field, StringConstraints, model_validator
 
 from packages.cognition.prompts import PromptBundle, PromptKind
 from packages.domain import (
+    ClaimReference,
+    ComputationObservation,
     DecisionEnvelope,
+    EvidenceKind,
+    ExperimentObservation,
     ObservationId,
+    ObservationProvenance,
     QuestionId,
     ToolDecision,
     ToolName,
+    TypedObservation,
     canonical_json_sha256,
+    evidence_identity_sha256,
 )
 from packages.domain._base import ContractModel, NonEmptyText, Sha256Hex, ShortReason
 from packages.llm_gateway import (
@@ -26,10 +33,6 @@ from packages.llm_gateway import (
     ModelRole,
 )
 
-ClaimReference = Annotated[
-    str,
-    StringConstraints(pattern=r"^[a-z][a-z0-9_-]{0,63}$"),
-]
 ClaimTypeName = Annotated[
     str,
     StringConstraints(strip_whitespace=True, min_length=1, max_length=64),
@@ -41,23 +44,40 @@ class ProtocolQuestion(ContractModel):
     text: NonEmptyText
 
 
-class ObservationProvenance(ContractModel):
-    """Public provenance already established by the trusted Tool Broker."""
-
-    tool: ToolName
-    source: NonEmptyText
-    captured_at: AwareDatetime
-
-
 class ProtocolObservation(ContractModel):
     """Read-only observation reference exposed to a model role."""
 
     id: ObservationId
-    kind: ShortReason
+    kind: EvidenceKind
     public_summary: NonEmptyText
     payload_sha256: Sha256Hex
     artifact_sha256: Sha256Hex | None = None
+    identity_sha256: Sha256Hex
     provenance: ObservationProvenance
+
+    @classmethod
+    def from_typed(
+        cls,
+        observation: TypedObservation,
+        *,
+        public_summary: str,
+    ) -> ProtocolObservation:
+        """Expose a bounded model-facing view of one trusted observation."""
+
+        artifact_sha256 = (
+            observation.artifact.sha256
+            if isinstance(observation, ExperimentObservation | ComputationObservation)
+            else None
+        )
+        return cls(
+            id=observation.id,
+            kind=observation.kind,
+            public_summary=public_summary,
+            payload_sha256=observation.payload_sha256,
+            artifact_sha256=artifact_sha256,
+            identity_sha256=evidence_identity_sha256(observation),
+            provenance=observation.provenance,
+        )
 
 
 class RelevantClaim(ContractModel):
@@ -226,7 +246,7 @@ def build_explorer_request(
 
     _require_role(prompts, PromptKind.EXPLORER)
     return _build_request(
-        protocol="explorer-input/v1",
+        protocol="explorer-input/v2",
         context=context,
         prompts=prompts,
         policy_version=policy_version,
@@ -245,7 +265,7 @@ def build_curator_request(
 
     _require_role(prompts, PromptKind.CURATOR)
     return _build_request(
-        protocol="curator-input/v1",
+        protocol="curator-input/v2",
         context=context,
         prompts=prompts,
         policy_version=policy_version,

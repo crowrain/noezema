@@ -31,7 +31,14 @@ from packages.cognition import (
     validate_curator_proposal,
     validate_explorer_decision,
 )
-from packages.domain import DecisionEnvelope, ObservationId, QuestionId, ToolName
+from packages.domain import (
+    ActionId,
+    DecisionEnvelope,
+    EvidenceKind,
+    ObservationId,
+    QuestionId,
+    ToolName,
+)
 from packages.llm_gateway import ChatRole, ModelPhase, ModelRole
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -58,10 +65,12 @@ def _question() -> ProtocolQuestion:
 def _observation() -> ProtocolObservation:
     return ProtocolObservation(
         id=ObservationId.new(),
-        kind="web_document",
+        kind=EvidenceKind.SOURCE_ASSERTION,
         public_summary="The project documentation describes a local-first thinker.",
         payload_sha256="a" * 64,
+        identity_sha256="b" * 64,
         provenance=ObservationProvenance(
+            action_id=ActionId.new(),
             tool=ToolName.WEB_FETCH,
             source="https://example.test/noezema",
             captured_at=datetime(2026, 8, 5, tzinfo=UTC),
@@ -90,7 +99,7 @@ def test_explorer_request_has_one_canonical_context_and_exact_prompt_hash() -> N
     assert request.prompt_sha256 == bundle.sha256
     assert [message.role for message in request.messages] == [ChatRole.SYSTEM, ChatRole.USER]
     payload = json.loads(request.messages[1].content)
-    assert payload["protocol"] == "explorer-input/v1"
+    assert payload["protocol"] == "explorer-input/v2"
     assert payload["context"]["question"]["id"] == str(context.question.id)
     assert request.messages[1].content == json.dumps(
         payload,
@@ -258,4 +267,4 @@ def test_curator_request_uses_consolidation_role() -> None:
 
     assert request.role is ModelRole.CURATOR
     assert request.phase is ModelPhase.CONSOLIDATION
-    assert json.loads(request.messages[1].content)["protocol"] == "curator-input/v1"
+    assert json.loads(request.messages[1].content)["protocol"] == "curator-input/v2"

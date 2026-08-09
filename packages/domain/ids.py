@@ -65,3 +65,19 @@ class QuestionId(_UuidIdentifier):
 
 class ObservationId(_UuidIdentifier):
     """Identity assigned to one typed tool observation by the trusted host."""
+
+
+class ArtifactId(_UuidIdentifier):
+    """Identity assigned to one content-addressed artifact by the trusted host."""
+
+
+class SourceId(_UuidIdentifier):
+    """Identity of one provenance source registered by the trusted host."""
+
+
+class ChunkId(_UuidIdentifier):
+    """Identity of one exact source chunk registered by the trusted host."""
+
+
+class EnvironmentManifestId(_UuidIdentifier):
+    """Identity of one immutable execution-environment manifest."""
