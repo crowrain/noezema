@@ -81,3 +81,23 @@ class ChunkId(_UuidIdentifier):
 
 class EnvironmentManifestId(_UuidIdentifier):
     """Identity of one immutable execution-environment manifest."""
+
+
+class ClaimId(_UuidIdentifier):
+    """Stable identity of one knowledge claim."""
+
+
+class EvidenceId(_UuidIdentifier):
+    """Identity of one deduplicated evidence record."""
+
+
+class ClaimAssessmentId(_UuidIdentifier):
+    """Identity of one immutable rules assessment."""
+
+
+class SessionStagingId(_UuidIdentifier):
+    """Identity of one immutable session staging batch."""
+
+
+class CheckpointId(_UuidIdentifier):
+    """Identity of one committed database checkpoint."""

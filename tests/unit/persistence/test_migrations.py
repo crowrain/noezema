@@ -9,7 +9,14 @@ import pytest
 from alembic import command
 from alembic.config import Config
 
-from packages.domain import EventType, QuestionOrigin, QuestionState
+from packages.domain import (
+    ClaimType,
+    EpistemicStatus,
+    EventType,
+    EvidenceKind,
+    QuestionOrigin,
+    QuestionState,
+)
 from packages.persistence import (
     BOOTSTRAP_CONFIG_SNAPSHOT_ID,
     BOOTSTRAP_PAYLOAD_SHA256,
@@ -23,6 +30,7 @@ from packages.persistence import (
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 FOUNDATION_MIGRATION = importlib.import_module("migrations.versions.0001_operational_foundation")
 QUESTION_MIGRATION = importlib.import_module("migrations.versions.0002_fifo_questions")
+KNOWLEDGE_MIGRATION = importlib.import_module("migrations.versions.0003_knowledge_commit_slice")
 FOUNDATION_TABLES = {
     "actions",
     "audit_events",
@@ -34,7 +42,17 @@ FOUNDATION_TABLES = {
     "sessions",
     "system_constants",
 }
-EXPECTED_TABLES = FOUNDATION_TABLES | {"questions"}
+EXPECTED_TABLES = FOUNDATION_TABLES | {
+    "assessment_evidence",
+    "checkpoints",
+    "claim_assessment_heads",
+    "claim_assessments",
+    "claims",
+    "commit_attempts",
+    "evidence",
+    "questions",
+    "session_staging",
+}
 
 
 def test_application_and_immutable_migration_literals_match() -> None:
@@ -50,6 +68,12 @@ def test_question_migration_literals_match_domain_enums() -> None:
     assert QUESTION_MIGRATION.QUESTION_ORIGINS == tuple(item.value for item in QuestionOrigin)
     assert QUESTION_MIGRATION.QUESTION_STATES == tuple(item.value for item in QuestionState)
     assert QUESTION_MIGRATION.AUDIT_EVENT_TYPES_V2 == tuple(item.value for item in EventType)
+
+
+def test_knowledge_migration_literals_match_closed_domain_registries() -> None:
+    assert KNOWLEDGE_MIGRATION.CLAIM_TYPES == tuple(item.value for item in ClaimType)
+    assert KNOWLEDGE_MIGRATION.EVIDENCE_KINDS == tuple(item.value for item in EvidenceKind)
+    assert KNOWLEDGE_MIGRATION.EPISTEMIC_STATUSES == tuple(item.value for item in EpistemicStatus)
 
 
 def test_bootstrap_payload_has_no_shared_mutable_state() -> None:
@@ -92,6 +116,7 @@ def test_migrations_render_valid_bootstrap_and_fifo_sql(
     assert '"embeddings":null' in sql
     assert '"embeddings"NULL' not in sql
     assert "ALTER TABLE sessions ADD COLUMN question_id UUID" in sql
+    assert "ALTER TABLE sessions ADD COLUMN commit_attempt_id UUID" in sql
     assert "CREATE INDEX ix_questions_fifo" in sql
     assert "DROP CONSTRAINT ck_audit_events_type_allowed" in sql
     assert "ck_audit_events_ck_audit_events_type_allowed" not in sql
@@ -99,5 +124,8 @@ def test_migrations_render_valid_bootstrap_and_fifo_sql(
     command.downgrade(config, "head:base", sql=True)
     downgrade_sql = capsys.readouterr().out
     assert "DROP TABLE questions" in downgrade_sql
+    assert "DROP TABLE claim_assessments" in downgrade_sql
+    assert "DROP TABLE commit_attempts" in downgrade_sql
     assert "DROP COLUMN question_id" in downgrade_sql
+    assert "DROP COLUMN commit_attempt_id" in downgrade_sql
     assert "DROP CONSTRAINT ck_audit_events_type_allowed" in downgrade_sql

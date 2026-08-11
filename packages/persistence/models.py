@@ -25,7 +25,12 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from packages.domain import (
     ActionState,
+    ClaimType,
+    EpistemicStatus,
     EventType,
+    EvidenceGrade,
+    EvidenceKind,
+    EvidenceUse,
     IdempotencyClass,
     PolicyDecision,
     QuestionOrigin,
@@ -184,6 +189,9 @@ class SessionRecord(Base):
     question_id: Mapped[UUID | None] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("questions.id"), nullable=True
     )
+    commit_attempt_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("commit_attempts.id"), nullable=True
+    )
     lease_owner: Mapped[str | None] = mapped_column(String(128), nullable=True)
     lease_expires_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
@@ -307,3 +315,236 @@ class OutboxEventRecord(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     attempts: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class CommitAttemptRecord(Base):
+    __tablename__ = "commit_attempts"
+    __table_args__ = (
+        CheckConstraint(
+            _allowed_values("status", ["prepared", "reconciling", "committed", "aborted"]),
+            name="status_allowed",
+        ),
+        CheckConstraint("validated_knowledge_revision >= 0", name="knowledge_revision_nonnegative"),
+        CheckConstraint(
+            "validated_dependency_graph_revision >= 0",
+            name="dependency_graph_revision_nonnegative",
+        ),
+        CheckConstraint(
+            _allowed_values("terminal_state", ["succeeded", "succeeded_partial"]),
+            name="terminal_state_allowed",
+        ),
+        UniqueConstraint("session_id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    session_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("sessions.id"))
+    status: Mapped[str] = mapped_column(String(16))
+    validated_knowledge_revision: Mapped[int] = mapped_column(BigInteger)
+    validated_dependency_graph_revision: Mapped[int] = mapped_column(BigInteger)
+    staging_hash: Mapped[str] = mapped_column(String(64))
+    terminal_state: Mapped[str] = mapped_column(String(32))
+    prepared_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class SessionStagingRecord(Base):
+    __tablename__ = "session_staging"
+    __table_args__ = (
+        CheckConstraint("aggregate_type = 'knowledge_batch'", name="aggregate_type_allowed"),
+        CheckConstraint("operation = 'insert'", name="operation_allowed"),
+        CheckConstraint("schema_version = 1", name="schema_version_supported"),
+        CheckConstraint("validation_status = 'verified'", name="validation_status_allowed"),
+        CheckConstraint("validated_knowledge_revision >= 0", name="knowledge_revision_nonnegative"),
+        CheckConstraint(
+            "validated_dependency_graph_revision >= 0",
+            name="dependency_graph_revision_nonnegative",
+        ),
+        UniqueConstraint("attempt_id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    session_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("sessions.id"))
+    attempt_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("commit_attempts.id"))
+    aggregate_type: Mapped[str] = mapped_column(String(32))
+    operation: Mapped[str] = mapped_column(String(16))
+    payload: Mapped[dict[str, Any]] = mapped_column(JsonType)
+    payload_hash: Mapped[str] = mapped_column(String(64))
+    schema_version: Mapped[int] = mapped_column(Integer)
+    validation_status: Mapped[str] = mapped_column(String(16))
+    validated_knowledge_revision: Mapped[int] = mapped_column(BigInteger)
+    validated_dependency_graph_revision: Mapped[int] = mapped_column(BigInteger)
+    validation_rules_hash: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class ClaimRecord(Base):
+    __tablename__ = "claims"
+    __table_args__ = (
+        CheckConstraint("length(statement) BETWEEN 1 AND 4096", name="statement_length"),
+        CheckConstraint(
+            _allowed_values("claim_type", [item.value for item in ClaimType]),
+            name="claim_type_allowed",
+        ),
+        CheckConstraint(
+            _allowed_values("freshness_status", ["fresh", "due", "stale", "unknown"]),
+            name="freshness_status_allowed",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    statement: Mapped[str] = mapped_column(Text)
+    claim_type: Mapped[str] = mapped_column(String(32))
+    freshness_status: Mapped[str] = mapped_column(String(16))
+    as_of: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    observed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    reverify_after: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    topic: Mapped[str] = mapped_column(String(256))
+    created_in_session: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("sessions.id"))
+
+
+class EvidenceRecord(Base):
+    __tablename__ = "evidence"
+    __table_args__ = (
+        CheckConstraint(
+            _allowed_values("relation", [item.value for item in EvidenceUse]),
+            name="relation_allowed",
+        ),
+        CheckConstraint(
+            _allowed_values("evidence_kind", [item.value for item in EvidenceKind]),
+            name="evidence_kind_allowed",
+        ),
+        UniqueConstraint("claim_id", "evidence_kind", "identity_hash"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    claim_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("claims.id"))
+    relation: Mapped[str] = mapped_column(String(16))
+    evidence_kind: Mapped[str] = mapped_column(String(32))
+    identity_hash: Mapped[str] = mapped_column(String(64))
+    scope: Mapped[str] = mapped_column(Text)
+    observation: Mapped[dict[str, Any]] = mapped_column(JsonType)
+    covered_scope: Mapped[list[str]] = mapped_column(JsonType)
+    integrity_checked: Mapped[bool] = mapped_column()
+    independence_group: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    successful: Mapped[bool | None] = mapped_column(nullable=True)
+    created_in_session: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("sessions.id"))
+
+
+class ClaimAssessmentRecord(Base):
+    __tablename__ = "claim_assessments"
+    __table_args__ = (
+        CheckConstraint(
+            _allowed_values("effective_grade", [item.value for item in EvidenceGrade]),
+            name="effective_grade_allowed",
+        ),
+        CheckConstraint(
+            _allowed_values("epistemic_status", [item.value for item in EpistemicStatus]),
+            name="epistemic_status_allowed",
+        ),
+        CheckConstraint("confidence_basis_points BETWEEN 0 AND 10000", name="confidence_range"),
+        CheckConstraint(
+            "(valid AND invalidation_reason IS NULL) OR "
+            "(NOT valid AND invalidation_reason IS NOT NULL)",
+            name="validity_tuple_complete",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    claim_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("claims.id"))
+    effective_grade: Mapped[str] = mapped_column(String(2))
+    epistemic_status: Mapped[str] = mapped_column(String(16))
+    rules_version: Mapped[str] = mapped_column(String(256))
+    rules_hash: Mapped[str] = mapped_column(String(64))
+    evidence_set_hash: Mapped[str] = mapped_column(String(64))
+    assessed_scope: Mapped[list[str]] = mapped_column(JsonType)
+    confidence_basis_points: Mapped[int] = mapped_column(Integer)
+    valid: Mapped[bool] = mapped_column()
+    invalidation_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_in_session: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("sessions.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class AssessmentEvidenceRecord(Base):
+    __tablename__ = "assessment_evidence"
+    __table_args__ = (
+        CheckConstraint(
+            _allowed_values("role", ["support", "counter", "scope_witness", "context"]),
+            name="role_allowed",
+        ),
+    )
+
+    assessment_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("claim_assessments.id"), primary_key=True
+    )
+    evidence_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("evidence.id"), primary_key=True
+    )
+    role: Mapped[str] = mapped_column(String(16))
+
+
+class ClaimAssessmentHeadRecord(Base):
+    __tablename__ = "claim_assessment_heads"
+    __table_args__ = (
+        CheckConstraint(
+            _allowed_values("assessment_state", ["current", "pending", "invalid"]),
+            name="assessment_state_allowed",
+        ),
+        CheckConstraint(
+            _allowed_values(
+                "epistemic_status",
+                [item.value for item in EpistemicStatus],
+            ),
+            name="epistemic_status_allowed",
+        ),
+        CheckConstraint(
+            _allowed_values(
+                "prepared_by",
+                ["session", "rules_activation", "reassessment_worker"],
+            ),
+            name="prepared_by_allowed",
+        ),
+        CheckConstraint(
+            "(assessment_state = 'current' AND current_assessment_id IS NOT NULL "
+            "AND epistemic_status IS NOT NULL) OR "
+            "(assessment_state IN ('pending', 'invalid') "
+            "AND current_assessment_id IS NULL AND epistemic_status IS NULL)",
+            name="lifecycle_tuple_complete",
+        ),
+    )
+
+    claim_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("claims.id"), primary_key=True
+    )
+    config_snapshot_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("config_snapshots.id"), primary_key=True
+    )
+    assessment_state: Mapped[str] = mapped_column(String(16))
+    current_assessment_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("claim_assessments.id"), nullable=True
+    )
+    epistemic_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    prepared_by: Mapped[str] = mapped_column(String(32))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class CheckpointRecord(Base):
+    __tablename__ = "checkpoints"
+    __table_args__ = (
+        CheckConstraint("knowledge_revision >= 0", name="knowledge_revision_nonnegative"),
+        CheckConstraint(
+            "dependency_graph_revision >= 0",
+            name="dependency_graph_revision_nonnegative",
+        ),
+        UniqueConstraint("session_id"),
+        UniqueConstraint("database_commit_id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    session_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("sessions.id"))
+    database_commit_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("commit_attempts.id")
+    )
+    knowledge_revision: Mapped[int] = mapped_column(BigInteger)
+    dependency_graph_revision: Mapped[int] = mapped_column(BigInteger)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
