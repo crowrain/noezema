@@ -4,6 +4,7 @@ import pytest
 from pydantic import ValidationError
 
 from packages.domain import (
+    ActionState,
     BoundAction,
     IdempotencyClass,
     ModelRunId,
@@ -91,4 +92,17 @@ def test_bound_action_rejects_argument_hash_mismatch() -> None:
     invalid_payload["arguments_sha256"] = "0" * 64
 
     with pytest.raises(ValidationError, match="arguments_sha256 does not match"):
+        BoundAction.model_validate(invalid_payload)
+
+
+def test_bound_action_state_is_assigned_by_the_trusted_lifecycle() -> None:
+    action = bind_action(
+        session_id=SessionId.new(),
+        model_run_id=ModelRunId.new(),
+        decision=_decision(ToolName.WORKSPACE_LIST),
+    )
+    invalid_payload = action.model_dump()
+    invalid_payload["state"] = ActionState.COMPLETED
+
+    with pytest.raises(ValidationError, match="must be in the proposed state"):
         BoundAction.model_validate(invalid_payload)

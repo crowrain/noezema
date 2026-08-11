@@ -72,6 +72,8 @@ class BoundAction(ContractModel):
 
     @model_validator(mode="after")
     def verify_binding(self) -> BoundAction:
+        if self.state is not ActionState.PROPOSED:
+            raise ValueError("a newly bound action must be in the proposed state")
         if self.idempotency_class is not _TOOL_IDEMPOTENCY[self.tool]:
             raise ValueError("idempotency_class does not match the trusted tool registry")
         arguments = self.arguments

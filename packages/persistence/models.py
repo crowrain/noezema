@@ -242,6 +242,13 @@ class ActionRecord(Base):
             _allowed_values("state", [item.value for item in ActionState]),
             name="state_allowed",
         ),
+        CheckConstraint("attempt_count >= 0", name="attempt_count_nonnegative"),
+        CheckConstraint(
+            "(policy_version IS NULL AND policy_hash IS NULL AND policy_reason IS NULL) OR "
+            "(policy_version IS NOT NULL AND policy_hash IS NOT NULL "
+            "AND policy_reason IS NOT NULL)",
+            name="policy_snapshot_complete",
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
@@ -250,9 +257,14 @@ class ActionRecord(Base):
     idempotency_key: Mapped[UUID] = mapped_column(Uuid(as_uuid=True))
     idempotency_class: Mapped[str] = mapped_column(String(32))
     tool: Mapped[str] = mapped_column(String(128))
+    arguments_json: Mapped[str] = mapped_column(Text)
     arguments_sha256: Mapped[str] = mapped_column(String(64))
     policy_decision: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    policy_version: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    policy_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    policy_reason: Mapped[str | None] = mapped_column(String(256), nullable=True)
     state: Mapped[str] = mapped_column(String(32))
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

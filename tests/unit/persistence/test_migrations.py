@@ -31,6 +31,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 FOUNDATION_MIGRATION = importlib.import_module("migrations.versions.0001_operational_foundation")
 QUESTION_MIGRATION = importlib.import_module("migrations.versions.0002_fifo_questions")
 KNOWLEDGE_MIGRATION = importlib.import_module("migrations.versions.0003_knowledge_commit_slice")
+TOOL_BROKER_MIGRATION = importlib.import_module("migrations.versions.0004_tool_broker")
 FOUNDATION_TABLES = {
     "actions",
     "audit_events",
@@ -117,6 +118,8 @@ def test_migrations_render_valid_bootstrap_and_fifo_sql(
     assert '"embeddings"NULL' not in sql
     assert "ALTER TABLE sessions ADD COLUMN question_id UUID" in sql
     assert "ALTER TABLE sessions ADD COLUMN commit_attempt_id UUID" in sql
+    assert "ALTER TABLE actions ADD COLUMN arguments_json TEXT" in sql
+    assert "ALTER TABLE actions ADD COLUMN attempt_count INTEGER" in sql
     assert "CREATE INDEX ix_questions_fifo" in sql
     assert "DROP CONSTRAINT ck_audit_events_type_allowed" in sql
     assert "ck_audit_events_ck_audit_events_type_allowed" not in sql
@@ -128,4 +131,5 @@ def test_migrations_render_valid_bootstrap_and_fifo_sql(
     assert "DROP TABLE commit_attempts" in downgrade_sql
     assert "DROP COLUMN question_id" in downgrade_sql
     assert "DROP COLUMN commit_attempt_id" in downgrade_sql
+    assert "DROP COLUMN arguments_json" in downgrade_sql
     assert "DROP CONSTRAINT ck_audit_events_type_allowed" in downgrade_sql

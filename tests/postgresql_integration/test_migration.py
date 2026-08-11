@@ -62,6 +62,13 @@ def test_upgrade_seeds_exactly_one_global_head(monkeypatch: pytest.MonkeyPatch) 
                     "AND table_name = 'sessions' AND column_name = 'commit_attempt_id'"
                 )
             )
+            action_arguments_column = connection.scalar(
+                text(
+                    "SELECT count(*) FROM information_schema.columns "
+                    "WHERE table_schema = current_schema() "
+                    "AND table_name = 'actions' AND column_name = 'arguments_json'"
+                )
+            )
 
         assert global_heads == 1
         assert active_snapshot == str(BOOTSTRAP_CONFIG_SNAPSHOT_ID)
@@ -70,6 +77,7 @@ def test_upgrade_seeds_exactly_one_global_head(monkeypatch: pytest.MonkeyPatch) 
         assert claims_table == "claims"
         assert session_question_column == 1
         assert session_attempt_column == 1
+        assert action_arguments_column == 1
     finally:
         engine.dispose()
         command.downgrade(config, "base")
