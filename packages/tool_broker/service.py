@@ -10,6 +10,7 @@ from pathlib import Path
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
+from packages.artifacts import ContentAddressedArtifactStore, WorkspaceSnapshotFactory
 from packages.domain import (
     ActionId,
     ActionState,
@@ -41,6 +42,7 @@ from packages.tool_broker.executor import (
     ToolExecutor,
 )
 from packages.tool_broker.policy import CapabilityPolicyEngine, EvaluatedAction
+from packages.tool_broker.publication import ToolEffectPublisher, WorkspaceArtifactPublisher
 from packages.tool_broker.sandbox_runtime import OciSandboxRunner, SandboxRunner
 
 _RETRYABLE_CLASSES = {IdempotencyClass.PURE, IdempotencyClass.IDEMPOTENT}
@@ -60,25 +62,47 @@ class ToolBroker:
         *,
         session_factory: sessionmaker[Session],
         workspace_root: Path,
+        artifact_store_root: Path | None = None,
         policy: CapabilityPolicy | None = None,
         executor: ToolExecutor | None = None,
         sandbox_runner: SandboxRunner | None = None,
+        effect_publisher: ToolEffectPublisher | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._session_factory = session_factory
+        resolved_workspace = workspace_root.resolve(strict=True)
+        selected_store_root = artifact_store_root or (
+            resolved_workspace.parent / f".{resolved_workspace.name}.noezema-artifacts"
+        )
+        artifact_store = ContentAddressedArtifactStore(selected_store_root)
+        if artifact_store.root.is_relative_to(resolved_workspace):
+            raise ValueError("artifact_store_root must be outside the model-visible workspace")
         self.policy = policy or sealed_mvp_capability_policy()
         self._policy_engine = CapabilityPolicyEngine(
             policy=self.policy,
-            workspace_root=workspace_root,
+            workspace_root=resolved_workspace,
         )
         if executor is not None and sandbox_runner is not None:
             raise ValueError("provide either executor or sandbox_runner, not both")
         safe_executor = SafeToolExecutor(
             session_factory=session_factory,
-            workspace_root=workspace_root,
+            workspace_root=resolved_workspace,
             max_workspace_read_bytes=self.policy.max_workspace_read_bytes,
             max_workspace_list_entries=self.policy.max_workspace_list_entries,
+            max_workspace_write_bytes=self.policy.max_workspace_write_bytes,
+            max_artifact_bytes=self.policy.max_artifact_bytes,
             max_memory_results=self.policy.max_memory_results,
+            artifact_store=artifact_store,
+        )
+        workspace_snapshots = WorkspaceSnapshotFactory(
+            session_factory=session_factory,
+            seed_root=resolved_workspace,
+            store=artifact_store,
+            max_bytes=(
+                self.policy.sandbox.workspace_max_bytes
+                if self.policy.sandbox is not None
+                else self.policy.max_workspace_total_bytes
+            ),
         )
         if executor is not None:
             self._executor = executor
@@ -88,7 +112,7 @@ class ToolBroker:
                 if runner is None:
                     runner = OciSandboxRunner(
                         profile=self.policy.sandbox,
-                        workspace_root=workspace_root,
+                        workspace_root=resolved_workspace,
                     )
                 elif runner.profile != self.policy.sandbox:
                     raise ValueError("sandbox runner does not match the capability policy")
@@ -96,8 +120,18 @@ class ToolBroker:
                 raise ValueError("sandbox runner requires a sandbox capability profile")
             self._executor = DispatchingToolExecutor(
                 safe=safe_executor,
-                sandbox=SandboxToolExecutor(runner=runner) if runner is not None else None,
+                sandbox=(
+                    SandboxToolExecutor(runner=runner, snapshots=workspace_snapshots)
+                    if runner is not None
+                    else None
+                ),
             )
+        self._effect_publisher = effect_publisher or WorkspaceArtifactPublisher(
+            store=artifact_store,
+            workspace_root=resolved_workspace,
+            max_workspace_total_bytes=self.policy.max_workspace_total_bytes,
+            max_artifact_store_bytes=self.policy.max_artifact_store_bytes,
+        )
         self._clock = clock or (lambda: datetime.now(UTC))
 
     def run(self, action: BoundAction) -> BrokerRunResult:
@@ -145,6 +179,7 @@ class ToolBroker:
                     captured_at=self._clock(),
                     timeout_ms=self.policy.action_timeout_ms,
                 )
+                return self._finish_completed(action, observation)
             except ToolExecutionError as exc:
                 failure = ToolExecutionFailure(
                     code=exc.code,
@@ -162,9 +197,6 @@ class ToolBroker:
                     outcome_known=outcome_known,
                     attempt=attempt,
                 )
-            else:
-                return self._finish_completed(action, observation)
-
             if (
                 failure.retryable
                 and action.idempotency_class in _RETRYABLE_CLASSES
@@ -370,6 +402,12 @@ class ToolBroker:
                 return self._result_from_record(record)
             if record.state != ActionState.STARTED.value:
                 raise ActionBindingConflictError("completion requires a started action")
+            published_effect = self._effect_publisher.publish(
+                db,
+                action=action,
+                observation=observation,
+                published_at=timestamp,
+            )
             record.state = ActionState.COMPLETED.value
             record.completed_at = timestamp
             record.result = {
@@ -390,6 +428,7 @@ class ToolBroker:
                     "observation_id": str(observation.id),
                     "payload_sha256": observation.payload_sha256,
                     "attempt": record.attempt_count,
+                    "published_effect": published_effect,
                 },
             )
             db.flush()

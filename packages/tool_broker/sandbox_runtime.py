@@ -185,6 +185,7 @@ class SandboxRunner(Protocol):
         tool: ToolName,
         arguments: SandboxArguments,
         timeout_ms: int,
+        workspace_root: Path | None = None,
     ) -> SandboxProcessResult: ...
 
 
@@ -215,16 +216,18 @@ class OciSandboxRunner:
         tool: ToolName,
         arguments: SandboxArguments,
         timeout_ms: int,
+        workspace_root: Path | None = None,
     ) -> SandboxProcessResult:
+        execution_root = self._validate_workspace_root(workspace_root or self.workspace_root)
         runtime_version = self._verify_rootless_runtime()
-        workdir = (self.workspace_root / arguments.cwd).resolve(strict=False)
-        if not workdir.is_relative_to(self.workspace_root) or not workdir.is_dir():
+        workdir = (execution_root / arguments.cwd).resolve(strict=False)
+        if not workdir.is_relative_to(execution_root) or not workdir.is_dir():
             raise ToolExecutionError(
                 "sandbox_workdir_not_found",
                 "The requested sandbox working directory does not exist.",
                 retryable=False,
             )
-        workspace_before = self._workspace_size()
+        workspace_before = self._workspace_size(execution_root)
         if workspace_before > self.profile.workspace_max_bytes:
             raise ToolExecutionError(
                 "workspace_quota_exceeded",
@@ -239,6 +242,7 @@ class OciSandboxRunner:
             session_id=session_id,
             tool=tool,
             arguments=arguments,
+            workspace_root=execution_root,
         )
         try:
             captured = self._transport.run(
@@ -263,7 +267,7 @@ class OciSandboxRunner:
                 retryable=False,
                 outcome_known=False,
             )
-        workspace_after = self._workspace_size()
+        workspace_after = self._workspace_size(execution_root)
         return SandboxProcessResult(
             captured=captured,
             environment=SandboxEnvironmentManifest.from_profile(
@@ -282,6 +286,7 @@ class OciSandboxRunner:
         session_id: str,
         tool: ToolName,
         arguments: SandboxArguments,
+        workspace_root: Path | None = None,
     ) -> tuple[str, ...]:
         """Build the complete security boundary as argv, never as host-shell text."""
 
@@ -296,7 +301,8 @@ class OciSandboxRunner:
         container_workdir = "/workspace"
         if arguments.cwd != ".":
             container_workdir = f"/workspace/{arguments.cwd}"
-        mount = f"type=bind,source={self.workspace_root},target=/workspace,readonly"
+        execution_root = self._validate_workspace_root(workspace_root or self.workspace_root)
+        mount = f"type=bind,source={execution_root},target=/workspace,readonly"
         return (
             self.profile.runtime,
             "run",
@@ -369,9 +375,18 @@ class OciSandboxRunner:
             )
         return version
 
-    def _workspace_size(self) -> int:
+    @staticmethod
+    def _validate_workspace_root(workspace_root: Path) -> Path:
+        root = workspace_root.resolve(strict=True)
+        if not root.is_dir():
+            raise ValueError("workspace_root must be an existing directory")
+        if any(character in str(root) for character in (",", "\r", "\n")):
+            raise ValueError("workspace_root contains characters unsafe for an OCI mount argument")
+        return root
+
+    def _workspace_size(self, workspace_root: Path) -> int:
         total = 0
-        pending = [self.workspace_root]
+        pending = [workspace_root]
         while pending:
             directory = pending.pop()
             try:

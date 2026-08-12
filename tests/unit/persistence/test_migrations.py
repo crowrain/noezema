@@ -44,6 +44,8 @@ FOUNDATION_TABLES = {
     "system_constants",
 }
 EXPECTED_TABLES = FOUNDATION_TABLES | {
+    "artifact_blobs",
+    "artifacts",
     "assessment_evidence",
     "checkpoints",
     "claim_assessment_heads",
@@ -53,6 +55,8 @@ EXPECTED_TABLES = FOUNDATION_TABLES | {
     "evidence",
     "questions",
     "session_staging",
+    "workspace_files",
+    "workspace_versions",
 }
 
 
@@ -120,6 +124,8 @@ def test_migrations_render_valid_bootstrap_and_fifo_sql(
     assert "ALTER TABLE sessions ADD COLUMN commit_attempt_id UUID" in sql
     assert "ALTER TABLE actions ADD COLUMN arguments_json TEXT" in sql
     assert "ALTER TABLE actions ADD COLUMN attempt_count INTEGER" in sql
+    assert "CREATE TABLE artifact_blobs" in sql
+    assert "CREATE TABLE workspace_versions" in sql
     assert "CREATE INDEX ix_questions_fifo" in sql
     assert "DROP CONSTRAINT ck_audit_events_type_allowed" in sql
     assert "ck_audit_events_ck_audit_events_type_allowed" not in sql
@@ -132,4 +138,6 @@ def test_migrations_render_valid_bootstrap_and_fifo_sql(
     assert "DROP COLUMN question_id" in downgrade_sql
     assert "DROP COLUMN commit_attempt_id" in downgrade_sql
     assert "DROP COLUMN arguments_json" in downgrade_sql
+    assert "DROP TABLE workspace_versions" in downgrade_sql
+    assert "DROP TABLE artifact_blobs" in downgrade_sql
     assert "DROP CONSTRAINT ck_audit_events_type_allowed" in downgrade_sql

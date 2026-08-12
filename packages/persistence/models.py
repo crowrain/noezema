@@ -272,6 +272,92 @@ class ActionRecord(Base):
     error: Mapped[dict[str, Any] | None] = mapped_column(JsonType, nullable=True)
 
 
+class ArtifactBlobRecord(Base):
+    """Immutable physical content; reachability is controlled by metadata rows."""
+
+    __tablename__ = "artifact_blobs"
+    __table_args__ = (
+        CheckConstraint("size_bytes >= 0", name="size_nonnegative"),
+        CheckConstraint("length(sha256) = 64", name="sha256_length"),
+        UniqueConstraint("storage_key"),
+    )
+
+    sha256: Mapped[str] = mapped_column(String(64), primary_key=True)
+    size_bytes: Mapped[int] = mapped_column(BigInteger)
+    storage_key: Mapped[str] = mapped_column(String(256))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class ArtifactRecord(Base):
+    """One durable logical artifact created by exactly one completed action."""
+
+    __tablename__ = "artifacts"
+    __table_args__ = (
+        CheckConstraint(
+            _allowed_values("kind", ["workspace_file", "standalone"]),
+            name="kind_allowed",
+        ),
+        CheckConstraint(
+            "safety_status = 'untrusted_model_output'",
+            name="safety_status_allowed",
+        ),
+        UniqueConstraint("action_id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    session_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("sessions.id"))
+    action_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("actions.id"))
+    blob_sha256: Mapped[str] = mapped_column(String(64), ForeignKey("artifact_blobs.sha256"))
+    kind: Mapped[str] = mapped_column(String(32))
+    logical_name: Mapped[str] = mapped_column(String(1024))
+    media_type: Mapped[str] = mapped_column(String(128))
+    encoding: Mapped[str] = mapped_column(String(32))
+    safety_status: Mapped[str] = mapped_column(String(32))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class WorkspaceFileRecord(Base):
+    """The canonical mutable workspace manifest; content remains immutable."""
+
+    __tablename__ = "workspace_files"
+    __table_args__ = (
+        CheckConstraint("revision >= 1", name="revision_positive"),
+        CheckConstraint("size_bytes >= 0", name="size_nonnegative"),
+    )
+
+    path: Mapped[str] = mapped_column(String(1024), primary_key=True)
+    artifact_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("artifacts.id"))
+    content_sha256: Mapped[str] = mapped_column(String(64), ForeignKey("artifact_blobs.sha256"))
+    size_bytes: Mapped[int] = mapped_column(BigInteger)
+    revision: Mapped[int] = mapped_column(BigInteger)
+    updated_by_action_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("actions.id"), unique=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class WorkspaceVersionRecord(Base):
+    """Append-only COW history for reconciliation and checkpoint snapshots."""
+
+    __tablename__ = "workspace_versions"
+    __table_args__ = (
+        CheckConstraint("revision >= 1", name="revision_positive"),
+        UniqueConstraint("path", "revision"),
+        UniqueConstraint("artifact_id"),
+    )
+
+    action_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("actions.id"), primary_key=True
+    )
+    session_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("sessions.id"))
+    path: Mapped[str] = mapped_column(String(1024))
+    revision: Mapped[int] = mapped_column(BigInteger)
+    artifact_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("artifacts.id"))
+    previous_content_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    content_sha256: Mapped[str] = mapped_column(String(64), ForeignKey("artifact_blobs.sha256"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 class AuditEventRecord(Base):
     __tablename__ = "audit_events"
     __table_args__ = (

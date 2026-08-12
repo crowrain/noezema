@@ -6,13 +6,18 @@ import hashlib
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Protocol
+from uuid import uuid5
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, sessionmaker
 
+from packages.artifacts import ContentAddressedArtifactStore, WorkspaceSnapshotFactory
 from packages.domain import (
+    ArtifactCreateArguments,
+    ArtifactCreatePayload,
+    ArtifactId,
     BoundAction,
     ClaimAssessmentId,
     ClaimId,
@@ -32,6 +37,8 @@ from packages.domain import (
     WorkspaceListPayload,
     WorkspaceReadArguments,
     WorkspaceReadPayload,
+    WorkspaceWriteArguments,
+    WorkspaceWritePayload,
     canonical_json_sha256,
     sandbox_profile_sha256,
 )
@@ -40,6 +47,7 @@ from packages.persistence.models import (
     ClaimAssessmentRecord,
     ClaimRecord,
     SessionRecord,
+    WorkspaceFileRecord,
 )
 from packages.tool_broker.errors import ToolDeadlineExceeded, ToolExecutionError
 from packages.tool_broker.sandbox_runtime import SandboxRunner
@@ -77,13 +85,19 @@ class SafeToolExecutor:
         workspace_root: Path,
         max_workspace_read_bytes: int,
         max_workspace_list_entries: int,
+        max_workspace_write_bytes: int,
+        max_artifact_bytes: int,
         max_memory_results: int,
+        artifact_store: ContentAddressedArtifactStore,
     ) -> None:
         self._session_factory = session_factory
         self._workspace_root = workspace_root.resolve(strict=True)
         self._max_workspace_read_bytes = max_workspace_read_bytes
         self._max_workspace_list_entries = max_workspace_list_entries
+        self._max_workspace_write_bytes = max_workspace_write_bytes
+        self._max_artifact_bytes = max_artifact_bytes
         self._max_memory_results = max_memory_results
+        self._artifact_store = artifact_store
 
     def execute(
         self,
@@ -98,6 +112,14 @@ class SafeToolExecutor:
             return self._read(action, arguments, captured_at, deadline)
         if action.tool is ToolName.WORKSPACE_LIST and isinstance(arguments, WorkspaceListArguments):
             return self._list(action, arguments, captured_at, deadline)
+        if action.tool is ToolName.WORKSPACE_WRITE and isinstance(
+            arguments, WorkspaceWriteArguments
+        ):
+            return self._write(action, arguments, captured_at, deadline)
+        if action.tool is ToolName.ARTIFACT_CREATE and isinstance(
+            arguments, ArtifactCreateArguments
+        ):
+            return self._create_artifact(action, arguments, captured_at, deadline)
         if action.tool is ToolName.MEMORY_SEARCH and isinstance(arguments, MemorySearchArguments):
             return self._search(action, arguments, captured_at, deadline)
         raise ToolExecutionError(
@@ -124,6 +146,33 @@ class SafeToolExecutor:
         deadline: _Deadline,
     ) -> ToolExecutionObservation:
         deadline.check()
+        with self._session_factory() as db:
+            manifest = db.get(WorkspaceFileRecord, arguments.path)
+        if manifest is not None:
+            if manifest.size_bytes > self._max_workspace_read_bytes:
+                raise ToolExecutionError(
+                    "workspace_file_too_large",
+                    "The requested workspace file exceeds the policy byte limit.",
+                    retryable=False,
+                )
+            try:
+                content_bytes = self._artifact_store.read(
+                    digest=manifest.content_sha256,
+                    max_bytes=self._max_workspace_read_bytes,
+                )
+            except ValueError as exc:
+                raise ToolExecutionError(
+                    "workspace_blob_unavailable",
+                    "The published workspace content failed integrity verification.",
+                    retryable=True,
+                ) from exc
+            return self._workspace_read_observation(
+                action,
+                path=arguments.path,
+                content_bytes=content_bytes,
+                captured_at=captured_at,
+            )
+
         path = self._resolve(arguments.path)
         try:
             if not path.is_file():
@@ -155,6 +204,21 @@ class SafeToolExecutor:
                 "The requested workspace file exceeds the policy byte limit.",
                 retryable=False,
             )
+        return self._workspace_read_observation(
+            action,
+            path=arguments.path,
+            content_bytes=content_bytes,
+            captured_at=captured_at,
+        )
+
+    @staticmethod
+    def _workspace_read_observation(
+        action: BoundAction,
+        *,
+        path: str,
+        content_bytes: bytes,
+        captured_at: datetime,
+    ) -> ToolExecutionObservation:
         try:
             content = content_bytes.decode("utf-8")
         except UnicodeDecodeError as exc:
@@ -164,7 +228,7 @@ class SafeToolExecutor:
                 retryable=False,
             ) from exc
         payload = WorkspaceReadPayload(
-            path=arguments.path,
+            path=path,
             size_bytes=len(content_bytes),
             content_sha256=hashlib.sha256(content_bytes).hexdigest(),
             content=content,
@@ -172,10 +236,91 @@ class SafeToolExecutor:
         return ToolExecutionObservation.build(
             action_id=action.action_id,
             tool=action.tool,
-            source=f"workspace:{arguments.path}",
+            source=f"workspace:{path}",
             captured_at=captured_at,
             payload=payload,
         )
+
+    def _write(
+        self,
+        action: BoundAction,
+        arguments: WorkspaceWriteArguments,
+        captured_at: datetime,
+        deadline: _Deadline,
+    ) -> ToolExecutionObservation:
+        deadline.check()
+        content_bytes = arguments.content.encode("utf-8")
+        if len(content_bytes) > self._max_workspace_write_bytes:
+            raise ToolExecutionError(
+                "workspace_write_too_large",
+                "The workspace write exceeds the policy byte limit.",
+                retryable=False,
+            )
+        staged = self._stage_text(action, arguments.content)
+        deadline.check()
+        payload = WorkspaceWritePayload(
+            path=arguments.path,
+            artifact_id=self._artifact_id(action),
+            size_bytes=staged.size_bytes,
+            content_sha256=staged.sha256,
+            expected_content_sha256=arguments.expected_content_sha256,
+        )
+        return ToolExecutionObservation.build(
+            action_id=action.action_id,
+            tool=action.tool,
+            source=f"artifact-store:{staged.storage_key}",
+            captured_at=captured_at,
+            payload=payload,
+        )
+
+    def _create_artifact(
+        self,
+        action: BoundAction,
+        arguments: ArtifactCreateArguments,
+        captured_at: datetime,
+        deadline: _Deadline,
+    ) -> ToolExecutionObservation:
+        deadline.check()
+        content_bytes = arguments.content.encode("utf-8")
+        if len(content_bytes) > self._max_artifact_bytes:
+            raise ToolExecutionError(
+                "artifact_too_large",
+                "The artifact exceeds the capability-policy byte limit.",
+                retryable=False,
+            )
+        staged = self._stage_text(action, arguments.content)
+        deadline.check()
+        payload = ArtifactCreatePayload(
+            artifact_id=self._artifact_id(action),
+            name=arguments.name,
+            media_type=arguments.media_type,
+            size_bytes=staged.size_bytes,
+            content_sha256=staged.sha256,
+        )
+        return ToolExecutionObservation.build(
+            action_id=action.action_id,
+            tool=action.tool,
+            source=f"artifact-store:{staged.storage_key}",
+            captured_at=captured_at,
+            payload=payload,
+        )
+
+    def _stage_text(self, action: BoundAction, content: str):
+        try:
+            return self._artifact_store.stage_text(
+                action_id=action.action_id,
+                content=content,
+            )
+        except (OSError, ValueError) as exc:
+            raise ToolExecutionError(
+                "artifact_staging_failed",
+                "The content-addressed artifact could not be staged safely.",
+                retryable=True,
+            ) from exc
+
+    @staticmethod
+    def _artifact_id(action: BoundAction) -> ArtifactId:
+        return ArtifactId(root=uuid5(action.action_id.root, f"{action.tool.value}:artifact/v1"))
 
     def _list(
         self,
@@ -185,14 +330,21 @@ class SafeToolExecutor:
         deadline: _Deadline,
     ) -> ToolExecutionObservation:
         root = self._resolve(arguments.path)
-        if not root.is_dir():
+        with self._session_factory() as db:
+            manifest_rows = db.scalars(select(WorkspaceFileRecord)).all()
+        manifest_entries = self._manifest_list_entries(
+            requested_path=arguments.path,
+            recursive=arguments.recursive,
+            rows=manifest_rows,
+        )
+        if not root.is_dir() and not manifest_entries:
             raise ToolExecutionError(
                 "workspace_directory_not_found",
                 "The requested workspace path is not a directory.",
                 retryable=False,
             )
-        pending = [root]
-        entries: list[WorkspaceEntry] = []
+        pending = [root] if root.is_dir() else []
+        entries_by_path: dict[str, WorkspaceEntry] = {}
         truncated = False
         try:
             while pending:
@@ -216,11 +368,11 @@ class SafeToolExecutor:
                         )
                     else:
                         continue
-                    if len(entries) == self._max_workspace_list_entries:
+                    entries_by_path[entry.path] = entry
+                    if len(entries_by_path) > self._max_workspace_list_entries * 4:
                         truncated = True
                         pending.clear()
                         break
-                    entries.append(entry)
         except ToolExecutionError:
             raise
         except OSError as exc:
@@ -229,11 +381,15 @@ class SafeToolExecutor:
                 "The workspace directory could not be listed.",
                 retryable=True,
             ) from exc
-        entries.sort(key=lambda item: item.path)
+        entries_by_path.update(manifest_entries)
+        ordered = sorted(entries_by_path.values(), key=lambda item: item.path)
+        if len(ordered) > self._max_workspace_list_entries:
+            truncated = True
+        entries = tuple(ordered[: self._max_workspace_list_entries])
         payload = WorkspaceListPayload(
             path=arguments.path,
             recursive=arguments.recursive,
-            entries=tuple(entries),
+            entries=entries,
             truncated=truncated,
         )
         return ToolExecutionObservation.build(
@@ -243,6 +399,50 @@ class SafeToolExecutor:
             captured_at=captured_at,
             payload=payload,
         )
+
+    @staticmethod
+    def _manifest_list_entries(
+        *,
+        requested_path: str,
+        recursive: bool,
+        rows: list[WorkspaceFileRecord],
+    ) -> dict[str, WorkspaceEntry]:
+        requested_parts = () if requested_path == "." else PurePosixPath(requested_path).parts
+        entries: dict[str, WorkspaceEntry] = {}
+        for row in rows:
+            parts = PurePosixPath(row.path).parts
+            if parts[: len(requested_parts)] != requested_parts or len(parts) <= len(
+                requested_parts
+            ):
+                continue
+            remaining = parts[len(requested_parts) :]
+            if not recursive:
+                visible_parts = parts[: len(requested_parts) + 1]
+                visible_path = PurePosixPath(*visible_parts).as_posix()
+                if len(remaining) == 1:
+                    entries[visible_path] = WorkspaceEntry(
+                        path=visible_path,
+                        kind="file",
+                        size_bytes=row.size_bytes,
+                    )
+                else:
+                    entries.setdefault(
+                        visible_path,
+                        WorkspaceEntry(path=visible_path, kind="directory"),
+                    )
+                continue
+            for end in range(len(requested_parts) + 1, len(parts)):
+                directory_path = PurePosixPath(*parts[:end]).as_posix()
+                entries.setdefault(
+                    directory_path,
+                    WorkspaceEntry(path=directory_path, kind="directory"),
+                )
+            entries[row.path] = WorkspaceEntry(
+                path=row.path,
+                kind="file",
+                size_bytes=row.size_bytes,
+            )
+        return entries
 
     def _search(
         self,
@@ -318,8 +518,14 @@ class SafeToolExecutor:
 class SandboxToolExecutor:
     """Adapt OCI sandbox results to trusted, typed Tool Broker observations."""
 
-    def __init__(self, *, runner: SandboxRunner) -> None:
+    def __init__(
+        self,
+        *,
+        runner: SandboxRunner,
+        snapshots: WorkspaceSnapshotFactory,
+    ) -> None:
         self._runner = runner
+        self._snapshots = snapshots
 
     def execute(
         self,
@@ -335,13 +541,22 @@ class SandboxToolExecutor:
                 "The sandbox executor received a non-execution tool.",
                 retryable=False,
             )
-        result = self._runner.execute(
-            action_id=action.action_id,
-            session_id=str(action.session_id),
-            tool=action.tool,
-            arguments=arguments,
-            timeout_ms=timeout_ms,
-        )
+        try:
+            with self._snapshots.materialize(action.action_id) as workspace_view:
+                result = self._runner.execute(
+                    action_id=action.action_id,
+                    session_id=str(action.session_id),
+                    tool=action.tool,
+                    arguments=arguments,
+                    timeout_ms=timeout_ms,
+                    workspace_root=workspace_view,
+                )
+        except (OSError, ValueError) as exc:
+            raise ToolExecutionError(
+                "workspace_snapshot_failed",
+                "The immutable sandbox workspace view could not be materialized.",
+                retryable=True,
+            ) from exc
         environment = result.environment
         if environment.profile_sha256 != sandbox_profile_sha256(self._runner.profile):
             raise ToolExecutionError(
@@ -406,6 +621,8 @@ class DispatchingToolExecutor:
         if action.tool in {
             ToolName.WORKSPACE_READ,
             ToolName.WORKSPACE_LIST,
+            ToolName.WORKSPACE_WRITE,
+            ToolName.ARTIFACT_CREATE,
             ToolName.MEMORY_SEARCH,
         }:
             return self._safe.execute(

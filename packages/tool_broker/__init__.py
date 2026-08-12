@@ -8,6 +8,10 @@ from packages.tool_broker.executor import (
     ToolExecutor,
 )
 from packages.tool_broker.policy import CapabilityPolicyEngine, EvaluatedAction
+from packages.tool_broker.publication import (
+    ToolEffectPublisher,
+    WorkspaceArtifactPublisher,
+)
 from packages.tool_broker.sandbox_runtime import (
     CapturedCommand,
     CommandTransport,
@@ -42,4 +46,6 @@ __all__ = [
     "ToolDeadlineExceeded",
     "ToolExecutionError",
     "ToolExecutor",
+    "ToolEffectPublisher",
+    "WorkspaceArtifactPublisher",
 ]

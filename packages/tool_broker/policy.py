@@ -8,6 +8,7 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from packages.domain import (
+    ArtifactCreateArguments,
     BoundAction,
     CapabilityPolicy,
     MemorySearchArguments,
@@ -19,12 +20,15 @@ from packages.domain import (
     ToolName,
     WorkspaceListArguments,
     WorkspaceReadArguments,
+    WorkspaceWriteArguments,
     capability_policy_sha256,
 )
 
 _ARGUMENT_SCHEMAS = {
     ToolName.WORKSPACE_READ: WorkspaceReadArguments,
     ToolName.WORKSPACE_LIST: WorkspaceListArguments,
+    ToolName.WORKSPACE_WRITE: WorkspaceWriteArguments,
+    ToolName.ARTIFACT_CREATE: ArtifactCreateArguments,
     ToolName.MEMORY_SEARCH: MemorySearchArguments,
     ToolName.SHELL_EXECUTE: ShellExecuteArguments,
     ToolName.PYTHON_EXECUTE: PythonExecuteArguments,
@@ -62,9 +66,20 @@ class CapabilityPolicyEngine:
         if isinstance(arguments, MemorySearchArguments):
             if arguments.limit > self.policy.max_memory_results:
                 return self.deny("memory_result_limit_exceeded")
-        elif isinstance(arguments, WorkspaceReadArguments | WorkspaceListArguments):
+        elif isinstance(
+            arguments,
+            WorkspaceReadArguments | WorkspaceListArguments | WorkspaceWriteArguments,
+        ):
             if not self._path_is_confined(arguments.path):
                 return self.deny("workspace_path_outside_root")
+            if (
+                isinstance(arguments, WorkspaceWriteArguments)
+                and len(arguments.content.encode("utf-8")) > self.policy.max_workspace_write_bytes
+            ):
+                return self.deny("workspace_write_limit_exceeded")
+        elif isinstance(arguments, ArtifactCreateArguments):
+            if len(arguments.content.encode("utf-8")) > self.policy.max_artifact_bytes:
+                return self.deny("artifact_size_limit_exceeded")
         elif isinstance(arguments, ShellExecuteArguments | PythonExecuteArguments):
             if self.policy.sandbox is None:
                 return self.deny("sandbox_not_configured")

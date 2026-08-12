@@ -28,6 +28,7 @@ from packages.domain.evidence import (
 )
 from packages.domain.ids import (
     ActionId,
+    ArtifactId,
     ChunkId,
     ClaimAssessmentId,
     ClaimId,
@@ -88,6 +89,34 @@ class WorkspaceListArguments(ContractModel):
     recursive: bool = False
 
 
+class WorkspaceWriteArguments(ContractModel):
+    """A compare-and-swap update of one UTF-8 workspace file."""
+
+    model_config = ConfigDict(str_strip_whitespace=False)
+
+    path: RelativeToolPath
+    content: Annotated[str, StringConstraints(max_length=2_097_152)]
+    expected_content_sha256: Sha256Hex | Literal["absent"]
+
+
+class ArtifactCreateArguments(ContractModel):
+    """Create one immutable text artifact without exposing a host path."""
+
+    model_config = ConfigDict(str_strip_whitespace=False)
+
+    name: RelativeToolPath
+    media_type: Annotated[
+        str,
+        StringConstraints(
+            strip_whitespace=True,
+            min_length=3,
+            max_length=128,
+            pattern=r"^[a-z0-9][a-z0-9.+-]*/[a-z0-9][a-z0-9.+-]*$",
+        ),
+    ] = "text/plain"
+    content: Annotated[str, StringConstraints(max_length=8_388_608)]
+
+
 class MemorySearchArguments(ContractModel):
     query: Annotated[
         str,
@@ -123,6 +152,8 @@ class PythonExecuteArguments(ContractModel):
 ToolArguments: TypeAlias = (
     WorkspaceReadArguments
     | WorkspaceListArguments
+    | WorkspaceWriteArguments
+    | ArtifactCreateArguments
     | MemorySearchArguments
     | ShellExecuteArguments
     | PythonExecuteArguments
@@ -160,11 +191,23 @@ def sandbox_profile_sha256(profile: SandboxProfile) -> str:
 class CapabilityPolicy(ContractModel):
     """Immutable limits selected by the trusted host, never by the model."""
 
-    schema_version: Literal["capability-policy/v2"] = "capability-policy/v2"
+    schema_version: Literal["capability-policy/v3"] = "capability-policy/v3"
     version: ShortReason
     allowed_tools: tuple[ToolName, ...] = Field(max_length=32)
     max_workspace_read_bytes: int = Field(default=262_144, ge=1, le=8_388_608)
     max_workspace_list_entries: int = Field(default=256, ge=1, le=10_000)
+    max_workspace_write_bytes: int = Field(default=262_144, ge=1, le=8_388_608)
+    max_workspace_total_bytes: int = Field(
+        default=1_073_741_824,
+        ge=1_048_576,
+        le=68_719_476_736,
+    )
+    max_artifact_bytes: int = Field(default=1_048_576, ge=1, le=67_108_864)
+    max_artifact_store_bytes: int = Field(
+        default=2_147_483_648,
+        ge=1_048_576,
+        le=274_877_906_944,
+    )
     max_memory_results: int = Field(default=20, ge=1, le=50)
     action_timeout_ms: int = Field(default=5_000, ge=1, le=300_000)
     max_attempts: int = Field(default=2, ge=1, le=10)
@@ -225,6 +268,21 @@ def sandbox_mvp_capability_policy(*, sandbox: SandboxProfile) -> CapabilityPolic
     )
 
 
+def transactional_workspace_mvp_capability_policy() -> CapabilityPolicy:
+    """Enable bounded persistent writes through the transactional artifact store."""
+
+    return CapabilityPolicy(
+        version="sealed-mvp/transactional-workspace/v1",
+        allowed_tools=(
+            ToolName.WORKSPACE_LIST,
+            ToolName.WORKSPACE_READ,
+            ToolName.WORKSPACE_WRITE,
+            ToolName.ARTIFACT_CREATE,
+            ToolName.MEMORY_SEARCH,
+        ),
+    )
+
+
 class PolicyEvaluation(ContractModel):
     decision: PolicyDecision
     policy_version: ShortReason
@@ -265,6 +323,39 @@ class WorkspaceListPayload(ContractModel):
     recursive: bool
     entries: tuple[WorkspaceEntry, ...]
     truncated: bool
+
+
+class WorkspaceWritePayload(ContractModel):
+    """Prepared content effect; visibility starts only with action completion."""
+
+    kind: Literal["workspace_write"] = "workspace_write"
+    path: RelativeToolPath
+    artifact_id: ArtifactId
+    media_type: Literal["text/plain"] = "text/plain"
+    encoding: Literal["utf-8"] = "utf-8"
+    size_bytes: int = Field(ge=0)
+    content_sha256: Sha256Hex
+    expected_content_sha256: Sha256Hex | Literal["absent"]
+
+
+class ArtifactCreatePayload(ContractModel):
+    """Prepared immutable artifact effect published with action completion."""
+
+    kind: Literal["artifact_create"] = "artifact_create"
+    artifact_id: ArtifactId
+    name: RelativeToolPath
+    media_type: Annotated[
+        str,
+        StringConstraints(
+            strip_whitespace=True,
+            min_length=3,
+            max_length=128,
+            pattern=r"^[a-z0-9][a-z0-9.+-]*/[a-z0-9][a-z0-9.+-]*$",
+        ),
+    ]
+    encoding: Literal["utf-8"] = "utf-8"
+    size_bytes: int = Field(ge=0)
+    content_sha256: Sha256Hex
 
 
 class MemorySearchHit(ContractModel):
@@ -368,6 +459,8 @@ class PythonExecutionPayload(_SandboxExecutionPayload):
 ToolResultPayload: TypeAlias = Annotated[
     WorkspaceReadPayload
     | WorkspaceListPayload
+    | WorkspaceWritePayload
+    | ArtifactCreatePayload
     | MemorySearchPayload
     | ShellExecutionPayload
     | PythonExecutionPayload,
@@ -377,6 +470,8 @@ ToolResultPayload: TypeAlias = Annotated[
 _PAYLOAD_TO_TOOL = {
     WorkspaceReadPayload: ToolName.WORKSPACE_READ,
     WorkspaceListPayload: ToolName.WORKSPACE_LIST,
+    WorkspaceWritePayload: ToolName.WORKSPACE_WRITE,
+    ArtifactCreatePayload: ToolName.ARTIFACT_CREATE,
     MemorySearchPayload: ToolName.MEMORY_SEARCH,
     ShellExecutionPayload: ToolName.SHELL_EXECUTE,
     PythonExecutionPayload: ToolName.PYTHON_EXECUTE,

@@ -78,6 +78,8 @@ from packages.domain.knowledge import (
 )
 from packages.domain.questions import QuestionDraft
 from packages.domain.tooling import (
+    ArtifactCreateArguments,
+    ArtifactCreatePayload,
     BrokerRunResult,
     CapabilityPolicy,
     MemorySearchArguments,
@@ -99,11 +101,14 @@ from packages.domain.tooling import (
     WorkspaceListPayload,
     WorkspaceReadArguments,
     WorkspaceReadPayload,
+    WorkspaceWriteArguments,
+    WorkspaceWritePayload,
     capability_policy_config_payload,
     capability_policy_sha256,
     sandbox_mvp_capability_policy,
     sandbox_profile_sha256,
     sealed_mvp_capability_policy,
+    transactional_workspace_mvp_capability_policy,
     workspace_read_as_source_observation,
 )
 
@@ -111,6 +116,8 @@ __all__ = [
     "ActionId",
     "ActionState",
     "ArtifactId",
+    "ArtifactCreateArguments",
+    "ArtifactCreatePayload",
     "ArtifactReference",
     "AuditEvent",
     "AuditEventId",
@@ -194,6 +201,8 @@ __all__ = [
     "WorkspaceListPayload",
     "WorkspaceReadArguments",
     "WorkspaceReadPayload",
+    "WorkspaceWriteArguments",
+    "WorkspaceWritePayload",
     "TurnId",
     "bind_action",
     "canonical_json_sha256",
@@ -205,5 +214,6 @@ __all__ = [
     "sandbox_mvp_capability_policy",
     "sandbox_profile_sha256",
     "sealed_mvp_capability_policy",
+    "transactional_workspace_mvp_capability_policy",
     "workspace_read_as_source_observation",
 ]
