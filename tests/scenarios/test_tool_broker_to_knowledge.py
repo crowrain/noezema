@@ -47,7 +47,11 @@ from packages.memory import (
     mvp_claim_type_rules,
     prepare_knowledge_commit,
 )
-from packages.persistence import BOOTSTRAP_CONFIG_SNAPSHOT_ID, bootstrap_payload
+from packages.persistence import (
+    BOOTSTRAP_CONFIG_SNAPSHOT_ID,
+    acquire_session_lease,
+    bootstrap_payload,
+)
 from packages.persistence.models import (
     ActionRecord,
     ClaimAssessmentRecord,
@@ -203,11 +207,19 @@ def test_workspace_read_flows_through_assessment_and_atomic_commit(
 
     attempt_id = CommitAttemptId.new()
     with session_factory.begin() as db:
+        lease = acquire_session_lease(
+            db,
+            session_id=session_id,
+            owner="orchestrator",
+            ttl_seconds=300,
+            occurred_at=NOW,
+        )
         prepare_knowledge_commit(
             db,
             session_id=session_id,
             attempt_id=attempt_id,
             batch=batch,
+            session_lease=lease,
             occurred_at=NOW,
         )
     with session_factory.begin() as db:
@@ -215,6 +227,7 @@ def test_workspace_read_flows_through_assessment_and_atomic_commit(
             db,
             session_id=session_id,
             attempt_id=attempt_id,
+            session_lease=lease,
             occurred_at=NOW,
         )
 

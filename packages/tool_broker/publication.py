@@ -14,10 +14,18 @@ from packages.artifacts import ContentAddressedArtifactStore
 from packages.domain import (
     ArtifactCreatePayload,
     BoundAction,
+    RevisionScope,
+    SessionLease,
     ToolExecutionObservation,
     WorkspaceWritePayload,
 )
 from packages.domain._base import JsonObject
+from packages.persistence import (
+    ConcurrencyControlError,
+    acquire_writer_intents,
+    advance_revision_vector,
+    release_writer_intents,
+)
 from packages.persistence.models import (
     ArtifactBlobRecord,
     ArtifactRecord,
@@ -34,6 +42,7 @@ class ToolEffectPublisher(Protocol):
         *,
         action: BoundAction,
         observation: ToolExecutionObservation,
+        session_lease: SessionLease,
         published_at: datetime,
     ) -> JsonObject | None: ...
 
@@ -60,17 +69,40 @@ class WorkspaceArtifactPublisher:
         *,
         action: BoundAction,
         observation: ToolExecutionObservation,
+        session_lease: SessionLease,
         published_at: datetime,
     ) -> JsonObject | None:
         payload = observation.payload
         if isinstance(payload, WorkspaceWritePayload):
-            return self._publish_workspace(
+            scopes = (RevisionScope.ARTIFACT_STORE, RevisionScope.WORKSPACE)
+        elif isinstance(payload, ArtifactCreatePayload):
+            scopes = (RevisionScope.ARTIFACT_STORE,)
+        else:
+            return None
+        try:
+            writer_leases = acquire_writer_intents(
+                db,
+                session_lease=session_lease,
+                operation_id=action.action_id.root,
+                scopes=scopes,
+                ttl_seconds=30,
+                occurred_at=published_at,
+            )
+        except ConcurrencyControlError as exc:
+            raise ToolExecutionError(
+                "writer_intent_unavailable",
+                "The durable effect could not acquire its fenced writer intent.",
+                retryable=True,
+            ) from exc
+        if isinstance(payload, WorkspaceWritePayload):
+            effect = self._publish_workspace(
                 db,
                 action=action,
                 payload=payload,
                 published_at=published_at,
             )
-        if isinstance(payload, ArtifactCreatePayload):
+            mutated_scopes = (RevisionScope.ARTIFACT_STORE, RevisionScope.WORKSPACE)
+        else:
             self._ensure_blob(
                 db,
                 digest=payload.content_sha256,
@@ -87,13 +119,37 @@ class WorkspaceArtifactPublisher:
                 media_type=payload.media_type,
                 published_at=published_at,
             )
-            return {
+            effect = {
                 "kind": payload.kind,
                 "artifact_id": str(payload.artifact_id),
                 "content_sha256": payload.content_sha256,
                 "size_bytes": payload.size_bytes,
             }
-        return None
+            mutated_scopes = (RevisionScope.ARTIFACT_STORE,)
+        try:
+            revisions = advance_revision_vector(
+                db,
+                leases=writer_leases,
+                mutated_scopes=mutated_scopes,
+                occurred_at=published_at,
+            )
+            release_writer_intents(
+                db,
+                leases=writer_leases,
+                occurred_at=published_at,
+            )
+        except ConcurrencyControlError as exc:
+            raise ToolExecutionError(
+                "writer_fence_rejected",
+                "The durable effect lost its writer fence before publication.",
+                retryable=True,
+            ) from exc
+        effect["revision_vector"] = revisions.model_dump(mode="json")
+        effect["session_fence"] = session_lease.fence
+        effect["writer_fences"] = {
+            item.scope.value: item.writer_fence for item in writer_leases.intents
+        }
+        return effect
 
     def _publish_workspace(
         self,

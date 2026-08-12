@@ -21,13 +21,27 @@ from packages.domain import (
     EventType,
     KnowledgeCommitBatch,
     QuestionState,
+    RevisionScope,
+    RevisionVector,
     SessionId,
+    SessionLease,
     SessionStagingId,
     SessionState,
+    WriterIntentLease,
+    WriterIntentSet,
     assessment_role,
     knowledge_commit_sha256,
 )
-from packages.persistence import append_session_audit
+from packages.persistence import (
+    ConcurrencyControlError,
+    RevisionVectorConflictError,
+    acquire_writer_intents,
+    advance_revision_vector,
+    append_session_audit,
+    release_session_lease,
+    release_writer_intents,
+    validate_writer_intents,
+)
 from packages.persistence.models import (
     AssessmentEvidenceRecord,
     CheckpointRecord,
@@ -50,6 +64,10 @@ class PreparedKnowledgeCommit:
     staging_id: SessionStagingId | None
     staging_sha256: str
     status: str
+    session_fence: int
+    knowledge_writer_fence: int
+    dependency_writer_fence: int
+    writer_lease_expires_at: datetime
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,17 +102,25 @@ class InvalidCommitStateError(KnowledgeCommitError):
     """The session/attempt tuple cannot cross the commit boundary."""
 
 
+class KnowledgeCommitLeaseError(KnowledgeCommitError):
+    """The session lease or writer fencing token cannot authorize publication."""
+
+
 def prepare_knowledge_commit(
     db: Session,
     *,
     session_id: SessionId,
     attempt_id: CommitAttemptId,
     batch: KnowledgeCommitBatch,
+    session_lease: SessionLease,
+    writer_ttl_seconds: int = 120,
     occurred_at: datetime | None = None,
 ) -> PreparedKnowledgeCommit:
     """Persist the immutable prepared boundary; the caller owns COMMIT/rollback."""
 
     timestamp = occurred_at or datetime.now(UTC)
+    if session_lease.session_id != session_id:
+        raise KnowledgeCommitLeaseError("session lease belongs to a different session")
     staging_hash = knowledge_commit_sha256(batch)
     session_record = db.scalar(
         select(SessionRecord).where(SessionRecord.id == session_id.root).with_for_update()
@@ -118,11 +144,61 @@ def prepare_knowledge_commit(
             raise CommitAttemptConflictError(
                 "session commit attempt is already bound to different content"
             )
+        if existing.status == "prepared":
+            try:
+                existing_intents = _attempt_writer_intents(
+                    existing,
+                    session_id=session_id,
+                    attempt_id=attempt_id,
+                    session_lease=session_lease,
+                )
+                validate_writer_intents(db, leases=existing_intents, occurred_at=timestamp)
+            except (ConcurrencyControlError, KnowledgeCommitLeaseError):
+                try:
+                    recovered = acquire_writer_intents(
+                        db,
+                        session_lease=session_lease,
+                        operation_id=attempt_id.root,
+                        scopes=(RevisionScope.DEPENDENCY_GRAPH, RevisionScope.KNOWLEDGE),
+                        ttl_seconds=writer_ttl_seconds,
+                        expected_revisions=RevisionVector(
+                            knowledge=existing.validated_knowledge_revision,
+                            dependency_graph=existing.validated_dependency_graph_revision,
+                        ),
+                        occurred_at=timestamp,
+                    )
+                except RevisionVectorConflictError as exc:
+                    raise KnowledgeRevisionConflictError(
+                        "prepared batch became stale before recovery"
+                    ) from exc
+                except ConcurrencyControlError as exc:
+                    raise KnowledgeCommitLeaseError(
+                        "prepared knowledge writer fence is still owned elsewhere"
+                    ) from exc
+                knowledge_recovered = recovered.intent_for(RevisionScope.KNOWLEDGE)
+                dependency_recovered = recovered.intent_for(RevisionScope.DEPENDENCY_GRAPH)
+                existing.writer_lease_owner = session_lease.owner
+                existing.session_fence = session_lease.fence
+                existing.knowledge_writer_fence = knowledge_recovered.writer_fence
+                existing.dependency_writer_fence = dependency_recovered.writer_fence
+                existing.writer_lease_expires_at = min(
+                    knowledge_recovered.expires_at,
+                    dependency_recovered.expires_at,
+                )
+                db.flush()
         return PreparedKnowledgeCommit(
             attempt_id=attempt_id,
             staging_id=SessionStagingId(root=staging.id) if staging is not None else None,
             staging_sha256=staging_hash,
             status=existing.status,
+            session_fence=_required_fence(existing.session_fence, "session"),
+            knowledge_writer_fence=_required_fence(
+                existing.knowledge_writer_fence, "knowledge writer"
+            ),
+            dependency_writer_fence=_required_fence(
+                existing.dependency_writer_fence, "dependency writer"
+            ),
+            writer_lease_expires_at=_required_datetime(existing.writer_lease_expires_at),
         )
 
     if session_record.state in {state.value for state in SessionState if state.is_terminal}:
@@ -131,7 +207,25 @@ def prepare_knowledge_commit(
         raise InvalidCommitStateError("knowledge commit session has no bound question")
 
     _verify_config_rules(db, session_record, batch)
-    _verify_revision_vector(db, batch, lock=False)
+    try:
+        writer_intents = acquire_writer_intents(
+            db,
+            session_lease=session_lease,
+            operation_id=attempt_id.root,
+            scopes=(RevisionScope.DEPENDENCY_GRAPH, RevisionScope.KNOWLEDGE),
+            ttl_seconds=writer_ttl_seconds,
+            expected_revisions=RevisionVector(
+                knowledge=batch.validated_knowledge_revision,
+                dependency_graph=batch.validated_dependency_graph_revision,
+            ),
+            occurred_at=timestamp,
+        )
+    except RevisionVectorConflictError as exc:
+        raise KnowledgeRevisionConflictError("batch was validated against stale revisions") from exc
+    except ConcurrencyControlError as exc:
+        raise KnowledgeCommitLeaseError("knowledge writer intent is unavailable") from exc
+    knowledge_intent = writer_intents.intent_for(RevisionScope.KNOWLEDGE)
+    dependency_intent = writer_intents.intent_for(RevisionScope.DEPENDENCY_GRAPH)
 
     staging_id = SessionStagingId.new()
     previous_state = session_record.state
@@ -147,6 +241,14 @@ def prepare_knowledge_commit(
             prepared_at=timestamp,
             resolved_at=None,
             last_error=None,
+            writer_lease_owner=session_lease.owner,
+            session_fence=session_lease.fence,
+            knowledge_writer_fence=knowledge_intent.writer_fence,
+            dependency_writer_fence=dependency_intent.writer_fence,
+            writer_lease_expires_at=min(
+                knowledge_intent.expires_at,
+                dependency_intent.expires_at,
+            ),
         )
     )
     db.flush()
@@ -198,6 +300,11 @@ def prepare_knowledge_commit(
             "staging_sha256": staging_hash,
             "validated_knowledge_revision": batch.validated_knowledge_revision,
             "validated_dependency_graph_revision": (batch.validated_dependency_graph_revision),
+            "session_fence": session_lease.fence,
+            "writer_fences": {
+                RevisionScope.KNOWLEDGE.value: knowledge_intent.writer_fence,
+                RevisionScope.DEPENDENCY_GRAPH.value: dependency_intent.writer_fence,
+            },
         },
     )
     return PreparedKnowledgeCommit(
@@ -205,6 +312,13 @@ def prepare_knowledge_commit(
         staging_id=staging_id,
         staging_sha256=staging_hash,
         status="prepared",
+        session_fence=session_lease.fence,
+        knowledge_writer_fence=knowledge_intent.writer_fence,
+        dependency_writer_fence=dependency_intent.writer_fence,
+        writer_lease_expires_at=min(
+            knowledge_intent.expires_at,
+            dependency_intent.expires_at,
+        ),
     )
 
 
@@ -213,6 +327,7 @@ def finalize_knowledge_commit(
     *,
     session_id: SessionId,
     attempt_id: CommitAttemptId,
+    session_lease: SessionLease,
     occurred_at: datetime | None = None,
     fail_after_domain_apply: Callable[[], None] | None = None,
 ) -> CommittedKnowledge:
@@ -225,7 +340,6 @@ def finalize_knowledge_commit(
     if session_record is None:
         raise InvalidCommitStateError(f"session does not exist: {session_id}")
 
-    revisions = _revision_records(db, lock=True)
     attempt = db.scalar(
         select(CommitAttemptRecord)
         .where(CommitAttemptRecord.id == attempt_id.root)
@@ -242,6 +356,19 @@ def finalize_knowledge_commit(
         or session_record.commit_attempt_id != attempt_id.root
     ):
         raise InvalidCommitStateError("session is outside the prepared commit fence")
+    writer_intents = _attempt_writer_intents(
+        attempt,
+        session_id=session_id,
+        attempt_id=attempt_id,
+        session_lease=session_lease,
+    )
+    try:
+        validate_writer_intents(db, leases=writer_intents, occurred_at=timestamp)
+    except ConcurrencyControlError as exc:
+        raise KnowledgeCommitLeaseError(
+            "prepared knowledge writer fence is no longer valid"
+        ) from exc
+    revisions = _revision_records(db, lock=True)
 
     staging = db.scalar(
         select(SessionStagingRecord).where(SessionStagingRecord.attempt_id == attempt_id.root)
@@ -363,8 +490,24 @@ def finalize_knowledge_commit(
     if fail_after_domain_apply is not None:
         fail_after_domain_apply()
 
-    knowledge_revision.revision += 1
-    knowledge_revision.updated_at = timestamp
+    try:
+        revision_vector = advance_revision_vector(
+            db,
+            leases=writer_intents,
+            mutated_scopes=(RevisionScope.KNOWLEDGE,),
+            occurred_at=timestamp,
+        )
+        release_writer_intents(
+            db,
+            leases=writer_intents,
+            occurred_at=timestamp,
+        )
+    except RevisionVectorConflictError as exc:
+        raise KnowledgeRevisionConflictError(
+            "domain revision vector changed after validation"
+        ) from exc
+    except ConcurrencyControlError as exc:
+        raise KnowledgeCommitLeaseError("knowledge writer fence was lost") from exc
     if session_record.question_id is not None:
         question = db.get(QuestionRecord, session_record.question_id)
         if question is None:
@@ -377,8 +520,8 @@ def finalize_knowledge_commit(
             id=checkpoint_id.root,
             session_id=session_id.root,
             database_commit_id=attempt_id.root,
-            knowledge_revision=knowledge_revision.revision,
-            dependency_graph_revision=dependency_revision.revision,
+            knowledge_revision=revision_vector.knowledge,
+            dependency_graph_revision=revision_vector.dependency_graph,
             created_at=timestamp,
         )
     )
@@ -400,8 +543,8 @@ def finalize_knowledge_commit(
         payload={
             "attempt_id": str(attempt_id),
             "status": "committed",
-            "knowledge_revision": knowledge_revision.revision,
-            "dependency_graph_revision": dependency_revision.revision,
+            "knowledge_revision": revision_vector.knowledge,
+            "dependency_graph_revision": revision_vector.dependency_graph,
             "claims_committed": len(batch.claims),
         },
     )
@@ -419,32 +562,85 @@ def finalize_knowledge_commit(
             "attempt_id": str(attempt_id),
         },
     )
+    try:
+        release_session_lease(db, lease=session_lease, occurred_at=timestamp)
+    except ConcurrencyControlError as exc:
+        raise KnowledgeCommitLeaseError("session fence was lost during finalization") from exc
     db.flush()
     ordered_claims = tuple(sorted(batch.claims, key=lambda item: str(item.id)))
     return CommittedKnowledge(
         attempt_id=attempt_id,
         session_id=session_id,
         checkpoint_id=checkpoint_id,
-        knowledge_revision=knowledge_revision.revision,
-        dependency_graph_revision=dependency_revision.revision,
+        knowledge_revision=revision_vector.knowledge,
+        dependency_graph_revision=revision_vector.dependency_graph,
         claim_ids=tuple(claim.id for claim in ordered_claims),
         assessment_ids=tuple(claim.assessment_id for claim in ordered_claims),
         epistemic_statuses=tuple(claim.assessment.epistemic_status for claim in ordered_claims),
     )
 
 
-def _verify_revision_vector(
-    db: Session,
-    batch: KnowledgeCommitBatch,
+def _attempt_writer_intents(
+    attempt: CommitAttemptRecord,
     *,
-    lock: bool,
-) -> None:
-    knowledge, dependency = _revision_records(db, lock=lock)
+    session_id: SessionId,
+    attempt_id: CommitAttemptId,
+    session_lease: SessionLease,
+) -> WriterIntentSet:
+    if session_lease.session_id != session_id:
+        raise KnowledgeCommitLeaseError("session lease belongs to a different session")
     if (
-        knowledge.revision != batch.validated_knowledge_revision
-        or dependency.revision != batch.validated_dependency_graph_revision
+        attempt.writer_lease_owner != session_lease.owner
+        or attempt.session_fence != session_lease.fence
     ):
-        raise KnowledgeRevisionConflictError("batch was validated against stale revisions")
+        raise KnowledgeCommitLeaseError("session lease does not match the prepared fence")
+    expiry = _required_datetime(attempt.writer_lease_expires_at)
+    return WriterIntentSet(
+        session_lease=session_lease,
+        operation_id=attempt_id.root,
+        intents=(
+            WriterIntentLease(
+                scope=RevisionScope.DEPENDENCY_GRAPH,
+                session_id=session_id,
+                operation_id=attempt_id.root,
+                owner=session_lease.owner,
+                session_fence=session_lease.fence,
+                writer_fence=_required_fence(
+                    attempt.dependency_writer_fence,
+                    "dependency writer",
+                ),
+                base_revision=attempt.validated_dependency_graph_revision,
+                expires_at=expiry,
+            ),
+            WriterIntentLease(
+                scope=RevisionScope.KNOWLEDGE,
+                session_id=session_id,
+                operation_id=attempt_id.root,
+                owner=session_lease.owner,
+                session_fence=session_lease.fence,
+                writer_fence=_required_fence(
+                    attempt.knowledge_writer_fence,
+                    "knowledge writer",
+                ),
+                base_revision=attempt.validated_knowledge_revision,
+                expires_at=expiry,
+            ),
+        ),
+    )
+
+
+def _required_fence(value: int | None, label: str) -> int:
+    if value is None or value < 1:
+        raise KnowledgeCommitLeaseError(f"prepared {label} fence is missing")
+    return value
+
+
+def _required_datetime(value: datetime | None) -> datetime:
+    if value is None:
+        raise KnowledgeCommitLeaseError("prepared writer lease expiry is missing")
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
 
 
 def _revision_records(
@@ -452,16 +648,22 @@ def _revision_records(
     *,
     lock: bool,
 ) -> tuple[DomainRevisionRecord, DomainRevisionRecord]:
-    records: list[DomainRevisionRecord] = []
-    for scope in ("knowledge", "dependency_graph"):
-        statement = select(DomainRevisionRecord).where(DomainRevisionRecord.scope == scope)
-        if lock:
-            statement = statement.with_for_update()
-        record = db.scalar(statement)
-        if record is None:
-            raise InvalidCommitStateError("domain revision vector is incomplete")
-        records.append(record)
-    return records[0], records[1]
+    statement = (
+        select(DomainRevisionRecord)
+        .where(
+            DomainRevisionRecord.scope.in_(
+                (RevisionScope.DEPENDENCY_GRAPH.value, RevisionScope.KNOWLEDGE.value)
+            )
+        )
+        .order_by(DomainRevisionRecord.scope)
+    )
+    if lock:
+        statement = statement.with_for_update()
+    records = tuple(db.scalars(statement))
+    if len(records) != 2:
+        raise InvalidCommitStateError("domain revision vector is incomplete")
+    by_scope = {RevisionScope(record.scope): record for record in records}
+    return by_scope[RevisionScope.KNOWLEDGE], by_scope[RevisionScope.DEPENDENCY_GRAPH]
 
 
 def _session_rules(db: Session, session_record: SessionRecord) -> ClaimTypeRulesSnapshot:

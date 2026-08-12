@@ -69,6 +69,10 @@ def test_upgrade_seeds_exactly_one_global_head(monkeypatch: pytest.MonkeyPatch) 
                     "AND table_name = 'actions' AND column_name = 'arguments_json'"
                 )
             )
+            revision_scopes = tuple(
+                connection.scalars(text("SELECT scope FROM domain_revisions ORDER BY scope"))
+            )
+            writer_intents = connection.scalar(text("SELECT count(*) FROM writer_intents"))
 
         assert global_heads == 1
         assert active_snapshot == str(BOOTSTRAP_CONFIG_SNAPSHOT_ID)
@@ -78,6 +82,13 @@ def test_upgrade_seeds_exactly_one_global_head(monkeypatch: pytest.MonkeyPatch) 
         assert session_question_column == 1
         assert session_attempt_column == 1
         assert action_arguments_column == 1
+        assert revision_scopes == (
+            "artifact_store",
+            "dependency_graph",
+            "knowledge",
+            "workspace",
+        )
+        assert writer_intents == 4
     finally:
         engine.dispose()
         command.downgrade(config, "base")

@@ -16,6 +16,7 @@ from packages.domain import (
     EvidenceKind,
     QuestionOrigin,
     QuestionState,
+    RevisionScope,
 )
 from packages.persistence import (
     BOOTSTRAP_CONFIG_SNAPSHOT_ID,
@@ -32,6 +33,7 @@ FOUNDATION_MIGRATION = importlib.import_module("migrations.versions.0001_operati
 QUESTION_MIGRATION = importlib.import_module("migrations.versions.0002_fifo_questions")
 KNOWLEDGE_MIGRATION = importlib.import_module("migrations.versions.0003_knowledge_commit_slice")
 TOOL_BROKER_MIGRATION = importlib.import_module("migrations.versions.0004_tool_broker")
+CONCURRENCY_MIGRATION = importlib.import_module("migrations.versions.0006_concurrency_control")
 FOUNDATION_TABLES = {
     "actions",
     "audit_events",
@@ -57,6 +59,7 @@ EXPECTED_TABLES = FOUNDATION_TABLES | {
     "session_staging",
     "workspace_files",
     "workspace_versions",
+    "writer_intents",
 }
 
 
@@ -79,6 +82,7 @@ def test_knowledge_migration_literals_match_closed_domain_registries() -> None:
     assert KNOWLEDGE_MIGRATION.CLAIM_TYPES == tuple(item.value for item in ClaimType)
     assert KNOWLEDGE_MIGRATION.EVIDENCE_KINDS == tuple(item.value for item in EvidenceKind)
     assert KNOWLEDGE_MIGRATION.EPISTEMIC_STATUSES == tuple(item.value for item in EpistemicStatus)
+    assert CONCURRENCY_MIGRATION.REVISION_SCOPES == tuple(item.value for item in RevisionScope)
 
 
 def test_bootstrap_payload_has_no_shared_mutable_state() -> None:
@@ -126,6 +130,8 @@ def test_migrations_render_valid_bootstrap_and_fifo_sql(
     assert "ALTER TABLE actions ADD COLUMN attempt_count INTEGER" in sql
     assert "CREATE TABLE artifact_blobs" in sql
     assert "CREATE TABLE workspace_versions" in sql
+    assert "CREATE TABLE writer_intents" in sql
+    assert "ALTER TABLE commit_attempts ADD COLUMN session_fence BIGINT" in sql
     assert "CREATE INDEX ix_questions_fifo" in sql
     assert "DROP CONSTRAINT ck_audit_events_type_allowed" in sql
     assert "ck_audit_events_ck_audit_events_type_allowed" not in sql
@@ -140,4 +146,5 @@ def test_migrations_render_valid_bootstrap_and_fifo_sql(
     assert "DROP COLUMN arguments_json" in downgrade_sql
     assert "DROP TABLE workspace_versions" in downgrade_sql
     assert "DROP TABLE artifact_blobs" in downgrade_sql
+    assert "DROP TABLE writer_intents" in downgrade_sql
     assert "DROP CONSTRAINT ck_audit_events_type_allowed" in downgrade_sql

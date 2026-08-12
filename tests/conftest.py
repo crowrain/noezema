@@ -9,6 +9,7 @@ import pytest
 from sqlalchemy import Engine, create_engine, event
 from sqlalchemy.orm import Session, sessionmaker
 
+from packages.domain import RevisionScope
 from packages.persistence import (
     BOOTSTRAP_CONFIG_SNAPSHOT_ID,
     BOOTSTRAP_PAYLOAD_SHA256,
@@ -20,6 +21,7 @@ from packages.persistence.models import (
     ConfigSnapshotRecord,
     DomainRevisionRecord,
     RuntimeConfigHeadRecord,
+    WriterIntentRecord,
 )
 
 
@@ -70,13 +72,22 @@ def session_factory(sqlite_engine: Engine) -> sessionmaker[Session]:
             )
         )
         db.add_all(
-            (
-                DomainRevisionRecord(scope="knowledge", revision=0, updated_at=created_at),
-                DomainRevisionRecord(
-                    scope="dependency_graph",
-                    revision=0,
-                    updated_at=created_at,
-                ),
+            DomainRevisionRecord(scope=scope.value, revision=0, updated_at=created_at)
+            for scope in RevisionScope
+        )
+        db.flush()
+        db.add_all(
+            WriterIntentRecord(
+                scope=scope.value,
+                fence=0,
+                holder_session_id=None,
+                holder_operation_id=None,
+                holder_owner=None,
+                holder_session_fence=None,
+                lease_expires_at=None,
+                base_revision=None,
+                updated_at=created_at,
             )
+            for scope in RevisionScope
         )
     return factory

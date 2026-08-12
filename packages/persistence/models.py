@@ -35,6 +35,7 @@ from packages.domain import (
     PolicyDecision,
     QuestionOrigin,
     QuestionState,
+    RevisionScope,
     SessionState,
 )
 from packages.persistence.base import Base
@@ -123,7 +124,7 @@ class DomainRevisionRecord(Base):
     __tablename__ = "domain_revisions"
     __table_args__ = (
         CheckConstraint(
-            _allowed_values("scope", ["knowledge", "dependency_graph"]),
+            _allowed_values("scope", [item.value for item in RevisionScope]),
             name="scope_allowed",
         ),
         CheckConstraint("revision >= 0", name="revision_nonnegative"),
@@ -131,6 +132,41 @@ class DomainRevisionRecord(Base):
 
     scope: Mapped[str] = mapped_column(String(32), primary_key=True)
     revision: Mapped[int] = mapped_column(BigInteger, default=0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class WriterIntentRecord(Base):
+    """Stable per-scope row carrying a monotonic fencing token."""
+
+    __tablename__ = "writer_intents"
+    __table_args__ = (
+        CheckConstraint("fence >= 0", name="fence_nonnegative"),
+        CheckConstraint(
+            "(holder_session_id IS NULL AND holder_operation_id IS NULL "
+            "AND holder_owner IS NULL AND holder_session_fence IS NULL "
+            "AND lease_expires_at IS NULL AND base_revision IS NULL) OR "
+            "(holder_session_id IS NOT NULL AND holder_operation_id IS NOT NULL "
+            "AND holder_owner IS NOT NULL AND holder_session_fence IS NOT NULL "
+            "AND holder_session_fence >= 1 AND lease_expires_at IS NOT NULL "
+            "AND base_revision IS NOT NULL AND base_revision >= 0)",
+            name="holder_tuple_complete",
+        ),
+    )
+
+    scope: Mapped[str] = mapped_column(
+        String(32), ForeignKey("domain_revisions.scope"), primary_key=True
+    )
+    fence: Mapped[int] = mapped_column(BigInteger, default=0)
+    holder_session_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("sessions.id"), nullable=True
+    )
+    holder_operation_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
+    holder_owner: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    holder_session_fence: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    base_revision: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
@@ -326,12 +362,7 @@ class WorkspaceFileRecord(Base):
     )
 
     path: Mapped[str] = mapped_column(String(1024), primary_key=True)
-    artifact_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("artifacts.id"))
-    content_sha256: Mapped[str] = mapped_column(String(64), ForeignKey("artifact_blobs.sha256"))
-    size_bytes: Mapped[int] = mapped_column(BigInteger)
-    revision: Mapped[int] = mapped_column(BigInteger)
-    updated_by_action_id: Mapped[UUID] = mapped_column(
-        Uuid(as_uuid=True), ForeignKey("actions.id"), unique=True
+    artifact_id: Mapped[UUID] = mapped_column(Uuid(as_u×^m¢G§²ÚîÆ­yÓtions.id"), unique=True
     )
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
@@ -432,6 +463,16 @@ class CommitAttemptRecord(Base):
             name="terminal_state_allowed",
         ),
         UniqueConstraint("session_id"),
+        CheckConstraint(
+            "(writer_lease_owner IS NULL AND session_fence IS NULL "
+            "AND knowledge_writer_fence IS NULL AND dependency_writer_fence IS NULL "
+            "AND writer_lease_expires_at IS NULL) OR "
+            "(writer_lease_owner IS NOT NULL AND session_fence IS NOT NULL "
+            "AND session_fence >= 1 AND knowledge_writer_fence IS NOT NULL "
+            "AND knowledge_writer_fence >= 1 AND dependency_writer_fence IS NOT NULL "
+            "AND dependency_writer_fence >= 1 AND writer_lease_expires_at IS NOT NULL)",
+            name="writer_fence_tuple_complete",
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
@@ -444,6 +485,13 @@ class CommitAttemptRecord(Base):
     prepared_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    writer_lease_owner: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    session_fence: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    knowledge_writer_fence: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    dependency_writer_fence: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    writer_lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
 
 class SessionStagingRecord(Base):

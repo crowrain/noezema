@@ -13,6 +13,13 @@ from packages.domain.assessments import (
     RuleEvidenceFacts,
     ScopeDimension,
 )
+from packages.domain.concurrency import (
+    RevisionScope,
+    RevisionVector,
+    SessionLease,
+    WriterIntentLease,
+    WriterIntentSet,
+)
 from packages.domain.decisions import CompleteDecision, DecisionEnvelope, ToolDecision
 from packages.domain.enums import (
     ActionState,
@@ -172,10 +179,13 @@ __all__ = [
     "QuestionId",
     "QuestionOrigin",
     "QuestionState",
+    "RevisionScope",
+    "RevisionVector",
     "RuleEvidenceFacts",
     "SandboxEnvironmentManifest",
     "SandboxProfile",
     "SessionId",
+    "SessionLease",
     "SessionStagingId",
     "SessionState",
     "ScopeDimension",
@@ -203,6 +213,8 @@ __all__ = [
     "WorkspaceReadPayload",
     "WorkspaceWriteArguments",
     "WorkspaceWritePayload",
+    "WriterIntentLease",
+    "WriterIntentSet",
     "TurnId",
     "bind_action",
     "canonical_json_sha256",

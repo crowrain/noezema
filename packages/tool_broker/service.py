@@ -27,7 +27,11 @@ from packages.domain import (
     capability_policy_sha256,
     sealed_mvp_capability_policy,
 )
-from packages.persistence import append_session_audit
+from packages.persistence import (
+    ConcurrencyControlError,
+    acquire_session_lease,
+    append_session_audit,
+)
 from packages.persistence.models import (
     ActionRecord,
     ConfigSnapshotRecord,
@@ -67,9 +71,16 @@ class ToolBroker:
         executor: ToolExecutor | None = None,
         sandbox_runner: SandboxRunner | None = None,
         effect_publisher: ToolEffectPublisher | None = None,
+        lease_owner: str = "orchestrator",
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._session_factory = session_factory
+        self.policy = policy or sealed_mvp_capability_policy()
+        self._lease_owner = lease_owner
+        self._lease_ttl_seconds = min(
+            3_600,
+            max(30, self.policy.action_timeout_ms // 1_000 + 30),
+        )
         resolved_workspace = workspace_root.resolve(strict=True)
         selected_store_root = artifact_store_root or (
             resolved_workspace.parent / f".{resolved_workspace.name}.noezema-artifacts"
@@ -77,7 +88,6 @@ class ToolBroker:
         artifact_store = ContentAddressedArtifactStore(selected_store_root)
         if artifact_store.root.is_relative_to(resolved_workspace):
             raise ValueError("artifact_store_root must be outside the model-visible workspace")
-        self.policy = policy or sealed_mvp_capability_policy()
         self._policy_engine = CapabilityPolicyEngine(
             policy=self.policy,
             workspace_root=resolved_workspace,
@@ -338,6 +348,20 @@ class ToolBroker:
     def _start_attempt(self, action: BoundAction) -> int:
         timestamp = self._clock()
         with self._session_factory.begin() as db:
+            try:
+                acquire_session_lease(
+                    db,
+                    session_id=action.session_id,
+                    owner=self._lease_owner,
+                    ttl_seconds=self._lease_ttl_seconds,
+                    occurred_at=timestamp,
+                )
+            except ConcurrencyControlError as exc:
+                raise ToolExecutionError(
+                    "session_lease_unavailable",
+                    "The action completion is fenced by another session owner.",
+                    retryable=True,
+                ) from exc
             record = self._locked_action(db, action.action_id)
             if record.state not in {
                 ActionState.ACCEPTED.value,
@@ -397,6 +421,20 @@ class ToolBroker:
             raise ActionBindingConflictError("executor returned an observation for another action")
         timestamp = self._clock()
         with self._session_factory.begin() as db:
+            try:
+                session_lease = acquire_session_lease(
+                    db,
+                    session_id=action.session_id,
+                    owner=self._lease_owner,
+                    ttl_seconds=self._lease_ttl_seconds,
+                    occurred_at=timestamp,
+                )
+            except ConcurrencyControlError as exc:
+                raise ToolExecutionError(
+                    "session_lease_unavailable",
+                    "The action completion is fenced by another session owner.",
+                    retryable=True,
+                ) from exc
             record = self._locked_action(db, action.action_id)
             if record.state == ActionState.COMPLETED.value:
                 return self._result_from_record(record)
@@ -406,6 +444,7 @@ class ToolBroker:
                 db,
                 action=action,
                 observation=observation,
+                session_lease=session_lease,
                 published_at=timestamp,
             )
             record.state = ActionState.COMPLETED.value

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import func, select
@@ -45,13 +45,18 @@ from packages.domain import (
     canonical_json_sha256,
 )
 from packages.memory import (
+    KnowledgeCommitLeaseError,
     KnowledgeRevisionConflictError,
     build_knowledge_commit_batch,
     finalize_knowledge_commit,
     mvp_claim_type_rules,
     prepare_knowledge_commit,
 )
-from packages.persistence import BOOTSTRAP_CONFIG_SNAPSHOT_ID, bootstrap_payload
+from packages.persistence import (
+    BOOTSTRAP_CONFIG_SNAPSHOT_ID,
+    acquire_session_lease,
+    bootstrap_payload,
+)
 from packages.persistence.models import (
     AssessmentEvidenceRecord,
     AuditEventRecord,
@@ -68,6 +73,7 @@ from packages.persistence.models import (
     RuntimeConfigHeadRecord,
     SessionRecord,
     SessionStagingRecord,
+    WriterIntentRecord,
 )
 
 NOW = datetime(2026, 8, 11, 10, 0, tzinfo=UTC)
@@ -77,6 +83,16 @@ def _count(db: Session, record: type[object]) -> int:
     value = db.scalar(select(func.count()).select_from(record))
     assert value is not None
     return value
+
+
+def _session_lease(db: Session, session_id: SessionId):
+    return acquire_session_lease(
+        db,
+        session_id=session_id,
+        owner="orchestrator",
+        ttl_seconds=300,
+        occurred_at=NOW,
+    )
 
 
 def _install_mvp_rules(db: Session) -> ConfigSnapshotId:
@@ -230,11 +246,13 @@ def test_supported_question_is_assessed_and_committed_atomically(
     assert batch.claims[0].assessment.epistemic_status is EpistemicStatus.SUPPORTED
 
     with session_factory.begin() as db:
+        lease = _session_lease(db, session_id)
         prepared = prepare_knowledge_commit(
             db,
             session_id=session_id,
             attempt_id=attempt_id,
             batch=batch,
+            session_lease=lease,
             occurred_at=NOW,
         )
         assert prepared.status == "prepared"
@@ -244,6 +262,7 @@ def test_supported_question_is_assessed_and_committed_atomically(
                 session_id=session_id,
                 attempt_id=attempt_id,
                 batch=batch,
+                session_lease=lease,
                 occurred_at=NOW,
             )
             == prepared
@@ -260,6 +279,7 @@ def test_supported_question_is_assessed_and_committed_atomically(
             db,
             session_id=session_id,
             attempt_id=attempt_id,
+            session_lease=lease,
             occurred_at=NOW,
         )
 
@@ -273,6 +293,9 @@ def test_supported_question_is_assessed_and_committed_atomically(
             (committed.claim_ids[0].root, session_record.config_snapshot_id),
         )
         revision = db.get(DomainRevisionRecord, "knowledge")
+        dependency_revision = db.get(DomainRevisionRecord, "dependency_graph")
+        knowledge_intent = db.get(WriterIntentRecord, "knowledge")
+        dependency_intent = db.get(WriterIntentRecord, "dependency_graph")
 
         assert session_record is not None
         assert question_record is not None
@@ -280,6 +303,9 @@ def test_supported_question_is_assessed_and_committed_atomically(
         assert assessment is not None
         assert head is not None
         assert revision is not None
+        assert dependency_revision is not None
+        assert knowledge_intent is not None
+        assert dependency_intent is not None
         assert session_record.state == SessionState.SUCCEEDED.value
         assert question_record.state == "answered"
         assert attempt.status == "committed"
@@ -288,6 +314,11 @@ def test_supported_question_is_assessed_and_committed_atomically(
         assert head.current_assessment_id == assessment.id
         assert head.epistemic_status == EpistemicStatus.SUPPORTED.value
         assert revision.revision == 1
+        assert dependency_revision.revision == 0
+        assert knowledge_intent.fence == 1
+        assert knowledge_intent.holder_operation_id is None
+        assert dependency_intent.fence == 1
+        assert dependency_intent.holder_operation_id is None
         assert _count(db, ClaimRecord) == 1
         assert _count(db, EvidenceRecord) == 2
         assert _count(db, AssessmentEvidenceRecord) == 2
@@ -301,6 +332,7 @@ def test_supported_question_is_assessed_and_committed_atomically(
             db,
             session_id=session_id,
             attempt_id=attempt_id,
+            session_lease=lease,
             occurred_at=NOW,
         )
     assert replayed == committed
@@ -319,11 +351,13 @@ def test_failure_inside_final_transaction_leaves_only_prepared_staging(
     batch = _build_external_fact_batch(question)
     attempt_id = CommitAttemptId.new()
     with session_factory.begin() as db:
+        lease = _session_lease(db, session_id)
         prepare_knowledge_commit(
             db,
             session_id=session_id,
             attempt_id=attempt_id,
             batch=batch,
+            session_lease=lease,
             occurred_at=NOW,
         )
 
@@ -335,6 +369,7 @@ def test_failure_inside_final_transaction_leaves_only_prepared_staging(
             db,
             session_id=session_id,
             attempt_id=attempt_id,
+            session_lease=lease,
             occurred_at=NOW,
             fail_after_domain_apply=failpoint,
         )
@@ -353,6 +388,92 @@ def test_failure_inside_final_transaction_leaves_only_prepared_staging(
         assert _count(db, ClaimAssessmentHeadRecord) == 0
         assert _count(db, CheckpointRecord) == 0
         assert db.get(DomainRevisionRecord, "knowledge").revision == 0
+        knowledge_intent = db.get(WriterIntentRecord, "knowledge")
+        dependency_intent = db.get(WriterIntentRecord, "dependency_graph")
+        assert knowledge_intent is not None
+        assert dependency_intent is not None
+        assert knowledge_intent.holder_operation_id == attempt_id.root
+        assert dependency_intent.holder_operation_id == attempt_id.root
+
+
+def test_expired_prepared_commit_is_refenced_before_recovery(
+    session_factory: sessionmaker[Session],
+) -> None:
+    session_id, question = _start_question(session_factory)
+    batch = _build_external_fact_batch(question)
+    attempt_id = CommitAttemptId.new()
+    with session_factory.begin() as db:
+        old_lease = acquire_session_lease(
+            db,
+            session_id=session_id,
+            owner="worker-a",
+            ttl_seconds=5,
+            occurred_at=NOW,
+        )
+        prepared = prepare_knowledge_commit(
+            db,
+            session_id=session_id,
+            attempt_id=attempt_id,
+            batch=batch,
+            session_lease=old_lease,
+            writer_ttl_seconds=5,
+            occurred_at=NOW,
+        )
+
+    recovered_at = NOW + timedelta(seconds=6)
+    with session_factory.begin() as db:
+        new_lease = acquire_session_lease(
+            db,
+            session_id=session_id,
+            owner="worker-b",
+            ttl_seconds=60,
+            occurred_at=recovered_at,
+        )
+        recovered = prepare_knowledge_commit(
+            db,
+            session_id=session_id,
+            attempt_id=attempt_id,
+            batch=batch,
+            session_lease=new_lease,
+            writer_ttl_seconds=60,
+            occurred_at=recovered_at,
+        )
+
+    assert new_lease.fence == old_lease.fence + 1
+    assert recovered.session_fence == new_lease.fence
+    assert recovered.knowledge_writer_fence == prepared.knowledge_writer_fence + 1
+    assert recovered.dependency_writer_fence == prepared.dependency_writer_fence + 1
+
+    with pytest.raises(KnowledgeCommitLeaseError), session_factory.begin() as db:
+        finalize_knowledge_commit(
+            db,
+            session_id=session_id,
+            attempt_id=attempt_id,
+            session_lease=old_lease,
+            occurred_at=recovered_at,
+        )
+
+    with session_factory.begin() as db:
+        committed = finalize_knowledge_commit(
+            db,
+            session_id=session_id,
+            attempt_id=attempt_id,
+            session_lease=new_lease,
+            occurred_at=recovered_at,
+        )
+
+    assert committed.knowledge_revision == 1
+    with session_factory() as db:
+        attempt = db.get(CommitAttemptRecord, attempt_id.root)
+        knowledge_intent = db.get(WriterIntentRecord, "knowledge")
+        dependency_intent = db.get(WriterIntentRecord, "dependency_graph")
+        assert attempt is not None and attempt.status == "committed"
+        assert knowledge_intent is not None
+        assert dependency_intent is not None
+        assert knowledge_intent.fence == recovered.knowledge_writer_fence
+        assert knowledge_intent.holder_operation_id is None
+        assert dependency_intent.fence == recovered.dependency_writer_fence
+        assert dependency_intent.holder_operation_id is None
 
 
 def test_insufficient_and_counter_evidence_never_look_supported(
@@ -366,11 +487,13 @@ def test_insufficient_and_counter_evidence_never_look_supported(
     assert assessment.effective_grade is EvidenceGrade.E2
     assert assessment.epistemic_status is EpistemicStatus.DISPUTED
     with session_factory.begin() as db:
+        lease = _session_lease(db, session_id)
         prepare_knowledge_commit(
             db,
             session_id=session_id,
             attempt_id=attempt_id,
             batch=batch,
+            session_lease=lease,
             occurred_at=NOW,
         )
     with session_factory.begin() as db:
@@ -378,6 +501,7 @@ def test_insufficient_and_counter_evidence_never_look_supported(
             db,
             session_id=session_id,
             attempt_id=attempt_id,
+            session_lease=lease,
             occurred_at=NOW,
         )
     with session_factory() as db:
@@ -398,11 +522,13 @@ def test_revision_change_rejects_finalization_without_partial_visibility(
     batch = _build_external_fact_batch(question)
     attempt_id = CommitAttemptId.new()
     with session_factory.begin() as db:
+        lease = _session_lease(db, session_id)
         prepare_knowledge_commit(
             db,
             session_id=session_id,
             attempt_id=attempt_id,
             batch=batch,
+            session_lease=lease,
             occurred_at=NOW,
         )
     with session_factory.begin() as db:
@@ -415,6 +541,7 @@ def test_revision_change_rejects_finalization_without_partial_visibility(
             db,
             session_id=session_id,
             attempt_id=attempt_id,
+            session_lease=lease,
             occurred_at=NOW,
         )
 

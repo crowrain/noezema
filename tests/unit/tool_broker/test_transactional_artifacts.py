@@ -26,9 +26,11 @@ from packages.persistence.models import (
     ArtifactBlobRecord,
     ArtifactRecord,
     AuditEventRecord,
+    DomainRevisionRecord,
     ModelRunRecord,
     WorkspaceFileRecord,
     WorkspaceVersionRecord,
+    WriterIntentRecord,
 )
 from packages.tool_broker import ToolBroker, ToolExecutionError, WorkspaceArtifactPublisher
 from tests.unit.tool_broker.test_service import (
@@ -127,6 +129,17 @@ def test_workspace_write_publishes_manifest_atomically_and_replays(
         assert len(artifacts) == 1
         assert completion is not None
         assert completion.payload["published_effect"]["workspace_revision"] == 1
+        revision_vector = completion.payload["published_effect"]["revision_vector"]
+        assert revision_vector["workspace"] == 1
+        assert revision_vector["artifact_store"] == 1
+        workspace_intent = db.get(WriterIntentRecord, "workspace")
+        artifact_intent = db.get(WriterIntentRecord, "artifact_store")
+        assert workspace_intent is not None
+        assert artifact_intent is not None
+        assert workspace_intent.fence == 1
+        assert workspace_intent.holder_operation_id is None
+        assert artifact_intent.fence == 1
+        assert artifact_intent.holder_operation_id is None
 
     read_run_id = _add_model_run(session_factory, session_id=session_id)
     read = broker.run(
@@ -224,11 +237,12 @@ class _FailAfterPublish:
     def __init__(self, inner: WorkspaceArtifactPublisher) -> None:
         self._inner = inner
 
-    def publish(self, db, *, action, observation, published_at):
+    def publish(self, db, *, action, observation, session_lease, published_at):
         self._inner.publish(
             db,
             action=action,
             observation=observation,
+            session_lease=session_lease,
             published_at=published_at,
         )
         raise ToolExecutionError(
@@ -289,6 +303,16 @@ def test_failure_after_effect_staging_rolls_back_manifest_artifact_and_audit(
             )
         )
         assert completion_count == 0
+        assert db.get(DomainRevisionRecord, "workspace").revision == 0
+        assert db.get(DomainRevisionRecord, "artifact_store").revision == 0
+        workspace_intent = db.get(WriterIntentRecord, "workspace")
+        artifact_intent = db.get(WriterIntentRecord, "artifact_store")
+        assert workspace_intent is not None
+        assert artifact_intent is not None
+        assert workspace_intent.fence == 0
+        assert workspace_intent.holder_operation_id is None
+        assert artifact_intent.fence == 0
+        assert artifact_intent.holder_operation_id is None
     assert any(path.is_file() for path in (store_root / "blobs").rglob("*"))
 
 
