@@ -73,6 +73,9 @@ def test_upgrade_seeds_exactly_one_global_head(monkeypatch: pytest.MonkeyPatch) 
                 connection.scalars(text("SELECT scope FROM domain_revisions ORDER BY scope"))
             )
             writer_intents = connection.scalar(text("SELECT count(*) FROM writer_intents"))
+            orchestrator_turns_table = connection.scalar(
+                text("SELECT to_regclass('orchestrator_turns')::text")
+            )
 
         assert global_heads == 1
         assert active_snapshot == str(BOOTSTRAP_CONFIG_SNAPSHOT_ID)
@@ -89,6 +92,7 @@ def test_upgrade_seeds_exactly_one_global_head(monkeypatch: pytest.MonkeyPatch) 
             "workspace",
         )
         assert writer_intents == 4
+        assert orchestrator_turns_table == "orchestrator_turns"
     finally:
         engine.dispose()
         command.downgrade(config, "base")

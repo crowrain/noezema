@@ -41,6 +41,7 @@ from packages.domain import (
 from packages.persistence.base import Base
 
 JsonType = JSON().with_variant(JSONB(), "postgresql")
+NullableJsonType = JSON(none_as_null=True).with_variant(JSONB(none_as_null=True), "postgresql")
 
 
 def _allowed_values(column: str, values: list[str]) -> str:
@@ -261,6 +262,59 @@ class ModelRunRecord(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
+class OrchestratorTurnRecord(Base):
+    """Durable intent and outcome for one resumable model turn."""
+
+    __tablename__ = "orchestrator_turns"
+    __table_args__ = (
+        UniqueConstraint("session_id", "ordinal"),
+        UniqueConstraint("model_run_id"),
+        Index("ix_orchestrator_turns_session_status", "session_id", "status"),
+        CheckConstraint("ordinal >= 1", name="ordinal_positive"),
+        CheckConstraint("session_fence >= 1", name="session_fence_positive"),
+        CheckConstraint(
+            _allowed_values(
+                "phase",
+                ["planning", "exploration", "verification", "consolidation"],
+            ),
+            name="phase_allowed",
+        ),
+        CheckConstraint(
+            _allowed_values("status", ["prepared", "completed", "failed"]),
+            name="status_allowed",
+        ),
+        CheckConstraint("length(request_sha256) = 64", name="request_sha256_length"),
+        CheckConstraint("length(response_schema_sha256) = 64", name="schema_sha256_length"),
+        CheckConstraint(
+            "(status = 'prepared' AND model_run_id IS NULL AND result IS NULL "
+            "AND error_code IS NULL AND completed_at IS NULL) OR "
+            "(status = 'completed' AND model_run_id IS NOT NULL AND result IS NOT NULL "
+            "AND error_code IS NULL AND completed_at IS NOT NULL) OR "
+            "(status = 'failed' AND model_run_id IS NULL AND result IS NULL "
+            "AND error_code IS NOT NULL AND completed_at IS NOT NULL)",
+            name="outcome_tuple_complete",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    session_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("sessions.id"))
+    ordinal: Mapped[int] = mapped_column(Integer)
+    phase: Mapped[str] = mapped_column(String(32))
+    status: Mapped[str] = mapped_column(String(16))
+    lease_owner: Mapped[str] = mapped_column(String(128))
+    session_fence: Mapped[int] = mapped_column(BigInteger)
+    request: Mapped[dict[str, Any]] = mapped_column(JsonType)
+    request_sha256: Mapped[str] = mapped_column(String(64))
+    response_schema_sha256: Mapped[str] = mapped_column(String(64))
+    model_run_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("model_runs.id"), nullable=True
+    )
+    result: Mapped[dict[str, Any] | None] = mapped_column(NullableJsonType, nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class ActionRecord(Base):
     __tablename__ = "actions"
     __table_args__ = (
@@ -362,7 +416,12 @@ class WorkspaceFileRecord(Base):
     )
 
     path: Mapped[str] = mapped_column(String(1024), primary_key=True)
-    artifact_id: Mapped[UUID] = mapped_column(Uuid(as_u◊^m¢Gß≤⁄Óù∆≠y”tions.id"), unique=True
+    artifact_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("artifacts.id"))
+    content_sha256: Mapped[str] = mapped_column(String(64), ForeignKey("artifact_blobs.sha256"))
+    size_bytes: Mapped[int] = mapped_column(BigInteger)
+    revision: Mapped[int] = mapped_column(BigInteger)
+    updated_by_action_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("actions.id"), unique=True
     )
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 

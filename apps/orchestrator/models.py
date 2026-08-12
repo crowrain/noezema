@@ -5,7 +5,22 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Literal
 
-from packages.domain import ConfigSnapshotId, QuestionId, QuestionOrigin, SessionId
+from pydantic import model_validator
+
+from packages.domain import (
+    ActionId,
+    BrokerRunResult,
+    ConfigSnapshotId,
+    DecisionEnvelope,
+    ModelRunId,
+    QuestionId,
+    QuestionOrigin,
+    SessionId,
+    SessionLease,
+    SessionState,
+    ToolDecision,
+    TurnId,
+)
 from packages.domain._base import ContractModel, NonEmptyText
 
 
@@ -30,3 +45,67 @@ class WakeSkipped(ContractModel):
 
 
 WakeResult = SessionStarted | WakeSkipped
+
+
+class SessionWorkKind(StrEnum):
+    WAKE = "wake"
+    ORIENT = "orient"
+    SELECT_QUESTION = "select_question"
+    PLAN = "plan"
+    EXPLORE = "explore"
+    VERIFY = "verify"
+    STOP = "stop"
+    CONSOLIDATE = "consolidate"
+    REPORT = "report"
+    RESUME_TURN = "resume_turn"
+    RECOVER_ACTION = "recover_action"
+    FINALIZE_COMMIT = "finalize_commit"
+    RECONCILE_COMMIT = "reconcile_commit"
+    ABORT = "abort"
+
+
+class SessionWorkDirective(ContractModel):
+    kind: SessionWorkKind
+    state: SessionState
+    turn_id: TurnId | None = None
+    action_id: ActionId | None = None
+
+    @model_validator(mode="after")
+    def require_exact_recovery_reference(self) -> SessionWorkDirective:
+        if self.kind is SessionWorkKind.RESUME_TURN:
+            if self.turn_id is None or self.action_id is not None:
+                raise ValueError("resume_turn requires only turn_id")
+        elif self.kind is SessionWorkKind.RECOVER_ACTION:
+            if self.action_id is None or self.turn_id is not None:
+                raise ValueError("recover_action requires only action_id")
+        elif self.turn_id is not None or self.action_id is not None:
+            raise ValueError("phase work must not carry a recovery identity")
+        return self
+
+
+class ClaimedSession(ContractModel):
+    session_id: SessionId
+    lease: SessionLease
+    directive: SessionWorkDirective
+
+    @model_validator(mode="after")
+    def require_session_binding(self) -> ClaimedSession:
+        if self.lease.session_id != self.session_id:
+            raise ValueError("claimed lease belongs to another session")
+        return self
+
+
+class ExplorerTurnResult(ContractModel):
+    session_id: SessionId
+    turn_id: TurnId
+    model_run_id: ModelRunId
+    decision: DecisionEnvelope
+    action_result: BrokerRunResult | None = None
+    replayed_model_run: bool
+
+    @model_validator(mode="after")
+    def require_decision_effect(self) -> ExplorerTurnResult:
+        expects_action = isinstance(self.decision.decision, ToolDecision)
+        if expects_action != (self.action_result is not None):
+            raise ValueError("tool decisions require exactly one broker result")
+        return self

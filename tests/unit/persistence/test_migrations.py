@@ -34,6 +34,9 @@ QUESTION_MIGRATION = importlib.import_module("migrations.versions.0002_fifo_ques
 KNOWLEDGE_MIGRATION = importlib.import_module("migrations.versions.0003_knowledge_commit_slice")
 TOOL_BROKER_MIGRATION = importlib.import_module("migrations.versions.0004_tool_broker")
 CONCURRENCY_MIGRATION = importlib.import_module("migrations.versions.0006_concurrency_control")
+ORCHESTRATOR_MIGRATION = importlib.import_module(
+    "migrations.versions.0007_durable_orchestrator_turns"
+)
 FOUNDATION_TABLES = {
     "actions",
     "audit_events",
@@ -41,6 +44,7 @@ FOUNDATION_TABLES = {
     "domain_revisions",
     "model_runs",
     "outbox_events",
+    "orchestrator_turns",
     "runtime_config_heads",
     "sessions",
     "system_constants",
@@ -83,6 +87,12 @@ def test_knowledge_migration_literals_match_closed_domain_registries() -> None:
     assert KNOWLEDGE_MIGRATION.EVIDENCE_KINDS == tuple(item.value for item in EvidenceKind)
     assert KNOWLEDGE_MIGRATION.EPISTEMIC_STATUSES == tuple(item.value for item in EpistemicStatus)
     assert CONCURRENCY_MIGRATION.REVISION_SCOPES == tuple(item.value for item in RevisionScope)
+    assert ORCHESTRATOR_MIGRATION.TURN_PHASES == (
+        "planning",
+        "exploration",
+        "verification",
+        "consolidation",
+    )
 
 
 def test_bootstrap_payload_has_no_shared_mutable_state() -> None:
@@ -131,6 +141,7 @@ def test_migrations_render_valid_bootstrap_and_fifo_sql(
     assert "CREATE TABLE artifact_blobs" in sql
     assert "CREATE TABLE workspace_versions" in sql
     assert "CREATE TABLE writer_intents" in sql
+    assert "CREATE TABLE orchestrator_turns" in sql
     assert "ALTER TABLE commit_attempts ADD COLUMN session_fence BIGINT" in sql
     assert "CREATE INDEX ix_questions_fifo" in sql
     assert "DROP CONSTRAINT ck_audit_events_type_allowed" in sql
@@ -147,4 +158,5 @@ def test_migrations_render_valid_bootstrap_and_fifo_sql(
     assert "DROP TABLE workspace_versions" in downgrade_sql
     assert "DROP TABLE artifact_blobs" in downgrade_sql
     assert "DROP TABLE writer_intents" in downgrade_sql
+    assert "DROP TABLE orchestrator_turns" in downgrade_sql
     assert "DROP CONSTRAINT ck_audit_events_type_allowed" in downgrade_sql
