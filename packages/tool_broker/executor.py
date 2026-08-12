@@ -20,7 +20,11 @@ from packages.domain import (
     MemorySearchArguments,
     MemorySearchHit,
     MemorySearchPayload,
-    SafeToolArguments,
+    PythonExecuteArguments,
+    PythonExecutionPayload,
+    ShellExecuteArguments,
+    ShellExecutionPayload,
+    ToolArguments,
     ToolExecutionObservation,
     ToolName,
     WorkspaceEntry,
@@ -28,6 +32,8 @@ from packages.domain import (
     WorkspaceListPayload,
     WorkspaceReadArguments,
     WorkspaceReadPayload,
+    canonical_json_sha256,
+    sandbox_profile_sha256,
 )
 from packages.persistence.models import (
     ClaimAssessmentHeadRecord,
@@ -35,33 +41,8 @@ from packages.persistence.models import (
     ClaimRecord,
     SessionRecord,
 )
-
-
-class ToolExecutionError(RuntimeError):
-    """Sanitized adapter failure carrying retry and outcome semantics."""
-
-    def __init__(
-        self,
-        code: str,
-        message: str,
-        *,
-        retryable: bool,
-        outcome_known: bool = True,
-    ) -> None:
-        self.code = code
-        self.public_message = message
-        self.retryable = retryable
-        self.outcome_known = outcome_known
-        super().__init__(message)
-
-
-class ToolDeadlineExceeded(ToolExecutionError):
-    def __init__(self) -> None:
-        super().__init__(
-            "tool_timeout",
-            "The bounded tool execution exceeded its policy timeout.",
-            retryable=True,
-        )
+from packages.tool_broker.errors import ToolDeadlineExceeded, ToolExecutionError
+from packages.tool_broker.sandbox_runtime import SandboxRunner
 
 
 class ToolExecutor(Protocol):
@@ -69,7 +50,7 @@ class ToolExecutor(Protocol):
         self,
         *,
         action: BoundAction,
-        arguments: SafeToolArguments,
+        arguments: ToolArguments,
         captured_at: datetime,
         timeout_ms: int,
     ) -> ToolExecutionObservation: ...
@@ -108,7 +89,7 @@ class SafeToolExecutor:
         self,
         *,
         action: BoundAction,
-        arguments: SafeToolArguments,
+        arguments: ToolArguments,
         captured_at: datetime,
         timeout_ms: int,
     ) -> ToolExecutionObservation:
@@ -331,4 +312,123 @@ class SafeToolExecutor:
             source="memory:current-assessment-heads",
             captured_at=captured_at,
             payload=payload,
+        )
+
+
+class SandboxToolExecutor:
+    """Adapt OCI sandbox results to trusted, typed Tool Broker observations."""
+
+    def __init__(self, *, runner: SandboxRunner) -> None:
+        self._runner = runner
+
+    def execute(
+        self,
+        *,
+        action: BoundAction,
+        arguments: ToolArguments,
+        captured_at: datetime,
+        timeout_ms: int,
+    ) -> ToolExecutionObservation:
+        if not isinstance(arguments, ShellExecuteArguments | PythonExecuteArguments):
+            raise ToolExecutionError(
+                "tool_contract_mismatch",
+                "The sandbox executor received a non-execution tool.",
+                retryable=False,
+            )
+        result = self._runner.execute(
+            action_id=action.action_id,
+            session_id=str(action.session_id),
+            tool=action.tool,
+            arguments=arguments,
+            timeout_ms=timeout_ms,
+        )
+        environment = result.environment
+        if environment.profile_sha256 != sandbox_profile_sha256(self._runner.profile):
+            raise ToolExecutionError(
+                "sandbox_environment_mismatch",
+                "The sandbox result does not match the pinned capability profile.",
+                retryable=False,
+                outcome_known=False,
+            )
+        payload_type = (
+            ShellExecutionPayload
+            if isinstance(arguments, ShellExecuteArguments)
+            else PythonExecutionPayload
+        )
+        payload = payload_type(
+            exit_code=result.captured.exit_code,
+            successful=(result.captured.exit_code == 0 and not result.workspace_quota_exceeded),
+            duration_ms=result.captured.duration_ms,
+            stdout=result.captured.stdout,
+            stderr=result.captured.stderr,
+            stdout_bytes=result.captured.stdout_bytes,
+            stderr_bytes=result.captured.stderr_bytes,
+            stdout_sha256=result.captured.stdout_sha256,
+            stderr_sha256=result.captured.stderr_sha256,
+            stdout_truncated=result.captured.stdout_truncated,
+            stderr_truncated=result.captured.stderr_truncated,
+            workspace_bytes_before=result.workspace_bytes_before,
+            workspace_bytes_after=result.workspace_bytes_after,
+            workspace_quota_exceeded=result.workspace_quota_exceeded,
+            arguments_sha256=action.arguments_sha256,
+            environment=environment,
+            environment_sha256=canonical_json_sha256(environment.model_dump(mode="json")),
+        )
+        return ToolExecutionObservation.build(
+            action_id=action.action_id,
+            tool=action.tool,
+            source=(f"sandbox:{environment.runtime}:{environment.image}:{action.action_id}"),
+            captured_at=captured_at,
+            payload=payload,
+        )
+
+
+class DispatchingToolExecutor:
+    """Route closed tool names to trusted adapters without model-controlled fallback."""
+
+    def __init__(
+        self,
+        *,
+        safe: SafeToolExecutor,
+        sandbox: SandboxToolExecutor | None,
+    ) -> None:
+        self._safe = safe
+        self._sandbox = sandbox
+
+    def execute(
+        self,
+        *,
+        action: BoundAction,
+        arguments: ToolArguments,
+        captured_at: datetime,
+        timeout_ms: int,
+    ) -> ToolExecutionObservation:
+        if action.tool in {
+            ToolName.WORKSPACE_READ,
+            ToolName.WORKSPACE_LIST,
+            ToolName.MEMORY_SEARCH,
+        }:
+            return self._safe.execute(
+                action=action,
+                arguments=arguments,
+                captured_at=captured_at,
+                timeout_ms=timeout_ms,
+            )
+        if action.tool in {ToolName.SHELL_EXECUTE, ToolName.PYTHON_EXECUTE}:
+            if self._sandbox is None:
+                raise ToolExecutionError(
+                    "sandbox_not_configured",
+                    "The capability policy did not configure a sandbox runtime.",
+                    retryable=False,
+                )
+            return self._sandbox.execute(
+                action=action,
+                arguments=arguments,
+                captured_at=captured_at,
+                timeout_ms=timeout_ms,
+            )
+        raise ToolExecutionError(
+            "tool_not_implemented",
+            "No trusted adapter exists for the accepted tool.",
+            retryable=False,
         )

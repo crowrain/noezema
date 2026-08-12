@@ -8,13 +8,17 @@ from pydantic import ValidationError
 
 from packages.domain import (
     ActionId,
+    CapabilityPolicy,
     EvidenceKind,
+    PythonExecuteArguments,
+    SandboxProfile,
     ToolExecutionObservation,
     ToolName,
     WorkspaceListArguments,
     WorkspaceReadArguments,
     WorkspaceReadPayload,
     capability_policy_sha256,
+    sandbox_mvp_capability_policy,
     sealed_mvp_capability_policy,
     workspace_read_as_source_observation,
 )
@@ -45,6 +49,35 @@ def test_sealed_policy_exposes_only_read_only_mvp_tools() -> None:
     assert capability_policy_sha256(policy) == capability_policy_sha256(
         sealed_mvp_capability_policy()
     )
+
+
+def test_sandbox_image_must_be_pinned_by_digest() -> None:
+    with pytest.raises(ValidationError):
+        SandboxProfile(image="python:latest")
+
+
+def test_execution_tools_require_an_explicit_sandbox_profile() -> None:
+    with pytest.raises(ValidationError, match="require a pinned sandbox"):
+        CapabilityPolicy(
+            version="invalid/v1",
+            allowed_tools=(ToolName.SHELL_EXECUTE,),
+        )
+
+
+def test_sandbox_policy_enables_only_local_networkless_computation() -> None:
+    sandbox = SandboxProfile(image=f"localhost/noezema-sandbox@sha256:{'a' * 64}")
+    policy = sandbox_mvp_capability_policy(sandbox=sandbox)
+
+    assert policy.sandbox == sandbox
+    assert ToolName.SHELL_EXECUTE in policy.allowed_tools
+    assert ToolName.PYTHON_EXECUTE in policy.allowed_tools
+    assert ToolName.WEB_FETCH not in policy.allowed_tools
+
+
+def test_python_source_whitespace_is_part_of_the_bound_program() -> None:
+    code = "if True:\n    print('preserved')\n"
+
+    assert PythonExecuteArguments(code=code).code == code
 
 
 def test_workspace_read_payload_is_bound_to_exact_utf8_content() -> None:

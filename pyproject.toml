@@ -41,6 +41,7 @@ pythonpath = ["."]
 markers = [
   "model_compatibility: opt-in checks against a real local LLM backend",
   "postgresql_integration: opt-in checks against a disposable PostgreSQL database",
+  "sandbox_integration: opt-in checks against a rootless OCI runtime and pinned image",
 ]
 
 [tool.ruff]

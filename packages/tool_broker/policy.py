@@ -13,7 +13,9 @@ from packages.domain import (
     MemorySearchArguments,
     PolicyDecision,
     PolicyEvaluation,
-    SafeToolArguments,
+    PythonExecuteArguments,
+    ShellExecuteArguments,
+    ToolArguments,
     ToolName,
     WorkspaceListArguments,
     WorkspaceReadArguments,
@@ -24,13 +26,15 @@ _ARGUMENT_SCHEMAS = {
     ToolName.WORKSPACE_READ: WorkspaceReadArguments,
     ToolName.WORKSPACE_LIST: WorkspaceListArguments,
     ToolName.MEMORY_SEARCH: MemorySearchArguments,
+    ToolName.SHELL_EXECUTE: ShellExecuteArguments,
+    ToolName.PYTHON_EXECUTE: PythonExecuteArguments,
 }
 
 
 @dataclass(frozen=True, slots=True)
 class EvaluatedAction:
     evaluation: PolicyEvaluation
-    arguments: SafeToolArguments | None
+    arguments: ToolArguments | None
 
 
 class CapabilityPolicyEngine:
@@ -58,8 +62,19 @@ class CapabilityPolicyEngine:
         if isinstance(arguments, MemorySearchArguments):
             if arguments.limit > self.policy.max_memory_results:
                 return self.deny("memory_result_limit_exceeded")
-        elif not self._path_is_confined(arguments.path):
-            return self.deny("workspace_path_outside_root")
+        elif isinstance(arguments, WorkspaceReadArguments | WorkspaceListArguments):
+            if not self._path_is_confined(arguments.path):
+                return self.deny("workspace_path_outside_root")
+        elif isinstance(arguments, ShellExecuteArguments | PythonExecuteArguments):
+            if self.policy.sandbox is None:
+                return self.deny("sandbox_not_configured")
+            if not self._path_is_confined(arguments.cwd):
+                return self.deny("workspace_path_outside_root")
+            if (
+                arguments.timeout_ms is not None
+                and arguments.timeout_ms > self.policy.action_timeout_ms
+            ):
+                return self.deny("action_timeout_limit_exceeded")
 
         return EvaluatedAction(
             evaluation=PolicyEvaluation(

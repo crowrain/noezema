@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -10,12 +11,15 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from packages.domain import (
     ActionState,
+    CapabilityPolicy,
     ClaimAssessmentId,
     ClaimId,
     ConfigSnapshotId,
     EpistemicStatus,
     EventType,
     ModelRunId,
+    SandboxEnvironmentManifest,
+    SandboxProfile,
     SessionId,
     ToolDecision,
     ToolExecutionObservation,
@@ -26,6 +30,7 @@ from packages.domain import (
     bind_action,
     canonical_json_sha256,
     capability_policy_config_payload,
+    sandbox_mvp_capability_policy,
     sealed_mvp_capability_policy,
 )
 from packages.persistence import (
@@ -43,7 +48,12 @@ from packages.persistence.models import (
     ModelRunRecord,
     OutboxEventRecord,
 )
-from packages.tool_broker import ToolBroker, ToolExecutionError
+from packages.tool_broker import (
+    CapturedCommand,
+    SandboxProcessResult,
+    ToolBroker,
+    ToolExecutionError,
+)
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=UTC)
 
@@ -52,15 +62,17 @@ def _seed_model_run(
     session_factory: sessionmaker[Session],
     *,
     bind_policy: bool = True,
+    policy: CapabilityPolicy | None = None,
 ) -> tuple[SessionId, ModelRunId, ConfigSnapshotId]:
     session_id = SessionId.new()
     model_run_id = ModelRunId.new()
     config_id = ConfigSnapshotId(root=BOOTSTRAP_CONFIG_SNAPSHOT_ID)
     with session_factory.begin() as db:
         if bind_policy:
+            selected_policy = policy or sealed_mvp_capability_policy()
             config_id = ConfigSnapshotId.new()
             payload = bootstrap_payload()
-            payload["policy"] = capability_policy_config_payload(sealed_mvp_capability_policy())
+            payload["policy"] = capability_policy_config_payload(selected_policy)
             payload_sha256 = canonical_json_sha256(payload)
             db.add(
                 ConfigSnapshotRecord(
@@ -365,3 +377,102 @@ def test_memory_search_returns_only_current_assessment_heads(
     assert result.observation is not None
     assert len(result.observation.payload.hits) == 1
     assert result.observation.payload.hits[0].claim_id == claim_id
+
+
+class _FakeSandboxRunner:
+    def __init__(self, profile: SandboxProfile) -> None:
+        self.profile = profile
+        self.calls = 0
+
+    def execute(self, **_kwargs: object) -> SandboxProcessResult:
+        self.calls += 1
+        stdout = b"42\n"
+        return SandboxProcessResult(
+            captured=CapturedCommand(
+                exit_code=0,
+                stdout=stdout.decode(),
+                stderr="",
+                stdout_bytes=len(stdout),
+                stderr_bytes=0,
+                stdout_sha256=hashlib.sha256(stdout).hexdigest(),
+                stderr_sha256=hashlib.sha256(b"").hexdigest(),
+                stdout_truncated=False,
+                stderr_truncated=False,
+                duration_ms=3,
+            ),
+            environment=SandboxEnvironmentManifest.from_profile(
+                self.profile,
+                runtime_version="5.4.2",
+            ),
+            workspace_bytes_before=0,
+            workspace_bytes_after=0,
+            workspace_quota_exceeded=False,
+        )
+
+
+def test_python_action_executes_only_through_policy_bound_sandbox(
+    session_factory: sessionmaker[Session],
+    tmp_path: Path,
+) -> None:
+    profile = SandboxProfile(image=f"localhost/noezema-sandbox@sha256:{'a' * 64}")
+    policy = sandbox_mvp_capability_policy(sandbox=profile)
+    session_id, model_run_id, _ = _seed_model_run(
+        session_factory,
+        policy=policy,
+    )
+    action = _bound_action(
+        session_id,
+        model_run_id,
+        ToolName.PYTHON_EXECUTE,
+        {"code": "print(6 * 7)"},
+    )
+    runner = _FakeSandboxRunner(profile)
+    broker = ToolBroker(
+        session_factory=session_factory,
+        workspace_root=tmp_path,
+        policy=policy,
+        sandbox_runner=runner,
+        clock=lambda: NOW,
+    )
+
+    completed = broker.run(action)
+    replayed = broker.run(action)
+
+    assert completed.state is ActionState.COMPLETED
+    assert completed.observation is not None
+    assert completed.observation.payload.kind == "python_execution"
+    assert completed.observation.payload.stdout == "42\n"
+    assert completed.observation.payload.environment.network == "none"
+    assert completed.observation == replayed.observation
+    assert runner.calls == 1
+
+
+def test_model_cannot_raise_the_sandbox_timeout_above_policy_limit(
+    session_factory: sessionmaker[Session],
+    tmp_path: Path,
+) -> None:
+    profile = SandboxProfile(image=f"localhost/noezema-sandbox@sha256:{'a' * 64}")
+    policy = sandbox_mvp_capability_policy(sandbox=profile)
+    session_id, model_run_id, _ = _seed_model_run(
+        session_factory,
+        policy=policy,
+    )
+    action = _bound_action(
+        session_id,
+        model_run_id,
+        ToolName.PYTHON_EXECUTE,
+        {"code": "print('never runs')", "timeout_ms": policy.action_timeout_ms + 1},
+    )
+    runner = _FakeSandboxRunner(profile)
+
+    result = ToolBroker(
+        session_factory=session_factory,
+        workspace_root=tmp_path,
+        policy=policy,
+        sandbox_runner=runner,
+        clock=lambda: NOW,
+    ).run(action)
+
+    assert result.state is ActionState.POLICY_EVALUATED
+    assert result.policy.reason == "action_timeout_limit_exceeded"
+    assert runner.calls == 0

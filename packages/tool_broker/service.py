@@ -33,12 +33,15 @@ from packages.persistence.models import (
     ModelRunRecord,
     SessionRecord,
 )
+from packages.tool_broker.errors import ToolExecutionError
 from packages.tool_broker.executor import (
+    DispatchingToolExecutor,
     SafeToolExecutor,
-    ToolExecutionError,
+    SandboxToolExecutor,
     ToolExecutor,
 )
 from packages.tool_broker.policy import CapabilityPolicyEngine, EvaluatedAction
+from packages.tool_broker.sandbox_runtime import OciSandboxRunner, SandboxRunner
 
 _RETRYABLE_CLASSES = {IdempotencyClass.PURE, IdempotencyClass.IDEMPOTENT}
 
@@ -59,6 +62,7 @@ class ToolBroker:
         workspace_root: Path,
         policy: CapabilityPolicy | None = None,
         executor: ToolExecutor | None = None,
+        sandbox_runner: SandboxRunner | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._session_factory = session_factory
@@ -67,13 +71,33 @@ class ToolBroker:
             policy=self.policy,
             workspace_root=workspace_root,
         )
-        self._executor = executor or SafeToolExecutor(
+        if executor is not None and sandbox_runner is not None:
+            raise ValueError("provide either executor or sandbox_runner, not both")
+        safe_executor = SafeToolExecutor(
             session_factory=session_factory,
             workspace_root=workspace_root,
             max_workspace_read_bytes=self.policy.max_workspace_read_bytes,
             max_workspace_list_entries=self.policy.max_workspace_list_entries,
             max_memory_results=self.policy.max_memory_results,
         )
+        if executor is not None:
+            self._executor = executor
+        else:
+            runner = sandbox_runner
+            if self.policy.sandbox is not None:
+                if runner is None:
+                    runner = OciSandboxRunner(
+                        profile=self.policy.sandbox,
+                        workspace_root=workspace_root,
+                    )
+                elif runner.profile != self.policy.sandbox:
+                    raise ValueError("sandbox runner does not match the capability policy")
+            elif runner is not None:
+                raise ValueError("sandbox runner requires a sandbox capability profile")
+            self._executor = DispatchingToolExecutor(
+                safe=safe_executor,
+                sandbox=SandboxToolExecutor(runner=runner) if runner is not None else None,
+            )
         self._clock = clock or (lambda: datetime.now(UTC))
 
     def run(self, action: BoundAction) -> BrokerRunResult:
