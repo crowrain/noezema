@@ -19,6 +19,7 @@ from packages.domain import (
     EventType,
     QuestionId,
     QuestionOrigin,
+    SessionBudget,
     SessionId,
     SessionState,
 )
@@ -36,6 +37,7 @@ def start_next_session(
     db: Session,
     *,
     session_id: SessionId,
+    budget: SessionBudget | None = None,
     occurred_at: datetime | None = None,
 ) -> WakeResult:
     """Admit one session and bind the oldest eligible question atomically.
@@ -75,6 +77,7 @@ def start_next_session(
         session_id=session_id,
         config_snapshot_id=config_snapshot_id,
         question_id=question_id,
+        budget=budget,
         occurred_at=timestamp,
     )
     append_session_audit(

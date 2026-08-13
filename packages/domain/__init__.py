@@ -13,6 +13,12 @@ from packages.domain.assessments import (
     RuleEvidenceFacts,
     ScopeDimension,
 )
+from packages.domain.budgets import (
+    BudgetExhaustionReason,
+    SessionBudget,
+    SessionBudgetUsage,
+    default_session_budget,
+)
 from packages.domain.concurrency import (
     RevisionScope,
     RevisionVector,
@@ -129,6 +135,7 @@ __all__ = [
     "AuditEvent",
     "AuditEventId",
     "BoundAction",
+    "BudgetExhaustionReason",
     "BrokerRunResult",
     "CapabilityPolicy",
     "CommitAttemptId",
@@ -185,6 +192,8 @@ __all__ = [
     "SandboxEnvironmentManifest",
     "SandboxProfile",
     "SessionId",
+    "SessionBudget",
+    "SessionBudgetUsage",
     "SessionLease",
     "SessionStagingId",
     "SessionState",
@@ -220,6 +229,7 @@ __all__ = [
     "canonical_json_sha256",
     "capability_policy_config_payload",
     "capability_policy_sha256",
+    "default_session_budget",
     "evidence_identity_sha256",
     "assessment_role",
     "knowledge_commit_sha256",

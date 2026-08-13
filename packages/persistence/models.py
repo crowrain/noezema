@@ -216,6 +216,15 @@ class SessionRecord(Base):
             "(lease_owner IS NULL) = (lease_expires_at IS NULL)",
             name="lease_tuple_complete",
         ),
+        CheckConstraint("length(budget_sha256) = 64", name="budget_sha256_length"),
+        CheckConstraint(
+            "cognitive_deadline_at < host_deadline_at",
+            name="deadline_order",
+        ),
+        CheckConstraint(
+            "(soft_exhausted_at IS NULL) = (soft_exhaustion_reason IS NULL)",
+            name="soft_exhaustion_tuple_complete",
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
@@ -235,6 +244,21 @@ class SessionRecord(Base):
     )
     fence: Mapped[int] = mapped_column(BigInteger, default=0)
     next_audit_sequence: Mapped[int] = mapped_column(BigInteger, default=1)
+    budget: Mapped[dict[str, Any]] = mapped_column(JsonType)
+    budget_sha256: Mapped[str] = mapped_column(String(64))
+    cognitive_deadline_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    host_deadline_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    stop_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    abort_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    soft_exhausted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    soft_exhaustion_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    termination_reason: Mapped[str | None] = mapped_column(String(256), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     terminal_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

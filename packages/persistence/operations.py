@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -14,8 +14,11 @@ from packages.domain import (
     EventType,
     OutboxEventId,
     QuestionId,
+    SessionBudget,
     SessionId,
     SessionState,
+    canonical_json_sha256,
+    default_session_budget,
 )
 from packages.domain._base import JsonObject
 from packages.persistence.models import AuditEventRecord, OutboxEventRecord, SessionRecord
@@ -44,6 +47,7 @@ def create_session_with_audit(
     session_id: SessionId,
     config_snapshot_id: ConfigSnapshotId,
     question_id: QuestionId | None = None,
+    budget: SessionBudget | None = None,
     occurred_at: datetime | None = None,
 ) -> CreatedSession:
     """Stage session state, its audit event and outbox event in one transaction.
@@ -53,6 +57,8 @@ def create_session_with_audit(
     """
 
     timestamp = occurred_at or datetime.now(UTC)
+    budget_snapshot = budget or default_session_budget()
+    budget_payload = budget_snapshot.model_dump(mode="json")
     event_payload: JsonObject = {"from": None, "to": SessionState.CREATED.value}
     if question_id is not None:
         event_payload["question_id"] = str(question_id)
@@ -77,6 +83,22 @@ def create_session_with_audit(
             lease_expires_at=None,
             fence=0,
             next_audit_sequence=2,
+            budget=budget_payload,
+            budget_sha256=canonical_json_sha256(budget_payload),
+            cognitive_deadline_at=timestamp
+            + timedelta(seconds=budget_snapshot.cognitive_duration_seconds),
+            host_deadline_at=timestamp
+            + timedelta(
+                seconds=(
+                    budget_snapshot.cognitive_duration_seconds
+                    + budget_snapshot.host_reserve_seconds
+                )
+            ),
+            stop_requested_at=None,
+            abort_requested_at=None,
+            soft_exhausted_at=None,
+            soft_exhaustion_reason=None,
+            termination_reason=None,
             created_at=timestamp,
             updated_at=timestamp,
             terminal_at=None,

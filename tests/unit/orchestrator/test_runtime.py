@@ -14,10 +14,16 @@ from apps.orchestrator import (
     DurableSessionOrchestrator,
     IllegalSessionTransitionError,
     InconsistentSessionRuntimeError,
+    SafeBoundaryKind,
+    SessionBoundaryFailureError,
     SessionStarted,
     SessionWorkKind,
+    SoftBudgetExhaustedError,
     TurnFenceRejectedError,
+    apply_session_safe_boundary,
     claim_session,
+    request_graceful_stop,
+    request_session_abort,
     start_next_session,
     terminate_session,
     transition_session_phase,
@@ -37,6 +43,7 @@ from packages.domain import (
     DecisionEnvelope,
     EventType,
     QuestionDraft,
+    SessionBudget,
     SessionId,
     SessionState,
     ToolDecision,
@@ -57,7 +64,7 @@ from packages.persistence.models import (
     RuntimeConfigHeadRecord,
     SessionRecord,
 )
-from packages.tool_broker import ToolBroker
+from packages.tool_broker import ToolBroker, ToolExecutionError
 
 NOW = datetime(2026, 8, 12, 15, 0, tzinfo=UTC)
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -76,6 +83,16 @@ class _Gateway:
 class _CrashingBroker:
     def run(self, _action):
         raise RuntimeError("simulated crash before action registration")
+
+
+class _UnknownOutcomeExecutor:
+    def execute(self, *, action, arguments, captured_at, timeout_ms):
+        raise ToolExecutionError(
+            "transport_lost",
+            "The action outcome cannot be established.",
+            retryable=False,
+            outcome_known=False,
+        )
 
 
 class _TakeoverGateway(_Gateway):
@@ -145,6 +162,13 @@ def _install_policy(db: Session) -> ConfigSnapshotId:
 
 
 def _start(session_factory: sessionmaker[Session]) -> tuple[SessionId, ProtocolQuestion]:
+    return _start_with_budget(session_factory)
+
+
+def _start_with_budget(
+    session_factory: sessionmaker[Session],
+    budget: SessionBudget | None = None,
+) -> tuple[SessionId, ProtocolQuestion]:
     session_id = SessionId.new()
     with session_factory.begin() as db:
         config_id = _install_policy(db)
@@ -154,7 +178,12 @@ def _start(session_factory: sessionmaker[Session]) -> tuple[SessionId, ProtocolQ
             created_at=NOW,
         )
         enqueue_question(db, question)
-        started = start_next_session(db, session_id=session_id, occurred_at=NOW)
+        started = start_next_session(
+            db,
+            session_id=session_id,
+            budget=budget,
+            occurred_at=NOW,
+        )
         assert isinstance(started, SessionStarted)
     return session_id, ProtocolQuestion(id=question.id, text=question.text)
 
@@ -232,12 +261,14 @@ def _broker(
     workspace: Path,
     *,
     owner: str = "worker-a/incarnation-1",
+    executor=None,
 ) -> ToolBroker:
     return ToolBroker(
         session_factory=session_factory,
         workspace_root=workspace,
         artifact_store_root=workspace.parent / "artifacts",
         policy=sealed_mvp_capability_policy(),
+        executor=executor,
         lease_owner=owner,
         clock=lambda: NOW,
     )
@@ -574,3 +605,244 @@ def test_failure_termination_is_two_audited_edges_and_releases_lease(
         assert session.state == SessionState.FAILED.value
         assert session.lease_owner is None
         assert session.lease_expires_at is None
+
+
+def test_graceful_stop_is_durable_idempotent_and_applied_at_safe_boundary(
+    session_factory: sessionmaker[Session],
+) -> None:
+    session_id, _ = _start(session_factory)
+    _advance_to_exploring(session_factory, session_id)
+    with session_factory.begin() as db:
+        first = request_graceful_stop(db, session_id=session_id, requested_at=NOW)
+        repeated = request_graceful_stop(db, session_id=session_id, requested_at=NOW)
+        assert first.newly_recorded is True
+        assert repeated.newly_recorded is False
+        claimed = claim_session(
+            db,
+            session_id=session_id,
+            owner="worker-a/incarnation-1",
+            ttl_seconds=300,
+            occurred_at=NOW,
+        )
+        boundary = apply_session_safe_boundary(db, lease=claimed.lease, occurred_at=NOW)
+
+    assert boundary.kind is SafeBoundaryKind.STOPPING
+    assert boundary.state is SessionState.STOPPING
+    with session_factory() as db:
+        events = db.scalars(
+            select(AuditEventRecord).where(
+                AuditEventRecord.session_id == session_id.root,
+                AuditEventRecord.type == EventType.SESSION_STOP_REQUESTED.value,
+            )
+        ).all()
+        assert len(events) == 1
+
+
+def test_abort_during_generation_discards_output_and_cancels_session(
+    session_factory: sessionmaker[Session],
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    session_id, question = _start(session_factory)
+    _advance_to_exploring(session_factory, session_id)
+
+    class _AbortingGateway(_Gateway):
+        def generate_decision(self, request) -> ModelRunResult:
+            result = super().generate_decision(request)
+            with session_factory.begin() as db:
+                request_session_abort(db, session_id=session_id, requested_at=NOW)
+            return result
+
+    gateway = _AbortingGateway(_result(complete=True))
+    runtime = DurableSessionOrchestrator(
+        session_factory=session_factory,
+        gateway=gateway,
+        tool_broker=_broker(session_factory, workspace),
+        lease_owner="worker-a/incarnation-1",
+        clock=lambda: NOW,
+    )
+    with pytest.raises(Exception, match="operator abort"):
+        runtime.run_explorer_turn(
+            session_id=session_id,
+            turn_id=TurnId.new(),
+            context=_context(question),
+            prompts=_prompts(),
+            policy_version=sealed_mvp_capability_policy().version,
+        )
+
+    with session_factory() as db:
+        session = db.get(SessionRecord, session_id.root)
+        assert session is not None and session.state == SessionState.CANCELLED.value
+        assert db.scalar(select(func.count()).select_from(ModelRunRecord)) == 0
+        turn = db.scalar(select(OrchestratorTurnRecord))
+        assert turn is not None and turn.status == "failed"
+        assert turn.error_code == "operator_abort"
+
+
+def test_abort_before_first_claim_does_not_wake_cognitive_runtime(
+    session_factory: sessionmaker[Session],
+) -> None:
+    session_id, _ = _start(session_factory)
+    with session_factory.begin() as db:
+        request_session_abort(db, session_id=session_id, requested_at=NOW)
+        claimed = claim_session(
+            db,
+            session_id=session_id,
+            owner="worker-a/incarnation-1",
+            ttl_seconds=60,
+            occurred_at=NOW,
+        )
+        assert claimed.directive.kind is SessionWorkKind.ABORT
+        assert claimed.directive.state is SessionState.CREATED
+        boundary = apply_session_safe_boundary(db, lease=claimed.lease, occurred_at=NOW)
+
+    assert boundary.kind is SafeBoundaryKind.CANCELLED
+    with session_factory() as db:
+        transitions = db.scalars(
+            select(AuditEventRecord.payload).where(
+                AuditEventRecord.session_id == session_id.root,
+                AuditEventRecord.type == EventType.SESSION_STATE_CHANGED.value,
+            )
+        ).all()
+        assert [item["to"] for item in transitions] == [
+            SessionState.CREATED.value,
+            SessionState.ABORTING.value,
+            SessionState.CANCELLED.value,
+        ]
+
+
+def test_unknown_action_outcome_forces_failure_instead_of_partial_success(
+    session_factory: sessionmaker[Session],
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "corpus.txt").write_text("Uncertain transport.", encoding="utf-8")
+    session_id, question = _start(session_factory)
+    _advance_to_exploring(session_factory, session_id)
+    runtime = DurableSessionOrchestrator(
+        session_factory=session_factory,
+        gateway=_Gateway(_result()),
+        tool_broker=_broker(
+            session_factory,
+            workspace,
+            executor=_UnknownOutcomeExecutor(),
+        ),
+        lease_owner="worker-a/incarnation-1",
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(SessionBoundaryFailureError):
+        runtime.run_explorer_turn(
+            session_id=session_id,
+            turn_id=TurnId.new(),
+            context=_context(question),
+            prompts=_prompts(),
+            policy_version=sealed_mvp_capability_policy().version,
+        )
+
+    with session_factory() as db:
+        session = db.get(SessionRecord, session_id.root)
+        action = db.scalar(select(ActionRecord))
+        assert session is not None and session.state == SessionState.FAILED.value
+        assert session.termination_reason == "action_outcome_unknown"
+        assert action is not None and action.state == ActionState.OUTCOME_UNKNOWN.value
+
+
+def test_model_turn_soft_limit_preserves_cognitive_reserve(
+    session_factory: sessionmaker[Session],
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    budget = SessionBudget(
+        max_model_turns=3,
+        max_tool_actions=2,
+        max_input_tokens=1_000,
+        max_output_tokens=500,
+        cognitive_reserve_model_turns=2,
+        cognitive_reserve_input_tokens=100,
+        cognitive_reserve_output_tokens=50,
+        cognitive_duration_seconds=300,
+        host_reserve_seconds=60,
+    )
+    session_id, question = _start_with_budget(session_factory, budget)
+    _advance_to_exploring(session_factory, session_id)
+    runtime = DurableSessionOrchestrator(
+        session_factory=session_factory,
+        gateway=_Gateway(_result(complete=True)),
+        tool_broker=_broker(session_factory, workspace),
+        lease_owner="worker-a/incarnation-1",
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(SoftBudgetExhaustedError, match="model_turns"):
+        runtime.run_explorer_turn(
+            session_id=session_id,
+            turn_id=TurnId.new(),
+            context=_context(question),
+            prompts=_prompts(),
+            policy_version=sealed_mvp_capability_policy().version,
+        )
+
+    with session_factory() as db:
+        session = db.get(SessionRecord, session_id.root)
+        assert session is not None
+        assert session.state == SessionState.STOPPING.value
+        assert session.soft_exhaustion_reason == "model_turns"
+        assert (
+            db.scalar(
+                select(func.count()).where(
+                    AuditEventRecord.type == EventType.SESSION_BUDGET_EXHAUSTED.value
+                )
+            )
+            == 1
+        )
+
+
+def test_host_deadline_fails_without_starting_new_model_call(
+    session_factory: sessionmaker[Session],
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    budget = SessionBudget(
+        max_model_turns=3,
+        max_tool_actions=2,
+        max_input_tokens=1_000,
+        max_output_tokens=500,
+        cognitive_reserve_model_turns=1,
+        cognitive_reserve_input_tokens=100,
+        cognitive_reserve_output_tokens=50,
+        cognitive_duration_seconds=5,
+        host_reserve_seconds=5,
+    )
+    session_id, question = _start_with_budget(session_factory, budget)
+    _advance_to_exploring(session_factory, session_id)
+    with session_factory.begin() as db:
+        request_graceful_stop(db, session_id=session_id, requested_at=NOW)
+    gateway = _Gateway(_result(complete=True))
+    runtime = DurableSessionOrchestrator(
+        session_factory=session_factory,
+        gateway=gateway,
+        tool_broker=_broker(session_factory, workspace),
+        lease_owner="worker-a/incarnation-1",
+        clock=lambda: NOW + timedelta(seconds=11),
+    )
+
+    with pytest.raises(Exception, match="safe boundary"):
+        runtime.run_explorer_turn(
+            session_id=session_id,
+            turn_id=TurnId.new(),
+            context=_context(question),
+            prompts=_prompts(),
+            policy_version=sealed_mvp_capability_policy().version,
+        )
+
+    assert gateway.calls == 0
+    with session_factory() as db:
+        session = db.get(SessionRecord, session_id.root)
+        assert session is not None
+        assert session.state == SessionState.FAILED.value
+        assert session.termination_reason == "host_reserve_exhausted"

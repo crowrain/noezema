@@ -93,6 +93,14 @@ def test_upgrade_seeds_exactly_one_global_head(monkeypatch: pytest.MonkeyPatch) 
         )
         assert writer_intents == 4
         assert orchestrator_turns_table == "orchestrator_turns"
+        with engine.connect() as connection:
+            session_budget_column = connection.scalar(
+                text(
+                    "SELECT count(*) FROM information_schema.columns "
+                    "WHERE table_name = 'sessions' AND column_name = 'budget'"
+                )
+            )
+        assert session_budget_column == 1
     finally:
         engine.dispose()
         command.downgrade(config, "base")

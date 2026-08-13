@@ -112,3 +112,6 @@ class EventType(StrEnum):
     ACTION_OUTCOME_UNKNOWN = "ActionOutcomeUnknown"
     COMMIT_ATTEMPT_PREPARED = "CommitAttemptPrepared"
     COMMIT_ATTEMPT_RECONCILED = "CommitAttemptReconciled"
+    SESSION_STOP_REQUESTED = "SessionStopRequested"
+    SESSION_ABORT_REQUESTED = "SessionAbortRequested"
+    SESSION_BUDGET_EXHAUSTED = "SessionBudgetExhausted"

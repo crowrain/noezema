@@ -37,6 +37,7 @@ CONCURRENCY_MIGRATION = importlib.import_module("migrations.versions.0006_concur
 ORCHESTRATOR_MIGRATION = importlib.import_module(
     "migrations.versions.0007_durable_orchestrator_turns"
 )
+BUDGET_MIGRATION = importlib.import_module("migrations.versions.0008_session_budgets_and_controls")
 FOUNDATION_TABLES = {
     "actions",
     "audit_events",
@@ -79,7 +80,7 @@ def test_application_and_immutable_migration_literals_match() -> None:
 def test_question_migration_literals_match_domain_enums() -> None:
     assert QUESTION_MIGRATION.QUESTION_ORIGINS == tuple(item.value for item in QuestionOrigin)
     assert QUESTION_MIGRATION.QUESTION_STATES == tuple(item.value for item in QuestionState)
-    assert QUESTION_MIGRATION.AUDIT_EVENT_TYPES_V2 == tuple(item.value for item in EventType)
+    assert QUESTION_MIGRATION.AUDIT_EVENT_TYPES_V2 == BUDGET_MIGRATION.AUDIT_EVENT_TYPES_V2
 
 
 def test_knowledge_migration_literals_match_closed_domain_registries() -> None:
@@ -93,6 +94,7 @@ def test_knowledge_migration_literals_match_closed_domain_registries() -> None:
         "verification",
         "consolidation",
     )
+    assert BUDGET_MIGRATION.AUDIT_EVENT_TYPES_V3 == tuple(item.value for item in EventType)
 
 
 def test_bootstrap_payload_has_no_shared_mutable_state() -> None:
@@ -142,6 +144,9 @@ def test_migrations_render_valid_bootstrap_and_fifo_sql(
     assert "CREATE TABLE workspace_versions" in sql
     assert "CREATE TABLE writer_intents" in sql
     assert "CREATE TABLE orchestrator_turns" in sql
+    assert "ALTER TABLE sessions ADD COLUMN budget JSONB" in sql
+    assert "ALTER TABLE sessions ADD COLUMN stop_requested_at" in sql
+    assert "SessionBudgetExhausted" in sql
     assert "ALTER TABLE commit_attempts ADD COLUMN session_fence BIGINT" in sql
     assert "CREATE INDEX ix_questions_fifo" in sql
     assert "DROP CONSTRAINT ck_audit_events_type_allowed" in sql
@@ -159,4 +164,6 @@ def test_migrations_render_valid_bootstrap_and_fifo_sql(
     assert "DROP TABLE artifact_blobs" in downgrade_sql
     assert "DROP TABLE writer_intents" in downgrade_sql
     assert "DROP TABLE orchestrator_turns" in downgrade_sql
+    assert "DROP COLUMN budget" in downgrade_sql
+    assert "DROP COLUMN abort_requested_at" in downgrade_sql
     assert "DROP CONSTRAINT ck_audit_events_type_allowed" in downgrade_sql

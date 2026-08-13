@@ -5,7 +5,7 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import model_validator
+from pydantic import AwareDatetime, model_validator
 
 from packages.domain import (
     ActionId,
@@ -15,6 +15,7 @@ from packages.domain import (
     ModelRunId,
     QuestionId,
     QuestionOrigin,
+    SessionBudgetUsage,
     SessionId,
     SessionLease,
     SessionState,
@@ -62,6 +63,40 @@ class SessionWorkKind(StrEnum):
     FINALIZE_COMMIT = "finalize_commit"
     RECONCILE_COMMIT = "reconcile_commit"
     ABORT = "abort"
+
+
+class OperatorControlKind(StrEnum):
+    STOP_GRACEFULLY = "stop_gracefully"
+    ABORT_SESSION = "abort_session"
+
+
+class SafeBoundaryKind(StrEnum):
+    CONTINUE = "continue"
+    ACTION_IN_FLIGHT = "action_in_flight"
+    STOPPING = "stopping"
+    CANCELLED = "cancelled"
+    FAILED = "failed"
+    SOFT_EXHAUSTED = "soft_exhausted"
+
+
+class OperatorControlResult(ContractModel):
+    command: OperatorControlKind
+    state: SessionState
+    requested_at: AwareDatetime
+    newly_recorded: bool
+
+
+class SafeBoundaryResult(ContractModel):
+    kind: SafeBoundaryKind
+    state: SessionState
+    budget_usage: SessionBudgetUsage
+    action_id: ActionId | None = None
+
+    @model_validator(mode="after")
+    def require_action_only_when_deferred(self) -> SafeBoundaryResult:
+        if (self.kind is SafeBoundaryKind.ACTION_IN_FLIGHT) != (self.action_id is not None):
+            raise ValueError("only an in-flight safe boundary carries action_id")
+        return self
 
 
 class SessionWorkDirective(ContractModel):
