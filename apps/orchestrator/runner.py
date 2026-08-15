@@ -10,6 +10,10 @@ from datetime import UTC, datetime
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
+from apps.orchestrator.commands import (
+    dispatch_next_operator_command,
+    reconcile_operator_commands_for_session,
+)
 from apps.orchestrator.models import (
     ClaimedSession,
     CuratorTurnResult,
@@ -52,6 +56,8 @@ from packages.domain import (
     EvidenceAdapterBudget,
     ExperimentObservation,
     KnowledgeCommitBatch,
+    MessageId,
+    MessageState,
     QuestionId,
     RevisionVector,
     ScopeDimension,
@@ -73,13 +79,18 @@ from packages.memory import (
     finalize_knowledge_commit,
     prepare_knowledge_commit,
 )
-from packages.persistence import load_revision_vector
+from packages.persistence import (
+    acknowledge_session_messages,
+    deliver_messages_for_session,
+    load_revision_vector,
+)
 from packages.persistence.models import (
     ActionRecord,
     CheckpointRecord,
     ClaimRecord,
     CommitAttemptRecord,
     ConfigSnapshotRecord,
+    MessageRecord,
     ModelRunRecord,
     OrchestratorTurnRecord,
     QuestionRecord,
@@ -157,6 +168,7 @@ class AutonomousSessionRunner:
     ) -> SessionRunResult | WakeSkipped:
         """Resume the single active session or admit the next FIFO question."""
 
+        self._dispatch_commands()
         terminal_values = tuple(state.value for state in SessionState if state.is_terminal)
         with self._session_factory() as db:
             active = tuple(
@@ -210,7 +222,9 @@ class AutonomousSessionRunner:
     def run_step(self, session_id: SessionId) -> None:
         """Interpret exactly one recovery directive and commit its durable boundary."""
 
+        self._dispatch_commands(session_id=session_id)
         if self._terminal_projection(session_id) is not None:
+            self._reconcile_commands(session_id)
             return
         timestamp = self._clock()
         with self._session_factory.begin() as db:
@@ -267,6 +281,7 @@ class AutonomousSessionRunner:
             self._abort(claimed)
         else:
             raise InconsistentSessionRuntimeError(f"unsupported session work: {work.value}")
+        self._reconcile_commands(session_id)
 
     def _transition(
         self,
@@ -294,6 +309,7 @@ class AutonomousSessionRunner:
             )
         except (GracefulStopRequestedError, SoftBudgetExhaustedError, SessionAbortedError):
             return
+        self._acknowledge_messages(session_id)
 
     def _resume_turn(self, session_id: SessionId, turn_id: TurnId) -> None:
         with self._session_factory() as db:
@@ -304,6 +320,7 @@ class AutonomousSessionRunner:
         try:
             if phase is ModelPhase.EXPLORATION:
                 self._turns.resume_explorer_turn(session_id=session_id, turn_id=turn_id)
+                self._acknowledge_messages(session_id)
             elif phase is ModelPhase.CONSOLIDATION:
                 self._turns.resume_curator_turn(session_id=session_id, turn_id=turn_id)
             else:
@@ -474,11 +491,18 @@ class AutonomousSessionRunner:
     def _explorer_context(self, session_id: SessionId) -> ExplorerContext:
         evidence = self._evidence_views(session_id)
         usage = self._budget_usage(session_id)
+        with self._session_factory.begin() as db:
+            messages = deliver_messages_for_session(
+                db,
+                session_id=session_id,
+                occurred_at=self._clock(),
+            )
         return ExplorerContext(
             question=self._protocol_question(session_id),
             remaining_actions=usage.remaining_tool_actions,
             allowed_tools=self._tool_broker.policy.allowed_tools,
             prior_summary=self._prior_explorer_summary(session_id),
+            new_messages=tuple(item.body for item in messages),
             recent_errors=self._recent_errors(session_id),
             observations=tuple(
                 ProtocolObservation.from_typed(
@@ -488,6 +512,46 @@ class AutonomousSessionRunner:
                 for item in evidence[-64:]
             ),
         )
+
+    def _acknowledge_messages(self, session_id: SessionId) -> None:
+        with self._session_factory.begin() as db:
+            ids = tuple(
+                MessageId(root=item)
+                for item in db.scalars(
+                    select(MessageRecord.id)
+                    .where(
+                        MessageRecord.delivered_session_id == session_id.root,
+                        MessageRecord.state == MessageState.DELIVERED.value,
+                    )
+                    .order_by(MessageRecord.id)
+                )
+            )
+            acknowledge_session_messages(
+                db,
+                session_id=session_id,
+                message_ids=ids,
+                occurred_at=self._clock(),
+            )
+
+    def _dispatch_commands(self, session_id: SessionId | None = None) -> None:
+        for _ in range(32):
+            with self._session_factory.begin() as db:
+                dispatched = dispatch_next_operator_command(
+                    db,
+                    occurred_at=self._clock(),
+                    session_id=session_id,
+                )
+            if dispatched is None:
+                return
+        raise InconsistentSessionRuntimeError("operator command dispatch batch exceeded 32 items")
+
+    def _reconcile_commands(self, session_id: SessionId) -> None:
+        with self._session_factory.begin() as db:
+            reconcile_operator_commands_for_session(
+                db,
+                session_id=session_id,
+                occurred_at=self._clock(),
+            )
 
     def _curator_context(
         self,

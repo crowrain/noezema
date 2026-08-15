@@ -43,6 +43,18 @@ class IdempotencyKey(_UuidIdentifier):
     """Host-generated key bound to one tool and canonical arguments hash."""
 
 
+class InboxIdempotencyKey(_UuidIdentifier):
+    """Host-generated key bound to one human input or operator command."""
+
+
+class MessageId(_UuidIdentifier):
+    """Identity of one durable human message."""
+
+
+class OperatorCommandId(_UuidIdentifier):
+    """Identity of one durable typed operator command."""
+
+
 class CommitAttemptId(_UuidIdentifier):
     """Identity of a durable commit reconciliation record."""
 

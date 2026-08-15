@@ -14,6 +14,9 @@ from packages.domain import (
     EpistemicStatus,
     EventType,
     EvidenceKind,
+    MessageState,
+    OperatorCommandState,
+    OperatorCommandType,
     QuestionOrigin,
     QuestionState,
     RevisionScope,
@@ -38,6 +41,7 @@ ORCHESTRATOR_MIGRATION = importlib.import_module(
     "migrations.versions.0007_durable_orchestrator_turns"
 )
 BUDGET_MIGRATION = importlib.import_module("migrations.versions.0008_session_budgets_and_controls")
+INBOX_MIGRATION = importlib.import_module("migrations.versions.0009_human_input_and_operator_inbox")
 FOUNDATION_TABLES = {
     "actions",
     "audit_events",
@@ -47,6 +51,7 @@ FOUNDATION_TABLES = {
     "outbox_events",
     "orchestrator_turns",
     "runtime_config_heads",
+    "runtime_controls",
     "sessions",
     "system_constants",
 }
@@ -60,6 +65,8 @@ EXPECTED_TABLES = FOUNDATION_TABLES | {
     "claims",
     "commit_attempts",
     "evidence",
+    "messages",
+    "operator_commands",
     "questions",
     "session_staging",
     "workspace_files",
@@ -94,7 +101,15 @@ def test_knowledge_migration_literals_match_closed_domain_registries() -> None:
         "verification",
         "consolidation",
     )
-    assert BUDGET_MIGRATION.AUDIT_EVENT_TYPES_V3 == tuple(item.value for item in EventType)
+    assert BUDGET_MIGRATION.AUDIT_EVENT_TYPES_V3 == INBOX_MIGRATION.AUDIT_EVENT_TYPES_V3
+    assert INBOX_MIGRATION.AUDIT_EVENT_TYPES_V4 == tuple(item.value for item in EventType)
+    assert INBOX_MIGRATION.MESSAGE_STATES == tuple(item.value for item in MessageState)
+    assert INBOX_MIGRATION.OPERATOR_COMMAND_TYPES == tuple(
+        item.value for item in OperatorCommandType
+    )
+    assert INBOX_MIGRATION.OPERATOR_COMMAND_STATES == tuple(
+        item.value for item in OperatorCommandState
+    )
 
 
 def test_bootstrap_payload_has_no_shared_mutable_state() -> None:
@@ -146,6 +161,9 @@ def test_migrations_render_valid_bootstrap_and_fifo_sql(
     assert "CREATE TABLE orchestrator_turns" in sql
     assert "ALTER TABLE sessions ADD COLUMN budget JSONB" in sql
     assert "ALTER TABLE sessions ADD COLUMN stop_requested_at" in sql
+    assert "CREATE TABLE runtime_controls" in sql
+    assert "CREATE TABLE messages" in sql
+    assert "CREATE TABLE operator_commands" in sql
     assert "SessionBudgetExhausted" in sql
     assert "ALTER TABLE commit_attempts ADD COLUMN session_fence BIGINT" in sql
     assert "CREATE INDEX ix_questions_fifo" in sql
@@ -166,4 +184,7 @@ def test_migrations_render_valid_bootstrap_and_fifo_sql(
     assert "DROP TABLE orchestrator_turns" in downgrade_sql
     assert "DROP COLUMN budget" in downgrade_sql
     assert "DROP COLUMN abort_requested_at" in downgrade_sql
+    assert "DROP TABLE operator_commands" in downgrade_sql
+    assert "DROP TABLE messages" in downgrade_sql
+    assert "DROP TABLE runtime_controls" in downgrade_sql
     assert "DROP CONSTRAINT ck_audit_events_type_allowed" in downgrade_sql

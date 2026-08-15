@@ -21,7 +21,12 @@ from packages.domain import (
     default_session_budget,
 )
 from packages.domain._base import JsonObject
-from packages.persistence.models import AuditEventRecord, OutboxEventRecord, SessionRecord
+from packages.persistence.models import (
+    AuditEventRecord,
+    OutboxEventRecord,
+    RuntimeControlRecord,
+    SessionRecord,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,4 +207,63 @@ def append_session_audit(
     )
     db.flush()
 
+    return AppendedAudit(audit_event=event, outbox_event_id=outbox_event_id)
+
+
+def append_global_audit(
+    db: Session,
+    *,
+    type: EventType,
+    occurred_at: datetime,
+    actor: str,
+    public_summary: str,
+    topic: str,
+    payload: JsonObject | None = None,
+) -> AppendedAudit:
+    """Append one globally ordered audit/outbox pair under the singleton lock."""
+
+    runtime = db.scalar(
+        select(RuntimeControlRecord).where(RuntimeControlRecord.scope == "global").with_for_update()
+    )
+    if runtime is None:
+        raise LookupError("global runtime control is missing")
+    event = AuditEvent.new(
+        session_id=None,
+        sequence=runtime.next_global_audit_sequence,
+        type=type,
+        occurred_at=occurred_at,
+        actor=actor,
+        public_summary=public_summary,
+        payload=payload,
+    )
+    outbox_event_id = OutboxEventId.new()
+    runtime.next_global_audit_sequence += 1
+    runtime.updated_at = occurred_at
+    db.add(
+        AuditEventRecord(
+            id=event.id.root,
+            session_id=None,
+            sequence=event.sequence,
+            type=event.type.value,
+            schema_version=event.schema_version,
+            occurred_at=event.occurred_at,
+            actor=event.actor,
+            public_summary=event.public_summary,
+            payload=event.payload,
+            visibility="public",
+        )
+    )
+    db.flush()
+    db.add(
+        OutboxEventRecord(
+            id=outbox_event_id.root,
+            audit_event_id=event.id.root,
+            topic=topic,
+            payload={"event": event.model_dump(mode="json")},
+            created_at=occurred_at,
+            published_at=None,
+            attempts=0,
+        )
+    )
+    db.flush()
     return AppendedAudit(audit_event=event, outbox_event_id=outbox_event_id)

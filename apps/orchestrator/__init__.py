@@ -1,5 +1,10 @@
 """Session orchestration application."""
 
+from apps.orchestrator.commands import (
+    dispatch_next_operator_command,
+    dispatch_operator_command,
+    reconcile_operator_commands_for_session,
+)
 from apps.orchestrator.models import (
     ClaimedSession,
     CuratorTurnResult,
@@ -77,8 +82,11 @@ __all__ = [
     "WakeSkipReason",
     "apply_session_safe_boundary",
     "claim_session",
+    "dispatch_next_operator_command",
+    "dispatch_operator_command",
     "request_graceful_stop",
     "request_session_abort",
+    "reconcile_operator_commands_for_session",
     "session_budget_usage",
     "start_next_session",
     "terminate_session",

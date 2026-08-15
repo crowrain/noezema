@@ -17,6 +17,7 @@ from packages.cognition import select_fifo_question_for_update
 from packages.domain import (
     ConfigSnapshotId,
     EventType,
+    NodeState,
     QuestionId,
     QuestionOrigin,
     SessionBudget,
@@ -24,7 +25,7 @@ from packages.domain import (
     SessionState,
 )
 from packages.persistence import append_session_audit, create_session_with_audit
-from packages.persistence.models import RuntimeConfigHeadRecord, SessionRecord
+from packages.persistence.models import RuntimeConfigHeadRecord, RuntimeControlRecord, SessionRecord
 
 _TERMINAL_SESSION_STATES = tuple(state.value for state in SessionState if state.is_terminal)
 
@@ -56,6 +57,13 @@ def start_next_session(
         raise InconsistentRuntimeStateError("global runtime configuration head is missing")
     if runtime_head.activating_config_snapshot_id is not None:
         return WakeSkipped(reason=WakeSkipReason.CONFIG_ACTIVATION_IN_PROGRESS)
+    runtime_control = db.scalar(
+        select(RuntimeControlRecord).where(RuntimeControlRecord.scope == "global").with_for_update()
+    )
+    if runtime_control is None:
+        raise InconsistentRuntimeStateError("global runtime control is missing")
+    if NodeState(runtime_control.node_state) is NodeState.PAUSED:
+        return WakeSkipped(reason=WakeSkipReason.OPERATOR_PAUSED)
 
     active_session = db.scalar(
         select(SessionRecord.id)

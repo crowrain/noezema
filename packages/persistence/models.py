@@ -32,6 +32,10 @@ from packages.domain import (
     EvidenceKind,
     EvidenceUse,
     IdempotencyClass,
+    MessageState,
+    NodeState,
+    OperatorCommandState,
+    OperatorCommandType,
     PolicyDecision,
     QuestionOrigin,
     QuestionState,
@@ -171,6 +175,30 @@ class WriterIntentRecord(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
+class RuntimeControlRecord(Base):
+    """Singleton operator-plane state and global audit sequence."""
+
+    __tablename__ = "runtime_controls"
+    __table_args__ = (
+        CheckConstraint("scope = 'global'", name="scope_global"),
+        CheckConstraint(
+            _allowed_values("node_state", [item.value for item in NodeState]),
+            name="node_state_allowed",
+        ),
+        CheckConstraint("wake_generation >= 0", name="wake_generation_nonnegative"),
+        CheckConstraint(
+            "next_global_audit_sequence >= 1",
+            name="next_global_audit_sequence_positive",
+        ),
+    )
+
+    scope: Mapped[str] = mapped_column(String(16), primary_key=True)
+    node_state: Mapped[str] = mapped_column(String(16))
+    wake_generation: Mapped[int] = mapped_column(BigInteger, default=0)
+    next_global_audit_sequence: Mapped[int] = mapped_column(BigInteger, default=1)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 class QuestionRecord(Base):
     __tablename__ = "questions"
     __table_args__ = (
@@ -201,6 +229,44 @@ class QuestionRecord(Base):
     score_components: Mapped[dict[str, Any]] = mapped_column(JsonType)
     embedding_fingerprint: Mapped[str | None] = mapped_column(String(128), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class MessageRecord(Base):
+    __tablename__ = "messages"
+    __table_args__ = (
+        CheckConstraint("length(sender) BETWEEN 1 AND 256", name="sender_length"),
+        CheckConstraint("length(body) BETWEEN 1 AND 4096", name="body_length"),
+        CheckConstraint("priority BETWEEN -1000 AND 1000", name="priority_range"),
+        CheckConstraint(
+            _allowed_values("state", [item.value for item in MessageState]),
+            name="state_allowed",
+        ),
+        CheckConstraint("expires_at > created_at", name="expiry_after_creation"),
+        CheckConstraint("length(request_sha256) = 64", name="request_sha256_length"),
+        Index("ix_messages_delivery", "state", "priority", "created_at", "id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    idempotency_key: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), unique=True)
+    request_sha256: Mapped[str] = mapped_column(String(64))
+    question_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("questions.id"), unique=True
+    )
+    sender: Mapped[str] = mapped_column(String(256))
+    body: Mapped[str] = mapped_column(Text)
+    priority: Mapped[int] = mapped_column(Integer, default=0)
+    state: Mapped[str] = mapped_column(String(32))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    delivered_session_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("sessions.id"), nullable=True
+    )
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    answered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    response_audit_event_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("audit_events.id"), nullable=True
+    )
 
 
 class SessionRecord(Base):
@@ -262,6 +328,46 @@ class SessionRecord(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     terminal_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class OperatorCommandRecord(Base):
+    __tablename__ = "operator_commands"
+    __table_args__ = (
+        CheckConstraint("length(actor_id) BETWEEN 1 AND 256", name="actor_id_length"),
+        CheckConstraint("length(reason) BETWEEN 1 AND 256", name="reason_length"),
+        CheckConstraint("length(request_sha256) = 64", name="request_sha256_length"),
+        CheckConstraint(
+            _allowed_values("type", [item.value for item in OperatorCommandType]),
+            name="type_allowed",
+        ),
+        CheckConstraint(
+            _allowed_values("state", [item.value for item in OperatorCommandState]),
+            name="state_allowed",
+        ),
+        CheckConstraint(
+            "(type IN ('stop_gracefully', 'abort_session') AND session_id IS NOT NULL) OR "
+            "(type NOT IN ('stop_gracefully', 'abort_session') AND session_id IS NULL)",
+            name="session_target_shape",
+        ),
+        Index("ix_operator_commands_dispatch", "state", "created_at", "id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    idempotency_key: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), unique=True)
+    request_sha256: Mapped[str] = mapped_column(String(64))
+    actor_id: Mapped[str] = mapped_column(String(256))
+    type: Mapped[str] = mapped_column(String(32))
+    session_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("sessions.id"), nullable=True
+    )
+    arguments: Mapped[dict[str, Any]] = mapped_column(JsonType)
+    state: Mapped[str] = mapped_column(String(32))
+    reason: Mapped[str] = mapped_column(String(256))
+    result: Mapped[dict[str, Any] | None] = mapped_column(NullableJsonType, nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class ModelRunRecord(Base):

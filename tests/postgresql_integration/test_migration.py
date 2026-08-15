@@ -76,6 +76,13 @@ def test_upgrade_seeds_exactly_one_global_head(monkeypatch: pytest.MonkeyPatch) 
             orchestrator_turns_table = connection.scalar(
                 text("SELECT to_regclass('orchestrator_turns')::text")
             )
+            runtime_controls = connection.scalar(
+                text("SELECT count(*) FROM runtime_controls WHERE scope = 'global'")
+            )
+            messages_table = connection.scalar(text("SELECT to_regclass('messages')::text"))
+            commands_table = connection.scalar(
+                text("SELECT to_regclass('operator_commands')::text")
+            )
 
         assert global_heads == 1
         assert active_snapshot == str(BOOTSTRAP_CONFIG_SNAPSHOT_ID)
@@ -93,6 +100,9 @@ def test_upgrade_seeds_exactly_one_global_head(monkeypatch: pytest.MonkeyPatch) 
         )
         assert writer_intents == 4
         assert orchestrator_turns_table == "orchestrator_turns"
+        assert runtime_controls == 1
+        assert messages_table == "messages"
+        assert commands_table == "operator_commands"
         with engine.connect() as connection:
             session_budget_column = connection.scalar(
                 text(

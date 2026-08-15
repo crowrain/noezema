@@ -31,6 +31,7 @@ class WakeSkipReason(StrEnum):
     ACTIVE_SESSION = "active_session"
     CONFIG_ACTIVATION_IN_PROGRESS = "config_activation_in_progress"
     NO_ELIGIBLE_QUESTION = "no_eligible_question"
+    OPERATOR_PAUSED = "operator_paused"
 
 
 class SessionStarted(ContractModel):

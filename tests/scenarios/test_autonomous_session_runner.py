@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections import deque
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from sqlalchemy import func, select
@@ -34,6 +34,8 @@ from packages.domain import (
     CompleteDecision,
     ConfigSnapshotId,
     DecisionEnvelope,
+    InboxIdempotencyKey,
+    MessageState,
     ObservationId,
     QuestionDraft,
     SessionBudget,
@@ -41,6 +43,7 @@ from packages.domain import (
     SessionState,
     ToolDecision,
     ToolName,
+    UserMessageDraft,
     canonical_json_sha256,
     capability_policy_config_payload,
     sealed_mvp_capability_policy,
@@ -51,13 +54,18 @@ from packages.llm_gateway import (
     TokenUsage,
 )
 from packages.memory import mvp_claim_type_rules
-from packages.persistence import BOOTSTRAP_CONFIG_SNAPSHOT_ID, bootstrap_payload
+from packages.persistence import (
+    BOOTSTRAP_CONFIG_SNAPSHOT_ID,
+    bootstrap_payload,
+    enqueue_user_message,
+)
 from packages.persistence.models import (
     ClaimAssessmentRecord,
     ClaimRecord,
     CommitAttemptRecord,
     ConfigSnapshotRecord,
     EvidenceRecord,
+    MessageRecord,
     ModelRunRecord,
     OrchestratorTurnRecord,
     QuestionRecord,
@@ -221,6 +229,17 @@ class _ContextBoundGateway(_Gateway):
             invocation_fingerprint_sha256="e" * 64,
             output_schema_sha256="f" * 64,
         )
+
+
+class _MessageCapturingGateway(_Gateway):
+    def __init__(self) -> None:
+        super().__init__(decisions=(_explorer_result(complete=True),))
+        self.new_messages: tuple[str, ...] = ()
+
+    def generate_decision(self, request) -> ModelRunResult:
+        context = json.loads(request.messages[-1].content)["context"]
+        self.new_messages = tuple(context["new_messages"])
+        return super().generate_decision(request)
 
 
 def _runner(
@@ -412,3 +431,36 @@ def test_runner_applies_durable_abort_before_any_model_call(
     assert result.tool_actions == 0
     assert gateway.decision_calls == 0
     assert gateway.curator_calls == 0
+
+
+def test_runner_delivers_and_acknowledges_human_message_in_model_context(
+    session_factory: sessionmaker[Session],
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    body = "Сравни состояние локального индекса с последним checkpoint."
+    with session_factory.begin() as db:
+        _install_runtime_config(db)
+        queued = enqueue_user_message(
+            db,
+            UserMessageDraft.new(
+                idempotency_key=InboxIdempotencyKey.new(),
+                sender="owner",
+                body=body,
+                created_at=NOW,
+                expires_at=NOW + timedelta(days=1),
+            ),
+        )
+    gateway = _MessageCapturingGateway()
+
+    result = _runner(session_factory, workspace, gateway).run_once()
+
+    assert result.terminal_state is SessionState.SUCCEEDED_PARTIAL
+    assert result.question_id == queued.question_id
+    assert gateway.new_messages == (body,)
+    with session_factory() as db:
+        message = db.get(MessageRecord, queued.id.root)
+        assert message is not None
+        assert message.state == MessageState.ACKNOWLEDGED.value
+        assert message.delivered_session_id == result.session_id.root

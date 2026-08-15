@@ -39,6 +39,43 @@ class NodeState(StrEnum):
     PAUSED = "paused"
 
 
+class MessageState(StrEnum):
+    CREATED = "created"
+    QUEUED = "queued"
+    DELIVERED = "delivered"
+    ACKNOWLEDGED = "acknowledged"
+    ANSWERED = "answered"
+    EXPIRED = "expired"
+
+
+class OperatorCommandType(StrEnum):
+    PAUSE = "pause"
+    RESUME = "resume"
+    WAKE_NOW = "wake_now"
+    STOP_GRACEFULLY = "stop_gracefully"
+    ABORT_SESSION = "abort_session"
+    SET_BUDGET = "set_budget"
+    SET_ACCESS_PROFILE = "set_access_profile"
+    RESTORE_CHECKPOINT = "restore_checkpoint"
+
+
+class OperatorCommandState(StrEnum):
+    ACCEPTED = "accepted"
+    REJECTED = "rejected"
+    WAITING_SAFE_BOUNDARY = "waiting_safe_boundary"
+    EXECUTING = "executing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+    @property
+    def is_terminal(self) -> bool:
+        return self in {
+            OperatorCommandState.REJECTED,
+            OperatorCommandState.COMPLETED,
+            OperatorCommandState.FAILED,
+        }
+
+
 class QuestionOrigin(StrEnum):
     SEEDED = "seeded"
     MESSAGE = "message"
@@ -115,3 +152,10 @@ class EventType(StrEnum):
     SESSION_STOP_REQUESTED = "SessionStopRequested"
     SESSION_ABORT_REQUESTED = "SessionAbortRequested"
     SESSION_BUDGET_EXHAUSTED = "SessionBudgetExhausted"
+    MESSAGE_QUEUED = "MessageQueued"
+    MESSAGE_DELIVERED = "MessageDelivered"
+    MESSAGE_ACKNOWLEDGED = "MessageAcknowledged"
+    MESSAGE_ANSWERED = "MessageAnswered"
+    MESSAGE_EXPIRED = "MessageExpired"
+    OPERATOR_COMMAND_ACCEPTED = "OperatorCommandAccepted"
+    OPERATOR_COMMAND_STATE_CHANGED = "OperatorCommandStateChanged"
