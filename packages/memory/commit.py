@@ -144,7 +144,7 @@ def prepare_knowledge_commit(
             raise CommitAttemptConflictError(
                 "session commit attempt is already bound to different content"
             )
-        if existing.status == "prepared":
+        if existing.status in {"prepared", "reconciling"}:
             try:
                 existing_intents = _attempt_writer_intents(
                     existing,
@@ -349,11 +349,15 @@ def finalize_knowledge_commit(
         raise InvalidCommitStateError("commit attempt is not bound to the session")
     if attempt.status == "committed":
         return _load_committed_result(db, attempt_id=attempt_id, session_id=session_id)
-    if attempt.status != "prepared":
+    if attempt.status not in {"prepared", "reconciling"}:
         raise InvalidCommitStateError(f"commit attempt is not finalizable: {attempt.status}")
-    if (
-        session_record.state != SessionState.COMMITTING.value
-        or session_record.commit_attempt_id != attempt_id.root
+    expected_session_state = (
+        SessionState.RECONCILING_COMMIT.value
+        if attempt.status == "reconciling"
+        else SessionState.COMMITTING.value
+    )
+    if session_record.state != expected_session_state or (
+        session_record.commit_attempt_id != attempt_id.root
     ):
         raise InvalidCommitStateError("session is outside the prepared commit fence")
     writer_intents = _attempt_writer_intents(
@@ -508,7 +512,7 @@ def finalize_knowledge_commit(
         ) from exc
     except ConcurrencyControlError as exc:
         raise KnowledgeCommitLeaseError("knowledge writer fence was lost") from exc
-    if session_record.question_id is not None:
+    if session_record.question_id is not None and batch.terminal_state is SessionState.SUCCEEDED:
         question = db.get(QuestionRecord, session_record.question_id)
         if question is None:
             raise InvalidCommitStateError("bound research question disappeared")
@@ -557,7 +561,7 @@ def finalize_knowledge_commit(
         public_summary="Session completed",
         topic="audit.session_state_changed.v1",
         payload={
-            "from": SessionState.COMMITTING.value,
+            "from": expected_session_state,
             "to": batch.terminal_state.value,
             "attempt_id": str(attempt_id),
         },

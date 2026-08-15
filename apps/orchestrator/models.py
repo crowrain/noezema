@@ -7,9 +7,11 @@ from typing import Literal
 
 from pydantic import AwareDatetime, model_validator
 
+from packages.cognition import CuratorProposal
 from packages.domain import (
     ActionId,
     BrokerRunResult,
+    CheckpointId,
     ConfigSnapshotId,
     DecisionEnvelope,
     ModelRunId,
@@ -143,4 +145,37 @@ class ExplorerTurnResult(ContractModel):
         expects_action = isinstance(self.decision.decision, ToolDecision)
         if expects_action != (self.action_result is not None):
             raise ValueError("tool decisions require exactly one broker result")
+        return self
+
+
+class CuratorTurnResult(ContractModel):
+    session_id: SessionId
+    turn_id: TurnId
+    model_run_id: ModelRunId
+    proposal: CuratorProposal
+    replayed_model_run: bool
+
+
+class SessionRunResult(ContractModel):
+    """Terminal projection returned by one complete or recovered session run."""
+
+    session_id: SessionId
+    question_id: QuestionId | None
+    terminal_state: SessionState
+    checkpoint_id: CheckpointId | None = None
+    model_turns: int
+    tool_actions: int
+    claims_committed: int
+    termination_reason: str | None = None
+
+    @model_validator(mode="after")
+    def require_terminal_projection(self) -> SessionRunResult:
+        if not self.terminal_state.is_terminal:
+            raise ValueError("session run result must describe a terminal session")
+        successful = self.terminal_state in {
+            SessionState.SUCCEEDED,
+            SessionState.SUCCEEDED_PARTIAL,
+        }
+        if successful != (self.checkpoint_id is not None):
+            raise ValueError("successful session run requires exactly one checkpoint")
         return self

@@ -2,17 +2,24 @@
 
 from apps.orchestrator.models import (
     ClaimedSession,
+    CuratorTurnResult,
     ExplorerTurnResult,
     OperatorControlKind,
     OperatorControlResult,
     SafeBoundaryKind,
     SafeBoundaryResult,
+    SessionRunResult,
     SessionStarted,
     SessionWorkDirective,
     SessionWorkKind,
     WakeResult,
     WakeSkipped,
     WakeSkipReason,
+)
+from apps.orchestrator.runner import (
+    AutonomousSessionRunner,
+    SessionRunnerLimits,
+    SessionStepLimitExceededError,
 )
 from apps.orchestrator.runtime import (
     DurableSessionOrchestrator,
@@ -38,7 +45,9 @@ from apps.orchestrator.runtime import (
 from apps.orchestrator.service import InconsistentRuntimeStateError, start_next_session
 
 __all__ = [
+    "AutonomousSessionRunner",
     "ClaimedSession",
+    "CuratorTurnResult",
     "DurableSessionOrchestrator",
     "ExplorerTurnResult",
     "FailedTurnError",
@@ -54,10 +63,13 @@ __all__ = [
     "SessionAbortedError",
     "SessionBoundaryFailureError",
     "SessionRuntimeError",
+    "SessionRunResult",
+    "SessionRunnerLimits",
     "SoftBudgetExhaustedError",
     "SessionStarted",
     "SessionWorkDirective",
     "SessionWorkKind",
+    "SessionStepLimitExceededError",
     "TurnBindingConflictError",
     "TurnFenceRejectedError",
     "WakeResult",
