@@ -244,6 +244,7 @@ class MessageRecord(Base):
         CheckConstraint("expires_at > created_at", name="expiry_after_creation"),
         CheckConstraint("length(request_sha256) = 64", name="request_sha256_length"),
         Index("ix_messages_delivery", "state", "priority", "created_at", "id"),
+        Index("ix_messages_query", "created_at", "id"),
     )
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
@@ -291,6 +292,7 @@ class SessionRecord(Base):
             "(soft_exhausted_at IS NULL) = (soft_exhaustion_reason IS NULL)",
             name="soft_exhaustion_tuple_complete",
         ),
+        Index("ix_sessions_query", "created_at", "id"),
     )
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
@@ -350,6 +352,7 @@ class OperatorCommandRecord(Base):
             name="session_target_shape",
         ),
         Index("ix_operator_commands_dispatch", "state", "created_at", "id"),
+        Index("ix_operator_commands_query", "created_at", "id"),
     )
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
@@ -604,6 +607,7 @@ class AuditEventRecord(Base):
             postgresql_where=text("session_id IS NULL"),
             sqlite_where=text("session_id IS NULL"),
         ),
+        Index("ix_audit_events_public_timeline", "visibility", "occurred_at", "id"),
     )
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)

@@ -167,6 +167,10 @@ def test_migrations_render_valid_bootstrap_and_fifo_sql(
     assert "SessionBudgetExhausted" in sql
     assert "ALTER TABLE commit_attempts ADD COLUMN session_fence BIGINT" in sql
     assert "CREATE INDEX ix_questions_fifo" in sql
+    assert "CREATE INDEX ix_audit_events_public_timeline" in sql
+    assert "CREATE INDEX ix_sessions_query" in sql
+    assert "CREATE INDEX ix_messages_query" in sql
+    assert "CREATE INDEX ix_operator_commands_query" in sql
     assert "DROP CONSTRAINT ck_audit_events_type_allowed" in sql
     assert "ck_audit_events_ck_audit_events_type_allowed" not in sql
 
@@ -187,4 +191,5 @@ def test_migrations_render_valid_bootstrap_and_fifo_sql(
     assert "DROP TABLE operator_commands" in downgrade_sql
     assert "DROP TABLE messages" in downgrade_sql
     assert "DROP TABLE runtime_controls" in downgrade_sql
+    assert "DROP INDEX ix_audit_events_public_timeline" in downgrade_sql
     assert "DROP CONSTRAINT ck_audit_events_type_allowed" in downgrade_sql
