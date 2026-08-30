@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import json
 from enum import StrEnum
 from typing import Annotated
 from uuid import UUID
 
-from pydantic import AwareDatetime, Field, model_validator
+from pydantic import AwareDatetime, ConfigDict, Field, SecretStr, field_validator, model_validator
 
 from packages.domain import (
     EventType,
@@ -18,9 +19,92 @@ from packages.domain import (
     SessionBudget,
     SessionState,
 )
-from packages.domain._base import ContractModel, NonEmptyText, ShortReason
+from packages.domain._base import ContractModel, JsonObject, NonEmptyText, ShortReason
 
 NonNegativeInt = Annotated[int, Field(ge=0)]
+
+
+class ApiRequestModel(ContractModel):
+    """JSON requests parse their wire strings before strict domain construction."""
+
+    model_config = ConfigDict(strict=False)
+
+
+class LoginRequest(ApiRequestModel):
+    password: SecretStr
+
+    @field_validator("password")
+    @classmethod
+    def validate_password_size(cls, value: SecretStr) -> SecretStr:
+        if not 1 <= len(value.get_secret_value()) <= 1024:
+            raise ValueError("password must contain between 1 and 1024 characters")
+        return value
+
+
+class AuthSessionResponse(ContractModel):
+    subject: str
+    csrf_token: str
+    issued_at: AwareDatetime
+    expires_at: AwareDatetime
+
+
+class MessageCreateRequest(ApiRequestModel):
+    idempotency_key: UUID
+    body: NonEmptyText
+    priority: Annotated[int, Field(default=0, ge=-1000, le=1000)]
+    expires_in_seconds: Annotated[
+        int,
+        Field(default=7 * 24 * 60 * 60, ge=60, le=30 * 24 * 60 * 60),
+    ]
+
+
+class MessageAcceptedResponse(ContractModel):
+    id: UUID
+    question_id: UUID
+    state: MessageState
+    newly_created: bool
+
+
+class OperatorCommandCreateRequest(ApiRequestModel):
+    idempotency_key: UUID
+    type: OperatorCommandType
+    session_id: UUID | None = None
+    arguments: JsonObject = Field(default_factory=dict)
+    reason: ShortReason
+
+    @model_validator(mode="after")
+    def require_target_and_argument_shape(self) -> OperatorCommandCreateRequest:
+        session_scoped = self.type in {
+            OperatorCommandType.STOP_GRACEFULLY,
+            OperatorCommandType.ABORT_SESSION,
+        }
+        if session_scoped != (self.session_id is not None):
+            raise ValueError("stop/abort require exactly one session target")
+        argument_free = self.type in {
+            OperatorCommandType.PAUSE,
+            OperatorCommandType.RESUME,
+            OperatorCommandType.WAKE_NOW,
+            OperatorCommandType.STOP_GRACEFULLY,
+            OperatorCommandType.ABORT_SESSION,
+        }
+        if argument_free and self.arguments:
+            raise ValueError(f"{self.type.value} does not accept arguments")
+        encoded_arguments = json.dumps(
+            self.arguments,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        if len(encoded_arguments) > 16 * 1024:
+            raise ValueError("operator command arguments exceed 16 KiB")
+        return self
+
+
+class OperatorCommandAcceptedResponse(ContractModel):
+    id: UUID
+    type: OperatorCommandType
+    state: OperatorCommandState
+    newly_created: bool
 
 
 class NodeActivity(StrEnum):
