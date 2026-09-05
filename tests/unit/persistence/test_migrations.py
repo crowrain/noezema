@@ -42,6 +42,7 @@ ORCHESTRATOR_MIGRATION = importlib.import_module(
 )
 BUDGET_MIGRATION = importlib.import_module("migrations.versions.0008_session_budgets_and_controls")
 INBOX_MIGRATION = importlib.import_module("migrations.versions.0009_human_input_and_operator_inbox")
+SCHEDULER_MIGRATION = importlib.import_module("migrations.versions.0012_autonomous_scheduler")
 FOUNDATION_TABLES = {
     "actions",
     "audit_events",
@@ -102,7 +103,8 @@ def test_knowledge_migration_literals_match_closed_domain_registries() -> None:
         "consolidation",
     )
     assert BUDGET_MIGRATION.AUDIT_EVENT_TYPES_V3 == INBOX_MIGRATION.AUDIT_EVENT_TYPES_V3
-    assert INBOX_MIGRATION.AUDIT_EVENT_TYPES_V4 == tuple(item.value for item in EventType)
+    assert INBOX_MIGRATION.AUDIT_EVENT_TYPES_V4 == SCHEDULER_MIGRATION.AUDIT_EVENT_TYPES_V4
+    assert SCHEDULER_MIGRATION.AUDIT_EVENT_TYPES_V5 == tuple(item.value for item in EventType)
     assert INBOX_MIGRATION.MESSAGE_STATES == tuple(item.value for item in MessageState)
     assert INBOX_MIGRATION.OPERATOR_COMMAND_TYPES == tuple(
         item.value for item in OperatorCommandType
@@ -175,6 +177,14 @@ def test_migrations_render_valid_bootstrap_and_fifo_sql(
     assert "ALTER TABLE outbox_events ADD COLUMN stream_sequence BIGINT" in sql
     assert "CREATE UNIQUE INDEX uq_outbox_events_stream_sequence" in sql
     assert "CREATE INDEX ix_outbox_events_unsequenced" in sql
+    assert "ALTER TABLE runtime_controls ADD COLUMN scheduler_fence BIGINT" in sql
+    assert (
+        "ALTER TABLE runtime_controls ADD COLUMN "
+        "scheduler_last_handled_wake_generation BIGINT" in sql
+    )
+    assert "ALTER TABLE runtime_controls ADD COLUMN scheduler_backoff_until" in sql
+    assert "SchedulerWakeStarted" in sql
+    assert "SchedulerWakeFinished" in sql
     assert "DROP CONSTRAINT ck_audit_events_type_allowed" in sql
     assert "ck_audit_events_ck_audit_events_type_allowed" not in sql
 
@@ -200,4 +210,6 @@ def test_migrations_render_valid_bootstrap_and_fifo_sql(
     assert "DROP INDEX uq_outbox_events_stream_sequence" in downgrade_sql
     assert "DROP COLUMN stream_sequence" in downgrade_sql
     assert "DROP COLUMN next_outbox_sequence" in downgrade_sql
+    assert "DROP COLUMN scheduler_last_handled_wake_generation" in downgrade_sql
+    assert "DROP COLUMN scheduler_lease_owner" in downgrade_sql
     assert "DROP CONSTRAINT ck_audit_events_type_allowed" in downgrade_sql

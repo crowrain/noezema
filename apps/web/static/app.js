@@ -263,6 +263,7 @@
 
   function renderStatus(status) {
     const active = status.active_session;
+    const scheduler = status.scheduler;
     state.activeSessionId = active ? active.id : null;
     elements.nodeState.textContent = labels.node[status.node_state] || status.node_state;
     elements.nodeDetail.textContent =
@@ -270,7 +271,13 @@
         ? "Новые сессии заблокированы"
         : active
           ? "Познавательный цикл выполняется"
-          : "Готов к следующему циклу";
+          : scheduler.busy
+            ? "Планировщик выполняет пробуждение"
+            : scheduler.backoff_until && Date.parse(scheduler.backoff_until) > Date.now()
+              ? `Повтор после ${formatDate(scheduler.backoff_until, true)}`
+              : scheduler.next_scheduled_at
+                ? `Следующее пробуждение ${formatDate(scheduler.next_scheduled_at, true)}`
+                : "Готов к следующему циклу";
     elements.activityState.textContent = labels.activity[status.activity] || status.activity;
     elements.sessionDetail.textContent = active
       ? `Сессия ${shortId(active.id)}`

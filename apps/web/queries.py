@@ -19,6 +19,7 @@ from apps.web.models import (
     NodeStatusProjection,
     OperatorCommandPage,
     OperatorCommandProjection,
+    SchedulerStatusProjection,
     SessionPage,
     SessionProjection,
     SessionUsageProjection,
@@ -108,14 +109,35 @@ class QueryService:
             )
             try:
                 node_state = NodeState(runtime.node_state)
+                last_terminal_state = (
+                    SessionState(runtime.scheduler_last_terminal_state)
+                    if runtime.scheduler_last_terminal_state is not None
+                    else None
+                )
             except ValueError as exc:
-                raise ProjectionInvariantError("runtime node_state is invalid") from exc
+                raise ProjectionInvariantError("runtime scheduler state is invalid") from exc
+            lease_expires_at = _optional_aware(runtime.scheduler_lease_expires_at)
             return NodeStatusProjection(
                 node_state=node_state,
                 activity=(
                     NodeActivity.RUNNING if active_session is not None else NodeActivity.IDLE
                 ),
                 active_session=active_session,
+                scheduler=SchedulerStatusProjection(
+                    busy=(
+                        runtime.scheduler_lease_owner is not None
+                        and lease_expires_at is not None
+                        and lease_expires_at > observed_at
+                    ),
+                    wake_generation=runtime.wake_generation,
+                    handled_wake_generation=(runtime.scheduler_last_handled_wake_generation),
+                    next_scheduled_at=_optional_aware(runtime.scheduler_next_scheduled_at),
+                    backoff_until=_optional_aware(runtime.scheduler_backoff_until),
+                    consecutive_failures=runtime.scheduler_consecutive_failures,
+                    last_session_id=runtime.scheduler_last_session_id,
+                    last_terminal_state=last_terminal_state,
+                    last_error_class=runtime.scheduler_last_error_class,
+                ),
                 queued_questions=queued_questions,
                 pending_messages=pending_messages,
                 pending_commands=pending_commands,

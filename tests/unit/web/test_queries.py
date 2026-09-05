@@ -20,7 +20,7 @@ from packages.domain import (
     UserMessageDraft,
 )
 from packages.persistence import append_global_audit, enqueue_user_message, submit_operator_command
-from packages.persistence.models import AuditEventRecord
+from packages.persistence.models import AuditEventRecord, RuntimeControlRecord
 
 NOW = datetime(2026, 8, 20, 12, 0, tzinfo=UTC)
 
@@ -46,6 +46,24 @@ def test_status_is_derived_from_durable_runtime_and_active_session(
     assert initial.activity is NodeActivity.IDLE
     assert initial.active_session is None
     assert initial.queued_questions == 0
+    assert initial.scheduler.busy is False
+    assert initial.scheduler.wake_generation == 0
+    assert initial.scheduler.handled_wake_generation == 0
+
+    with session_factory.begin() as db:
+        runtime = db.get(RuntimeControlRecord, "global")
+        assert runtime is not None
+        runtime.scheduler_lease_owner = "supervisor/incarnation-1"
+        runtime.scheduler_lease_expires_at = NOW + timedelta(minutes=5)
+        runtime.scheduler_next_scheduled_at = NOW + timedelta(hours=1)
+        runtime.scheduler_backoff_until = NOW + timedelta(minutes=1)
+        runtime.scheduler_consecutive_failures = 2
+
+    scheduled = service.status()
+    assert scheduled.scheduler.busy is True
+    assert scheduled.scheduler.next_scheduled_at == NOW + timedelta(hours=1)
+    assert scheduled.scheduler.backoff_until == NOW + timedelta(minutes=1)
+    assert scheduled.scheduler.consecutive_failures == 2
 
     with session_factory.begin() as db:
         queued = enqueue_user_message(db, _message())

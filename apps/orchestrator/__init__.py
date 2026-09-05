@@ -17,6 +17,10 @@ from apps.orchestrator.models import (
     SessionStarted,
     SessionWorkDirective,
     SessionWorkKind,
+    SupervisorSkipReason,
+    SupervisorTickResult,
+    SupervisorTickStatus,
+    SupervisorTrigger,
     WakeResult,
     WakeSkipped,
     WakeSkipReason,
@@ -48,9 +52,15 @@ from apps.orchestrator.runtime import (
     transition_session_phase,
 )
 from apps.orchestrator.service import InconsistentRuntimeStateError, start_next_session
+from apps.orchestrator.supervisor import (
+    AutonomousSupervisor,
+    SupervisorLeaseLostError,
+    SupervisorPolicy,
+)
 
 __all__ = [
     "AutonomousSessionRunner",
+    "AutonomousSupervisor",
     "ClaimedSession",
     "CuratorTurnResult",
     "DurableSessionOrchestrator",
@@ -74,6 +84,12 @@ __all__ = [
     "SessionStarted",
     "SessionWorkDirective",
     "SessionWorkKind",
+    "SupervisorLeaseLostError",
+    "SupervisorPolicy",
+    "SupervisorSkipReason",
+    "SupervisorTickResult",
+    "SupervisorTickStatus",
+    "SupervisorTrigger",
     "SessionStepLimitExceededError",
     "TurnBindingConflictError",
     "TurnFenceRejectedError",

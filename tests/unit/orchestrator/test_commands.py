@@ -111,6 +111,11 @@ def test_pause_and_resume_gate_new_session_admission(
     assert isinstance(skipped, WakeSkipped)
     assert skipped.reason is WakeSkipReason.OPERATOR_PAUSED
     with session_factory.begin() as db:
+        runtime = db.get(RuntimeControlRecord, "global")
+        assert runtime is not None
+        runtime.scheduler_backoff_until = NOW
+        runtime.scheduler_consecutive_failures = 3
+        runtime.scheduler_last_error_class = "ConnectionError"
         resume = submit_operator_command(db, _command(OperatorCommandType.RESUME))
         dispatch_operator_command(db, command_id=resume.id, occurred_at=NOW)
         started = start_next_session(db, session_id=SessionId.new(), occurred_at=NOW)
@@ -119,6 +124,9 @@ def test_pause_and_resume_gate_new_session_admission(
     with session_factory() as db:
         runtime = db.get(RuntimeControlRecord, "global")
         assert runtime is not None and runtime.node_state == NodeState.SLEEPING.value
+        assert runtime.scheduler_backoff_until is None
+        assert runtime.scheduler_consecutive_failures == 0
+        assert runtime.scheduler_last_error_class is None
 
 
 def test_wake_now_is_rejected_while_paused_and_increments_when_resumed(

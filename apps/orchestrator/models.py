@@ -5,7 +5,7 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import AwareDatetime, model_validator
+from pydantic import AwareDatetime, Field, model_validator
 
 from packages.cognition import CuratorProposal
 from packages.domain import (
@@ -49,6 +49,64 @@ class WakeSkipped(ContractModel):
 
 
 WakeResult = SessionStarted | WakeSkipped
+
+
+class SupervisorTrigger(StrEnum):
+    SCHEDULED = "scheduled"
+    WAKE_NOW = "wake_now"
+    RECOVERY = "recovery"
+
+
+class SupervisorTickStatus(StrEnum):
+    IDLE = "idle"
+    SKIPPED = "skipped"
+    SESSION_COMPLETED = "session_completed"
+    ERROR = "error"
+
+
+class SupervisorSkipReason(StrEnum):
+    NOT_DUE = "not_due"
+    SCHEDULER_BUSY = "scheduler_busy"
+    BACKOFF = "backoff"
+    RESOURCE_UNAVAILABLE = "resource_unavailable"
+    UNRESOLVED_COMMIT = "unresolved_commit"
+    CONFIG_ACTIVATION_IN_PROGRESS = "config_activation_in_progress"
+    OPERATOR_PAUSED = "operator_paused"
+    NO_ELIGIBLE_QUESTION = "no_eligible_question"
+    ACTIVE_SESSION = "active_session"
+
+
+class SupervisorTickResult(ContractModel):
+    """Public, secret-free result of one autonomous supervisor tick."""
+
+    status: SupervisorTickStatus
+    observed_at: AwareDatetime
+    trigger: SupervisorTrigger | None = None
+    skip_reason: SupervisorSkipReason | None = None
+    session_id: SessionId | None = None
+    terminal_state: SessionState | None = None
+    error_class: str | None = Field(default=None, min_length=1, max_length=128)
+    handled_wake_generation: int = Field(ge=0)
+    next_scheduled_at: AwareDatetime | None = None
+    backoff_until: AwareDatetime | None = None
+    consecutive_failures: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def require_status_shape(self) -> SupervisorTickResult:
+        if (self.status is SupervisorTickStatus.SKIPPED) != (self.skip_reason is not None):
+            raise ValueError("only a skipped tick carries skip_reason")
+        completed = self.status is SupervisorTickStatus.SESSION_COMPLETED
+        has_session_id = self.session_id is not None
+        has_terminal_state = self.terminal_state is not None
+        if completed != (has_session_id and has_terminal_state):
+            raise ValueError("a completed tick requires exactly one terminal session")
+        if not completed and (has_session_id or has_terminal_state):
+            raise ValueError("only a completed tick carries a terminal session")
+        if self.terminal_state is not None and not self.terminal_state.is_terminal:
+            raise ValueError("supervisor result must not expose a non-terminal outcome")
+        if (self.status is SupervisorTickStatus.ERROR) != (self.error_class is not None):
+            raise ValueError("only an error tick carries error_class")
+        return self
 
 
 class SessionWorkKind(StrEnum):

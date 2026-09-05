@@ -13,8 +13,12 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from apps.orchestrator import (
     AutonomousSessionRunner,
+    AutonomousSupervisor,
     SessionRunnerLimits,
     SessionStarted,
+    SupervisorPolicy,
+    SupervisorTickStatus,
+    SupervisorTrigger,
     request_session_abort,
     start_next_session,
 )
@@ -70,6 +74,7 @@ from packages.persistence.models import (
     OrchestratorTurnRecord,
     QuestionRecord,
     RuntimeConfigHeadRecord,
+    RuntimeControlRecord,
     SessionRecord,
 )
 from packages.tool_broker import ToolBroker
@@ -318,6 +323,49 @@ def test_runner_completes_full_local_cognitive_cycle(
         assert db.scalar(select(func.count()).select_from(ClaimAssessmentRecord)) == 1
         question_record = db.get(QuestionRecord, question.id.root)
         assert question_record is not None and question_record.state == "answered"
+
+
+def test_supervisor_schedules_and_completes_full_local_cognitive_cycle(
+    session_factory: sessionmaker[Session],
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "corpus.txt").write_text(
+        "NOEZEMA keeps evidence provenance with learned claims.",
+        encoding="utf-8",
+    )
+    with session_factory.begin() as db:
+        config_id = _install_runtime_config(db)
+        question = _enqueue(db, config_id)
+    gateway = _ContextBoundGateway(
+        decisions=(_explorer_result(complete=False), _explorer_result(complete=True)),
+    )
+    supervisor = AutonomousSupervisor(
+        session_factory=session_factory,
+        runner=_runner(session_factory, workspace, gateway),
+        owner="supervisor/incarnation-1",
+        policy=SupervisorPolicy(max_session_steps=32),
+        clock=lambda: NOW,
+    )
+
+    result = supervisor.tick()
+
+    assert result.status is SupervisorTickStatus.SESSION_COMPLETED
+    assert result.trigger is SupervisorTrigger.SCHEDULED
+    assert result.terminal_state is SessionState.SUCCEEDED
+    assert result.session_id is not None
+    assert gateway.decision_calls == 2
+    assert gateway.curator_calls == 1
+    with session_factory() as db:
+        runtime = db.get(RuntimeControlRecord, "global")
+        stored_question = db.get(QuestionRecord, question.id.root)
+        assert runtime is not None
+        assert runtime.scheduler_lease_owner is None
+        assert runtime.scheduler_last_session_id == result.session_id.root
+        assert runtime.scheduler_last_terminal_state == SessionState.SUCCEEDED.value
+        assert result.next_scheduled_at == NOW + timedelta(hours=1)
+        assert stored_question is not None and stored_question.state == "answered"
 
 
 def test_soft_exhaustion_reserves_curator_and_commits_partial_progress(

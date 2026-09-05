@@ -159,3 +159,5 @@ class EventType(StrEnum):
     MESSAGE_EXPIRED = "MessageExpired"
     OPERATOR_COMMAND_ACCEPTED = "OperatorCommandAccepted"
     OPERATOR_COMMAND_STATE_CHANGED = "OperatorCommandStateChanged"
+    SCHEDULER_WAKE_STARTED = "SchedulerWakeStarted"
+    SCHEDULER_WAKE_FINISHED = "SchedulerWakeFinished"

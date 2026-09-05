@@ -194,6 +194,28 @@ class RuntimeControlRecord(Base):
             "next_outbox_sequence >= 1",
             name="next_outbox_sequence_positive",
         ),
+        CheckConstraint("scheduler_fence >= 0", name="scheduler_fence_nonnegative"),
+        CheckConstraint(
+            "scheduler_last_handled_wake_generation >= 0 "
+            "AND scheduler_last_handled_wake_generation <= wake_generation",
+            name="scheduler_wake_generation_valid",
+        ),
+        CheckConstraint(
+            "scheduler_consecutive_failures >= 0",
+            name="scheduler_failures_nonnegative",
+        ),
+        CheckConstraint(
+            "(scheduler_lease_owner IS NULL) = (scheduler_lease_expires_at IS NULL)",
+            name="scheduler_lease_tuple_complete",
+        ),
+        CheckConstraint(
+            "scheduler_last_terminal_state IS NULL OR "
+            + _allowed_values(
+                "scheduler_last_terminal_state",
+                [state.value for state in SessionState if state.is_terminal],
+            ),
+            name="scheduler_terminal_state_allowed",
+        ),
     )
 
     scope: Mapped[str] = mapped_column(String(16), primary_key=True)
@@ -201,6 +223,24 @@ class RuntimeControlRecord(Base):
     wake_generation: Mapped[int] = mapped_column(BigInteger, default=0)
     next_global_audit_sequence: Mapped[int] = mapped_column(BigInteger, default=1)
     next_outbox_sequence: Mapped[int] = mapped_column(BigInteger, default=1)
+    scheduler_lease_owner: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    scheduler_lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    scheduler_fence: Mapped[int] = mapped_column(BigInteger, default=0)
+    scheduler_last_handled_wake_generation: Mapped[int] = mapped_column(BigInteger, default=0)
+    scheduler_next_scheduled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    scheduler_backoff_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    scheduler_consecutive_failures: Mapped[int] = mapped_column(Integer, default=0)
+    scheduler_last_session_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True), nullable=True
+    )
+    scheduler_last_terminal_state: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    scheduler_last_error_class: Mapped[str | None] = mapped_column(String(128), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 

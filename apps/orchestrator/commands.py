@@ -240,6 +240,10 @@ def _dispatch_node_control(
     else:
         target = NodeState.PAUSED if command is OperatorCommandType.PAUSE else NodeState.SLEEPING
         runtime.node_state = target.value
+        if command is OperatorCommandType.RESUME:
+            runtime.scheduler_backoff_until = None
+            runtime.scheduler_consecutive_failures = 0
+            runtime.scheduler_last_error_class = None
         result = {
             "previous_node_state": previous.value,
             "node_state": target.value,

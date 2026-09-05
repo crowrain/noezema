@@ -149,10 +149,31 @@ class SessionProjection(ContractModel):
         return self
 
 
+class SchedulerStatusProjection(ContractModel):
+    """Secret-free durable scheduler state exposed to the owner."""
+
+    busy: bool
+    wake_generation: NonNegativeInt
+    handled_wake_generation: NonNegativeInt
+    next_scheduled_at: AwareDatetime | None
+    backoff_until: AwareDatetime | None
+    consecutive_failures: NonNegativeInt
+    last_session_id: UUID | None
+    last_terminal_state: SessionState | None
+    last_error_class: Annotated[str | None, Field(max_length=128)]
+
+    @model_validator(mode="after")
+    def handled_generation_cannot_exceed_requested(self) -> SchedulerStatusProjection:
+        if self.handled_wake_generation > self.wake_generation:
+            raise ValueError("handled wake generation exceeds the requested generation")
+        return self
+
+
 class NodeStatusProjection(ContractModel):
     node_state: NodeState
     activity: NodeActivity
     active_session: SessionProjection | None
+    scheduler: SchedulerStatusProjection
     queued_questions: NonNegativeInt
     pending_messages: NonNegativeInt
     pending_commands: NonNegativeInt
