@@ -41,6 +41,41 @@ async def _login(client: httpx.AsyncClient) -> httpx.Response:
     )
 
 
+def test_owner_console_and_assets_have_a_hardened_static_boundary(
+    session_factory: sessionmaker[Session],
+    web_security: WebSecurityConfig,
+) -> None:
+    app = create_app(session_factory, security=web_security, clock=lambda: NOW)
+
+    async def scenario() -> None:
+        async with await _client(app) as client:
+            page = await client.get("/")
+            stylesheet = await client.get("/assets/app.css")
+            script = await client.get("/assets/app.js")
+
+            assert page.status_code == stylesheet.status_code == script.status_code == 200
+            assert page.headers["cache-control"] == "no-store"
+            assert "default-src 'self'" in page.headers["content-security-policy"]
+            assert "script-src 'self'" in page.headers["content-security-policy"]
+            assert "'unsafe-inline'" not in page.headers["content-security-policy"]
+            assert page.headers["x-frame-options"] == "DENY"
+            assert page.headers["x-content-type-options"] == "nosniff"
+            assert stylesheet.headers["content-type"].startswith("text/css")
+            assert script.headers["content-type"].startswith("text/javascript")
+
+            assert '<script src="/assets/app.js" defer></script>' in page.text
+            assert '<link rel="stylesheet" href="/assets/app.css">' in page.text
+            assert "<style" not in page.text
+            assert "<script>" not in page.text
+            assert ".innerHTML" not in script.text
+            assert "localStorage" not in script.text
+            assert 'new EventSource("/api/timeline/stream?after=0"' in script.text
+            assert 'headers.set("X-CSRF-Token"' in script.text
+            assert "crypto.randomUUID()" in script.text
+
+    _run(scenario)
+
+
 def test_owner_login_protects_query_api_and_sets_hardened_cookie(
     session_factory: sessionmaker[Session],
     web_security: WebSecurityConfig,
@@ -352,7 +387,7 @@ def test_openapi_does_not_publish_internal_or_staging_fields(
     mutation_methods = {
         (route.path, method)
         for route in app.routes
-        for method in (route.methods or set())
+        for method in (getattr(route, "methods", None) or set())
         if method in {"POST", "PUT", "PATCH", "DELETE"}
     }
     assert mutation_methods == {

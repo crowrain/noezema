@@ -19,6 +19,7 @@ dependencies = [
   "psycopg[binary]>=3.2,<4",
   "pydantic>=2.11,<3",
   "sqlalchemy>=2.0,<2.1",
+  "uvicorn>=0.34,<1",
 ]
 
 [project.optional-dependencies]
@@ -33,6 +34,9 @@ include-package-data = false
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["apps*", "packages*"]
+
+[tool.setuptools.package-data]
+"apps.web" = ["static/*.html", "static/*.css", "static/*.js"]
 
 [tool.pytest.ini_options]
 minversion = "8.3"

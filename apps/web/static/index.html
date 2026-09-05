@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <meta name="description" content="Локальная панель управления автономным мыслителем NOEZEMA">
+    <title>NOEZEMA · Пульт мыслителя</title>
+    <link rel="stylesheet" href="/assets/app.css">
+    <script src="/assets/app.js" defer></script>
+  </head>
+  <body>
+    <div class="ambient ambient-one" aria-hidden="true"></div>
+    <div class="ambient ambient-two" aria-hidden="true"></div>
+
+    <header class="site-header">
+      <a class="brand" href="/" aria-label="NOEZEMA — главная">
+        <span class="brand-mark" aria-hidden="true"><span></span></span>
+        <span class="brand-copy">
+          <strong>NOEZEMA</strong>
+          <small>local cognition system</small>
+        </span>
+      </a>
+      <div class="header-actions">
+        <span id="stream-state" class="connection-pill is-offline" hidden>
+          <span class="connection-dot" aria-hidden="true"></span>
+          <span id="stream-state-label">Нет соединения</span>
+        </span>
+        <button id="refresh-button" class="icon-button" type="button" title="Обновить данные" hidden>
+          <span aria-hidden="true">↻</span>
+          <span class="sr-only">Обновить данные</span>
+        </button>
+        <button id="logout-button" class="text-button" type="button" hidden>Выйти</button>
+      </div>
+    </header>
+
+    <main>
+      <section id="login-view" class="login-shell" aria-labelledby="login-title">
+        <div class="login-panel">
+          <p class="eyebrow">Закрытый локальный контур</p>
+          <h1 id="login-title">Войти в пульт мыслителя</h1>
+          <p class="login-copy">
+            Статус, хронология и команды доступны только владельцу этого узла.
+          </p>
+          <form id="login-form" class="stack" autocomplete="on">
+            <label for="password">Пароль администратора</label>
+            <input
+              id="password"
+              name="password"
+              type="password"
+              minlength="1"
+              maxlength="1024"
+              autocomplete="current-password"
+              required
+              autofocus
+            >
+            <p id="login-error" class="form-error" role="alert" hidden></p>
+            <button class="primary-button" type="submit">
+              <span class="button-label">Продолжить</span>
+              <span class="button-progress" aria-hidden="true"></span>
+            </button>
+          </form>
+          <div class="trust-note">
+            <span class="trust-icon" aria-hidden="true">⌁</span>
+            <span>Учётные данные остаются в локальном процессе NOEZEMA.</span>
+          </div>
+        </div>
+      </section>
+
+      <section id="console-view" class="console" aria-labelledby="console-title" hidden>
+        <div class="console-heading">
+          <div>
+            <p class="eyebrow">Операционный обзор</p>
+            <h1 id="console-title">Что происходит сейчас</h1>
+          </div>
+          <p id="observed-at" class="observed-at">Ожидание данных…</p>
+        </div>
+
+        <section class="status-grid" aria-label="Состояние системы">
+          <article class="status-card status-card-primary">
+            <span class="metric-label">Узел</span>
+            <strong id="node-state" class="metric-value">—</strong>
+            <span id="node-detail" class="metric-detail">Проверяем состояние</span>
+          </article>
+          <article class="status-card">
+            <span class="metric-label">Активность</span>
+            <strong id="activity-state" class="metric-value">—</strong>
+            <span id="session-detail" class="metric-detail">Нет данных</span>
+          </article>
+          <article class="status-card">
+            <span class="metric-label">Вопросы</span>
+            <strong id="queued-questions" class="metric-value metric-number">0</strong>
+            <span class="metric-detail">в очереди на исследование</span>
+          </article>
+          <article class="status-card">
+            <span class="metric-label">Входящие</span>
+            <strong id="pending-messages" class="metric-value metric-number">0</strong>
+            <span id="command-count" class="metric-detail">0 команд ожидают</span>
+          </article>
+        </section>
+
+        <section id="active-session" class="session-strip" aria-labelledby="session-title" hidden>
+          <div class="session-main">
+            <div class="section-kicker">
+              <span class="pulse" aria-hidden="true"></span>
+              <span>Активная сессия</span>
+            </div>
+            <h2 id="session-title">—</h2>
+            <p id="session-question" class="session-question">—</p>
+          </div>
+          <dl class="session-stats">
+            <div><dt>Фаза</dt><dd id="session-state">—</dd></div>
+            <div><dt>Ходы модели</dt><dd id="session-turns">0</dd></div>
+            <div><dt>Действия</dt><dd id="session-actions">0</dd></div>
+            <div><dt>Токены</dt><dd id="session-tokens">0</dd></div>
+          </dl>
+        </section>
+
+        <div class="workspace-grid">
+          <section class="panel timeline-panel" aria-labelledby="timeline-title">
+            <div class="panel-heading">
+              <div>
+                <p class="section-kicker">Committed audit</p>
+                <h2 id="timeline-title">Хронология</h2>
+              </div>
+              <span id="timeline-count" class="counter-badge">0 событий</span>
+            </div>
+            <div id="timeline-empty" class="empty-state">
+              <span class="empty-symbol" aria-hidden="true">∴</span>
+              <strong>История пока пуста</strong>
+              <span>Новые подтверждённые события появятся здесь автоматически.</span>
+            </div>
+            <ol id="timeline-list" class="timeline-list" aria-live="polite" hidden></ol>
+          </section>
+
+          <aside class="side-column" aria-label="Взаимодействие с мыслителем">
+            <section class="panel composer-panel" aria-labelledby="message-title">
+              <div class="panel-heading compact-heading">
+                <div>
+                  <p class="section-kicker">Human input</p>
+                  <h2 id="message-title">Написать мыслителю</h2>
+                </div>
+              </div>
+              <form id="message-form" class="stack">
+                <label for="message-body">Сообщение или новый вопрос</label>
+                <textarea
+                  id="message-body"
+                  name="body"
+                  rows="5"
+                  minlength="1"
+                  maxlength="4096"
+                  placeholder="Например: исследуй причины расхождения в последних результатах…"
+                  required
+                ></textarea>
+                <div class="form-row">
+                  <label class="compact-field" for="message-priority">
+                    <span>Приоритет</span>
+                    <select id="message-priority" name="priority">
+                      <option value="0" selected>Обычный</option>
+                      <option value="10">Высокий</option>
+                      <option value="-10">Фоновый</option>
+                    </select>
+                  </label>
+                  <span id="message-length" class="character-count">0 / 4096</span>
+                </div>
+                <button class="primary-button" type="submit">
+                  <span class="button-label">Поставить в очередь</span>
+                  <span class="button-progress" aria-hidden="true"></span>
+                </button>
+              </form>
+            </section>
+
+            <section class="panel controls-panel" aria-labelledby="controls-title">
+              <div class="panel-heading compact-heading">
+                <div>
+                  <p class="section-kicker">Safe controls</p>
+                  <h2 id="controls-title">Управление</h2>
+                </div>
+              </div>
+              <div class="control-grid">
+                <button class="control-button control-wake" type="button" data-command="wake_now">
+                  <span class="control-icon" aria-hidden="true">↗</span>
+                  <span><strong>Разбудить</strong><small>Запустить следующий цикл</small></span>
+                </button>
+                <button class="control-button" type="button" data-command="pause">
+                  <span class="control-icon" aria-hidden="true">Ⅱ</span>
+                  <span><strong>Пауза</strong><small>Не начинать новые сессии</small></span>
+                </button>
+                <button class="control-button" type="button" data-command="resume">
+                  <span class="control-icon" aria-hidden="true">▷</span>
+                  <span><strong>Продолжить</strong><small>Снять паузу узла</small></span>
+                </button>
+                <button class="control-button session-command" type="button" data-command="stop_gracefully" disabled>
+                  <span class="control-icon" aria-hidden="true">□</span>
+                  <span><strong>Остановить</strong><small>На безопасной границе</small></span>
+                </button>
+                <button class="control-button control-danger session-command" type="button" data-command="abort_session" disabled>
+                  <span class="control-icon" aria-hidden="true">×</span>
+                  <span><strong>Прервать</strong><small>Отменить активную сессию</small></span>
+                </button>
+              </div>
+              <p class="control-note">Команды сначала фиксируются в durable inbox и исполняются оркестратором.</p>
+            </section>
+
+            <section class="panel inbox-panel" aria-labelledby="inbox-title">
+              <div class="panel-heading compact-heading">
+                <div>
+                  <p class="section-kicker">Delivery queue</p>
+                  <h2 id="inbox-title">Последние сообщения</h2>
+                </div>
+              </div>
+              <ul id="message-list" class="message-list"></ul>
+              <p id="message-empty" class="small-empty">Отправленных сообщений пока нет.</p>
+            </section>
+          </aside>
+        </div>
+      </section>
+    </main>
+
+    <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="true"></div>
+    <noscript>Для локального пульта NOEZEMA требуется JavaScript.</noscript>
+  </body>
+</html>

@@ -7,6 +7,7 @@ import logging
 import os
 from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Annotated, Any
 from uuid import UUID
 
@@ -14,7 +15,8 @@ from fastapi import FastAPI, Header, HTTPException, Query, Request, Response, st
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
-from starlette.responses import StreamingResponse
+from starlette.responses import FileResponse, StreamingResponse
+from starlette.staticfiles import StaticFiles
 
 from apps.web.commands import CommandService
 from apps.web.models import (
@@ -60,6 +62,7 @@ PageCursor = Annotated[str | None, Query(max_length=1024)]
 StreamAfter = Annotated[int | None, Query(ge=0, le=MAX_STREAM_SEQUENCE)]
 LastEventId = Annotated[str | None, Header(max_length=32)]
 _LOGGER = logging.getLogger(__name__)
+_STATIC_DIR = Path(__file__).with_name("static")
 
 
 def create_app(
@@ -78,6 +81,7 @@ def create_app(
     auth = AuthManager(security, clock=web_clock)
     limiter = rate_limiter or FixedWindowRateLimiter()
     app = FastAPI(title="NOEZEMA Owner API", version="1", docs_url="/api/docs")
+    app.mount("/assets", StaticFiles(directory=_STATIC_DIR), name="assets")
 
     @app.middleware("http")
     async def prevent_api_caching(request: Request, call_next):
@@ -90,6 +94,21 @@ def create_app(
                 else "no-store"
             )
             response.headers["Pragma"] = "no-cache"
+        if request.url.path == "/" or request.url.path.startswith("/assets/"):
+            response.headers["Cache-Control"] = "no-store"
+            response.headers["Content-Security-Policy"] = (
+                "default-src 'self'; script-src 'self'; style-src 'self'; "
+                "connect-src 'self'; img-src 'self' data:; font-src 'self'; "
+                "object-src 'none'; base-uri 'none'; frame-ancestors 'none'; "
+                "form-action 'self'"
+            )
+            response.headers["Cross-Origin-Resource-Policy"] = "same-origin"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Permissions-Policy"] = (
+            "camera=(), microphone=(), geolocation=(), payment=(), usb=()"
+        )
         return response
 
     def require_principal(request: Request) -> AuthenticatedPrincipal:
@@ -129,6 +148,10 @@ def create_app(
         except RateLimitExceeded as exc:
             raise _rate_limit_error(exc) from exc
         return principal
+
+    @app.get("/", include_in_schema=False)
+    async def owner_console() -> FileResponse:
+        return FileResponse(_STATIC_DIR / "index.html", media_type="text/html")
 
     @app.post("/api/auth/login", response_model=AuthSessionResponse)
     async def login(
