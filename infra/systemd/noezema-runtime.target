@@ -1,0 +1,5 @@
+[Unit]
+Description=NOEZEMA cognitive runtime
+Requires=noezema-runtime-admission.service noezema-orchestrator.service
+After=noezema-runtime-admission.service
+ConditionPathExists=!/run/noezema-offline-rules/active

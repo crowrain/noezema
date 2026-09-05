@@ -19,18 +19,26 @@ from starlette.responses import FileResponse, StreamingResponse
 from starlette.staticfiles import StaticFiles
 
 from apps.web.commands import CommandService
+from apps.web.host_status import (
+    AssumedHealthyHostStatusReader,
+    FilesystemHostStatusReader,
+    HostStatusReader,
+)
 from apps.web.models import (
     AuthSessionResponse,
+    DegradedReason,
+    HostStatusProjection,
     LoginRequest,
     MessageAcceptedResponse,
     MessageCreateRequest,
     MessagePage,
-    NodeStatusProjection,
     OperatorCommandAcceptedResponse,
     OperatorCommandCreateRequest,
     OperatorCommandPage,
+    RuntimeMode,
     SessionPage,
     SessionProjection,
+    SystemStatusProjection,
     TimelinePage,
 )
 from apps.web.queries import InvalidCursorError, ProjectionInvariantError, QueryService
@@ -71,6 +79,7 @@ def create_app(
     security: WebSecurityConfig,
     clock: Callable[[], datetime] | None = None,
     rate_limiter: FixedWindowRateLimiter | None = None,
+    host_status_reader: HostStatusReader | None = None,
 ) -> FastAPI:
     """Create a fail-closed owner API with separated Query and Command services."""
 
@@ -80,6 +89,7 @@ def create_app(
     stream = TimelineStreamService(session_factory, clock=web_clock)
     auth = AuthManager(security, clock=web_clock)
     limiter = rate_limiter or FixedWindowRateLimiter()
+    host_reader = host_status_reader or AssumedHealthyHostStatusReader()
     app = FastAPI(title="NOEZEMA Owner API", version="1", docs_url="/api/docs")
     app.mount("/assets", StaticFiles(directory=_STATIC_DIR), name="assets")
 
@@ -129,7 +139,7 @@ def create_app(
                 detail="request origin is not allowed",
             ) from exc
 
-    def require_mutation(request: Request) -> AuthenticatedPrincipal:
+    def require_authenticated_mutation(request: Request) -> AuthenticatedPrincipal:
         require_same_origin(request)
         principal = require_principal(request)
         try:
@@ -149,9 +159,71 @@ def create_app(
             raise _rate_limit_error(exc) from exc
         return principal
 
+    def require_command_mutation(request: Request) -> AuthenticatedPrincipal:
+        principal = require_authenticated_mutation(request)
+        availability = system_status()
+        if not availability.command_api_enabled:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={
+                    "code": "runtime_unavailable",
+                    "reasons": [reason.value for reason in availability.reasons],
+                },
+            )
+        return principal
+
+    def system_status() -> SystemStatusProjection:
+        observed_at = _aware_time(web_clock())
+        try:
+            host = host_reader.status(observed_at=observed_at)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            _LOGGER.exception("host status projection failed")
+            host = HostStatusProjection(
+                snapshot_state="invalid",
+                snapshot_observed_at=None,
+                snapshot_age_seconds=None,
+                boot_id=None,
+                target=None,
+                members=(),
+                maintenance_active=False,
+                host_transition_active=False,
+                host_policy_change_active=False,
+                reasons=(DegradedReason.UNIT_STATE_INVALID,),
+            )
+        reasons = list(host.reasons)
+        try:
+            operational = queries.status()
+        except (
+            LookupError,
+            ProjectionInvariantError,
+            SQLAlchemyError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ):
+            _LOGGER.exception("operational status projection failed")
+            operational = None
+            reasons.append(DegradedReason.DATABASE_UNAVAILABLE)
+        unique_reasons = tuple(dict.fromkeys(reasons))
+        healthy = not unique_reasons and operational is not None
+        return SystemStatusProjection(
+            mode=RuntimeMode.NORMAL if healthy else RuntimeMode.DEGRADED,
+            command_api_enabled=healthy,
+            reasons=unique_reasons,
+            host=host,
+            operational=operational,
+            observed_at=observed_at,
+        )
+
     @app.get("/", include_in_schema=False)
     async def owner_console() -> FileResponse:
         return FileResponse(_STATIC_DIR / "index.html", media_type="text/html")
+
+    @app.get("/api/health/live", include_in_schema=False)
+    async def liveness() -> dict[str, str]:
+        """Prove only that the observer process is serving, even in degraded mode."""
+
+        return {"status": "ok"}
 
     @app.post("/api/auth/login", response_model=AuthSessionResponse)
     async def login(
@@ -204,7 +276,7 @@ def create_app(
 
     @app.post("/api/auth/logout", status_code=status.HTTP_204_NO_CONTENT)
     async def logout(request: Request) -> Response:
-        require_mutation(request)
+        require_authenticated_mutation(request)
         response = Response(status_code=status.HTTP_204_NO_CONTENT)
         response.delete_cookie(
             key=security.cookie_name,
@@ -215,10 +287,10 @@ def create_app(
         )
         return response
 
-    @app.get("/api/status", response_model=NodeStatusProjection)
-    async def get_status(request: Request) -> NodeStatusProjection:
+    @app.get("/api/status", response_model=SystemStatusProjection)
+    async def get_status(request: Request) -> SystemStatusProjection:
         require_principal(request)
-        return _project(queries.status)
+        return system_status()
 
     @app.get("/api/timeline", response_model=TimelinePage)
     async def get_timeline(
@@ -348,7 +420,7 @@ def create_app(
         request: Request,
         message: MessageCreateRequest,
     ) -> MessageAcceptedResponse:
-        principal = require_mutation(request)
+        principal = require_command_mutation(request)
         return _command(commands.submit_message, message, actor_id=principal.subject)
 
     @app.get("/api/operator-commands", response_model=OperatorCommandPage)
@@ -369,7 +441,7 @@ def create_app(
         request: Request,
         command: OperatorCommandCreateRequest,
     ) -> OperatorCommandAcceptedResponse:
-        principal = require_mutation(request)
+        principal = require_command_mutation(request)
         return _command(
             commands.submit_operator_command,
             command,
@@ -389,6 +461,7 @@ def create_environment_app() -> FastAPI:
     return create_app(
         session_factory,
         security=WebSecurityConfig.from_environment(),
+        host_status_reader=FilesystemHostStatusReader.from_environment(),
     )
 
 
@@ -397,7 +470,7 @@ def _project(operation: Callable[..., Any], *args: object, **kwargs: object):
         return operation(*args, **kwargs)
     except InvalidCursorError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except ProjectionInvariantError as exc:
+    except (ProjectionInvariantError, SQLAlchemyError) as exc:
         raise HTTPException(status_code=503, detail="read model is inconsistent") from exc
 
 
@@ -408,7 +481,7 @@ def _command(operation: Callable[..., Any], *args: object, **kwargs: object):
         raise HTTPException(
             status_code=409, detail="inbox request conflicts with durable state"
         ) from exc
-    except LookupError as exc:
+    except (LookupError, SQLAlchemyError) as exc:
         raise HTTPException(status_code=503, detail="operational state is unavailable") from exc
 
 

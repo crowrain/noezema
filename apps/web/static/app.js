@@ -13,6 +13,8 @@
     streamState: $("stream-state"),
     streamStateLabel: $("stream-state-label"),
     observedAt: $("observed-at"),
+    degradedBanner: $("degraded-banner"),
+    degradedDetail: $("degraded-detail"),
     nodeState: $("node-state"),
     nodeDetail: $("node-detail"),
     activityState: $("activity-state"),
@@ -49,6 +51,7 @@
     timeline: new Map(),
     pendingMessage: null,
     pendingCommands: new Map(),
+    commandApiEnabled: false,
   };
 
   const labels = {
@@ -86,6 +89,19 @@
       succeeded_partial: "частично завершена",
       failed: "ошибка",
       cancelled: "отменена",
+    },
+    degraded: {
+      unit_state_missing: "нет снимка systemd",
+      unit_state_invalid: "снимок systemd некорректен",
+      unit_state_stale: "снимок systemd устарел",
+      boot_id_mismatch: "снимок относится к прошлой загрузке",
+      unit_state_publisher_failed: "publisher состояния завершился ошибкой",
+      runtime_inactive: "контур выполнения остановлен",
+      runtime_member_unhealthy: "один из процессов контура нездоров",
+      maintenance_active: "идёт offline-обслуживание",
+      host_transition_in_progress: "переход состояния хоста не завершён",
+      host_policy_change_in_progress: "смена host policy не завершена",
+      database_unavailable: "операционная база недоступна",
     },
   };
 
@@ -126,6 +142,8 @@
         const problem = await response.json();
         if (typeof problem.detail === "string") {
           message = problem.detail;
+        } else if (problem.detail && problem.detail.code === "runtime_unavailable") {
+          message = "Контур выполнения сейчас доступен только для чтения";
         }
       } catch (_error) {
         // The public message above is deliberately generic for non-JSON failures.
@@ -165,6 +183,8 @@
 
   function enterConsole(session) {
     state.csrfToken = session.csrf_token;
+    state.commandApiEnabled = false;
+    setMutationAvailability(false);
     elements.loginView.hidden = true;
     elements.consoleView.hidden = false;
     elements.logoutButton.hidden = false;
@@ -262,38 +282,69 @@
   }
 
   function renderStatus(status) {
-    const active = status.active_session;
-    const scheduler = status.scheduler;
+    const operational = status.operational;
+    const active = operational ? operational.active_session : null;
+    const scheduler = operational ? operational.scheduler : null;
+    state.commandApiEnabled = status.command_api_enabled;
     state.activeSessionId = active ? active.id : null;
-    elements.nodeState.textContent = labels.node[status.node_state] || status.node_state;
+    elements.degradedBanner.hidden = status.mode !== "degraded";
+    elements.degradedDetail.textContent = status.reasons.length
+      ? `Причины: ${status.reasons
+          .map((reason) => labels.degraded[reason] || reason)
+          .join(", ")}. Команды отключены.`
+      : "Сайт работает только для чтения.";
+    if (!operational) {
+      elements.nodeState.textContent = "Недоступен";
+      elements.nodeDetail.textContent = "Operational store не отвечает";
+      elements.activityState.textContent = "Нет данных";
+      elements.sessionDetail.textContent = "Активная сессия неизвестна";
+      elements.queuedQuestions.textContent = "—";
+      elements.pendingMessages.textContent = "—";
+      elements.commandCount.textContent = "Команды отключены";
+      elements.observedAt.textContent = `Срез ${formatDate(status.observed_at, true)}`;
+      renderSession(null);
+      setMutationAvailability(false);
+      return;
+    }
+    elements.nodeState.textContent =
+      labels.node[operational.node_state] || operational.node_state;
     elements.nodeDetail.textContent =
-      status.node_state === "paused"
+      operational.node_state === "paused"
         ? "Новые сессии заблокированы"
         : active
           ? "Познавательный цикл выполняется"
-          : scheduler.busy
+          : scheduler && scheduler.busy
             ? "Планировщик выполняет пробуждение"
-            : scheduler.backoff_until && Date.parse(scheduler.backoff_until) > Date.now()
+            : scheduler &&
+                scheduler.backoff_until &&
+                Date.parse(scheduler.backoff_until) > Date.now()
               ? `Повтор после ${formatDate(scheduler.backoff_until, true)}`
-              : scheduler.next_scheduled_at
+              : scheduler && scheduler.next_scheduled_at
                 ? `Следующее пробуждение ${formatDate(scheduler.next_scheduled_at, true)}`
                 : "Готов к следующему циклу";
-    elements.activityState.textContent = labels.activity[status.activity] || status.activity;
+    elements.activityState.textContent =
+      labels.activity[operational.activity] || operational.activity;
     elements.sessionDetail.textContent = active
       ? `Сессия ${shortId(active.id)}`
       : "Активной сессии нет";
-    elements.queuedQuestions.textContent = formatNumber(status.queued_questions);
-    elements.pendingMessages.textContent = formatNumber(status.pending_messages);
-    elements.commandCount.textContent = `${formatNumber(status.pending_commands)} ${plural(
-      status.pending_commands,
+    elements.queuedQuestions.textContent = formatNumber(operational.queued_questions);
+    elements.pendingMessages.textContent = formatNumber(operational.pending_messages);
+    elements.commandCount.textContent = `${formatNumber(operational.pending_commands)} ${plural(
+      operational.pending_commands,
       "команда ожидает",
       "команды ожидают",
       "команд ожидают",
     )}`;
     elements.observedAt.textContent = `Срез ${formatDate(status.observed_at, true)}`;
     renderSession(active);
-    document.querySelectorAll(".session-command").forEach((button) => {
-      button.disabled = !state.activeSessionId;
+    setMutationAvailability(status.command_api_enabled);
+  }
+
+  function setMutationAvailability(enabled) {
+    const messageButton = elements.messageForm.querySelector("button[type='submit']");
+    messageButton.disabled = !enabled;
+    document.querySelectorAll(".control-button").forEach((button) => {
+      button.disabled = !enabled || (button.classList.contains("session-command") && !state.activeSessionId);
     });
   }
 
@@ -482,11 +533,16 @@
       if (error.status === 409) {
         state.pendingMessage = null;
       }
+      if (error.status === 503) {
+        state.commandApiEnabled = false;
+        void refreshData();
+      }
       if (error.status !== 401) {
         toast(humanError(error, "Не удалось отправить сообщение"), true);
       }
     } finally {
       setBusy(submit, false);
+      submit.disabled = !state.commandApiEnabled;
     }
   }
 
@@ -532,12 +588,17 @@
       if (error.status === 409) {
         state.pendingCommands.delete(signature);
       }
+      if (error.status === 503) {
+        state.commandApiEnabled = false;
+        void refreshData();
+      }
       if (error.status !== 401) {
         toast(humanError(error, "Команда не принята"), true);
       }
     } finally {
       button.removeAttribute("aria-busy");
-      button.disabled = sessionScoped ? !state.activeSessionId : false;
+      button.disabled =
+        !state.commandApiEnabled || (sessionScoped && !state.activeSessionId);
     }
   }
 

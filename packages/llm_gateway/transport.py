@@ -103,6 +103,15 @@ class OpenAICompatibleTransport:
             ),
         )
 
+    def is_ready(self) -> bool:
+        """Return whether the configured local backend answers its standard model endpoint."""
+
+        try:
+            response = self._client.get("models")
+        except (httpx.TimeoutException, httpx.TransportError):
+            return False
+        return 200 <= response.status_code < 300
+
     def close(self) -> None:
         if self._owns_client:
             self._client.close()

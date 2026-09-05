@@ -4,10 +4,18 @@ from __future__ import annotations
 
 import json
 from enum import StrEnum
-from typing import Annotated
+from typing import Annotated, Literal
 from uuid import UUID
 
-from pydantic import AwareDatetime, ConfigDict, Field, SecretStr, field_validator, model_validator
+from pydantic import (
+    AwareDatetime,
+    ConfigDict,
+    Field,
+    SecretStr,
+    StringConstraints,
+    field_validator,
+    model_validator,
+)
 
 from packages.domain import (
     EventType,
@@ -22,6 +30,15 @@ from packages.domain import (
 from packages.domain._base import ContractModel, JsonObject, NonEmptyText, ShortReason
 
 NonNegativeInt = Annotated[int, Field(ge=0)]
+UnitName = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        min_length=1,
+        max_length=256,
+        pattern=r"^[A-Za-z0-9_.@:-]+$",
+    ),
+]
 
 
 class ApiRequestModel(ContractModel):
@@ -184,6 +201,102 @@ class NodeStatusProjection(ContractModel):
         expected = NodeActivity.RUNNING if self.active_session is not None else NodeActivity.IDLE
         if self.activity is not expected:
             raise ValueError("node activity must match active_session")
+        return self
+
+
+class RuntimeMode(StrEnum):
+    NORMAL = "normal"
+    DEGRADED = "degraded"
+
+
+class DegradedReason(StrEnum):
+    UNIT_STATE_MISSING = "unit_state_missing"
+    UNIT_STATE_INVALID = "unit_state_invalid"
+    UNIT_STATE_STALE = "unit_state_stale"
+    BOOT_ID_MISMATCH = "boot_id_mismatch"
+    UNIT_STATE_PUBLISHER_FAILED = "unit_state_publisher_failed"
+    RUNTIME_INACTIVE = "runtime_inactive"
+    RUNTIME_MEMBER_UNHEALTHY = "runtime_member_unhealthy"
+    MAINTENANCE_ACTIVE = "maintenance_active"
+    HOST_TRANSITION_IN_PROGRESS = "host_transition_in_progress"
+    HOST_POLICY_CHANGE_IN_PROGRESS = "host_policy_change_in_progress"
+    DATABASE_UNAVAILABLE = "database_unavailable"
+
+
+class HostUnitProjection(ContractModel):
+    name: UnitName
+    active_state: UnitName
+    sub_state: UnitName
+    result: UnitName
+
+
+class HostStatusProjection(ContractModel):
+    snapshot_state: Literal["current", "missing", "invalid", "stale"]
+    snapshot_observed_at: AwareDatetime | None
+    snapshot_age_seconds: float | None = Field(default=None, ge=0)
+    boot_id: UUID | None
+    target: HostUnitProjection | None
+    members: tuple[HostUnitProjection, ...]
+    maintenance_active: bool
+    host_transition_active: bool
+    host_policy_change_active: bool
+    reasons: tuple[DegradedReason, ...]
+
+    @model_validator(mode="after")
+    def snapshot_shape_is_consistent(self) -> HostStatusProjection:
+        has_snapshot = self.snapshot_state in {"current", "stale"}
+        complete = (
+            self.snapshot_observed_at is not None
+            and self.snapshot_age_seconds is not None
+            and self.boot_id is not None
+            and self.target is not None
+        )
+        if has_snapshot != complete:
+            raise ValueError("current and stale host snapshots require complete unit state")
+        if len(set(self.reasons)) != len(self.reasons):
+            raise ValueError("degraded reasons must be unique")
+        required_snapshot_reason = {
+            "missing": {DegradedReason.UNIT_STATE_MISSING},
+            "invalid": {
+                DegradedReason.UNIT_STATE_INVALID,
+                DegradedReason.BOOT_ID_MISMATCH,
+            },
+            "stale": {DegradedReason.UNIT_STATE_STALE},
+        }.get(self.snapshot_state)
+        if required_snapshot_reason is not None and not required_snapshot_reason.intersection(
+            self.reasons
+        ):
+            raise ValueError("non-current snapshot requires its degraded reason")
+        return self
+
+
+class SystemStatusProjection(ContractModel):
+    mode: RuntimeMode
+    command_api_enabled: bool
+    reasons: tuple[DegradedReason, ...]
+    host: HostStatusProjection
+    operational: NodeStatusProjection | None
+    observed_at: AwareDatetime
+
+    @model_validator(mode="after")
+    def availability_shape_is_consistent(self) -> SystemStatusProjection:
+        expected_reasons = tuple(
+            dict.fromkeys(
+                (
+                    *self.host.reasons,
+                    *((DegradedReason.DATABASE_UNAVAILABLE,) if self.operational is None else ()),
+                )
+            )
+        )
+        if self.reasons != expected_reasons:
+            raise ValueError("system reasons must exactly describe host and database state")
+        healthy = not expected_reasons and self.operational is not None
+        if (self.mode is RuntimeMode.NORMAL) != healthy:
+            raise ValueError("normal mode requires healthy host and operational state")
+        if self.command_api_enabled != healthy:
+            raise ValueError("Command API must fail closed outside normal mode")
+        if len(set(self.reasons)) != len(self.reasons):
+            raise ValueError("degraded reasons must be unique")
         return self
 
 

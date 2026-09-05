@@ -41,3 +41,25 @@ jobs:
 
       - name: Run validation suite
         run: python scripts/check.py
+
+  systemd:
+    name: Verify systemd units
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Prepare verification-only host paths and principals
+        run: |
+          sudo groupadd --system noezema-observer
+          sudo useradd --system --user-group --home /nonexistent --shell /usr/sbin/nologin noezema
+          sudo useradd --system --home /nonexistent --shell /usr/sbin/nologin --gid noezema-observer noezema-web
+          sudo install -d /opt/noezema/.venv/bin /etc/noezema
+          sudo install -m 0755 /bin/true /opt/noezema/.venv/bin/python
+          sudo install -m 0755 /bin/true /opt/noezema/.venv/bin/uvicorn
+          sudo touch /etc/noezema/noezema-runtime.env /etc/noezema/noezema-web.env
+
+      - name: Verify supervision graph
+        run: systemd-analyze verify infra/systemd/*.service infra/systemd/*.target infra/systemd/*.timer

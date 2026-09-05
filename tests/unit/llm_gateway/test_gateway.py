@@ -250,3 +250,33 @@ def test_retry_exhaustion_is_classified(model_profile: ModelProfile) -> None:
     with pytest.raises(RetryExhaustedError) as error:
         gateway.generate_decision(_request())
     assert error.value.attempts == 2
+
+
+def test_transport_readiness_uses_the_standard_models_endpoint(
+    model_profile: ModelProfile,
+) -> None:
+    requested: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested.append(str(request.url))
+        return httpx.Response(200, json={"data": []})
+
+    with httpx.Client(
+        base_url=model_profile.normalized_base_url,
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        transport = OpenAICompatibleTransport(profile=model_profile, client=client)
+        assert transport.is_ready() is True
+    assert requested == ["http://127.0.0.1:8080/v1/models"]
+
+
+def test_transport_readiness_maps_transport_failure_to_false(model_profile: ModelProfile) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("offline", request=request)
+
+    with httpx.Client(
+        base_url=model_profile.normalized_base_url,
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        transport = OpenAICompatibleTransport(profile=model_profile, client=client)
+        assert transport.is_ready() is False

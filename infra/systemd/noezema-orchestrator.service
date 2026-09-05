@@ -1,0 +1,36 @@
+[Unit]
+Description=NOEZEMA autonomous orchestrator
+PartOf=noezema-runtime.target
+Requires=noezema-runtime-admission.service
+After=noezema-runtime-admission.service network.target
+ConditionPathExists=!/run/noezema-offline-rules/active
+
+[Service]
+Type=simple
+User=noezema
+Group=noezema
+EnvironmentFile=/etc/noezema/noezema-runtime.env
+WorkingDirectory=/opt/noezema
+ExecStartPre=/opt/noezema/.venv/bin/python -m apps.runtime.admission
+ExecStart=/opt/noezema/.venv/bin/python -m apps.runtime
+Restart=on-failure
+RestartPreventExitStatus=78
+RestartSec=10s
+TimeoutStopSec=45s
+KillSignal=SIGTERM
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/noezema/workspace /var/lib/noezema/artifacts
+
+[Install]
+WantedBy=noezema-runtime.target

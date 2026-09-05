@@ -1,0 +1,22 @@
+[Unit]
+Description=Validate NOEZEMA runtime admission invariants
+ConditionPathExists=!/run/noezema-offline-rules/active
+
+[Service]
+Type=oneshot
+User=noezema
+Group=noezema
+EnvironmentFile=/etc/noezema/noezema-runtime.env
+WorkingDirectory=/opt/noezema
+ExecStart=/opt/noezema/.venv/bin/python -m apps.runtime.admission
+RemainAfterExit=no
+TimeoutStartSec=20s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes

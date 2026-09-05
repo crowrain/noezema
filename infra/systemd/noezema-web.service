@@ -1,0 +1,37 @@
+[Unit]
+Description=NOEZEMA owner observer console
+After=network.target
+
+[Service]
+Type=simple
+User=noezema-web
+Group=noezema-observer
+EnvironmentFile=/etc/noezema/noezema-web.env
+WorkingDirectory=/opt/noezema
+ExecStart=/opt/noezema/.venv/bin/uvicorn apps.web:create_environment_app --factory --host 127.0.0.1 --port 8765
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=20s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+InaccessiblePaths=-/run/systemd/private
+InaccessiblePaths=-/run/dbus/system_bus_socket
+InaccessiblePaths=-/var/lib/noezema/workspace
+InaccessiblePaths=-/var/lib/noezema/artifacts
+ReadOnlyPaths=-/run/noezema
+ReadOnlyPaths=-/run/noezema-offline-rules
+ReadOnlyPaths=-/var/lib/noezema/host-transition-head.json
+ReadOnlyPaths=-/var/lib/noezema/host-policy-change-head.json
+
+[Install]
+WantedBy=multi-user.target

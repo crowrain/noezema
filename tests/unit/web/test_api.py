@@ -6,9 +6,11 @@ from uuid import uuid4
 
 import httpx
 from sqlalchemy import func, select
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 
 from apps.web import FixedWindowRateLimiter, WebSecurityConfig, create_app
+from apps.web.models import DegradedReason, HostStatusProjection
 from packages.domain import OperatorCommandState
 from packages.persistence.models import (
     MessageRecord,
@@ -100,23 +102,53 @@ def test_owner_login_protects_query_api_and_sets_hardened_cookie(
             status = await client.get("/api/status")
             assert status.status_code == 200
             assert status.json() == {
-                "node_state": "sleeping",
-                "activity": "idle",
-                "active_session": None,
-                "scheduler": {
-                    "busy": False,
-                    "wake_generation": 0,
-                    "handled_wake_generation": 0,
-                    "next_scheduled_at": None,
-                    "backoff_until": None,
-                    "consecutive_failures": 0,
-                    "last_session_id": None,
-                    "last_terminal_state": None,
-                    "last_error_class": None,
+                "mode": "normal",
+                "command_api_enabled": True,
+                "reasons": [],
+                "host": {
+                    "snapshot_state": "current",
+                    "snapshot_observed_at": "2030-08-20T12:00:00Z",
+                    "snapshot_age_seconds": 0.0,
+                    "boot_id": "00000000-0000-0000-0000-000000000000",
+                    "target": {
+                        "name": "noezema-runtime.target",
+                        "active_state": "active",
+                        "sub_state": "active",
+                        "result": "success",
+                    },
+                    "members": [
+                        {
+                            "name": "noezema-orchestrator.service",
+                            "active_state": "active",
+                            "sub_state": "running",
+                            "result": "success",
+                        }
+                    ],
+                    "maintenance_active": False,
+                    "host_transition_active": False,
+                    "host_policy_change_active": False,
+                    "reasons": [],
                 },
-                "queued_questions": 0,
-                "pending_messages": 0,
-                "pending_commands": 0,
+                "operational": {
+                    "node_state": "sleeping",
+                    "activity": "idle",
+                    "active_session": None,
+                    "scheduler": {
+                        "busy": False,
+                        "wake_generation": 0,
+                        "handled_wake_generation": 0,
+                        "next_scheduled_at": None,
+                        "backoff_until": None,
+                        "consecutive_failures": 0,
+                        "last_session_id": None,
+                        "last_terminal_state": None,
+                        "last_error_class": None,
+                    },
+                    "queued_questions": 0,
+                    "pending_messages": 0,
+                    "pending_commands": 0,
+                    "observed_at": "2030-08-20T12:00:00Z",
+                },
                 "observed_at": "2030-08-20T12:00:00Z",
             }
             assert (await client.get("/api/timeline?limit=0")).status_code == 422
@@ -138,6 +170,117 @@ def test_owner_login_protects_query_api_and_sets_hardened_cookie(
             assert foreign_stream.status_code == 403
             missing = await client.get("/api/sessions/00000000-0000-0000-0000-000000000001")
             assert missing.status_code == 404
+
+    _run(scenario)
+
+
+def test_degraded_host_keeps_status_available_and_disables_command_api(
+    session_factory: sessionmaker[Session],
+    web_security: WebSecurityConfig,
+) -> None:
+    class _DegradedHostReader:
+        def status(self, *, observed_at: datetime) -> HostStatusProjection:
+            return HostStatusProjection(
+                snapshot_state="missing",
+                snapshot_observed_at=None,
+                snapshot_age_seconds=None,
+                boot_id=None,
+                target=None,
+                members=(),
+                maintenance_active=True,
+                host_transition_active=False,
+                host_policy_change_active=False,
+                reasons=(
+                    DegradedReason.UNIT_STATE_MISSING,
+                    DegradedReason.MAINTENANCE_ACTIVE,
+                ),
+            )
+
+    app = create_app(
+        session_factory,
+        security=web_security,
+        clock=lambda: NOW,
+        host_status_reader=_DegradedHostReader(),
+    )
+
+    async def scenario() -> None:
+        async with await _client(app) as client:
+            login = await _login(client)
+            status = await client.get("/api/status")
+            assert status.status_code == 200
+            assert status.json()["mode"] == "degraded"
+            assert status.json()["operational"]["node_state"] == "sleeping"
+            assert status.json()["command_api_enabled"] is False
+
+            rejected = await client.post(
+                "/api/messages",
+                json={
+                    "idempotency_key": str(uuid4()),
+                    "body": "Must not be queued during maintenance",
+                },
+                headers={
+                    "Origin": TEST_ORIGIN,
+                    "X-CSRF-Token": login.json()["csrf_token"],
+                },
+            )
+            assert rejected.status_code == 503
+            assert rejected.json()["detail"] == {
+                "code": "runtime_unavailable",
+                "reasons": ["unit_state_missing", "maintenance_active"],
+            }
+
+            logout = await client.post(
+                "/api/auth/logout",
+                headers={
+                    "Origin": TEST_ORIGIN,
+                    "X-CSRF-Token": login.json()["csrf_token"],
+                },
+            )
+            assert logout.status_code == 204
+
+    _run(scenario)
+    with session_factory() as db:
+        assert db.scalar(select(func.count()).select_from(MessageRecord)) == 0
+
+
+def test_database_outage_keeps_host_only_status_available(
+    web_security: WebSecurityConfig,
+) -> None:
+    def unavailable_session() -> Session:
+        raise OperationalError("database unavailable", {}, ConnectionError())
+
+    app = create_app(
+        unavailable_session,
+        security=web_security,
+        clock=lambda: NOW,
+    )
+
+    async def scenario() -> None:
+        async with await _client(app) as client:
+            liveness = await client.get("/api/health/live")
+            assert liveness.status_code == 200
+            assert liveness.json() == {"status": "ok"}
+            login = await _login(client)
+            status = await client.get("/api/status")
+            assert status.status_code == 200
+            assert status.json()["mode"] == "degraded"
+            assert status.json()["reasons"] == ["database_unavailable"]
+            assert status.json()["operational"] is None
+
+            rejected = await client.post(
+                "/api/operator-commands",
+                json={
+                    "idempotency_key": str(uuid4()),
+                    "type": "wake_now",
+                    "reason": "database is down",
+                },
+                headers={
+                    "Origin": TEST_ORIGIN,
+                    "X-CSRF-Token": login.json()["csrf_token"],
+                },
+            )
+            assert rejected.status_code == 503
+            assert rejected.json()["detail"]["code"] == "runtime_unavailable"
 
     _run(scenario)
 

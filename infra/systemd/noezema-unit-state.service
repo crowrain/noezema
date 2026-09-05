@@ -1,0 +1,23 @@
+[Unit]
+Description=Publish NOEZEMA systemd state for the web observer
+After=noezema-web.service
+
+[Service]
+Type=oneshot
+User=root
+Group=noezema-observer
+WorkingDirectory=/opt/noezema
+ExecStart=/opt/noezema/.venv/bin/python -m apps.runtime.unit_state
+TimeoutStartSec=4s
+RuntimeDirectory=noezema
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+UMask=0027
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ReadWritePaths=/run/noezema
