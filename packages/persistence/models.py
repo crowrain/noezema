@@ -176,7 +176,7 @@ class WriterIntentRecord(Base):
 
 
 class RuntimeControlRecord(Base):
-    """Singleton operator-plane state and global audit sequence."""
+    """Singleton operator-plane state and global durable sequences."""
 
     __tablename__ = "runtime_controls"
     __table_args__ = (
@@ -190,12 +190,17 @@ class RuntimeControlRecord(Base):
             "next_global_audit_sequence >= 1",
             name="next_global_audit_sequence_positive",
         ),
+        CheckConstraint(
+            "next_outbox_sequence >= 1",
+            name="next_outbox_sequence_positive",
+        ),
     )
 
     scope: Mapped[str] = mapped_column(String(16), primary_key=True)
     node_state: Mapped[str] = mapped_column(String(16))
     wake_generation: Mapped[int] = mapped_column(BigInteger, default=0)
     next_global_audit_sequence: Mapped[int] = mapped_column(BigInteger, default=1)
+    next_outbox_sequence: Mapped[int] = mapped_column(BigInteger, default=1)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
@@ -626,7 +631,27 @@ class AuditEventRecord(Base):
 
 class OutboxEventRecord(Base):
     __tablename__ = "outbox_events"
-    __table_args__ = (CheckConstraint("attempts >= 0", name="attempts_nonnegative"),)
+    __table_args__ = (
+        CheckConstraint("attempts >= 0", name="attempts_nonnegative"),
+        CheckConstraint(
+            "stream_sequence IS NULL OR stream_sequence >= 1",
+            name="stream_sequence_positive",
+        ),
+        Index(
+            "uq_outbox_events_stream_sequence",
+            "stream_sequence",
+            unique=True,
+            postgresql_where=text("stream_sequence IS NOT NULL"),
+            sqlite_where=text("stream_sequence IS NOT NULL"),
+        ),
+        Index(
+            "ix_outbox_events_unsequenced",
+            "created_at",
+            "id",
+            postgresql_where=text("stream_sequence IS NULL"),
+            sqlite_where=text("stream_sequence IS NULL"),
+        ),
+    )
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
     audit_event_id: Mapped[UUID] = mapped_column(
@@ -635,6 +660,7 @@ class OutboxEventRecord(Base):
     topic: Mapped[str] = mapped_column(String(128))
     payload: Mapped[dict[str, Any]] = mapped_column(JsonType)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    stream_sequence: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     attempts: Mapped[int] = mapped_column(Integer, default=0)
 

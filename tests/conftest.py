@@ -78,6 +78,7 @@ def session_factory(sqlite_engine: Engine) -> sessionmaker[Session]:
                 node_state=NodeState.SLEEPING.value,
                 wake_generation=0,
                 next_global_audit_sequence=1,
+                next_outbox_sequence=1,
                 updated_at=created_at,
             )
         )

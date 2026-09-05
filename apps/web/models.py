@@ -177,6 +177,12 @@ class TimelineEventProjection(ContractModel):
     summary: NonEmptyText
 
 
+class TimelineStreamEventProjection(TimelineEventProjection):
+    """One public audit projection at its durable cross-session stream position."""
+
+    stream_sequence: Annotated[int, Field(ge=1)]
+
+
 class MessageProjection(ContractModel):
     id: UUID
     question_id: UUID

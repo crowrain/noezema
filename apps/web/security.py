@@ -71,6 +71,7 @@ class WebSecurityConfig:
     cookie_name: str = "noezema_session"
     login_attempt_limit: int = 5
     command_request_limit: int = 60
+    stream_connection_attempt_limit: int = 30
     rate_window_seconds: int = 60
 
     def __post_init__(self) -> None:
@@ -87,7 +88,11 @@ class WebSecurityConfig:
             raise ValueError("web session TTL must be between 5 minutes and 7 days")
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", self.cookie_name):
             raise ValueError("web cookie name is invalid")
-        if self.login_attempt_limit < 1 or self.command_request_limit < 1:
+        if (
+            self.login_attempt_limit < 1
+            or self.command_request_limit < 1
+            or self.stream_connection_attempt_limit < 1
+        ):
             raise ValueError("web rate limits must be positive")
         if not 1 <= self.rate_window_seconds <= 60 * 60:
             raise ValueError("web rate-limit window must be between 1 second and 1 hour")

@@ -171,6 +171,10 @@ def test_migrations_render_valid_bootstrap_and_fifo_sql(
     assert "CREATE INDEX ix_sessions_query" in sql
     assert "CREATE INDEX ix_messages_query" in sql
     assert "CREATE INDEX ix_operator_commands_query" in sql
+    assert "ALTER TABLE runtime_controls ADD COLUMN next_outbox_sequence BIGINT" in sql
+    assert "ALTER TABLE outbox_events ADD COLUMN stream_sequence BIGINT" in sql
+    assert "CREATE UNIQUE INDEX uq_outbox_events_stream_sequence" in sql
+    assert "CREATE INDEX ix_outbox_events_unsequenced" in sql
     assert "DROP CONSTRAINT ck_audit_events_type_allowed" in sql
     assert "ck_audit_events_ck_audit_events_type_allowed" not in sql
 
@@ -192,4 +196,8 @@ def test_migrations_render_valid_bootstrap_and_fifo_sql(
     assert "DROP TABLE messages" in downgrade_sql
     assert "DROP TABLE runtime_controls" in downgrade_sql
     assert "DROP INDEX ix_audit_events_public_timeline" in downgrade_sql
+    assert "DROP INDEX ix_outbox_events_unsequenced" in downgrade_sql
+    assert "DROP INDEX uq_outbox_events_stream_sequence" in downgrade_sql
+    assert "DROP COLUMN stream_sequence" in downgrade_sql
+    assert "DROP COLUMN next_outbox_sequence" in downgrade_sql
     assert "DROP CONSTRAINT ck_audit_events_type_allowed" in downgrade_sql

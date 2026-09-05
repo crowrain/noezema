@@ -52,6 +52,7 @@ def test_owner_login_protects_query_api_and_sets_hardened_cookie(
             denied = await client.get("/api/status")
             assert denied.status_code == 401
             assert denied.headers["cache-control"] == "no-store"
+            assert (await client.get("/api/timeline/stream")).status_code == 401
 
             login = await _login(client)
             assert login.status_code == 200
@@ -74,8 +75,54 @@ def test_owner_login_protects_query_api_and_sets_hardened_cookie(
             }
             assert (await client.get("/api/timeline?limit=0")).status_code == 422
             assert (await client.get("/api/timeline?cursor=broken!")).status_code == 400
+            invalid_stream = await client.get(
+                "/api/timeline/stream",
+                headers={"Origin": TEST_ORIGIN, "Last-Event-ID": "broken"},
+            )
+            assert invalid_stream.status_code == 400
+            future_stream = await client.get(
+                "/api/timeline/stream?after=1",
+                headers={"Origin": TEST_ORIGIN},
+            )
+            assert future_stream.status_code == 400
+            foreign_stream = await client.get(
+                "/api/timeline/stream",
+                headers={"Origin": "https://attacker.example"},
+            )
+            assert foreign_stream.status_code == 403
             missing = await client.get("/api/sessions/00000000-0000-0000-0000-000000000001")
             assert missing.status_code == 404
+
+    _run(scenario)
+
+
+def test_timeline_stream_has_eventsource_headers_and_stops_at_auth_expiry(
+    session_factory: sessionmaker[Session],
+    web_security: WebSecurityConfig,
+) -> None:
+    clock_calls = 0
+
+    def expiring_clock() -> datetime:
+        nonlocal clock_calls
+        clock_calls += 1
+        if clock_calls <= 2:
+            return NOW
+        return NOW.replace(hour=13)
+
+    app = create_app(session_factory, security=web_security, clock=expiring_clock)
+
+    async def scenario() -> None:
+        async with await _client(app) as client:
+            assert (await _login(client)).status_code == 200
+            response = await client.get(
+                "/api/timeline/stream",
+                headers={"Origin": TEST_ORIGIN},
+            )
+            assert response.status_code == 200
+            assert response.headers["content-type"].startswith("text/event-stream")
+            assert response.headers["cache-control"] == "no-cache, no-transform"
+            assert response.headers["x-accel-buffering"] == "no"
+            assert response.text == "retry: 2000\n\n"
 
     _run(scenario)
 

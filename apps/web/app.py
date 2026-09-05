@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import os
-from collections.abc import Callable
-from datetime import datetime
+from collections.abc import AsyncIterator, Callable
+from datetime import UTC, datetime
 from typing import Annotated, Any
 from uuid import UUID
 
-from fastapi import FastAPI, HTTPException, Query, Request, Response, status
-from sqlalchemy.exc import IntegrityError
+from fastapi import FastAPI, Header, HTTPException, Query, Request, Response, status
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
+from starlette.responses import StreamingResponse
 
 from apps.web.commands import CommandService
 from apps.web.models import (
@@ -38,6 +42,13 @@ from apps.web.security import (
     RateLimitExceeded,
     WebSecurityConfig,
 )
+from apps.web.streaming import (
+    MAX_STREAM_SEQUENCE,
+    InvalidStreamPositionError,
+    TimelineStreamService,
+    encode_timeline_sse,
+    parse_stream_position,
+)
 from packages.persistence import (
     InboxBindingConflictError,
     InboxStateConflictError,
@@ -46,6 +57,9 @@ from packages.persistence import (
 
 PageLimit = Annotated[int, Query(ge=1, le=100)]
 PageCursor = Annotated[str | None, Query(max_length=1024)]
+StreamAfter = Annotated[int | None, Query(ge=0, le=MAX_STREAM_SEQUENCE)]
+LastEventId = Annotated[str | None, Header(max_length=32)]
+_LOGGER = logging.getLogger(__name__)
 
 
 def create_app(
@@ -57,9 +71,11 @@ def create_app(
 ) -> FastAPI:
     """Create a fail-closed owner API with separated Query and Command services."""
 
-    queries = QueryService(session_factory, clock=clock)
-    commands = CommandService(session_factory, clock=clock)
-    auth = AuthManager(security, clock=clock)
+    web_clock = clock or (lambda: datetime.now(UTC))
+    queries = QueryService(session_factory, clock=web_clock)
+    commands = CommandService(session_factory, clock=web_clock)
+    stream = TimelineStreamService(session_factory, clock=web_clock)
+    auth = AuthManager(security, clock=web_clock)
     limiter = rate_limiter or FixedWindowRateLimiter()
     app = FastAPI(title="NOEZEMA Owner API", version="1", docs_url="/api/docs")
 
@@ -67,7 +83,12 @@ def create_app(
     async def prevent_api_caching(request: Request, call_next):
         response = await call_next(request)
         if request.url.path.startswith("/api/"):
-            response.headers["Cache-Control"] = "no-store"
+            content_type = response.headers.get("content-type", "")
+            response.headers["Cache-Control"] = (
+                "no-cache, no-transform"
+                if content_type.startswith("text/event-stream")
+                else "no-store"
+            )
             response.headers["Pragma"] = "no-cache"
         return response
 
@@ -191,6 +212,84 @@ def create_app(
             session_id=session_id,
         )
 
+    @app.get("/api/timeline/stream", response_class=StreamingResponse)
+    async def stream_timeline(
+        request: Request,
+        after: StreamAfter = None,
+        last_event_id: LastEventId = None,
+    ) -> StreamingResponse:
+        require_same_origin(request)
+        principal = require_principal(request)
+        try:
+            limiter.consume(
+                f"stream:{principal.subject}:{_client_identity(request)}",
+                limit=security.stream_connection_attempt_limit,
+                window_seconds=security.rate_window_seconds,
+            )
+        except RateLimitExceeded as exc:
+            raise _rate_limit_error(exc) from exc
+        try:
+            position = parse_stream_position(last_event_id, after)
+        except InvalidStreamPositionError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        current_position = _project(stream.current_position)
+        if position > current_position:
+            raise HTTPException(
+                status_code=400,
+                detail="timeline stream position is ahead of durable history",
+            )
+
+        async def event_source() -> AsyncIterator[str]:
+            cursor = position
+            loop = asyncio.get_running_loop()
+            next_heartbeat = loop.time() + 15.0
+            yield "retry: 2000\n\n"
+            while True:
+                if await request.is_disconnected():
+                    return
+                now = _aware_time(web_clock())
+                if now >= principal.expires_at:
+                    return
+                try:
+                    events = await run_in_threadpool(
+                        stream.poll,
+                        after_sequence=cursor,
+                        limit=100,
+                    )
+                except (
+                    InvalidStreamPositionError,
+                    LookupError,
+                    ProjectionInvariantError,
+                    SQLAlchemyError,
+                    RuntimeError,
+                    TypeError,
+                    ValueError,
+                ):
+                    _LOGGER.exception("timeline SSE polling failed")
+                    yield 'event: error\ndata: {"code":"stream_unavailable"}\n\n'
+                    return
+                if events:
+                    for event in events:
+                        yield encode_timeline_sse(event)
+                        cursor = event.stream_sequence
+                    next_heartbeat = loop.time() + 15.0
+                    continue
+                if loop.time() >= next_heartbeat:
+                    yield ": keep-alive\n\n"
+                    next_heartbeat = loop.time() + 15.0
+                remaining = (principal.expires_at - now).total_seconds()
+                await asyncio.sleep(min(1.0, max(0.0, remaining)))
+
+        return StreamingResponse(
+            event_source(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
     @app.get("/api/sessions", response_model=SessionPage)
     async def get_sessions(
         request: Request,
@@ -300,3 +399,9 @@ def _rate_limit_error(error: RateLimitExceeded) -> HTTPException:
         detail="rate limit exceeded",
         headers={"Retry-After": str(error.retry_after_seconds)},
     )
+
+
+def _aware_time(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        raise ValueError("web clock must return a timezone-aware datetime")
+    return value.astimezone(UTC)

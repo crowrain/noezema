@@ -45,6 +45,7 @@ from packages.persistence.operations import (
     append_session_audit,
     create_session_with_audit,
 )
+from packages.persistence.outbox import SequencedOutboxBatch, sequence_pending_outbox
 
 __all__ = [
     "BOOTSTRAP_CONFIG_SNAPSHOT_ID",
@@ -63,6 +64,7 @@ __all__ = [
     "LeaseBusyError",
     "LeaseExpiredError",
     "RevisionVectorConflictError",
+    "SequencedOutboxBatch",
     "acquire_session_lease",
     "acquire_writer_intents",
     "acknowledge_session_messages",
@@ -80,6 +82,7 @@ __all__ = [
     "release_session_lease",
     "release_writer_intents",
     "renew_session_lease",
+    "sequence_pending_outbox",
     "submit_operator_command",
     "validate_session_lease",
     "validate_writer_intents",
