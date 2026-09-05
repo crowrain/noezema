@@ -90,4 +90,25 @@ class OpenAICompatibleTransport:
 
         if len(provider_response.choices) != 1:
             raise BackendProtocolError("backend must return exactly one choice")
-5ë_-¢G§²ÚîÆ­yÒ&÷W'G¢FVb66†VÖ÷6†#Sb‡6VÆb’Óâ7G# ¢&WGW&âFööÅ÷66†VÖ÷6†#Sb‚ 
+        choice = provider_response.choices[0]
+        usage = provider_response.usage
+        return BackendCompletion(
+            content=choice.message.content,
+            finish_reason=choice.finish_reason,
+            backend_model=provider_response.model,
+            usage=TokenUsage(
+                input_tokens=usage.prompt_tokens,
+                output_tokens=usage.completion_tokens,
+                total_tokens=usage.total_tokens,
+            ),
+        )
+
+    def close(self) -> None:
+        if self._owns_client:
+            self._client.close()
+
+    def __enter__(self) -> OpenAICompatibleTransport:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()

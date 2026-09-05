@@ -480,4 +480,1190 @@ def apply_session_safe_boundary(
         )
 
     if usage.exhaustion_reason is not None:
-        _record_budget_exhaustion(db, record, usage.exhaustion_reason×N¼òÚ$z{-®éÜj×ö67W'&VEöC×F–ÖW7F×À¢¢&÷'FVBÒG'VP¢VÇ6S ¢ÖöFVÅ÷'Våö–BÒÖöFVÅ'Vä–BææWr‚¢6öçFW‡EöÖæ–fW7BÒö6öçFW‡EöÖæ–fW7B‡&WVW7B¢F"æFB€¢ÖöFVÅ'Vå&V6÷&B€¢–CÖÖöFVÅ÷'Våö–Bç&ö÷BÀ¢6W76–öåö–C×6W76–öåö–Bç&ö÷BÀ¢GW&åö–C×GW&åö–Bç&ö÷BÀ¢†6S×&WVW7Bç†6RçfÇVRÀ¢ÖöFVÅöf–ævW'&–çC×&W7VÇBæÖöFVÅöf–ævW'&–çE÷6†#SbÀ¢6öçFW‡EöÖæ–fW7E÷6†#Sc×&WVW7Bæ6öçFW‡EöÖæ–fW7E÷6†#SbÀ¢6öçFW‡EöÖæ–fW7CÖ6öçFW‡EöÖæ–fW7BÀ¢&ö×E÷fW'6–öã×&WVW7Bç&ö×E÷fW'6–öâÀ¢FööÅ÷66†VÖ÷6†#Sc×&W7VÇBçFööÅ÷66†VÖ÷6†#SbÀ¢–çWE÷Fö¶Vç3×&W7VÇBçW6vRæ–çWE÷Fö¶Vç2À¢÷WGWE÷Fö¶Vç3×&W7VÇBçW6vRæ÷WGWE÷Fö¶Vç2À¢ÆFVæ7•ö×3×&W7VÇBæÆFVæ7•ö×2À¢f–æ—6…÷&V6öã×&W7VÇBæf–æ—6…÷&V6öâÀ¢÷WGWE÷66†VÖ÷fÆ–CÕG'VRÀ¢&u÷&W7öç6Uö'F–f7CÔæöæRÀ¢7&VFVEöC×F–ÖW7F×À¢¢¢F"æfÇW6‚‚¢GW&âç7FGW2Ò&6ö×ÆWFVB ¢GW&âæÖöFVÅ÷'Våö–BÒÖöFVÅ÷'Våö–Bç&ö÷@¢GW&âç&W7VÇBÒ&W7VÇBæÖöFVÅöGV×†ÖöFSÒ&§6öâ"¢GW&âæ6ö×ÆWFVEöBÒF–ÖW7F× ¢VæE÷6W76–öåöVF—B€¢F"À¢6W76–öåö–C×6W76–öåö–BÀ¢G—SÔWfVçEG—RäÔôDTÅõ%Tåô4ôÕÄUDTBÀ¢ö67W'&VEöC×F–ÖW7F×À¢7F÷#Ò&÷&6†W7G&F÷""À¢V&Æ–5÷7VÖÖ'“×&W7VÇBæFV6—6–öâçV&Æ–5÷&F–öæÆRÀ¢F÷–3Ò&VF—BæÖöFVÅ÷'Våö6ö×ÆWFVBçc"À¢–ÆöC×°¢'GW&åö–B#¢7G"‡GW&åö–B’À¢&ÖöFVÅ÷'Våö–B#¢7G"†ÖöFVÅ÷'Våö–B’À¢'†6R#¢&WVW7Bç†6RçfÇVRÀ¢&FV6—6–öåö¶–æB#¢&W7VÇBæFV6—6–öâæFV6—6–öâæ¶–æBçfÇVRÀ¢&–çWE÷Fö¶Vç2#¢&W7VÇBçW6vRæ–çWE÷Fö¶Vç2À¢&÷WGWE÷Fö¶Vç2#¢&W7VÇBçW6vRæ÷WGWE÷Fö¶Vç2À¢&ÆFVæ7•ö×2#¢&W7VÇBæÆFVæ7•ö×2À¢ÒÀ¢¢F"æfÇW6‚‚¢–b&÷'FVC ¢&—6R6W76–öä&÷'FVDW'&÷"‚&÷W&F÷"&÷'BF—66&FVBF†RVæf–æ—6†VBÖöFVÂ÷WGWB"¢&WGW&â&W7VÇ@ ¢FVböf–Å÷GW&åö–eö÷væVB€¢6VÆbÀ¢¢À¢6W76–öåö–C¢6W76–öä–BÀ¢GW&åö–C¢GW&ä–BÀ¢W'&÷%ö6öFS¢7G"À¢’ÓâæöæS ¢F–ÖW7F×Ò6VÆbåö6Æö6²‚¢G'“ ¢v—F‚6VÆbå÷6W76–öåöf7F÷'’æ&Vv–â‚’2F# ¢ÆV6RÒ6VÆbåö7V—&R†F"Â6W76–öåö–C×6W76–öåö–BÂö67W'&VEöC×F–ÖW7F×¢GW&âÒF"ç66Æ"€¢6VÆV7B„÷&6†W7G&F÷%GW&å&V6÷&B¢çv†W&R„÷&6†W7G&F÷%GW&å&V6÷&Bæ–BÓÒGW&åö–Bç&ö÷B¢çv—F…öf÷%÷WFFR‚¢¢–b€¢GW&â—2æ÷BæöæP¢æBGW&âç7FGW2ÓÒ'&W&VB ¢æBGW&âæÆV6Uö÷væW"ÓÒÆV6Ræ÷væW ¢æBGW&âç6W76–öåöfVæ6RÓÒÆV6RæfVæ6P¢“ ¢GW&âç7FGW2Ò&f–ÆVB ¢GW&âæW'&÷%ö6öFRÒW'&÷%ö6öFU³£#…Ð¢GW&âæ6ö×ÆWFVEöBÒF–ÖW7F× ¢F"æfÇW6‚‚¢W†6WB6öæ7W'&Væ7”6öçG&öÄW'&÷# ¢&WGW&à ¢FVböÖöFVÅ÷'Våö–B‡6VÆbÂ¢Â6W76–öåö–C¢6W76–öä–BÂGW&åö–C¢GW&ä–B’ÓâÖöFVÅ'Vä–C ¢v—F‚6VÆbå÷6W76–öåöf7F÷'’‚’2F# ¢GW&âÒF"ævWB„÷&6†W7G&F÷%GW&å&V6÷&BÂGW&åö–Bç&ö÷B¢–b€¢GW&â—2æöæP¢÷"GW&âç6W76–öåö–BÒ6W76–öåö–Bç&ö÷@¢÷"GW&âç7FGW2Ò&6ö×ÆWFVB ¢÷"GW&âæÖöFVÅ÷'Våö–B—2æöæP¢“ ¢&—6R–æ6öç6—7FVçE6W76–öå'VçF–ÖTW'&÷"‚&6ö×ÆWFVBGW&â†2æòÖöFVÂ'Vâ"¢&WGW&âÖöFVÅ'Vä–B‡&ö÷C×GW&âæÖöFVÅ÷'Våö–B ¢FVbö&÷VæEö7F–öâ€¢6VÆbÀ¢¢À¢6W76–öåö–C¢6W76–öä–BÀ¢ÖöFVÅ÷'Våö–C¢ÖöFVÅ'Vä–BÀ¢FV6—6–öã¢FööÄFV6—6–öâÀ¢’Óâ&÷VæD7F–öã ¢v—F‚6VÆbå÷6W76–öåöf7F÷'’‚’2F# ¢&V6÷&BÒF"ç66Æ"€¢6VÆV7B„7F–öå&V6÷&B’çv†W&R„7F–öå&V6÷&BæÖöFVÅ÷'Våö–BÓÒÖöFVÅ÷'Våö–Bç&ö÷B¢¢–b&V6÷&B—2æöæS ¢&WGW&â&–æEö7F–öâ€¢6W76–öåö–C×6W76–öåö–BÀ¢ÖöFVÅ÷'Våö–CÖÖöFVÅ÷'Våö–BÀ¢FV6—6–öãÖFV6—6–öâÀ¢¢7F–öâÒ&÷VæD7F–öâ€¢7F–öåö–CÔ7F–öä–B‡&ö÷C×&V6÷&Bæ–B’À¢6W76–öåö–C×6W76–öåö–BÀ¢ÖöFVÅ÷'Våö–CÖÖöFVÅ÷'Våö–BÀ¢–FV×÷FVæ7•ö¶W“Ô–FV×÷FVæ7”¶W’‡&ö÷C×&V6÷&Bæ–FV×÷FVæ7•ö¶W’’À¢–FV×÷FVæ7•ö6Æ73Ô–FV×÷FVæ7”6Æ72‡&V6÷&Bæ–FV×÷FVæ7•ö6Æ72’À¢FööÃÕFööÄæÖR‡&V6÷&BçFööÂ’À¢&wVÖVçG5ö§6öã×&V6÷&Bæ&wVÖVçG5ö§6öâÀ¢&wVÖVçG5÷6†#Sc×&V6÷&Bæ&wVÖVçG5÷6†#SbÀ¢¢W‡V7FVBÒ&–æEö7F–öâ€¢6W76–öåö–C×6W76–öåö–BÀ¢ÖöFVÅ÷'Våö–CÖÖöFVÅ÷'Våö–BÀ¢FV6—6–öãÖFV6—6–öâÀ¢¢–b€¢7F–öâçFööÂ—2æ÷BW‡V7FVBçFööÀ¢÷"7F–öâæ&wVÖVçG5ö§6öâÒW‡V7FVBæ&wVÖVçG5ö§6öà¢÷"7F–öâæ&wVÖVçG5÷6†#SbÒW‡V7FVBæ&wVÖVçG5÷6†#S`¢“ ¢&—6R–æ6öç6—7FVçE6W76–öå'VçF–ÖTW'&÷"€¢&ÖöFVÂ'Vâ7F–öâ6öæfÆ–7G2v—F‚—G2W'6—7FVBFV6—6–öâ ¢¢&WGW&â7F–öà ¢FVbö7V—&R€¢6VÆbÀ¢F#¢6W76–öâÀ¢¢À¢6W76–öåö–C¢6W76–öä–BÀ¢ö67W'&VEöC¢FFWF–ÖRÀ¢’Óâ6W76–öäÆV6S ¢&WGW&â7V—&U÷6W76–öåöÆV6R€¢F"À¢6W76–öåö–C×6W76–öåö–BÀ¢÷væW#×6VÆbåöÆV6Uö÷væW"À¢GFÅ÷6V6öæG3×6VÆbåöÆV6U÷GFÅ÷6V6öæG2À¢ö67W'&VEöCÖö67W'&VEöBÀ¢ ¢FVb÷6fUö&÷VæF'’€¢6VÆbÀ¢¢À¢6W76–öåö–C¢6W76–öä–BÀ¢ö67W'&VEöC¢FFWF–ÖRÂæöæRÒæöæRÀ¢’Óâ6fT&÷VæF'•&W7VÇC ¢F–ÖW7F×Òö67W'&VEöB÷"6VÆbåö6Æö6²‚¢v—F‚6VÆbå÷6W76–öåöf7F÷'’æ&Vv–â‚’2F# ¢ÆV6RÒ6VÆbåö7V—&R†F"Â6W76–öåö–C×6W76–öåö–BÂö67W'&VEöC×F–ÖW7F×¢&WGW&âÇ•÷6W76–öå÷6fUö&÷VæF'’†F"ÂÆV6SÖÆV6RÂö67W'&VEöC×F–ÖW7F× ¢FVböVæf÷&6U÷6fUö&÷VæF'’€¢6VÆbÀ¢¢À¢6W76–öåö–C¢6W76–öä–BÀ¢ö67W'&VEöC¢FFWF–ÖRÂæöæRÒæöæRÀ¢’ÓâæöæS ¢6VÆbå÷&—6Uöf÷%ö&÷VæF'’€¢6VÆbå÷6fUö&÷VæF'’‡6W76–öåö–C×6W76–öåö–BÂö67W'&VEöCÖö67W'&VEöB¢ ¢FVböVæf÷&6Uöf–æÆ—¦F–öåö&÷VæF'’€¢6VÆbÀ¢¢À¢6W76–öåö–C¢6W76–öä–BÀ¢ö67W'&VEöC¢FFWF–ÖRÂæöæRÒæöæRÀ¢’ÓâæöæS ¢""$†öæ÷"&÷'Bö†÷7B6fWG’v†–ÆRÆÆ÷v–ær&W6W'fVB6öç6öÆ–FF–öâv÷&²â""  ¢&÷VæF'’Ò6VÆbå÷6fUö&÷VæF'’‡6W76–öåö–C×6W76–öåö–BÂö67W'&VEöCÖö67W'&VEöB¢–b&÷VæF'’æ¶–æB–â°¢6fT&÷VæF'”¶–æBä4ôåD”åTRÀ¢6fT&÷VæF'”¶–æBå5Dõ”ärÀ¢6fT&÷VæF'”¶–æBå4ôeEôU„„U5DTBÀ¢Ó ¢&WGW&à¢6VÆbå÷&—6Uöf÷%ö&÷VæF'’†&÷VæF'’ ¢7FF–6ÖWF†ö@¢FVb÷&—6Uöf÷%ö&÷VæF'’†&÷VæF'“¢6fT&÷VæF'•&W7VÇB’ÓâæöæS ¢–b&÷VæF'’æ¶–æB—26fT&÷VæF'”¶–æBä4ôåD”åTS ¢&WGW&à¢–b&÷VæF'’æ¶–æB—26fT&÷VæF'”¶–æBä5D”ôåô”åôdÄ”t…C ¢&—6R–æ6öç6—7FVçE6W76–öå'VçF–ÖTW'&÷"€¢b&7F–öâ¶&÷VæF'’æ7F–öåö–GÒ×W7B&V6‚FW&Ö–æÂ7FFR&Vf÷&RæWrv÷&² ¢¢–b&÷VæF'’æ¶–æB—26fT&÷VæF'”¶–æBå5Dõ”äs ¢&—6Rw&6VgVÅ7F÷&WVW7FVDW'&÷"‚&÷W&F÷"7F÷&V6†VB6fR&÷VæF'’"¢–b&÷VæF'’æ¶–æB—26fT&÷VæF'”¶–æBä4ä4TÄÄTC ¢&—6R6W76–öä&÷'FVDW'&÷"‚&÷W&F÷"&÷'B&V6†VB6fR&÷VæF'’"¢–b&÷VæF'’æ¶–æB—26fT&÷VæF'”¶–æBå4ôeEôU„„U5DTC ¢&V6öâÒ&÷VæF'’æ'VFvWE÷W6vRæW††W7F–öå÷&V6öà¢&—6R6ögD'VFvWDW††W7FVDW'&÷"€¢b'6ögB6W76–öâ'VFvWBW††W7FVC¢·&V6öâçfÇVR–b&V6öâVÇ6RwVæ¶æ÷vâwÒ ¢¢&—6R6W76–öä&÷VæF'”f–ÇW&TW'&÷"‚'6W76–öâf–ÆVBB6fR&÷VæF'’"  ¦FVb÷&V6÷fW'•öF—&V7F—fR€¢F#¢6W76–öâÀ¢6W76–öå÷&V6÷&C¢6W76–öå&V6÷&BÀ¢’Óâ6W76–öåv÷&´F—&V7F—fS ¢7FFRÒ6W76–öå7FFR‡6W76–öå÷&V6÷&Bç7FFR¢–b7FFR—26W76–öå7FFRä4ôÔÔ•ED”äs ¢GFV×BÒö&÷VæEö6öÖÖ—EöGFV×B†F"Â6W76–öå÷&V6÷&B¢¶–æBÒ€¢6W76–öåv÷&´¶–æBäd”äÄ•¤Uô4ôÔÔ•@¢–bGFV×Bç7FGW2ÓÒ'&W&VB ¢VÇ6R6W76–öåv÷&´¶–æBå$T4ôä4”ÄUô4ôÔÔ•@¢¢&WGW&â6W76–öåv÷&´F—&V7F—fR†¶–æCÖ¶–æBÂ7FFS×7FFR¢–b7FFR—26W76–öå7FFRå$T4ôä4”Ä”äuô4ôÔÔ•C ¢ö&÷VæEö6öÖÖ—EöGFV×B†F"Â6W76–öå÷&V6÷&B¢&WGW&â6W76–öåv÷&´F—&V7F—fR†¶–æCÕ6W76–öåv÷&´¶–æBå$T4ôä4”ÄUô4ôÔÔ•BÂ7FFS×7FFR ¢&V6÷fW&&ÆUö7F–öç2ÒGWÆR€¢F"ç66Æ'2€¢6VÆV7B„7F–öå&V6÷&B¢çv†W&R€¢7F–öå&V6÷&Bç6W76–öåö–BÓÒ6W76–öå÷&V6÷&Bæ–BÀ¢7F–öå&V6÷&Bç7FFRæ–åò…õ$T4õdU$$ÄUô5D”ôåõ5DDU2’À¢¢æ÷&FW%ö'’„7F–öå&V6÷&Bæ7&VFVEöBÂ7F–öå&V6÷&Bæ–B¢¢¢–bÆVâ‡&V6÷fW&&ÆUö7F–öç2’â ¢&—6R–æ6öç6—7FVçE6W76–öå'VçF–ÖTW'&÷"‚'6W76–öâ†2×VÇF—ÆR&V6÷fW&&ÆR7F–öç2"¢–b&V6÷fW&&ÆUö7F–öç3 ¢7F–öâÒ&V6÷fW&&ÆUö7F–öç5³Ð¢&WGW&â6W76–öåv÷&´F—&V7F—fR€¢¶–æCÕ6W76–öåv÷&´¶–æBå$T4õdU%ô5D”ôâÀ¢7FFS×7FFRÀ¢7F–öåö–CÔ7F–öä–B‡&ö÷CÖ7F–öâæ–B’À¢ ¢–b6W76–öå÷&V6÷&Bæ&÷'E÷&WVW7FVEöB—2æ÷BæöæS ¢&WGW&â6W76–öåv÷&´F—&V7F—fR†¶–æCÕ6W76–öåv÷&´¶–æBä$õ%BÂ7FFS×7FFR¢–b€¢6W76–öå÷&V6÷&Bç7F÷÷&WVW7FVEöB—2æ÷BæöæR÷"6W76–öå÷&V6÷&Bç6ögEöW††W7FVEöB—2æ÷BæöæP¢’æB7FFR–â°¢6W76–öå7FFRåt´”ärÀ¢6W76–öå7FFRäõ$”TåD”ärÀ¢6W76–öå7FFRå4TÄT5D”äuõTU5D”ôâÀ¢6W76–öå7FFRåÄää”ärÀ¢6W76–öå7FFRäU…Äõ$”ärÀ¢6W76–öå7FFRådU$”e””ärÀ¢6W76–öå7FFRå5Dõ”ärÀ¢Ó ¢&WGW&â6W76–öåv÷&´F—&V7F—fR†¶–æCÕ6W76–öåv÷&´¶–æBå5DõÂ7FFS×7FFR ¢ÆFW7E÷GW&âÒF"ç66Æ"€¢6VÆV7B„÷&6†W7G&F÷%GW&å&V6÷&B¢çv†W&R„÷&6†W7G&F÷%GW&å&V6÷&Bç6W76–öåö–BÓÒ6W76–öå÷&V6÷&Bæ–B¢æ÷&FW%ö'’„÷&6†W7G&F÷%GW&å&V6÷&Bæ÷&F–æÂæFW62‚’¢æÆ–Ö—Bƒ¢¢–bÆFW7E÷GW&â—2æ÷BæöæRæBÆFW7E÷GW&âç7FGW2ÓÒ'&W&VB# ¢&WGW&â6W76–öåv÷&´F—&V7F—fR€¢¶–æCÕ6W76–öåv÷&´¶–æBå$U5TÔUõEU$âÀ¢7FFS×7FFRÀ¢GW&åö–CÕGW&ä–B‡&ö÷CÖÆFW7E÷GW&âæ–B’À¢¢–b€¢ÆFW7E÷GW&â—2æ÷BæöæP¢æBÆFW7E÷GW&âç7FGW2ÓÒ&6ö×ÆWFVB ¢æB7FFR—26W76–öå7FFRäU…Äõ$”äp¢“ ¢–bÆFW7E÷GW&âç&W7VÇB—2æöæS ¢&—6R–æ6öç6—7FVçE6W76–öå'VçF–ÖTW'&÷"‚&6ö×ÆWFVBGW&â†2æò&W7VÇB"¢FV6—6–öâÒöÖöFVÅ÷'Vå÷&W7VÇB†ÆFW7E÷GW&âç&W7VÇB’æFV6—6–öâæFV6—6–öà¢–bæ÷B—6–ç7Fæ6R†FV6—6–öâÂFööÄFV6—6–öâ“ ¢&WGW&â6W76–öåv÷&´F—&V7F—fR€¢¶–æCÕ6W76–öåv÷&´¶–æBå$U5TÔUõEU$âÀ¢7FFS×7FFRÀ¢GW&åö–CÕGW&ä–B‡&ö÷CÖÆFW7E÷GW&âæ–B’À¢¢–bÆFW7E÷GW&âæÖöFVÅ÷'Våö–B—2æöæS ¢&—6R–æ6öç6—7FVçE6W76–öå'VçF–ÖTW'&÷"‚&6ö×ÆWFVBGW&â†2æòÖöFVÂ'Vâ"¢7F–öâÒF"ç66Æ"€¢6VÆV7B„7F–öå&V6÷&B’çv†W&R„7F–öå&V6÷&BæÖöFVÅ÷'Våö–BÓÒÆFW7E÷GW&âæÖöFVÅ÷'Våö–B¢¢–b7F–öâ—2æöæS ¢&WGW&â6W76–öåv÷&´F—&V7F—fR€¢¶–æCÕ6W76–öåv÷&´¶–æBå$U5TÔUõEU$âÀ¢7FFS×7FFRÀ¢GW&åö–CÕGW&ä–B‡&ö÷CÖÆFW7E÷GW&âæ–B’À¢ ¢¶–æBÒõ„4Uõtõ$²ævWB‡7FFR¢–b¶–æB—2æöæS ¢&—6R–æ6öç6—7FVçE6W76–öå'VçF–ÖTW'&÷"†b'6W76–öâ7FFR†2æò&V6÷fW'’v÷&³¢·7FFWÒ"¢&WGW&â6W76–öåv÷&´F—&V7F—fR†¶–æCÖ¶–æBÂ7FFS×7FFR  ¦FVbö&÷VæEö6öÖÖ—EöGFV×B€¢F#¢6W76–öâÀ¢6W76–öå÷&V6÷&C¢6W76–öå&V6÷&BÀ¢’Óâ6öÖÖ—DGFV×E&V6÷&C ¢–b6W76–öå÷&V6÷&Bæ6öÖÖ—EöGFV×Eö–B—2æöæS ¢&—6R–æ6öç6—7FVçE6W76–öå'VçF–ÖTW'&÷"‚&6öÖÖ—B7FFR†2æò&÷VæBGFV×B"¢GFV×BÒF"ævWB„6öÖÖ—DGFV×E&V6÷&BÂ6W76–öå÷&V6÷&Bæ6öÖÖ—EöGFV×Eö–B¢–bGFV×B—2æöæR÷"GFV×Bç6W76–öåö–BÒ6W76–öå÷&V6÷&Bæ–C ¢&—6R–æ6öç6—7FVçE6W76–öå'VçF–ÖTW'&÷"‚&&÷VæB6öÖÖ—BGFV×B—2Ö—76–ær"¢&WGW&âGFV×@  ¦FVbö6öçFW‡EöÖæ–fW7B‡&WVW7C¢vFWv•&WVW7B’ÓâF–7E·7G"Âö&¦V7EÓ ¢G'“ ¢–ÆöBÒ§6öâæÆöG2‡&WVW7BæÖW76vW5²ÓÒæ6öçFVçB¢W†6WB„–æFW„W'&÷"Â§6öâä¥4ôäFV6öFTW'&÷"’2W†3 ¢&—6R–æ6öç6—7FVçE6W76–öå'VçF–ÖTW'&÷"€¢&vFWv’&WVW7B6öçFW‡B—2æ÷B6æöæ–6Â¥4ôâ ¢’g&öÒW†0¢–bæ÷B—6–ç7Fæ6R‡–ÆöBÂF–7B“ ¢&—6R–æ6öç6—7FVçE6W76–öå'VçF–ÖTW'&÷"‚&vFWv’&WVW7B6öçFW‡B—2æ÷Bâö&¦V7B"¢&WGW&â–Æö@  ¦FVböW‡Æ÷&W%ö6öçFW‡B‡&WVW7C¢vFWv•&WVW7B’ÓâW‡Æ÷&W$6öçFW‡C ¢–ÆöBÒö6öçFW‡EöÖæ–fW7B‡&WVW7B¢–b–ÆöBævWB‚'&÷Fö6öÂ"’Ò&W‡Æ÷&W"Ö–çWB÷c"# ¢&—6R–æ6öç6—7FVçE6W76–öå'VçF–ÖTW'&÷"‚'GW&â—2æ÷BâW‡Æ÷&W"&÷Fö6öÂ&WVW7B"¢G'“ ¢6öçFW‡BÒ–ÆöE²&6öçFW‡B%Ð¢–bæ÷B—6–ç7Fæ6R†6öçFW‡BÂF–7B“ ¢&—6RfÇVTW'&÷"‚$W‡Æ÷&W"6öçFW‡B—2æ÷Bâö&¦V7B"¢&WGW&âW‡Æ÷&W$6öçFW‡BæÖöFVÅ÷fÆ–FFUö§6öâ…ö6æöæ–6Åö§6öâ†6öçFW‡B’¢W†6WB„¶W”W'&÷"ÂfÇVTW'&÷"’2W†3 ¢&—6R–æ6öç6—7FVçE6W76–öå'VçF–ÖTW'&÷"‚'7F÷&VBW‡Æ÷&W"6öçFW‡B—2–çfÆ–B"’g&öÒW†0  ¦FVbö7W&F÷%ö6öçFW‡B‡&WVW7C¢vFWv•&WVW7B’Óâ7W&F÷$6öçFW‡C ¢–ÆöBÒö6öçFW‡EöÖæ–fW7B‡&WVW7B¢–b–ÆöBævWB‚'&÷Fö6öÂ"’Ò&7W&F÷"Ö–çWB÷c"# ¢&—6R–æ6öç6—7FVçE6W76–öå'VçF–ÖTW'&÷"‚'GW&â—2æ÷B7W&F÷"&÷Fö6öÂ&WVW7B"¢G'“ ¢6öçFW‡BÒ–ÆöE²&6öçFW‡B%Ð¢–bæ÷B—6–ç7Fæ6R†6öçFW‡BÂF–7B“ ¢&—6RfÇVTW'&÷"‚$7W&F÷"6öçFW‡B—2æ÷Bâö&¦V7B"¢&WGW&â7W&F÷$6öçFW‡BæÖöFVÅ÷fÆ–FFUö§6öâ…ö6æöæ–6Åö§6öâ†6öçFW‡B’¢W†6WB„¶W”W'&÷"ÂfÇVTW'&÷"’2W†3 ¢&—6R–æ6öç6—7FVçE6W76–öå'VçF–ÖTW'&÷"‚'7F÷&VB7W&F÷"6öçFW‡B—2–çfÆ–B"’g&öÒW†0  ¦FVbövFWv•÷&WVW7B‡fÇVS¢F–7E·7G"Âö&¦V7EÒ’ÓâvFWv•&WVW7C ¢&WGW&âvFWv•&WVW7BæÖöFVÅ÷fÆ–FFUö§6öâ…ö6æöæ–6Åö§6öâ‡fÇVR’  ¦FVböÖöFVÅ÷'Vå÷&W7VÇB‡fÇVS¢F–7E·7G"Âö&¦V7EÒ’ÓâÖöFVÅ'Vå&W7VÇC ¢&WGW&âÖöFVÅ'Vå&W7VÇBæÖöFVÅ÷fÆ–FFUö§6öâ…ö6æöæ–6Åö§6öâ‡fÇVR’  ¦FVbö7W&F÷%÷'Vå÷&W7VÇB€¢fÇVS¢F–7E·7G"Âö&¦V7EÒÀ¢’Óâ7G'V7GW&VE'Vå&W7VÇE´7W&F÷%&÷÷6ÅÓ ¢&WGW&â7G'V7GW&VE'Vå&W7VÇE´7W&F÷%&÷÷6ÅÒæÖöFVÅ÷fÆ–FFUö§6öâ…ö6æöæ–6Åö§6öâ‡fÇVR’  ¦FVbö6æöæ–6Åö§6öâ‡fÇVS¢F–7E·7G"Âö&¦V7EÒ’Óâ7G# ¢&WGW&â§6öâæGV×2€¢fÇVRÀ¢ÆÆ÷uöæãÔfÇ6RÀ¢Vç7W&Uö66–“ÔfÇ6RÀ¢6W&F÷'3Ò‚"Â"Â#¢"’À¢6÷'Eö¶W—3ÕG'VRÀ¢  ¦FVböv&R‡fÇVS¢FFWF–ÖR’ÓâFFWF–ÖS ¢–bfÇVRçG¦–æfò—2æöæS ¢&WGW&âfÇVRç&WÆ6R‡G¦–æfóÕUD2¢&WGW&âfÇVRæ7F–ÖW¦öæR…UD2
+        _record_budget_exhaustion(db, record, usage.exhaustion_reason, timestamp)
+        _discard_prepared_turn(db, record, timestamp, usage.exhaustion_reason.value)
+        resulting_state = _move_to_stopping(
+            db,
+            lease=lease,
+            state=SessionState(record.state),
+            reason=f"soft_budget:{usage.exhaustion_reason.value}",
+            occurred_at=timestamp,
+        )
+        return SafeBoundaryResult(
+            kind=SafeBoundaryKind.SOFT_EXHAUSTED,
+            state=resulting_state,
+            budget_usage=usage,
+        )
+
+    return SafeBoundaryResult(
+        kind=SafeBoundaryKind.CONTINUE,
+        state=SessionState(record.state),
+        budget_usage=usage,
+    )
+
+
+def _request_operator_control(
+    db: Session,
+    *,
+    session_id: SessionId,
+    command: OperatorControlKind,
+    actor: str,
+    requested_at: datetime | None,
+) -> OperatorControlResult:
+    timestamp = requested_at or datetime.now(UTC)
+    normalized_actor = actor.strip()
+    if not normalized_actor:
+        raise ValueError("operator control actor must not be empty")
+    record = db.scalar(
+        select(SessionRecord).where(SessionRecord.id == session_id.root).with_for_update()
+    )
+    if record is None:
+        raise LookupError(f"session does not exist: {session_id}")
+    state = SessionState(record.state)
+    allowed = (
+        _GRACEFUL_STOP_SOURCE_STATES
+        if command is OperatorControlKind.STOP_GRACEFULLY
+        else _ABORT_SOURCE_STATES
+    )
+    if state not in allowed:
+        raise OperatorControlRejectedError(f"{command.value} is rejected in {state.value}")
+    attribute = (
+        "stop_requested_at"
+        if command is OperatorControlKind.STOP_GRACEFULLY
+        else "abort_requested_at"
+    )
+    existing = getattr(record, attribute)
+    if existing is not None:
+        return OperatorControlResult(
+            command=command,
+            state=state,
+            requested_at=_aware(existing),
+            newly_recorded=False,
+        )
+    setattr(record, attribute, timestamp)
+    event_type = (
+        EventType.SESSION_STOP_REQUESTED
+        if command is OperatorControlKind.STOP_GRACEFULLY
+        else EventType.SESSION_ABORT_REQUESTED
+    )
+    append_session_audit(
+        db,
+        session_id=session_id,
+        type=event_type,
+        occurred_at=timestamp,
+        actor=normalized_actor,
+        public_summary=f"Operator requested {command.value}",
+        topic=f"audit.session_{command.value}_requested.v1",
+        payload={"command": command.value, "state": state.value},
+    )
+    db.flush()
+    return OperatorControlResult(
+        command=command,
+        state=state,
+        requested_at=timestamp,
+        newly_recorded=True,
+    )
+
+
+def _session_budget_usage(
+    db: Session,
+    record: SessionRecord,
+    occurred_at: datetime,
+) -> SessionBudgetUsage:
+    try:
+        budget = SessionBudget.model_validate(record.budget)
+    except ValueError as exc:
+        raise InconsistentSessionRuntimeError("session budget snapshot is invalid") from exc
+    if canonical_json_sha256(record.budget) != record.budget_sha256:
+        raise InconsistentSessionRuntimeError("session budget snapshot hash does not match")
+    model_turns, input_tokens, output_tokens = db.execute(
+        select(
+            func.count(ModelRunRecord.id),
+            func.coalesce(func.sum(ModelRunRecord.input_tokens), 0),
+            func.coalesce(func.sum(ModelRunRecord.output_tokens), 0),
+        ).where(ModelRunRecord.session_id == record.id)
+    ).one()
+    tool_actions = db.scalar(
+        select(func.count(ActionRecord.id)).where(ActionRecord.session_id == record.id)
+    )
+    used_turns = int(model_turns or 0)
+    used_actions = int(tool_actions or 0)
+    used_input = int(input_tokens or 0)
+    used_output = int(output_tokens or 0)
+    reason: BudgetExhaustionReason | None = None
+    if occurred_at >= _aware(record.host_deadline_at):
+        reason = BudgetExhaustionReason.HOST_DEADLINE
+    elif occurred_at >= _aware(record.cognitive_deadline_at):
+        reason = BudgetExhaustionReason.COGNITIVE_DEADLINE
+    elif used_turns >= budget.exploration_model_turn_limit:
+        reason = BudgetExhaustionReason.MODEL_TURNS
+    elif used_actions >= budget.max_tool_actions:
+        reason = BudgetExhaustionReason.TOOL_ACTIONS
+    elif used_input >= budget.exploration_input_token_limit:
+        reason = BudgetExhaustionReason.INPUT_TOKENS
+    elif used_output >= budget.exploration_output_token_limit:
+        reason = BudgetExhaustionReason.OUTPUT_TOKENS
+    return SessionBudgetUsage(
+        model_turns=used_turns,
+        tool_actions=used_actions,
+        input_tokens=used_input,
+        output_tokens=used_output,
+        remaining_exploration_model_turns=max(0, budget.exploration_model_turn_limit - used_turns),
+        remaining_tool_actions=max(0, budget.max_tool_actions - used_actions),
+        remaining_exploration_input_tokens=max(
+            0, budget.exploration_input_token_limit - used_input
+        ),
+        remaining_exploration_output_tokens=max(
+            0, budget.exploration_output_token_limit - used_output
+        ),
+        exhaustion_reason=reason,
+    )
+
+
+def _record_budget_exhaustion(
+    db: Session,
+    record: SessionRecord,
+    reason: BudgetExhaustionReason,
+    occurred_at: datetime,
+) -> None:
+    if record.soft_exhausted_at is not None:
+        return
+    record.soft_exhausted_at = occurred_at
+    record.soft_exhaustion_reason = reason.value
+    append_session_audit(
+        db,
+        session_id=SessionId(root=record.id),
+        type=EventType.SESSION_BUDGET_EXHAUSTED,
+        occurred_at=occurred_at,
+        actor="orchestrator",
+        public_summary=f"Session budget exhausted: {reason.value}",
+        topic="audit.session_budget_exhausted.v1",
+        payload={"reason": reason.value},
+    )
+
+
+def _discard_prepared_turn(
+    db: Session,
+    record: SessionRecord,
+    occurred_at: datetime,
+    error_code: str,
+) -> None:
+    prepared = tuple(
+        db.scalars(
+            select(OrchestratorTurnRecord)
+            .where(
+                OrchestratorTurnRecord.session_id == record.id,
+                OrchestratorTurnRecord.status == "prepared",
+            )
+            .with_for_update()
+        )
+    )
+    if len(prepared) > 1:
+        raise InconsistentSessionRuntimeError("session has multiple prepared model turns")
+    if prepared:
+        prepared[0].status = "failed"
+        prepared[0].error_code = error_code[:128]
+        prepared[0].completed_at = occurred_at
+
+
+def _move_to_stopping(
+    db: Session,
+    *,
+    lease: SessionLease,
+    state: SessionState,
+    reason: str,
+    occurred_at: datetime,
+) -> SessionState:
+    if state in {
+        SessionState.STOPPING,
+        SessionState.CONSOLIDATING,
+        SessionState.REPORTING,
+    }:
+        return state
+    if state not in _GRACEFUL_STOP_SOURCE_STATES:
+        raise InconsistentSessionRuntimeError(f"cannot enter stopping from {state.value}")
+    transition_session_phase(
+        db,
+        lease=lease,
+        target=SessionState.STOPPING,
+        reason=reason,
+        occurred_at=occurred_at,
+    )
+    return SessionState.STOPPING
+
+
+class DurableSessionOrchestrator:
+    """Persist turn intent before LLM I/O and replay downstream effects safely."""
+
+    def __init__(
+        self,
+        *,
+        session_factory: sessionmaker[Session],
+        gateway: CognitiveGateway,
+        tool_broker: ToolBroker,
+        lease_owner: str,
+        lease_ttl_seconds: int = 300,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
+        if not lease_owner.strip():
+            raise ValueError("lease_owner must identify one worker incarnation")
+        self._session_factory = session_factory
+        self._gateway = gateway
+        self._tool_broker = tool_broker
+        self._lease_owner = lease_owner
+        self._lease_ttl_seconds = lease_ttl_seconds
+        self._clock = clock or (lambda: datetime.now(UTC))
+
+    def run_explorer_turn(
+        self,
+        *,
+        session_id: SessionId,
+        turn_id: TurnId,
+        context: ExplorerContext,
+        prompts: PromptBundle,
+        policy_version: str,
+    ) -> ExplorerTurnResult:
+        request = build_explorer_request(
+            context,
+            prompts=prompts,
+            policy_version=policy_version,
+        )
+        return self._run_explorer_request(
+            session_id=session_id,
+            turn_id=turn_id,
+            request=request,
+            context=context,
+        )
+
+    def resume_explorer_turn(
+        self,
+        *,
+        session_id: SessionId,
+        turn_id: TurnId,
+    ) -> ExplorerTurnResult:
+        with self._session_factory() as db:
+            turn = db.get(OrchestratorTurnRecord, turn_id.root)
+            if turn is None or turn.session_id != session_id.root:
+                raise InconsistentSessionRuntimeError("orchestrator turn is missing")
+            request = _gateway_request(turn.request)
+        context = _explorer_context(request)
+        return self._run_explorer_request(
+            session_id=session_id,
+            turn_id=turn_id,
+            request=request,
+            context=context,
+        )
+
+    def run_curator_turn(
+        self,
+        *,
+        session_id: SessionId,
+        turn_id: TurnId,
+        context: CuratorContext,
+        prompts: PromptBundle,
+        policy_version: str,
+    ) -> CuratorTurnResult:
+        """Persist and execute one strict Curator proposal inside the host reserve."""
+
+        request = build_curator_request(
+            context,
+            prompts=prompts,
+            policy_version=policy_version,
+        )
+        return self._run_curator_request(
+            session_id=session_id,
+            turn_id=turn_id,
+            request=request,
+            context=context,
+        )
+
+    def resume_curator_turn(
+        self,
+        *,
+        session_id: SessionId,
+        turn_id: TurnId,
+    ) -> CuratorTurnResult:
+        """Resume a prepared Curator turn or replay its durable result."""
+
+        with self._session_factory() as db:
+            turn = db.get(OrchestratorTurnRecord, turn_id.root)
+            if turn is None or turn.session_id != session_id.root:
+                raise InconsistentSessionRuntimeError("orchestrator turn is missing")
+            request = _gateway_request(turn.request)
+        context = _curator_context(request)
+        return self._run_curator_request(
+            session_id=session_id,
+            turn_id=turn_id,
+            request=request,
+            context=context,
+        )
+
+    def recover_action(
+        self,
+        *,
+        session_id: SessionId,
+        action_id: ActionId,
+    ) -> BrokerRunResult:
+        """Resume exactly one durable Tool Broker action selected by recovery."""
+
+        with self._session_factory() as db:
+            record = db.get(ActionRecord, action_id.root)
+            if record is None or record.session_id != session_id.root:
+                raise InconsistentSessionRuntimeError("recoverable action is missing")
+            action = BoundAction(
+                action_id=ActionId(root=record.id),
+                session_id=session_id,
+                model_run_id=ModelRunId(root=record.model_run_id),
+                idempotency_key=IdempotencyKey(root=record.idempotency_key),
+                idempotency_class=IdempotencyClass(record.idempotency_class),
+                tool=ToolName(record.tool),
+                arguments_json=record.arguments_json,
+                arguments_sha256=record.arguments_sha256,
+            )
+        result = self._tool_broker.run(action)
+        boundary = self._safe_boundary(session_id=session_id)
+        if boundary.kind is not SafeBoundaryKind.SOFT_EXHAUSTED:
+            self._raise_for_boundary(boundary)
+        return result
+
+    def _run_curator_request(
+        self,
+        *,
+        session_id: SessionId,
+        turn_id: TurnId,
+        request: GatewayRequest,
+        context: CuratorContext,
+    ) -> CuratorTurnResult:
+        started_at = self._clock()
+        self._enforce_finalization_boundary(session_id=session_id, occurred_at=started_at)
+        persisted = self._prepare_curator_turn(
+            session_id=session_id,
+            turn_id=turn_id,
+            request=request,
+            occurred_at=started_at,
+        )
+        replayed = persisted is not None
+        if persisted is None:
+            try:
+                generated = self._gateway.generate_structured(
+                    request,
+                    response_model=CuratorProposal,
+                    schema_name="noezema_curator_proposal_v1",
+                )
+                validate_curator_proposal(generated.output, context=context)
+            except Exception as exc:
+                self._fail_turn_if_owned(
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    error_code=type(exc).__name__,
+                )
+                self._enforce_finalization_boundary(session_id=session_id)
+                raise
+            persisted = self._complete_curator_turn(
+                session_id=session_id,
+                turn_id=turn_id,
+                request=request,
+                result=generated,
+            )
+
+        self._enforce_finalization_boundary(session_id=session_id)
+        return CuratorTurnResult(
+            session_id=session_id,
+            turn_id=turn_id,
+            model_run_id=self._model_run_id(session_id=session_id, turn_id=turn_id),
+            proposal=persisted.output,
+            replayed_model_run=replayed,
+        )
+
+    def _run_explorer_request(
+        self,
+        *,
+        session_id: SessionId,
+        turn_id: TurnId,
+        request: GatewayRequest,
+        context: ExplorerContext,
+    ) -> ExplorerTurnResult:
+        started_at = self._clock()
+        self._enforce_safe_boundary(session_id=session_id, occurred_at=started_at)
+        persisted = self._prepare_turn(
+            session_id=session_id,
+            turn_id=turn_id,
+            request=request,
+            occurred_at=started_at,
+        )
+        replayed = persisted is not None
+        if persisted is None:
+            try:
+                generated = self._gateway.generate_decision(request)
+                validate_explorer_decision(generated.decision, context=context)
+            except Exception as exc:
+                self._fail_turn_if_owned(
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    error_code=type(exc).__name__,
+                )
+                self._enforce_safe_boundary(session_id=session_id)
+                raise
+            persisted = self._complete_turn(
+                session_id=session_id,
+                turn_id=turn_id,
+                request=request,
+                result=generated,
+            )
+
+        self._enforce_safe_boundary(session_id=session_id)
+        model_run_id = self._model_run_id(session_id=session_id, turn_id=turn_id)
+        action_result = None
+        if isinstance(persisted.decision.decision, ToolDecision):
+            action = self._bound_action(
+                session_id=session_id,
+                model_run_id=model_run_id,
+                decision=persisted.decision.decision,
+            )
+            action_result = self._tool_broker.run(action)
+            boundary = self._safe_boundary(session_id=session_id)
+            if boundary.kind is not SafeBoundaryKind.SOFT_EXHAUSTED:
+                self._raise_for_boundary(boundary)
+        else:
+            timestamp = self._clock()
+            with self._session_factory.begin() as db:
+                lease = self._acquire(db, session_id=session_id, occurred_at=timestamp)
+                record = validate_session_lease(db, lease=lease, occurred_at=timestamp)
+                state = SessionState(record.state)
+                if state is SessionState.EXPLORING:
+                    transition_session_phase(
+                        db,
+                        lease=lease,
+                        target=SessionState.VERIFYING,
+                        reason="explorer_completed",
+                        occurred_at=timestamp,
+                    )
+                elif state is not SessionState.VERIFYING:
+                    raise InconsistentSessionRuntimeError(
+                        "completed Explorer turn is outside exploring/verifying"
+                    )
+        return ExplorerTurnResult(
+            session_id=session_id,
+            turn_id=turn_id,
+            model_run_id=model_run_id,
+            decision=persisted.decision,
+            action_result=action_result,
+            replayed_model_run=replayed,
+        )
+
+    def _prepare_turn(
+        self,
+        *,
+        session_id: SessionId,
+        turn_id: TurnId,
+        request: GatewayRequest,
+        occurred_at: datetime | None = None,
+    ) -> ModelRunResult | None:
+        if request.phase is not ModelPhase.EXPLORATION:
+            raise ValueError("Explorer runtime accepts only exploration requests")
+        timestamp = occurred_at or self._clock()
+        request_json = request.model_dump(mode="json")
+        request_hash = canonical_json_sha256(request_json)
+        schema_hash = response_schema_sha256(DecisionEnvelope)
+        with self._session_factory.begin() as db:
+            lease = self._acquire(db, session_id=session_id, occurred_at=timestamp)
+            session_record = validate_session_lease(db, lease=lease, occurred_at=timestamp)
+            state = SessionState(session_record.state)
+            turn = db.scalar(
+                select(OrchestratorTurnRecord)
+                .where(OrchestratorTurnRecord.id == turn_id.root)
+                .with_for_update()
+            )
+            if turn is None:
+                if state is not SessionState.EXPLORING:
+                    raise InconsistentSessionRuntimeError(
+                        "a new Explorer turn requires the exploring state"
+                    )
+                if (
+                    session_record.stop_requested_at is not None
+                    or session_record.abort_requested_at is not None
+                    or session_record.soft_exhausted_at is not None
+                ):
+                    raise InconsistentSessionRuntimeError(
+                        "a new Explorer turn cannot cross a pending safe boundary"
+                    )
+                in_flight = db.scalar(
+                    select(OrchestratorTurnRecord.id)
+                    .where(
+                        OrchestratorTurnRecord.session_id == session_id.root,
+                        OrchestratorTurnRecord.status == "prepared",
+                    )
+                    .limit(1)
+                    .with_for_update()
+                )
+                if in_flight is not None:
+                    raise InconsistentSessionRuntimeError(
+                        "session already has a prepared model turn"
+                    )
+                ordinal = db.scalar(
+                    select(func.coalesce(func.max(OrchestratorTurnRecord.ordinal), 0)).where(
+                        OrchestratorTurnRecord.session_id == session_id.root
+                    )
+                )
+                turn = OrchestratorTurnRecord(
+                    id=turn_id.root,
+                    session_id=session_id.root,
+                    ordinal=int(ordinal or 0) + 1,
+                    phase=request.phase.value,
+                    status="prepared",
+                    lease_owner=lease.owner,
+                    session_fence=lease.fence,
+                    request=request_json,
+                    request_sha256=request_hash,
+                    response_schema_sha256=schema_hash,
+                    model_run_id=None,
+                    result=None,
+                    error_code=None,
+                    created_at=timestamp,
+                    completed_at=None,
+                )
+                db.add(turn)
+                db.flush()
+                return None
+            if (
+                turn.session_id != session_id.root
+                or turn.request_sha256 != request_hash
+                or turn.response_schema_sha256 != schema_hash
+                or turn.request != request_json
+            ):
+                raise TurnBindingConflictError("turn is bound to another immutable request")
+            if turn.status == "failed":
+                raise FailedTurnError(turn.error_code or "model turn failed")
+            if turn.status == "completed":
+                if turn.result is None:
+                    raise InconsistentSessionRuntimeError("completed turn has no result")
+                return _model_run_result(turn.result)
+            if state is not SessionState.EXPLORING:
+                raise InconsistentSessionRuntimeError(
+                    "prepared Explorer turn requires the exploring state"
+                )
+            turn.lease_owner = lease.owner
+            turn.session_fence = lease.fence
+            db.flush()
+            return None
+
+    def _prepare_curator_turn(
+        self,
+        *,
+        session_id: SessionId,
+        turn_id: TurnId,
+        request: GatewayRequest,
+        occurred_at: datetime | None = None,
+    ) -> StructuredRunResult[CuratorProposal] | None:
+        if request.phase is not ModelPhase.CONSOLIDATION:
+            raise ValueError("Curator runtime accepts only consolidation requests")
+        timestamp = occurred_at or self._clock()
+        request_json = request.model_dump(mode="json")
+        request_hash = canonical_json_sha256(request_json)
+        schema_hash = response_schema_sha256(CuratorProposal)
+        with self._session_factory.begin() as db:
+            lease = self._acquire(db, session_id=session_id, occurred_at=timestamp)
+            session_record = validate_session_lease(db, lease=lease, occurred_at=timestamp)
+            state = SessionState(session_record.state)
+            turn = db.scalar(
+                select(OrchestratorTurnRecord)
+                .where(OrchestratorTurnRecord.id == turn_id.root)
+                .with_for_update()
+            )
+            if turn is None:
+                if state is not SessionState.CONSOLIDATING:
+                    raise InconsistentSessionRuntimeError(
+                        "a new Curator turn requires the consolidating state"
+                    )
+                if session_record.abort_requested_at is not None:
+                    raise InconsistentSessionRuntimeError(
+                        "a new Curator turn cannot cross a pending abort boundary"
+                    )
+                in_flight = db.scalar(
+                    select(OrchestratorTurnRecord.id)
+                    .where(
+                        OrchestratorTurnRecord.session_id == session_id.root,
+                        OrchestratorTurnRecord.status == "prepared",
+                    )
+                    .limit(1)
+                    .with_for_update()
+                )
+                if in_flight is not None:
+                    raise InconsistentSessionRuntimeError(
+                        "session already has a prepared model turn"
+                    )
+                ordinal = db.scalar(
+                    select(func.coalesce(func.max(OrchestratorTurnRecord.ordinal), 0)).where(
+                        OrchestratorTurnRecord.session_id == session_id.root
+                    )
+                )
+                turn = OrchestratorTurnRecord(
+                    id=turn_id.root,
+                    session_id=session_id.root,
+                    ordinal=int(ordinal or 0) + 1,
+                    phase=request.phase.value,
+                    status="prepared",
+                    lease_owner=lease.owner,
+                    session_fence=lease.fence,
+                    request=request_json,
+                    request_sha256=request_hash,
+                    response_schema_sha256=schema_hash,
+                    model_run_id=None,
+                    result=None,
+                    error_code=None,
+                    created_at=timestamp,
+                    completed_at=None,
+                )
+                db.add(turn)
+                db.flush()
+                return None
+            if (
+                turn.session_id != session_id.root
+                or turn.request_sha256 != request_hash
+                or turn.response_schema_sha256 != schema_hash
+                or turn.request != request_json
+            ):
+                raise TurnBindingConflictError("turn is bound to another immutable request")
+            if turn.status == "failed":
+                raise FailedTurnError(turn.error_code or "model turn failed")
+            if turn.status == "completed":
+                if turn.result is None:
+                    raise InconsistentSessionRuntimeError("completed turn has no result")
+                return _curator_run_result(turn.result)
+            if state is not SessionState.CONSOLIDATING:
+                raise InconsistentSessionRuntimeError(
+                    "prepared Curator turn requires the consolidating state"
+                )
+            turn.lease_owner = lease.owner
+            turn.session_fence = lease.fence
+            db.flush()
+            return None
+
+    def _complete_curator_turn(
+        self,
+        *,
+        session_id: SessionId,
+        turn_id: TurnId,
+        request: GatewayRequest,
+        result: StructuredRunResult[CuratorProposal],
+    ) -> StructuredRunResult[CuratorProposal]:
+        timestamp = self._clock()
+        aborted = False
+        with self._session_factory.begin() as db:
+            try:
+                lease = self._acquire(db, session_id=session_id, occurred_at=timestamp)
+            except ConcurrencyControlError as exc:
+                raise TurnFenceRejectedError(
+                    "model result cannot reacquire its session incarnation"
+                ) from exc
+            turn = db.scalar(
+                select(OrchestratorTurnRecord)
+                .where(OrchestratorTurnRecord.id == turn_id.root)
+                .with_for_update()
+            )
+            if turn is None or turn.session_id != session_id.root:
+                raise InconsistentSessionRuntimeError("prepared turn disappeared")
+            if turn.status == "completed":
+                if turn.result is None:
+                    raise InconsistentSessionRuntimeError("completed turn has no result")
+                return _curator_run_result(turn.result)
+            if turn.status != "prepared":
+                raise FailedTurnError(turn.error_code or "model turn failed")
+            if turn.lease_owner != lease.owner or turn.session_fence != lease.fence:
+                raise TurnFenceRejectedError("model result was produced under a stale fence")
+            session_record = validate_session_lease(db, lease=lease, occurred_at=timestamp)
+            if session_record.abort_requested_at is not None:
+                turn.status = "failed"
+                turn.error_code = "operator_abort"
+                turn.completed_at = timestamp
+                terminate_session(
+                    db,
+                    lease=lease,
+                    terminal_state=SessionState.CANCELLED,
+                    reason="operator_abort",
+                    occurred_at=timestamp,
+                )
+                aborted = True
+            elif SessionState(session_record.state) is not SessionState.CONSOLIDATING:
+                raise InconsistentSessionRuntimeError(
+                    "completed Curator turn is outside consolidating"
+                )
+            else:
+                model_run_id = ModelRunId.new()
+                context_manifest = _context_manifest(request)
+                db.add(
+                    ModelRunRecord(
+                        id=model_run_id.root,
+                        session_id=session_id.root,
+                        turn_id=turn_id.root,
+                        phase=request.phase.value,
+                        model_fingerprint=result.model_fingerprint_sha256,
+                        context_manifest_sha256=request.context_manifest_sha256,
+                        context_manifest=context_manifest,
+                        prompt_version=request.prompt_version,
+                        tool_schema_sha256=result.output_schema_sha256,
+                        input_tokens=result.usage.input_tokens,
+                        output_tokens=result.usage.output_tokens,
+                        latency_ms=result.latency_ms,
+                        finish_reason=result.finish_reason,
+                        output_schema_valid=True,
+                        raw_response_artifact=None,
+                        created_at=timestamp,
+                    )
+                )
+                db.flush()
+                turn.status = "completed"
+                turn.model_run_id = model_run_id.root
+                turn.result = result.model_dump(mode="json")
+                turn.completed_at = timestamp
+                append_session_audit(
+                    db,
+                    session_id=session_id,
+                    type=EventType.MODEL_RUN_COMPLETED,
+                    occurred_at=timestamp,
+                    actor="orchestrator",
+                    public_summary=result.output.public_summary,
+                    topic="audit.model_run_completed.v1",
+                    payload={
+                        "turn_id": str(turn_id),
+                        "model_run_id": str(model_run_id),
+                        "phase": request.phase.value,
+                        "outcome": result.output.outcome.value,
+                        "claims_proposed": len(result.output.claims),
+                        "handoffs_proposed": len(result.output.handoffs),
+                        "input_tokens": result.usage.input_tokens,
+                        "output_tokens": result.usage.output_tokens,
+                        "latency_ms": result.latency_ms,
+                    },
+                )
+                db.flush()
+        if aborted:
+            raise SessionAbortedError("operator abort discarded the unfinished model output")
+        return result
+
+    def _complete_turn(
+        self,
+        *,
+        session_id: SessionId,
+        turn_id: TurnId,
+        request: GatewayRequest,
+        result: ModelRunResult,
+    ) -> ModelRunResult:
+        timestamp = self._clock()
+        aborted = False
+        with self._session_factory.begin() as db:
+            try:
+                lease = self._acquire(db, session_id=session_id, occurred_at=timestamp)
+            except ConcurrencyControlError as exc:
+                raise TurnFenceRejectedError(
+                    "model result cannot reacquire its session incarnation"
+                ) from exc
+            turn = db.scalar(
+                select(OrchestratorTurnRecord)
+                .where(OrchestratorTurnRecord.id == turn_id.root)
+                .with_for_update()
+            )
+            if turn is None or turn.session_id != session_id.root:
+                raise InconsistentSessionRuntimeError("prepared turn disappeared")
+            if turn.status == "completed":
+                if turn.result is None:
+                    raise InconsistentSessionRuntimeError("completed turn has no result")
+                return _model_run_result(turn.result)
+            if turn.status != "prepared":
+                raise FailedTurnError(turn.error_code or "model turn failed")
+            if turn.lease_owner != lease.owner or turn.session_fence != lease.fence:
+                raise TurnFenceRejectedError("model result was produced under a stale fence")
+            session_record = validate_session_lease(db, lease=lease, occurred_at=timestamp)
+            if session_record.abort_requested_at is not None:
+                turn.status = "failed"
+                turn.error_code = "operator_abort"
+                turn.completed_at = timestamp
+                terminate_session(
+                    db,
+                    lease=lease,
+                    terminal_state=SessionState.CANCELLED,
+                    reason="operator_abort",
+                    occurred_at=timestamp,
+                )
+                aborted = True
+            else:
+                model_run_id = ModelRunId.new()
+                context_manifest = _context_manifest(request)
+                db.add(
+                    ModelRunRecord(
+                        id=model_run_id.root,
+                        session_id=session_id.root,
+                        turn_id=turn_id.root,
+                        phase=request.phase.value,
+                        model_fingerprint=result.model_fingerprint_sha256,
+                        context_manifest_sha256=request.context_manifest_sha256,
+                        context_manifest=context_manifest,
+                        prompt_version=request.prompt_version,
+                        tool_schema_sha256=result.tool_schema_sha256,
+                        input_tokens=result.usage.input_tokens,
+                        output_tokens=result.usage.output_tokens,
+                        latency_ms=result.latency_ms,
+                        finish_reason=result.finish_reason,
+                        output_schema_valid=True,
+                        raw_response_artifact=None,
+                        created_at=timestamp,
+                    )
+                )
+                db.flush()
+                turn.status = "completed"
+                turn.model_run_id = model_run_id.root
+                turn.result = result.model_dump(mode="json")
+                turn.completed_at = timestamp
+                append_session_audit(
+                    db,
+                    session_id=session_id,
+                    type=EventType.MODEL_RUN_COMPLETED,
+                    occurred_at=timestamp,
+                    actor="orchestrator",
+                    public_summary=result.decision.public_rationale,
+                    topic="audit.model_run_completed.v1",
+                    payload={
+                        "turn_id": str(turn_id),
+                        "model_run_id": str(model_run_id),
+                        "phase": request.phase.value,
+                        "decision_kind": result.decision.decision.kind.value,
+                        "input_tokens": result.usage.input_tokens,
+                        "output_tokens": result.usage.output_tokens,
+                        "latency_ms": result.latency_ms,
+                    },
+                )
+                db.flush()
+        if aborted:
+            raise SessionAbortedError("operator abort discarded the unfinished model output")
+        return result
+
+    def _fail_turn_if_owned(
+        self,
+        *,
+        session_id: SessionId,
+        turn_id: TurnId,
+        error_code: str,
+    ) -> None:
+        timestamp = self._clock()
+        try:
+            with self._session_factory.begin() as db:
+                lease = self._acquire(db, session_id=session_id, occurred_at=timestamp)
+                turn = db.scalar(
+                    select(OrchestratorTurnRecord)
+                    .where(OrchestratorTurnRecord.id == turn_id.root)
+                    .with_for_update()
+                )
+                if (
+                    turn is not None
+                    and turn.status == "prepared"
+                    and turn.lease_owner == lease.owner
+                    and turn.session_fence == lease.fence
+                ):
+                    turn.status = "failed"
+                    turn.error_code = error_code[:128]
+                    turn.completed_at = timestamp
+                    db.flush()
+        except ConcurrencyControlError:
+            return
+
+    def _model_run_id(self, *, session_id: SessionId, turn_id: TurnId) -> ModelRunId:
+        with self._session_factory() as db:
+            turn = db.get(OrchestratorTurnRecord, turn_id.root)
+            if (
+                turn is None
+                or turn.session_id != session_id.root
+                or turn.status != "completed"
+                or turn.model_run_id is None
+            ):
+                raise InconsistentSessionRuntimeError("completed turn has no model run")
+            return ModelRunId(root=turn.model_run_id)
+
+    def _bound_action(
+        self,
+        *,
+        session_id: SessionId,
+        model_run_id: ModelRunId,
+        decision: ToolDecision,
+    ) -> BoundAction:
+        with self._session_factory() as db:
+            record = db.scalar(
+                select(ActionRecord).where(ActionRecord.model_run_id == model_run_id.root)
+            )
+            if record is None:
+                return bind_action(
+                    session_id=session_id,
+                    model_run_id=model_run_id,
+                    decision=decision,
+                )
+            action = BoundAction(
+                action_id=ActionId(root=record.id),
+                session_id=session_id,
+                model_run_id=model_run_id,
+                idempotency_key=IdempotencyKey(root=record.idempotency_key),
+                idempotency_class=IdempotencyClass(record.idempotency_class),
+                tool=ToolName(record.tool),
+                arguments_json=record.arguments_json,
+                arguments_sha256=record.arguments_sha256,
+            )
+            expected = bind_action(
+                session_id=session_id,
+                model_run_id=model_run_id,
+                decision=decision,
+            )
+            if (
+                action.tool is not expected.tool
+                or action.arguments_json != expected.arguments_json
+                or action.arguments_sha256 != expected.arguments_sha256
+            ):
+                raise InconsistentSessionRuntimeError(
+                    "model run action conflicts with its persisted decision"
+                )
+            return action
+
+    def _acquire(
+        self,
+        db: Session,
+        *,
+        session_id: SessionId,
+        occurred_at: datetime,
+    ) -> SessionLease:
+        return acquire_session_lease(
+            db,
+            session_id=session_id,
+            owner=self._lease_owner,
+            ttl_seconds=self._lease_ttl_seconds,
+            occurred_at=occurred_at,
+        )
+
+    def _safe_boundary(
+        self,
+        *,
+        session_id: SessionId,
+        occurred_at: datetime | None = None,
+    ) -> SafeBoundaryResult:
+        timestamp = occurred_at or self._clock()
+        with self._session_factory.begin() as db:
+            lease = self._acquire(db, session_id=session_id, occurred_at=timestamp)
+            return apply_session_safe_boundary(db, lease=lease, occurred_at=timestamp)
+
+    def _enforce_safe_boundary(
+        self,
+        *,
+        session_id: SessionId,
+        occurred_at: datetime | None = None,
+    ) -> None:
+        self._raise_for_boundary(
+            self._safe_boundary(session_id=session_id, occurred_at=occurred_at)
+        )
+
+    def _enforce_finalization_boundary(
+        self,
+        *,
+        session_id: SessionId,
+        occurred_at: datetime | None = None,
+    ) -> None:
+        """Honor abort/host safety while allowing reserved consolidation work."""
+
+        boundary = self._safe_boundary(session_id=session_id, occurred_at=occurred_at)
+        if boundary.kind in {
+            SafeBoundaryKind.CONTINUE,
+            SafeBoundaryKind.STOPPING,
+            SafeBoundaryKind.SOFT_EXHAUSTED,
+        }:
+            return
+        self._raise_for_boundary(boundary)
+
+    @staticmethod
+    def _raise_for_boundary(boundary: SafeBoundaryResult) -> None:
+        if boundary.kind is SafeBoundaryKind.CONTINUE:
+            return
+        if boundary.kind is SafeBoundaryKind.ACTION_IN_FLIGHT:
+            raise InconsistentSessionRuntimeError(
+                f"action {boundary.action_id} must reach a terminal state before new work"
+            )
+        if boundary.kind is SafeBoundaryKind.STOPPING:
+            raise GracefulStopRequestedError("operator stop reached a safe boundary")
+        if boundary.kind is SafeBoundaryKind.CANCELLED:
+            raise SessionAbortedError("operator abort reached a safe boundary")
+        if boundary.kind is SafeBoundaryKind.SOFT_EXHAUSTED:
+            reason = boundary.budget_usage.exhaustion_reason
+            raise SoftBudgetExhaustedError(
+                f"soft session budget exhausted: {reason.value if reason else 'unknown'}"
+            )
+        raise SessionBoundaryFailureError("session failed at a safe boundary")
+
+
+def _recovery_directive(
+    db: Session,
+    session_record: SessionRecord,
+) -> SessionWorkDirective:
+    state = SessionState(session_record.state)
+    if state is SessionState.COMMITTING:
+        attempt = _bound_commit_attempt(db, session_record)
+        kind = (
+            SessionWorkKind.FINALIZE_COMMIT
+            if attempt.status == "prepared"
+            else SessionWorkKind.RECONCILE_COMMIT
+        )
+        return SessionWorkDirective(kind=kind, state=state)
+    if state is SessionState.RECONCILING_COMMIT:
+        _bound_commit_attempt(db, session_record)
+        return SessionWorkDirective(kind=SessionWorkKind.RECONCILE_COMMIT, state=state)
+
+    recoverable_actions = tuple(
+        db.scalars(
+            select(ActionRecord)
+            .where(
+                ActionRecord.session_id == session_record.id,
+                ActionRecord.state.in_(_RECOVERABLE_ACTION_STATES),
+            )
+            .order_by(ActionRecord.created_at, ActionRecord.id)
+        )
+    )
+    if len(recoverable_actions) > 1:
+        raise InconsistentSessionRuntimeError("session has multiple recoverable actions")
+    if recoverable_actions:
+        action = recoverable_actions[0]
+        return SessionWorkDirective(
+            kind=SessionWorkKind.RECOVER_ACTION,
+            state=state,
+            action_id=ActionId(root=action.id),
+        )
+
+    if session_record.abort_requested_at is not None:
+        return SessionWorkDirective(kind=SessionWorkKind.ABORT, state=state)
+    if (
+        session_record.stop_requested_at is not None or session_record.soft_exhausted_at is not None
+    ) and state in {
+        SessionState.WAKING,
+        SessionState.ORIENTING,
+        SessionState.SELECTING_QUESTION,
+        SessionState.PLANNING,
+        SessionState.EXPLORING,
+        SessionState.VERIFYING,
+        SessionState.STOPPING,
+    }:
+        return SessionWorkDirective(kind=SessionWorkKind.STOP, state=state)
+
+    latest_turn = db.scalar(
+        select(OrchestratorTurnRecord)
+        .where(OrchestratorTurnRecord.session_id == session_record.id)
+        .order_by(OrchestratorTurnRecord.ordinal.desc())
+        .limit(1)
+    )
+    if latest_turn is not None and latest_turn.status == "prepared":
+        return SessionWorkDirective(
+            kind=SessionWorkKind.RESUME_TURN,
+            state=state,
+            turn_id=TurnId(root=latest_turn.id),
+        )
+    if (
+        latest_turn is not None
+        and latest_turn.status == "completed"
+        and state is SessionState.EXPLORING
+    ):
+        if latest_turn.result is None:
+            raise InconsistentSessionRuntimeError("completed turn has no result")
+        decision = _model_run_result(latest_turn.result).decision.decision
+        if not isinstance(decision, ToolDecision):
+            return SessionWorkDirective(
+                kind=SessionWorkKind.RESUME_TURN,
+                state=state,
+                turn_id=TurnId(root=latest_turn.id),
+            )
+        if latest_turn.model_run_id is None:
+            raise InconsistentSessionRuntimeError("completed turn has no model run")
+        action = db.scalar(
+            select(ActionRecord).where(ActionRecord.model_run_id == latest_turn.model_run_id)
+        )
+        if action is None:
+            return SessionWorkDirective(
+                kind=SessionWorkKind.RESUME_TURN,
+                state=state,
+                turn_id=TurnId(root=latest_turn.id),
+            )
+
+    kind = _PHASE_WORK.get(state)
+    if kind is None:
+        raise InconsistentSessionRuntimeError(f"session state has no recovery work: {state}")
+    return SessionWorkDirective(kind=kind, state=state)
+
+
+def _bound_commit_attempt(
+    db: Session,
+    session_record: SessionRecord,
+) -> CommitAttemptRecord:
+    if session_record.commit_attempt_id is None:
+        raise InconsistentSessionRuntimeError("commit state has no bound attempt")
+    attempt = db.get(CommitAttemptRecord, session_record.commit_attempt_id)
+    if attempt is None or attempt.session_id != session_record.id:
+        raise InconsistentSessionRuntimeError("bound commit attempt is missing")
+    return attempt
+
+
+def _context_manifest(request: GatewayRequest) -> dict[str, object]:
+    try:
+        payload = json.loads(request.messages[-1].content)
+    except (IndexError, json.JSONDecodeError) as exc:
+        raise InconsistentSessionRuntimeError(
+            "gateway request context is not canonical JSON"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise InconsistentSessionRuntimeError("gateway request context is not an object")
+    return payload
+
+
+def _explorer_context(request: GatewayRequest) -> ExplorerContext:
+    payload = _context_manifest(request)
+    if payload.get("protocol") != "explorer-input/v2":
+        raise InconsistentSessionRuntimeError("turn is not an Explorer protocol request")
+    try:
+        context = payload["context"]
+        if not isinstance(context, dict):
+            raise ValueError("Explorer context is not an object")
+        return ExplorerContext.model_validate_json(_canonical_json(context))
+    except (KeyError, ValueError) as exc:
+        raise InconsistentSessionRuntimeError("stored Explorer context is invalid") from exc
+
+
+def _curator_context(request: GatewayRequest) -> CuratorContext:
+    payload = _context_manifest(request)
+    if payload.get("protocol") != "curator-input/v2":
+        raise InconsistentSessionRuntimeError("turn is not a Curator protocol request")
+    try:
+        context = payload["context"]
+        if not isinstance(context, dict):
+            raise ValueError("Curator context is not an object")
+        return CuratorContext.model_validate_json(_canonical_json(context))
+    except (KeyError, ValueError) as exc:
+        raise InconsistentSessionRuntimeError("stored Curator context is invalid") from exc
+
+
+def _gateway_request(value: dict[str, object]) -> GatewayRequest:
+    return GatewayRequest.model_validate_json(_canonical_json(value))
+
+
+def _model_run_result(value: dict[str, object]) -> ModelRunResult:
+    return ModelRunResult.model_validate_json(_canonical_json(value))
+
+
+def _curator_run_result(
+    value: dict[str, object],
+) -> StructuredRunResult[CuratorProposal]:
+    return StructuredRunResult[CuratorProposal].model_validate_json(_canonical_json(value))
+
+
+def _canonical_json(value: dict[str, object]) -> str:
+    return json.dumps(
+        value,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _aware(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
