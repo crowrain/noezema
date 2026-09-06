@@ -80,6 +80,13 @@
           <strong>Контур выполнения временно недоступен</strong>
           <span id="degraded-detail">Сайт работает только для чтения.</span>
         </div>
+        <section id="host-journal" class="host-journal" aria-labelledby="host-journal-title" hidden>
+          <div>
+            <strong id="host-journal-title">Локальный журнал восстановления</strong>
+            <span>Ещё не обязательно зафиксирован в DB audit</span>
+          </div>
+          <ol id="host-journal-list"></ol>
+        </section>
 
         <section class="status-grid" aria-label="Состояние системы">
           <article class="status-card status-card-primary">

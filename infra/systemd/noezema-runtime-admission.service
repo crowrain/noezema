@@ -6,6 +6,7 @@ ConditionPathExists=!/run/noezema-offline-rules/active
 Type=oneshot
 User=noezema
 Group=noezema
+SupplementaryGroups=noezema-host
 EnvironmentFile=/etc/noezema/noezema-runtime.env
 WorkingDirectory=/opt/noezema
 ExecStart=/opt/noezema/.venv/bin/python -m apps.runtime.admission

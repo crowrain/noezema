@@ -161,3 +161,6 @@ class EventType(StrEnum):
     OPERATOR_COMMAND_STATE_CHANGED = "OperatorCommandStateChanged"
     SCHEDULER_WAKE_STARTED = "SchedulerWakeStarted"
     SCHEDULER_WAKE_FINISHED = "SchedulerWakeFinished"
+    HOST_TRANSITION_STATE_CHANGED = "HostTransitionStateChanged"
+    CONFIG_ACTIVATED = "ConfigActivated"
+    HOST_POLICY_CHANGED = "HostPolicyChanged"

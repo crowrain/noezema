@@ -463,6 +463,34 @@ input::placeholder {
   display: none;
 }
 
+.host-journal {
+  display: grid;
+  gap: 10px;
+  margin: -0.2rem 0 1rem;
+  padding: 0.9rem 1rem;
+  border: 1px solid rgba(255, 184, 77, 0.24);
+  border-radius: 0.9rem;
+  background: rgba(32, 24, 12, 0.42);
+  color: #f4d7a0;
+  font-size: 0.74rem;
+}
+
+.host-journal[hidden] {
+  display: none;
+}
+
+.host-journal > div,
+.host-journal ol {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+}
+
+.host-journal span,
+.host-journal li {
+  color: var(--muted);
+}
+
 .status-card {
   display: grid;
   min-height: 144px;

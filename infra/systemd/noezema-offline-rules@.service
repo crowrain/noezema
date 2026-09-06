@@ -1,0 +1,31 @@
+[Unit]
+Description=Apply NOEZEMA offline rules candidate %i
+After=local-fs.target network.target
+Wants=network.target
+OnSuccess=noezema-runtime-resume.service
+OnFailure=noezema-runtime-resume.service
+
+[Service]
+Type=oneshot
+User=root
+Group=noezema-host
+EnvironmentFile=/etc/noezema/noezema-runtime.env
+Environment=NOEZEMA_OFFLINE_RULES_PAYLOAD_PATH=/etc/noezema/rules-candidates/%i.json
+WorkingDirectory=/opt/noezema
+ExecStart=/opt/noezema/.venv/bin/python -m apps.host_control.offline
+RuntimeDirectory=noezema-offline-rules
+RuntimeDirectoryMode=0750
+TimeoutStartSec=infinity
+TimeoutStopSec=30s
+UMask=0027
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ReadOnlyPaths=/etc/noezema/rules-candidates
+ReadWritePaths=/var/lib/noezema /run/noezema-offline-rules
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

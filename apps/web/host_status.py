@@ -11,9 +11,16 @@ from uuid import UUID
 
 from pydantic import AwareDatetime, ConfigDict, Field, model_validator
 
+from apps.host_control.journal import (
+    HostJournalInconsistentError,
+    read_active_transition,
+    read_transition_events,
+)
 from apps.web.models import (
     DegradedReason,
     HostStatusProjection,
+    HostTransitionEventProjection,
+    HostTransitionProjection,
     HostUnitProjection,
 )
 from packages.domain import canonical_json_sha256
@@ -116,6 +123,47 @@ class FilesystemHostStatusReader:
         now = _aware(observed_at)
         maintenance = _present(self._maintenance_marker_path)
         transition = _present(self._transition_head_path)
+        transition_projection = None
+        transition_events: tuple[HostTransitionEventProjection, ...] = ()
+        transition_invalid = False
+        if transition:
+            try:
+                record = read_active_transition(self._transition_head_path)
+            except (HostJournalInconsistentError, OSError, ValueError):
+                transition_invalid = True
+            else:
+                if record is None:
+                    transition_invalid = True
+                else:
+                    transition_projection = HostTransitionProjection(
+                        attempt_id=record.attempt_id,
+                        operation=record.operation.value,
+                        state=record.state.value,
+                        attempts_total=record.snapshot.attempts_total,
+                        current_attempt_seq=record.snapshot.current_attempt_seq,
+                        error_class=record.snapshot.error_class,
+                        next_attempt_at=record.snapshot.next_attempt_at,
+                        last_event_seq=record.last_event_seq,
+                    )
+                    transition_events = tuple(
+                        HostTransitionEventProjection(
+                            event_seq=event.event_seq,
+                            from_state=(
+                                event.from_state.value
+                                if event.from_state is not None
+                                else None
+                            ),
+                            to_state=event.to_state.value,
+                            actor=event.actor,
+                            reason=event.reason,
+                            error_class=event.error_class,
+                            occurred_at=event.occurred_at,
+                        )
+                        for event in read_transition_events(
+                            self._transition_head_path,
+                            record.attempt_id,
+                        )[-20:]
+                    )
         policy_change = _present(self._policy_change_head_path)
         reasons: list[DegradedReason] = []
 
@@ -175,7 +223,11 @@ class FilesystemHostStatusReader:
         if maintenance:
             reasons.append(DegradedReason.MAINTENANCE_ACTIVE)
         if transition:
-            reasons.append(DegradedReason.HOST_TRANSITION_IN_PROGRESS)
+            reasons.append(
+                DegradedReason.HOST_TRANSITION_INVALID
+                if transition_invalid
+                else DegradedReason.HOST_TRANSITION_IN_PROGRESS
+            )
         if policy_change:
             reasons.append(DegradedReason.HOST_POLICY_CHANGE_IN_PROGRESS)
         return HostStatusProjection(
@@ -187,6 +239,8 @@ class FilesystemHostStatusReader:
             members=members,
             maintenance_active=maintenance,
             host_transition_active=transition,
+            host_transition=transition_projection,
+            host_transition_events=transition_events,
             host_policy_change_active=policy_change,
             reasons=tuple(dict.fromkeys(reasons)),
         )
@@ -218,6 +272,8 @@ class AssumedHealthyHostStatusReader:
             ),
             maintenance_active=False,
             host_transition_active=False,
+            host_transition=None,
+            host_transition_events=(),
             host_policy_change_active=False,
             reasons=(),
         )

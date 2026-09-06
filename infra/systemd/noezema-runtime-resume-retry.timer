@@ -1,0 +1,12 @@
+[Unit]
+Description=Schedule due NOEZEMA runtime recovery attempts
+
+[Timer]
+OnBootSec=30s
+OnUnitInactiveSec=30s
+AccuracySec=1s
+RandomizedDelaySec=0
+Unit=noezema-runtime-resume-retry.service
+
+[Install]
+WantedBy=timers.target

@@ -12,6 +12,17 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from apps.host_control.journal import (
+    HostJournalError,
+    HostJournalInconsistentError,
+    HostJournalPaths,
+    HostTransitionState,
+    read_active_transition,
+)
+from apps.host_control.policy_change import (
+    PolicyChangeJournal,
+    replay_terminal_policy_events,
+)
 from packages.domain import canonical_json_sha256
 from packages.persistence import (
     BOOTSTRAP_CONFIG_SNAPSHOT_ID,
@@ -44,14 +55,42 @@ def check_runtime_admission(
     maintenance_marker_path: Path,
     transition_head_path: Path,
     policy_change_head_path: Path,
+    transition_lock_path: Path | None = None,
 ) -> None:
     for path, reason in (
         (maintenance_marker_path, "offline maintenance is active"),
-        (transition_head_path, "host transition is unresolved"),
         (policy_change_head_path, "host policy change is unresolved"),
     ):
         if _present_or_unreadable(path):
             raise RuntimeAdmissionRejectedError(reason)
+
+    try:
+        transition = read_active_transition(transition_head_path)
+    except (HostJournalInconsistentError, OSError, ValueError) as exc:
+        raise RuntimeAdmissionRejectedError("host transition journal is invalid") from exc
+    if transition is not None and transition.state is not HostTransitionState.READY_TO_START:
+        raise RuntimeAdmissionRejectedError("host transition is not ready to start")
+
+    check_runtime_database_admission(session_factory)
+    journal_paths = HostJournalPaths(
+        transition_head_path.parent,
+        lock_path=transition_lock_path,
+    )
+    journal_paths.policy_change_head = policy_change_head_path
+    try:
+        replay_terminal_policy_events(
+            session_factory,
+            PolicyChangeJournal(journal_paths),
+            replayed_at=datetime.now(UTC),
+        )
+    except SQLAlchemyError as exc:
+        raise RuntimeAdmissionTemporaryError("operational database is unavailable") from exc
+    except HostJournalError as exc:
+        raise RuntimeAdmissionRejectedError("host policy history is inconsistent") from exc
+
+
+def check_runtime_database_admission(session_factory: Callable[[], Session]) -> None:
+    """Classify only the durable DB invariants for the host recovery automaton."""
 
     try:
         with session_factory() as db:
@@ -119,6 +158,12 @@ def main(environment: Mapping[str, str] | None = None) -> int:
                     values.get(
                         "NOEZEMA_HOST_POLICY_CHANGE_HEAD_PATH",
                         "/var/lib/noezema/host-policy-change-head.json",
+                    )
+                ),
+                transition_lock_path=Path(
+                    values.get(
+                        "NOEZEMA_HOST_TRANSITION_LOCK_PATH",
+                        "/run/lock/noezema-host-transition.lock",
                     )
                 ),
             )

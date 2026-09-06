@@ -6,6 +6,7 @@ After=network.target
 Type=simple
 User=noezema-web
 Group=noezema-observer
+SupplementaryGroups=noezema-host
 EnvironmentFile=/etc/noezema/noezema-web.env
 WorkingDirectory=/opt/noezema
 ExecStart=/opt/noezema/.venv/bin/uvicorn apps.web:create_environment_app --factory --host 127.0.0.1 --port 8765
@@ -31,6 +32,8 @@ InaccessiblePaths=-/var/lib/noezema/artifacts
 ReadOnlyPaths=-/run/noezema
 ReadOnlyPaths=-/run/noezema-offline-rules
 ReadOnlyPaths=-/var/lib/noezema/host-transition-head.json
+ReadOnlyPaths=-/var/lib/noezema/host-transitions
+ReadOnlyPaths=-/var/lib/noezema/host-transition-events
 ReadOnlyPaths=-/var/lib/noezema/host-policy-change-head.json
 
 [Install]

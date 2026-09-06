@@ -7,12 +7,20 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID
 
+from apps.host_control import (
+    HostJournalPaths,
+    HostOperation,
+    HostTransitionJournal,
+    load_host_recovery_policy,
+)
 from apps.web.host_status import FilesystemHostStatusReader
 from apps.web.models import DegradedReason
 from packages.domain import canonical_json_sha256
 
 NOW = datetime(2026, 8, 21, 12, 0, tzinfo=UTC)
 BOOT_ID = UUID("11111111-2222-4333-8444-555555555555")
+ROOT = Path(__file__).resolve().parents[3]
+BASELINE = ROOT / "infra" / "systemd" / "host-recovery.defaults.toml"
 
 
 def _reader(root: Path) -> FilesystemHostStatusReader:
@@ -104,7 +112,7 @@ def test_markers_and_unhealthy_members_are_reported_together(tmp_path: Path) -> 
     assert status.reasons == (
         DegradedReason.RUNTIME_MEMBER_UNHEALTHY,
         DegradedReason.MAINTENANCE_ACTIVE,
-        DegradedReason.HOST_TRANSITION_IN_PROGRESS,
+        DegradedReason.HOST_TRANSITION_INVALID,
         DegradedReason.HOST_POLICY_CHANGE_IN_PROGRESS,
     )
 
@@ -116,3 +124,34 @@ def test_active_member_with_failed_result_is_not_reported_as_healthy(tmp_path: P
     status = _reader(tmp_path).status(observed_at=NOW)
 
     assert status.reasons == (DegradedReason.RUNTIME_MEMBER_UNHEALTHY,)
+
+
+def test_valid_host_transition_exposes_current_recovery_state(tmp_path: Path) -> None:
+    (tmp_path / "boot-id").write_text(str(BOOT_ID), encoding="ascii")
+    _write_snapshot(tmp_path)
+    paths = HostJournalPaths(tmp_path)
+    paths.head = tmp_path / "transition-head.json"
+    record = HostTransitionJournal(paths).create(
+        operation=HostOperation.RUNTIME_START,
+        boot_id=BOOT_ID,
+        policy=load_host_recovery_policy(BASELINE, enforce_root_metadata=False),
+        actor="host-recovery",
+        reason="boot",
+        occurred_at=NOW,
+        initial_snapshot_updates={
+            "attempts_total": 1,
+            "current_attempt_seq": 1,
+            "last_probe_started_at": NOW,
+        },
+    )
+
+    status = _reader(tmp_path).status(observed_at=NOW)
+
+    assert status.reasons == (DegradedReason.HOST_TRANSITION_IN_PROGRESS,)
+    assert status.host_transition is not None
+    assert status.host_transition.attempt_id == record.attempt_id
+    assert status.host_transition.state == "checking"
+    assert status.host_transition.current_attempt_seq == 1
+    assert len(status.host_transition_events) == 1
+    assert status.host_transition_events[0].to_state == "checking"
+    assert status.host_transition_events[0].reason == "boot"

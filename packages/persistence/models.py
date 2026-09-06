@@ -77,6 +77,30 @@ class ConfigSnapshotRecord(Base):
             ),
             name="activation_state_allowed",
         ),
+        CheckConstraint(
+            "(activation_manifest_sha256 IS NULL AND activation_cohort_revision IS NULL "
+            "AND activation_expected_head_count IS NULL "
+            "AND activation_verified_head_count IS NULL "
+            "AND activation_heads_sha256 IS NULL AND activation_invalid_head_count IS NULL "
+            "AND activation_verified_at IS NULL) OR "
+            "(activation_manifest_sha256 IS NOT NULL AND activation_cohort_revision >= 0 "
+            "AND activation_expected_head_count >= 0 "
+            "AND activation_verified_head_count = activation_expected_head_count "
+            "AND activation_heads_sha256 IS NOT NULL "
+            "AND activation_invalid_head_count BETWEEN 0 AND activation_expected_head_count "
+            "AND activation_verified_at IS NOT NULL)",
+            name="activation_seal_complete",
+        ),
+        Index(
+            "uq_config_snapshots_unfinished_offline_candidate",
+            "base_snapshot_id",
+            "payload_sha256",
+            unique=True,
+            postgresql_where=text(
+                "activation_mode = 'offline' AND activation_state <> 'failed'"
+            ),
+            sqlite_where=text("activation_mode = 'offline' AND activation_state <> 'failed'"),
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
@@ -88,7 +112,27 @@ class ConfigSnapshotRecord(Base):
     sha: Mapped[str] = mapped_column(String(64), unique=True)
     activation_mode: Mapped[str] = mapped_column(String(16))
     activation_state: Mapped[str] = mapped_column(String(32))
+    activation_manifest_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    activation_cohort_revision: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    activation_expected_head_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    activation_verified_head_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    activation_heads_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    activation_invalid_head_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    activation_verified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class ConfigActivationManifestRecord(Base):
+    __tablename__ = "config_activation_manifest_claims"
+
+    config_snapshot_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("config_snapshots.id"), primary_key=True
+    )
+    claim_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("claims.id"), primary_key=True
+    )
 
 
 class RuntimeConfigHeadRecord(Base):
@@ -667,6 +711,20 @@ class AuditEventRecord(Base):
     public_summary: Mapped[str] = mapped_column(Text)
     payload: Mapped[dict[str, Any]] = mapped_column(JsonType)
     visibility: Mapped[str] = mapped_column(String(16))
+
+
+class HostEventReplayRecord(Base):
+    __tablename__ = "host_event_replays"
+    __table_args__ = (
+        CheckConstraint("event_seq >= 1", name="event_seq_positive"),
+    )
+
+    attempt_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    event_seq: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    audit_event_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("audit_events.id"), unique=True
+    )
+    replayed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
 class OutboxEventRecord(Base):

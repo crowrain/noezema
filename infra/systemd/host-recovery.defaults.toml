@@ -1,0 +1,9 @@
+schema_version = 1
+resume_retry_initial = "30s"
+resume_retry_multiplier = 2.0
+resume_retry_max = "30min"
+resume_retry_jitter = 0.0
+resume_retry_escalate_after = "15min"
+retry_timer_period = "30s"
+retry_timer_accuracy = "1s"
+maintenance_flock_deadline = "2s"

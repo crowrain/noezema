@@ -4,11 +4,19 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from pathlib import Path
+from uuid import UUID
 
 import pytest
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 
+from apps.host_control import (
+    HostJournalPaths,
+    HostOperation,
+    HostTransitionJournal,
+    HostTransitionState,
+    load_host_recovery_policy,
+)
 from apps.runtime.admission import (
     RuntimeAdmissionRejectedError,
     RuntimeAdmissionTemporaryError,
@@ -20,6 +28,9 @@ from packages.persistence.models import (
     RuntimeConfigHeadRecord,
     SystemConstantRecord,
 )
+
+_ROOT = Path(__file__).resolve().parents[3]
+_BASELINE = _ROOT / "infra" / "systemd" / "host-recovery.defaults.toml"
 
 
 def _paths(root: Path) -> dict[str, Path]:
@@ -112,3 +123,38 @@ def test_admission_classifies_database_outage_as_temporary(tmp_path: Path) -> No
 
     with pytest.raises(RuntimeAdmissionTemporaryError, match="database is unavailable"):
         check_runtime_admission(unavailable, **_paths(tmp_path))
+
+
+def test_admission_accepts_only_a_verified_ready_to_start_host_record(
+    session_factory: sessionmaker[Session],
+    tmp_path: Path,
+) -> None:
+    _seed_system_constant(session_factory)
+    paths = HostJournalPaths(tmp_path)
+    journal = HostTransitionJournal(paths)
+    record = journal.create(
+        operation=HostOperation.RUNTIME_START,
+        boot_id=UUID("11111111-2222-4333-8444-555555555555"),
+        policy=load_host_recovery_policy(_BASELINE, enforce_root_metadata=False),
+        actor="test",
+        reason="boot",
+        occurred_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    journal.transition(
+        record.attempt_id,
+        to_state=HostTransitionState.READY_TO_START,
+        actor="test",
+        reason="admitted",
+        occurred_at=datetime(2026, 1, 1, tzinfo=UTC),
+        snapshot_updates={
+            "dispatch_id": UUID("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"),
+            "dispatch_deadline": datetime(2026, 1, 1, 0, 0, 30, tzinfo=UTC),
+        },
+    )
+
+    check_runtime_admission(
+        session_factory,
+        maintenance_marker_path=tmp_path / "maintenance",
+        transition_head_path=paths.head,
+        policy_change_head_path=paths.policy_change_head,
+    )

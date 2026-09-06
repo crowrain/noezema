@@ -126,6 +126,8 @@ def test_owner_login_protects_query_api_and_sets_hardened_cookie(
                     ],
                     "maintenance_active": False,
                     "host_transition_active": False,
+                    "host_transition": None,
+                    "host_transition_events": [],
                     "host_policy_change_active": False,
                     "reasons": [],
                 },

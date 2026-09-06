@@ -219,6 +219,7 @@ class DegradedReason(StrEnum):
     RUNTIME_MEMBER_UNHEALTHY = "runtime_member_unhealthy"
     MAINTENANCE_ACTIVE = "maintenance_active"
     HOST_TRANSITION_IN_PROGRESS = "host_transition_in_progress"
+    HOST_TRANSITION_INVALID = "host_transition_invalid"
     HOST_POLICY_CHANGE_IN_PROGRESS = "host_policy_change_in_progress"
     DATABASE_UNAVAILABLE = "database_unavailable"
 
@@ -230,6 +231,34 @@ class HostUnitProjection(ContractModel):
     result: UnitName
 
 
+class HostTransitionProjection(ContractModel):
+    attempt_id: UUID
+    operation: Literal["runtime_start", "offline_rules"]
+    state: Literal[
+        "checking",
+        "retry_wait",
+        "ready_to_start",
+        "resume_degraded",
+        "resume_blocked",
+        "resolved",
+    ]
+    attempts_total: int = Field(ge=0)
+    current_attempt_seq: int = Field(ge=0)
+    error_class: str | None = Field(default=None, max_length=128)
+    next_attempt_at: AwareDatetime | None
+    last_event_seq: int = Field(ge=1)
+
+
+class HostTransitionEventProjection(ContractModel):
+    event_seq: int = Field(ge=1)
+    from_state: str | None = Field(default=None, max_length=32)
+    to_state: str = Field(min_length=1, max_length=32)
+    actor: ShortReason
+    reason: NonEmptyText
+    error_class: str | None = Field(default=None, max_length=128)
+    occurred_at: AwareDatetime
+
+
 class HostStatusProjection(ContractModel):
     snapshot_state: Literal["current", "missing", "invalid", "stale"]
     snapshot_observed_at: AwareDatetime | None
@@ -239,6 +268,8 @@ class HostStatusProjection(ContractModel):
     members: tuple[HostUnitProjection, ...]
     maintenance_active: bool
     host_transition_active: bool
+    host_transition: HostTransitionProjection | None = None
+    host_transition_events: tuple[HostTransitionEventProjection, ...] = ()
     host_policy_change_active: bool
     reasons: tuple[DegradedReason, ...]
 
@@ -255,6 +286,14 @@ class HostStatusProjection(ContractModel):
             raise ValueError("current and stale host snapshots require complete unit state")
         if len(set(self.reasons)) != len(self.reasons):
             raise ValueError("degraded reasons must be unique")
+        if self.host_transition is not None and not self.host_transition_active:
+            raise ValueError("host transition details require an active head")
+        if self.host_transition_events and self.host_transition is None:
+            raise ValueError("host transition events require verified current details")
+        if tuple(event.event_seq for event in self.host_transition_events) != tuple(
+            sorted({event.event_seq for event in self.host_transition_events})
+        ):
+            raise ValueError("host transition events must be ordered and unique")
         required_snapshot_reason = {
             "missing": {DegradedReason.UNIT_STATE_MISSING},
             "invalid": {

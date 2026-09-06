@@ -15,6 +15,8 @@
     observedAt: $("observed-at"),
     degradedBanner: $("degraded-banner"),
     degradedDetail: $("degraded-detail"),
+    hostJournal: $("host-journal"),
+    hostJournalList: $("host-journal-list"),
     nodeState: $("node-state"),
     nodeDetail: $("node-detail"),
     activityState: $("activity-state"),
@@ -63,6 +65,14 @@
       idle: "Свободен",
       running: "Исследует",
     },
+    hostTransition: {
+      checking: "проверка",
+      retry_wait: "ожидание повтора",
+      ready_to_start: "готов к запуску",
+      resume_degraded: "медленное восстановление",
+      resume_blocked: "запуск заблокирован",
+      resolved: "завершён",
+    },
     message: {
       created: "создано",
       queued: "в очереди",
@@ -100,6 +110,7 @@
       runtime_member_unhealthy: "один из процессов контура нездоров",
       maintenance_active: "идёт offline-обслуживание",
       host_transition_in_progress: "переход состояния хоста не завершён",
+      host_transition_invalid: "журнал перехода хоста некорректен",
       host_policy_change_in_progress: "смена host policy не завершена",
       database_unavailable: "операционная база недоступна",
     },
@@ -293,6 +304,16 @@
           .map((reason) => labels.degraded[reason] || reason)
           .join(", ")}. Команды отключены.`
       : "Сайт работает только для чтения.";
+    if (status.host.host_transition) {
+      const transition = status.host.host_transition;
+      const retry = transition.next_attempt_at
+        ? `, повтор ${formatDate(transition.next_attempt_at, true)}`
+        : "";
+      elements.degradedDetail.textContent +=
+        ` Переход: ${labels.hostTransition[transition.state] || transition.state}, ` +
+        `попытка ${transition.current_attempt_seq}${retry}.`;
+    }
+    renderHostJournal(status.host.host_transition_events || []);
     if (!operational) {
       elements.nodeState.textContent = "Недоступен";
       elements.nodeDetail.textContent = "Operational store не отвечает";
@@ -338,6 +359,18 @@
     elements.observedAt.textContent = `Срез ${formatDate(status.observed_at, true)}`;
     renderSession(active);
     setMutationAvailability(status.command_api_enabled);
+  }
+
+  function renderHostJournal(events) {
+    elements.hostJournal.hidden = events.length === 0;
+    elements.hostJournalList.replaceChildren(
+      ...events.map((event) => {
+        const item = document.createElement("li");
+        const stateLabel = labels.hostTransition[event.to_state] || event.to_state;
+        item.textContent = `${formatDate(event.occurred_at, true)} · ${stateLabel} · ${event.reason}`;
+        return item;
+      }),
+    );
   }
 
   function setMutationAvailability(enabled) {
