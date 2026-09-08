@@ -106,6 +106,16 @@ def test_runtime_and_web_secrets_use_separate_environment_files() -> None:
     assert "NOEZEMA_WEB_SESSION_SECRET" not in runtime_environment
     assert "NOEZEMA_LLM_API_KEY" not in web_environment
     assert "NOEZEMA_LLM_BASE_URL" not in web_environment
+    assert (
+        "NOEZEMA_DATABASE_URL=postgresql+psycopg://noezema@/noezema?host=/var/run/postgresql"
+        in runtime_environment
+    )
+    assert (
+        "NOEZEMA_DATABASE_URL=postgresql+psycopg://noezema-web@/noezema?host=/var/run/postgresql"
+        in web_environment
+    )
+    assert "NOEZEMA_WEB_ALLOWED_ORIGINS=http://127.0.0.1:8765" in web_environment
+    assert "NOEZEMA_WEB_COOKIE_SECURE=false" in web_environment
 
 
 def test_unit_files_use_lf_line_endings() -> None:

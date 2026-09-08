@@ -12,6 +12,13 @@ two example environment files without the `.example` suffix, with mode `0640`:
 Do not merge them: the observer must not receive LLM credentials or writer
 configuration.
 
+The examples use PostgreSQL peer authentication over the local Unix socket, so
+the database roles deliberately match the system accounts (`noezema` and
+`noezema-web`) and no database password is stored in either file. The example
+web origin is plain HTTP on loopback for an SSH tunnel, therefore its session
+cookie is not marked `Secure`; set `NOEZEMA_WEB_COOKIE_SECURE=true` when the
+browser endpoint is served over HTTPS.
+
 Create a dedicated `noezema-host` group for the read-only host journal shared
 by admission, runtime and web processes. Keep it distinct from `noezema` and
 `noezema-observer`, so membership does not expose either environment file.
