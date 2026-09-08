@@ -30,6 +30,11 @@ DEFAULT_SESSION_BUDGET_JSON = (
     '"host_reserve_seconds":300,"max_input_tokens":131072,"max_model_turns":32,'
     '"max_output_tokens":32768,"max_tool_actions":24}'
 )
+# ``sa.text`` treats every ``:name`` fragment as a bind parameter, even inside
+# the JSON string used by a DDL default. Escape the separators before handing
+# the literal to SQLAlchemy; the compiler removes the escape characters when
+# it renders the PostgreSQL statement.
+DEFAULT_SESSION_BUDGET_SQL = DEFAULT_SESSION_BUDGET_JSON.replace(":", r"\:")
 DEFAULT_SESSION_BUDGET_SHA256 = "2542123f9263cc1e3deace9a7fd28f2170364d798ab635ccba2fd9eeeab2d8a3"
 
 AUDIT_EVENT_TYPES_V2 = (
@@ -59,13 +64,23 @@ def _in(values: Sequence[str]) -> str:
 
 
 def upgrade() -> None:
+    # Alembic creates ``version_num`` as VARCHAR(32), while this revision and
+    # several later descriptive identifiers are longer than 32 characters.
+    # Widen it before Alembic records this revision after ``upgrade`` returns.
+    op.alter_column(
+        "alembic_version",
+        "version_num",
+        existing_type=sa.String(length=32),
+        type_=sa.String(length=64),
+        existing_nullable=False,
+    )
     op.add_column(
         "sessions",
         sa.Column(
             "budget",
             postgresql.JSONB(astext_type=sa.Text()),
             nullable=False,
-            server_default=sa.text(f"'{DEFAULT_SESSION_BUDGET_JSON}'::jsonb"),
+            server_default=sa.text(f"'{DEFAULT_SESSION_BUDGET_SQL}'::jsonb"),
         ),
     )
     op.add_column(

@@ -171,6 +171,9 @@ def test_migrations_render_valid_bootstrap_and_fifo_sql(
     assert "CREATE TABLE writer_intents" in sql
     assert "CREATE TABLE orchestrator_turns" in sql
     assert "ALTER TABLE sessions ADD COLUMN budget JSONB" in sql
+    assert "ALTER TABLE alembic_version ALTER COLUMN version_num TYPE VARCHAR(64)" in sql
+    assert BUDGET_MIGRATION.DEFAULT_SESSION_BUDGET_JSON in sql
+    assert '"cognitive_duration_seconds"NULL' not in sql
     assert "ALTER TABLE sessions ADD COLUMN stop_requested_at" in sql
     assert "CREATE TABLE runtime_controls" in sql
     assert "CREATE TABLE messages" in sql
@@ -215,6 +218,8 @@ def test_migrations_render_valid_bootstrap_and_fifo_sql(
     assert "DROP COLUMN question_id" in downgrade_sql
     assert "DROP COLUMN commit_attempt_id" in downgrade_sql
     assert "DROP COLUMN arguments_json" in downgrade_sql
+    assert "DROP CONSTRAINT ck_actions_policy_snapshot_complete" in downgrade_sql
+    assert "ck_actions_ck_actions_policy_snapshot_complete" not in downgrade_sql
     assert "DROP TABLE workspace_versions" in downgrade_sql
     assert "DROP TABLE artifact_blobs" in downgrade_sql
     assert "DROP TABLE writer_intents" in downgrade_sql

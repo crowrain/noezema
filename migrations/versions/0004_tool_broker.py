@@ -59,8 +59,16 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.drop_constraint("ck_actions_policy_snapshot_complete", "actions", type_="check")
-    op.drop_constraint("ck_actions_attempt_count_nonnegative", "actions", type_="check")
+    op.drop_constraint(
+        op.f("ck_actions_policy_snapshot_complete"),
+        "actions",
+        type_="check",
+    )
+    op.drop_constraint(
+        op.f("ck_actions_attempt_count_nonnegative"),
+        "actions",
+        type_="check",
+    )
     op.drop_column("actions", "attempt_count")
     op.drop_column("actions", "policy_reason")
     op.drop_column("actions", "policy_hash")
