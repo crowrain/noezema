@@ -24,3 +24,13 @@ limits, bounded output, and one fresh `--rm` container per action. The
 configured workspace is mounted read-only; transient writes are confined to
 the size-limited `/tmp`. Persistent writes must later pass through a separate
 typed and transactional workspace capability.
+
+For the production `noezema` account, install
+`infra/containers/storage.conf` as
+`/var/lib/noezema/.config/containers/storage.conf` with owner `root:root` and
+mode `0644`. Create `/var/lib/noezema-containers/storage` as
+`noezema:noezema 0700`. The separate graph root is required because the
+host-journal parent `/var/lib/noezema` is deliberately protected as
+`root:noezema-host 2750`; placing overlay mounts below that group-owned parent
+prevents `crun` from making the merged root private inside the rootless user
+namespace.
