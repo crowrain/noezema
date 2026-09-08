@@ -303,6 +303,11 @@ class OciSandboxRunner:
             container_workdir = f"/workspace/{arguments.cwd}"
         execution_root = self._validate_workspace_root(workspace_root or self.workspace_root)
         mount = f"type=bind,source={execution_root},target=/workspace,readonly"
+        user_namespace = (
+            (f"--userns=keep-id:uid={self.profile.user_id},gid={self.profile.group_id}",)
+            if self.profile.runtime == "podman"
+            else ()
+        )
         return (
             self.profile.runtime,
             "run",
@@ -316,6 +321,7 @@ class OciSandboxRunner:
             "--read-only",
             "--cap-drop=ALL",
             "--security-opt=no-new-privileges",
+            *user_namespace,
             f"--user={self.profile.user_id}:{self.profile.group_id}",
             f"--cpus={cpu_value}",
             f"--memory={self.profile.memory_bytes}",

@@ -25,6 +25,11 @@ configured workspace is mounted read-only; transient writes are confined to
 the size-limited `/tmp`. Persistent writes must later pass through a separate
 typed and transactional workspace capability.
 
+For Podman, the runner also uses `keep-id` to map the fixed non-root container
+UID and GID to the rootless service account. This lets the process read private
+workspace snapshots owned by that account without weakening host-directory
+permissions or making the container process root.
+
 For the production `noezema` account, install
 `infra/containers/storage.conf` as
 `/var/lib/noezema/.config/containers/storage.conf` with owner `root:root` and

@@ -120,6 +120,7 @@ def test_shell_command_is_only_an_inner_container_argument(
     assert "--read-only" in argv
     assert "--cap-drop=ALL" in argv
     assert "--security-opt=no-new-privileges" in argv
+    assert "--userns=keep-id:uid=65532,gid=65532" in argv
     assert "--pull=never" in argv
     assert any(item.startswith("--pids-limit=") for item in argv)
     assert any(item.startswith("--memory=") for item in argv)
@@ -148,6 +149,27 @@ def test_python_uses_isolated_mode_and_never_host_python(
 
     assert argv[-5:] == ("python3", "-I", "-B", "-c", code)
     assert sys.executable not in argv
+
+
+def test_docker_profile_does_not_receive_podman_user_namespace_syntax(
+    tmp_path: Path,
+    sandbox_profile: SandboxProfile,
+) -> None:
+    docker_profile = sandbox_profile.model_copy(update={"runtime": "docker"})
+    runner = OciSandboxRunner(
+        profile=docker_profile,
+        workspace_root=tmp_path,
+        transport=_FakeTransport(),
+    )
+
+    argv = runner.build_run_argv(
+        container_name="noezema-test",
+        session_id="session",
+        tool=ToolName.PYTHON_EXECUTE,
+        arguments=PythonExecuteArguments(code="print('ok')"),
+    )
+
+    assert not any(item.startswith("--userns=keep-id") for item in argv)
 
 
 def test_non_rootless_runtime_is_rejected_before_container_start(
