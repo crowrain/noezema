@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import stat
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
@@ -315,10 +316,18 @@ def _present(path: Path) -> bool:
 
 
 def _read_bounded_regular_file(path: Path, *, maximum_bytes: int = _MAX_SNAPSHOT_BYTES) -> bytes:
-    metadata = path.lstat()
-    if path.is_symlink() or not path.is_file() or not 1 <= metadata.st_size <= maximum_bytes:
-        raise ValueError("host status input must be a bounded regular file")
-    return path.read_bytes()
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError("host status input must be a bounded regular file")
+        content = os.read(descriptor, maximum_bytes + 1)
+        if not 1 <= len(content) <= maximum_bytes:
+            raise ValueError("host status input must be a bounded regular file")
+        return content
+    finally:
+        os.close(descriptor)
 
 
 def _aware(value: datetime) -> datetime:

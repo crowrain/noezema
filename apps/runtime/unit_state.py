@@ -125,10 +125,21 @@ def _fsync_directory(path: Path) -> None:
 
 
 def _read_regular_file(path: Path, maximum_bytes: int) -> bytes:
-    metadata = path.lstat()
-    if path.is_symlink() or not path.is_file() or not 1 <= metadata.st_size <= maximum_bytes:
-        raise RuntimeError(f"{path} is not a bounded regular file")
-    return path.read_bytes()
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise RuntimeError(f"{path} is not a bounded regular file") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise RuntimeError(f"{path} is not a bounded regular file")
+        content = os.read(descriptor, maximum_bytes + 1)
+        if not 1 <= len(content) <= maximum_bytes:
+            raise RuntimeError(f"{path} is not a bounded regular file")
+        return content
+    finally:
+        os.close(descriptor)
 
 
 def _aware(value: datetime) -> datetime:
