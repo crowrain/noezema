@@ -150,9 +150,7 @@ class FilesystemHostStatusReader:
                         HostTransitionEventProjection(
                             event_seq=event.event_seq,
                             from_state=(
-                                event.from_state.value
-                                if event.from_state is not None
-                                else None
+                                event.from_state.value if event.from_state is not None else None
                             ),
                             to_state=event.to_state.value,
                             actor=event.actor,
