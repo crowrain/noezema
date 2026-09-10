@@ -23,7 +23,6 @@ def _show(unit: str, _properties: Sequence[str]) -> Mapping[str, str]:
             "Id": unit,
             "ActiveState": "active",
             "SubState": "active",
-            "Result": "success",
             "ConsistsOf": "noezema-worker.service noezema-orchestrator.service",
         }
     return {

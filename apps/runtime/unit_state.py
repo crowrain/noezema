@@ -15,6 +15,7 @@ from packages.domain import canonical_json_sha256
 
 _TARGET = "noezema-runtime.target"
 _PROPERTIES = ("Id", "ActiveState", "SubState", "Result")
+_TARGET_PROPERTIES = ("Id", "ActiveState", "SubState", "ConsistsOf")
 
 
 def publish_unit_state(
@@ -27,7 +28,7 @@ def publish_unit_state(
     observed_at = _aware((clock or (lambda: datetime.now(UTC)))())
     boot_id = UUID(_read_regular_file(boot_id_path, 128).decode("ascii").strip())
     show = show_unit or _systemctl_show
-    target_values = show(_TARGET, (*_PROPERTIES, "ConsistsOf"))
+    target_values = show(_TARGET, _TARGET_PROPERTIES)
     member_names = tuple(sorted(set(target_values.get("ConsistsOf", "").split())))
     if not member_names or any(not name.endswith(".service") for name in member_names):
         raise RuntimeError("runtime target has no valid ConsistsOf service inventory")
@@ -87,11 +88,12 @@ def _systemctl_show(unit: str, properties: Sequence[str]) -> Mapping[str, str]:
 def _unit_projection(expected_name: str, values: Mapping[str, str]) -> dict[str, str]:
     if values.get("Id") != expected_name:
         raise RuntimeError(f"systemd returned the wrong unit identity for {expected_name}")
+    result = values.get("Result") or ("success" if expected_name == _TARGET else "unknown")
     return {
         "name": expected_name,
         "active_state": values.get("ActiveState") or "unknown",
         "sub_state": values.get("SubState") or "unknown",
-        "result": values.get("Result") or "unknown",
+        "result": result,
     }
 
 
