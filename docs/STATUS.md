@@ -177,7 +177,16 @@ gateway-settings, а не из секции `model` снапшота (T1.7 «ч�
 `tests/fakes/fake_openai_server.py`: `delay_seconds` у scripted response (имитация медленной
 модели). Полная проверка: ruff + mypy strict + pytest 374.
 
-Серия реальных MVP-сессий (замер нагрузки, precondition M4) продолжается повторной сессией
-после T3.30.
+**Повторная реальная сессия после T3.30 — SUCCEEDED (фикс подтверждён на реальной модели).**
+Сессия `e6a30c19` (qwen36-35b-a3b-q6-mtp, `max_output_tokens=4096`, «Сколько будет 6*7?»),
+длительность 4 мин 1 с: explorer 2 вызова (in 888/973, out 545/1195, **68.9 с и 143.4 с** —
+второй в 4.8 раза длиннее TTL 30 с, guard пережил), sandbox `python.execute` → «42»,
+куратор (in 600, out 1841, 24.4 с, schema_valid) → staging claim+evidence → fenced commit
+(prepared 16:25:45.234 → committed 16:25:45.280, 46 мс, staging_hash `b03167b7…`) →
+claim «6 * 7 = 42» (computed_result) + evidence computation (identity_hash `d49ab144…`) +
+assessment **E2 / supported / confidence 0.55** (только rules engine, rules_hash
+`19aed59f…`) → manifest `cf155a67…` (1 файл, 25 Б) → outbox 26 событий, вопрос →
+`verified`, wake: `consecutive_failures=0, node_state=idle`. БД `noezema_mvp` сохранена как
+доказательство (фореинзика — в отчёте по сессии).
 
 Merge в `main` — отдельное решение (не выполняется автоматически).

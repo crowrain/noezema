@@ -374,7 +374,9 @@ host recovery. После этой вехи — merge MVP в `main`.
 llama.cpp на 192.168.1.48, «Сколько будет 6*7?»): sandbox `python.execute` 56 мс, ответ модели 2 шага,
 fenced commit отклонён по истёкшему lease → T3.30; куратор: `reasoning_content` съедает бюджет
 `max_output_tokens` (2048 → пустой content, `finish_reason=length`, 3 ретрая ~84 с) → операционное
-решение: `max_output_tokens ≥ 4096` для реальной сессии. Повторная сессия после T3.30 — продолжение серии.
+решение: `max_output_tokens ≥ 4096` для реальной сессии. 2-я сессия (после T3.30, 2026-09-14) —
+**SUCCEEDED**: explorer 68.9 с + 143.4 с (4.8×TTL, guard), куратор 24.4 с (out 1841, schema_valid),
+fenced commit 46 мс, claim «6*7=42» → E2/supported/0.55, вопрос → verified; замер: серия продолжается.
 
 ---
 
