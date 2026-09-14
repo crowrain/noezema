@@ -41,7 +41,7 @@ BOOTSTRAP_PAYLOAD: dict[str, Any] = {
     },
     "embeddings": {"enabled": False, "dimensions": None},
     "prompts": {
-        "explorer": {"version": "explorer-v1", "path": "prompts/explorer.md"},
+        "explorer": {"version": "explorer-v2", "path": "prompts/explorer.md"},
         "curator": {"version": "curator-v1", "path": "prompts/curator.md"},
     },
     "policy": {

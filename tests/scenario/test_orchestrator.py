@@ -223,6 +223,85 @@ async def test_budget_exhausted_partial(migrated_db, fake_llm: FakeLLM, tmp_path
     assert question_state == QuestionState.PARTIALLY_ANSWERED.value
 
 
+TOOL_DENIED: JsonDict = {
+    "public_rationale": "Попробовать недопустимый инструмент",
+    "decision": {
+        "kind": "tool",
+        "tool": "web.fetch",
+        "arguments": {"url": "https://example.com"},
+    },
+}
+
+
+@pytest.mark.asyncio
+async def test_policy_denies_and_session_continues(
+    migrated_db, fake_llm: FakeLLM, tmp_path: Path
+) -> None:
+    """A tool outside the profile is denied by the Policy Engine: the action
+    is never executed, the decision is audited, the model sees the denial,
+    and the session continues (T2.5)."""
+    scratch_url, _engine = migrated_db
+    question_id = await _seed_question(scratch_url)
+
+    fake_llm.script(
+        [
+            {"content": TOOL_DENIED},  # denied by policy
+            {"content": TOOL_PYTHON},  # allowed
+            {"content": COMPLETE},
+            {"content": CURATOR_OK},
+        ]
+    )
+    orch, gateway, engine = _make_orchestrator(scratch_url, fake_llm, tmp_path / "ws")
+    try:
+        outcome = await orch.run_session(question_id)
+    finally:
+        await gateway.close()
+        await engine.dispose()
+
+    assert outcome.final_state is SessionState.SUCCEEDED
+    assert outcome.termination_reason == "goal_reached"
+    assert outcome.steps == 3
+
+    engine = create_async_engine(scratch_url)
+    try:
+        sid = str(outcome.session_id)
+        async with engine.connect() as conn:
+            # both the denied and the allowed action rows exist
+            action_rows = (
+                await conn.execute(
+                    text("SELECT tool, policy_decision, state, error_code FROM actions WHERE session_id=:s"),
+                    {"s": sid},
+                )
+            ).fetchall()
+            actions = {r[0]: (r[1], r[2], r[3]) for r in action_rows}
+            policy_evaluated = (
+                await conn.execute(
+                    text(
+                        "SELECT payload FROM audit_events "
+                        "WHERE session_id=:s AND type='policy_evaluated' ORDER BY sequence"
+                    ),
+                    {"s": sid},
+                )
+            ).fetchall()
+    finally:
+        await engine.dispose()
+
+    assert set(actions) == {"web.fetch", "python.execute"}
+    d_decision, d_state, d_error = actions["web.fetch"]
+    a_decision, a_state, _a_error = actions["python.execute"]
+    assert d_decision in ("deny", "require_operator")
+    assert d_state == "failed"
+    assert d_error == f"policy:{d_decision}"
+    assert a_decision == "allow"
+    assert a_state == "completed"
+
+    # every tool decision produced a PolicyEvaluated audit row
+    assert len(policy_evaluated) == 2
+    assert policy_evaluated[0][0]["decision"] in ("deny", "require_operator")
+    assert policy_evaluated[1][0]["decision"] == "allow"
+    assert policy_evaluated[0][0]["profile_version"] == "sealed-v1"
+
+
 @pytest.mark.asyncio
 async def test_curator_failure_reports_but_commits(migrated_db, fake_llm: FakeLLM, tmp_path: Path) -> None:
     scratch_url, _engine = migrated_db

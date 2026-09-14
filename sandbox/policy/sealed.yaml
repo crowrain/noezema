@@ -2,6 +2,7 @@
 # No network, read-only rootfs, writes only to the session overlay.
 # The runtime enforces these options; the Policy Engine (M2) consumes the
 # tool/path rules from here.
+version: v1
 name: sealed
 network: none
 read_only_rootfs: true
@@ -20,9 +21,10 @@ tools:
   workspace.write: true
   python.execute: true
   shell.execute: true
-  memory.search: false      # M3
+  memory.search: true       # §5.7: все профили (сервис — M3)
   question.create: true     # staging, host-side
   message.reply: true       # staging, host-side
+  artifact.create: true     # M14, все профили (§5.7)
 paths:
   writable: ["/workspace"]
   readable: ["/base", "/workspace"]

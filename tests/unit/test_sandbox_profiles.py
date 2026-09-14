@@ -30,9 +30,18 @@ def test_profiles_load(name: str) -> None:
 @pytest.mark.unit
 def test_sealed_tools() -> None:
     profile = SandboxProfile.from_yaml(POLICY_DIR / "sealed.yaml")
-    for tool in ("workspace.read", "workspace.list", "workspace.write", "python.execute", "shell.execute"):
+    for tool in (
+        "workspace.read",
+        "workspace.list",
+        "workspace.write",
+        "python.execute",
+        "shell.execute",
+        "memory.search",
+        "question.create",
+        "message.reply",
+        "artifact.create",
+    ):
         assert profile.tool_allowed(tool), tool
-    assert not profile.tool_allowed("memory.search")
     assert not profile.tool_allowed("net.fetch")  # unknown tool -> denied by default
 
 

@@ -38,6 +38,7 @@ INIT_COMMAND = f"cp -a {BASE_PATH}/. {WORKSPACE_PATH}/ 2>/dev/null; exec sleep i
 
 _KNOWN_PROFILE_KEYS = frozenset(
     {
+        "version",
         "name",
         "network",
         "read_only_rootfs",
@@ -74,6 +75,7 @@ class SandboxProfile(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    version: str = "v1"
     name: str
     network: str = "none"
     read_only_rootfs: bool = True

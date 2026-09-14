@@ -2,6 +2,7 @@
 # Расширенный экспериментальный режим: пока НЕ включается по умолчанию;
 # включение требует отдельного operator command (M7) и остаётся под
 # теми же hard-лимитами ресурсов.
+version: v1
 name: open_lab
 network: none               # до M6 сеть запрещена во всех профилях
 read_only_rootfs: true
@@ -23,6 +24,7 @@ tools:
   memory.search: true
   question.create: true
   message.reply: true
+  artifact.create: true
   research.fetch: false
 paths:
   writable: ["/workspace"]

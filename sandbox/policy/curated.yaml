@@ -1,5 +1,6 @@
 # Curated profile — заготовка (M2 T2.2), активируется с Research Proxy (M6).
 # Network через Research Proxy только, read-only rootfs сохраняется.
+version: v1
 name: curated
 network: none               # M6: research-proxy (только через прокси)
 read_only_rootfs: true
@@ -21,6 +22,7 @@ tools:
   memory.search: true
   question.create: true
   message.reply: true
+  artifact.create: true
   research.fetch: false     # M6, через Research Proxy
 paths:
   writable: ["/workspace"]

@@ -62,7 +62,7 @@ def test_real_prompts_are_versioned() -> None:
 
     explorer = load_prompt(Role.EXPLORER)
     curator = load_prompt(Role.CURATOR)
-    assert explorer.version == "explorer-v1"
+    assert explorer.version == "explorer-v2"
     assert curator.version == "curator-v1"
     assert len(explorer.sha256) == 64
     assert len(curator.sha256) == 64

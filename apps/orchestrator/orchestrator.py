@@ -6,12 +6,16 @@ Flow: waking → orienting → selecting_question → planning → exploring
 (M1 "simple commit": terminal state + audit + outbox in one transaction;
 fenced commit with staging lands in M2).
 
-M1 boundaries (deliberate):
-  - no lease/heartbeat/reconciliation (M2);
-  - single session at a time, enforced by checking nonterminal sessions;
-  - claims/evidence are in-memory, recorded in the final audit payload —
-    durable knowledge tables land in M3;
-  - policy is stub-allow (the Policy Engine lands in M2).
+M2 state (after this PR):
+  - every tool decision is authorized by the Policy Engine against the
+    capability profile from the config snapshot; the decision is recorded
+    as PolicyEvaluated (allow / deny / require_operator);
+  - a denied or require_operator action is never executed; the model gets
+    the denial reason back as an observation (interactive operator approval
+    lands with the full web in M7);
+  - only profile-allowed tools appear in the model's context (T2.6);
+  - still deferred: lease/heartbeat/reconciliation (PR #15), durable
+    knowledge tables (M3).
 """
 
 from __future__ import annotations
@@ -22,9 +26,6 @@ from dataclasses import dataclass, field
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from apps.orchestrator.evidence import observation_to_evidence
-
-# idempotency class per tool (shared with the executor)
-from apps.orchestrator.executor import _IDEMPOTENCY as _IDEMPOTENCY_BY_TOOL
 from apps.orchestrator.executor import StubToolExecutor, arguments_hash
 from apps.orchestrator.state_machine import transition
 from packages.cognition.question_selector import FIFOQuestionSelector
@@ -39,7 +40,6 @@ from packages.domain.models.enums import (
     DecisionKind,
     IdempotencyClass,
     MessageState,
-    PolicyDecision,
     QuestionOrigin,
     QuestionState,
     SessionState,
@@ -58,16 +58,9 @@ from packages.llm_gateway.client import LLMError, LLMMiddleware
 from packages.llm_gateway.config import ModelProfile
 from packages.llm_gateway.fingerprint import build_model_fingerprint
 from packages.llm_gateway.roles import Role, load_prompt, tool_schema_hash
-
-TOOLS_FOR_SCHEMA_HASH = [
-    "workspace.read",
-    "workspace.list",
-    "workspace.write",
-    "python.execute",
-    "memory.search",
-    "question.create",
-    "message.reply",
-]
+from packages.policy.engine import PolicyEngine
+from packages.policy.profiles import CapabilityProfile, ProfileError, effective_profile
+from packages.policy.tools import get_tool
 
 PLAN_TEMPLATE = "Исследовать вопрос, собрать evidence инструментами, предложить claims."
 
@@ -129,6 +122,14 @@ class Orchestrator:
         snapshot = await ConfigService.get_effective(db)
         limits = snapshot.session_limits
 
+        # capability profile from the config snapshot (fail-closed):
+        # the snapshot may only narrow the YAML ceiling
+        try:
+            cap_profile = effective_profile(snapshot.policy)
+        except ProfileError as exc:
+            raise RuntimeError(f"capability profile unavailable: {exc}") from exc
+        policy_engine = PolicyEngine(cap_profile)
+
         session = ORMSession(state=SessionState.CREATED.value, config_snapshot_id=snapshot.id)
         await SessionRepository.create(db, session)
         await audit.record(
@@ -172,7 +173,9 @@ class Orchestrator:
         # exploring
         await self._transition(db, audit, session, SessionState.EXPLORING)
         max_steps = int(limits.get("max_explorer_steps", 10))
-        steps, stopped, aborted = await self._explorer_loop(db, audit, session, ctx, max_steps)
+        steps, stopped, aborted = await self._explorer_loop(
+            db, audit, session, ctx, max_steps, cap_profile, policy_engine
+        )
         if aborted:
             # ABORTING was set in the loop; finish as cancelled in the SAME
             # transaction so the audit trail of the aborted session survives.
@@ -242,9 +245,13 @@ class Orchestrator:
         session: ORMSession,
         ctx: SessionContext,
         max_steps: int,
+        cap_profile: CapabilityProfile,
+        policy_engine: PolicyEngine,
     ) -> tuple[int, bool, bool]:
         """Returns (steps_done, stop_requested, abort_requested)."""
         explorer = self.prompts[Role.EXPLORER]
+        # only profile-allowed tools are in the model's schema (T2.6)
+        allowed_tools = sorted(cap_profile.tools)
         steps = 0
         stop_requested = False
         abort_requested = False
@@ -262,12 +269,12 @@ class Orchestrator:
                 ctx.complete_reason = CompleteReason.OPERATOR_STOP.value
                 break
 
-            user_ctx = self._explorer_context(ctx)
+            user_ctx = self._explorer_context(ctx, allowed_tools)
             fingerprint = build_model_fingerprint(
                 self.profile,
                 prompt_version=explorer.version,
-                tool_schema_hash=tool_schema_hash(TOOLS_FOR_SCHEMA_HASH),
-                policy_version="sealed-m1-stub",
+                tool_schema_hash=tool_schema_hash(allowed_tools),
+                policy_version=cap_profile.policy_version,
             )
             try:
                 response, record = await self.gateway.chat(
@@ -310,23 +317,66 @@ class Orchestrator:
                 )
                 break
 
-            # tool decision
+            # tool decision — authorized by the Policy Engine (§5.6)
             tool_name = decision.tool
             if tool_name is None:  # schema validation makes this unreachable
                 raise LLMError("tool decision without tool name")
             args: JsonDict = decision.arguments
             args_hash = arguments_hash(args)
+            spec = get_tool(tool_name)
+            evaluation = policy_engine.evaluate(tool_name, args, external_texts=ctx.messages)
+            await audit.record(
+                AuditEventType.POLICY_EVALUATED,
+                session_id=session.id,
+                actor="policy-engine",
+                payload={
+                    "tool": tool_name,
+                    "decision": evaluation.decision.value,
+                    "reasons": list(evaluation.reasons),
+                    "arguments_hash": evaluation.arguments_hash,
+                    "profile_version": evaluation.profile_version,
+                    "similarity_signal": evaluation.similarity_signal,
+                },
+                public_summary=f"policy {evaluation.decision.value}: {tool_name}",
+            )
+
             action = ORMAction(
                 session_id=session.id,
                 model_run_id=run.id,
                 idempotency_key=f"{turn_id}:{tool_name}:{args_hash[:32]}",
-                idempotency_class=_IDEMPOTENCY_BY_TOOL.get(tool_name, IdempotencyClass.PURE).value,
+                idempotency_class=(
+                    spec.idempotency_class.value if spec is not None else IdempotencyClass.NON_IDEMPOTENT.value
+                ),
                 tool=tool_name,
                 arguments_hash=args_hash,
-                policy_decision=PolicyDecision.ALLOW.value,  # M2: real Policy Engine
-                state=ActionState.STARTED.value,
+                policy_decision=evaluation.decision.value,
+                state=ActionState.POLICY_EVALUATED.value,
             )
             await ActionRepository.create(db, action)
+
+            if not evaluation.allowed:
+                # deny / require_operator: the action is NEVER executed;
+                # the model gets the reason back as an observation.
+                action.state = ActionState.FAILED.value
+                action.error_code = f"policy:{evaluation.decision.value}"
+                await audit.record(
+                    AuditEventType.ACTION_FAILED,
+                    session_id=session.id,
+                    payload={
+                        "action_id": str(action.id),
+                        "denied": True,
+                        "reasons": list(evaluation.reasons),
+                    },
+                    public_summary=f"action denied by policy: {tool_name}",
+                )
+                ctx.observations.append(
+                    f"[{step}] {tool_name} ОТКЛОНЕНО политикой: {'; '.join(evaluation.reasons)[:300]}"
+                )
+                continue
+
+            # allow: proposed → accepted → started
+            action.state = ActionState.ACCEPTED.value
+            action.state = ActionState.STARTED.value
             await audit.record(
                 AuditEventType.ACTION_STARTED,
                 session_id=session.id,
@@ -378,10 +428,12 @@ class Orchestrator:
             return question
         return await self.selector.select(db)
 
-    def _explorer_context(self, ctx: SessionContext) -> str:
+    def _explorer_context(self, ctx: SessionContext, allowed_tools: list[str]) -> str:
         parts = [
             f"# Вопрос\n{ctx.question_text}",
             f"# План\n{ctx.plan}",
+            f"# Доступные инструменты\n{', '.join(allowed_tools)}\n"
+            "Только этот список существует; другие инструменты вызывать нельзя.",
         ]
         if ctx.observations:
             parts.append("# Наблюдения\n" + "\n".join(ctx.observations[-15:]))
