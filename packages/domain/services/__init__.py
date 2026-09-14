@@ -1,6 +1,5 @@
-"""Domain services layer."""
+"""Domain services (M1/T1.6: audit)."""
 
-from packages.domain.services.memory_service import MemoryService
-from packages.domain.services.curator_service import CuratorService
+from packages.domain.services import audit
 
-__all__ = ["MemoryService", "CuratorService"]
+__all__ = ["audit"]

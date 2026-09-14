@@ -2,16 +2,39 @@ name: CI
 
 on:
   push:
-    branches: [main, branch-qwen3.6-27b, develop]
+    branches: [main, develop, impl/from-scratch]
   pull_request:
-    branches: [main]
+    branches: [main, impl/from-scratch]
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install --upgrade uv
+      - run: uv pip install --system ".[dev]"
+      - name: ruff
+        run: ruff check .
+
+  types:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install --upgrade uv
+      - run: uv pip install --system ".[dev]"
+      - name: mypy
+        run: mypy packages apps hostctl
+
   test:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python-version: ["3.11"]
     services:
       postgres:
         image: postgres:15-alpine
@@ -26,16 +49,22 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
+    env:
+      NOEZEMA_TEST_DATABASE_URL: postgresql+asyncpg://noezema:noezema_dev@localhost:5432/noezema
     steps:
       - uses: actions/checkout@v4
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: "3.11"
           cache: pip
-      - name: Install uv
-        run: pip install --upgrade uv
-      - name: Install dependencies
-        run: uv pip install --system ".[dev]" aiosqlite
+      - run: pip install --upgrade uv
+      - run: uv pip install --system ".[dev]"
       - name: Run tests
-        run: python -m pytest tests/ -v --tb=short
+        run: python -m pytest -v --tb=short
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build dev image
+        run: docker build -f Dockerfile -t noezema-dev:ci .

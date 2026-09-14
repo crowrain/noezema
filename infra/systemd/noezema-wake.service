@@ -1,0 +1,21 @@
+# NOEZEMA wake tick (T3.29, §5.2.1).
+#
+# One tick: evaluate the wake schedule (wake_schedule section of the
+# effective config snapshot) + the admission gates, then run one session
+# if admitted. wait/skip is not an error (exit 0); exit 78 is the
+# fail-closed state (broken effective config), exit 1 an admitted session
+# that failed (counted into the backoff). The schedule itself lives in the
+# snapshot; the timer only provides the tick cadence.
+[Unit]
+Description=NOEZEMA wake tick
+Documentation=man:noezemactl(1)
+After=network.target
+PartOf=noezema-runtime.target
+
+[Service]
+Type=oneshot
+User=noezema
+EnvironmentFile=-/etc/noezema/noezema.env
+ExecStart=/usr/lib/noezema/venv/bin/python -m hostctl.cli wake-tick
+# a session may run up to session_timeout_seconds (1800s); leave margin
+TimeoutStartSec=3600

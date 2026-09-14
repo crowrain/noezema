@@ -1,57 +1,57 @@
-"""Alembic environment — async support via SQLAlchemy."""
+"""Alembic environment: async engine over NOEZEMA_DATABASE_URL (T1.3)."""
+
+from __future__ import annotations
 
 import asyncio
+import os
 from logging.config import fileConfig
 
 from alembic import context
 from sqlalchemy import pool
-from sqlalchemy.ext.asyncio import create_async_engine
-
-from packages.domain.models.base import Base
-# Import all ORM models so Base.metadata knows them
-from packages.domain.models.orm_session import *  # noqa: F401, F403
-from packages.domain.models.orm_claim import *    # noqa: F401, F403
+from sqlalchemy.engine import Connection
+from sqlalchemy.ext.asyncio import async_engine_from_config
 
 config = context.config
+
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-target_metadata = Base.metadata
+target_metadata = None  # hand-written migrations, no autogenerate in v1
+
+DEFAULT_URL = "postgresql+asyncpg://noezema:noezema_dev@127.0.0.1:5432/noezema"
+
+
+def _database_url() -> str:
+    return os.environ.get("NOEZEMA_DATABASE_URL", DEFAULT_URL)
 
 
 def run_migrations_offline() -> None:
-    """Run migrations in 'offline' mode."""
-    url = config.get_main_option("sqlalchemy.url")
-    context.configure(
-        url=url,
-        target_metadata=target_metadata,
-        literal_binds=True,
-        dialect_opts={"paramstyle": "named"},
-    )
+    url = _database_url()
+    context.configure(url=url, target_metadata=target_metadata, literal_binds=True)
     with context.begin_transaction():
         context.run_migrations()
 
 
-def do_run_migrations(connection) -> None:
+def _do_run_migrations(connection: Connection) -> None:
     context.configure(connection=connection, target_metadata=target_metadata)
     with context.begin_transaction():
         context.run_migrations()
 
 
-async def run_migrations_online() -> None:
-    """Run migrations in 'online' async mode."""
-    import os
-    url = os.environ.get("DATABASE_URL") or config.get_main_option("sqlalchemy.url")
-    connectable = create_async_engine(
-        url,
-        poolclass=pool.NullPool,
-    )
+async def _run_async_migrations() -> None:
+    section = config.get_section(config.config_ini_section, {})
+    section["sqlalchemy.url"] = _database_url()
+    connectable = async_engine_from_config(section, prefix="sqlalchemy.", poolclass=pool.NullPool)
     async with connectable.connect() as connection:
-        await connection.run_sync(do_run_migrations)
+        await connection.run_sync(_do_run_migrations)
     await connectable.dispose()
+
+
+def run_migrations_online() -> None:
+    asyncio.run(_run_async_migrations())
 
 
 if context.is_offline_mode():
     run_migrations_offline()
 else:
-    asyncio.run(run_migrations_online())
+    run_migrations_online()

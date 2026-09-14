@@ -1,0 +1,31 @@
+# NOEZEMA host recovery policy — packaged baseline (schema v1).
+#
+# This file is hash-pinned by CI (T3.17). It is the ONLY trusted source of
+# the durable backoff policy and the emergency envelope for a present-but-
+# invalid override. The optional operator override lives at
+# /etc/noezema/host-recovery.toml and is changed ONLY by
+# `noezemactl install-host-recovery-policy`.
+#
+# Schema v1 REQUIRES resume_retry_jitter = 0.0 (single-node: there is
+# nothing to decorrelate). A non-zero jitter is a validation error.
+
+schema_version = 1
+
+# first retry backoff
+resume_retry_initial = "30s"
+# exponential multiplier (>= 1)
+resume_retry_multiplier = 2.0
+# backoff ceiling (a DB outage stays in retry_wait with this long backoff,
+# unbounded, and resolves on its own)
+resume_retry_max = "30min"
+# REQUIRED to be 0.0 in schema v1
+resume_retry_jitter = 0.0
+# a warning (not a block) is raised after this much accumulated retry time;
+# the retry continues and the backoff resets after a clean admission
+resume_retry_escalate_after = "15min"
+# the retry timer period (<= resume_retry_initial)
+retry_timer_period = "30s"
+# explicit timer accuracy (0 < accuracy < period); domain jitter is zero
+retry_timer_accuracy = "1s"
+# the maintenance flock is held at most this long (bounded retry/backoff)
+maintenance_flock_deadline = "2s"

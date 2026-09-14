@@ -1,0 +1,17 @@
+# NOEZEMA resume failure handler (T3.14, §8.7.1.1).
+#
+# Triggered by OnFailure= of a resume/retry unit. It replays the host
+# events into the DB audit (idempotent by (attempt_id, event_seq)) and
+# raises the critical alert for a resume_blocked outcome. A crash-loop of
+# the resume unit itself is separated from "the DB is not answering" and
+# lands in resume_degraded, not a permanent block.
+[Unit]
+Description=NOEZEMA resume failure handler for %i
+Documentation=man:noezemactl(1)
+ConditionPathExists=/var/lib/noezema
+
+[Service]
+Type=oneshot
+User=root
+EnvironmentFile=-/etc/noezema/noezema.env
+ExecStart=/usr/lib/noezema/venv/bin/python -m hostctl.cli resume-runtime --reason "resume-failure:%i"

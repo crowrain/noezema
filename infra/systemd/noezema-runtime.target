@@ -1,0 +1,15 @@
+# NOEZEMA cognitive runtime target (T3.13, §8.7.1.1).
+#
+# The target aggregates every cognitive-runtime member. Members use
+# Requires=/After= so a stop of the target stops all members, and the
+# admission service is the gate: the members may only become active after
+# admission passes. A stop of the target is the maintenance stop used by
+# the offline rules unit (which then verifies every member is inactive).
+[Unit]
+Description=NOEZEMA cognitive runtime
+Documentation=man:noezemactl(1)
+Requires=noezema-runtime-admission.service
+After=noezema-runtime-admission.service network.target
+
+[Install]
+WantedBy=multi-user.target

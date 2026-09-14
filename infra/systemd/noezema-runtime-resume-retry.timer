@@ -1,0 +1,21 @@
+# NOEZEMA resume retry timer (T3.14, §8.7.1.1).
+#
+# Explicit accuracy, zero domain jitter (schema v1). The period is bounded
+# by resume_retry_initial and the accuracy is strictly inside the period,
+# both validated by the policy helper.
+[Unit]
+Description=NOEZEMA resume retry timer
+Documentation=man:noezemactl(1)
+Requires=noezema-runtime-resume-retry.service
+Before=noezema-runtime-resume-retry.service
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=30s
+AccuracySec=1s
+RandomizedDelaySec=0
+Persistent=false
+Unit=noezema-runtime-resume-retry.service
+
+[Install]
+WantedBy=timers.target

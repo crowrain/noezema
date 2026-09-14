@@ -1,128 +1,59 @@
-"""Noezema Orchestrator — CLI entry point.
+"""Orchestrator entry point: run one cognitive session (M1).
 
-Usage:
-    python -m apps.orchestrator.main [--config path] [--once]
-
-Runs the orchestrator loop: pick unresolved question → explore → assess → commit.
-With --once: run a single session and exit.
-Without: continuous loop with heartbeat.
+Usage: python -m apps.orchestrator
 """
 
-import argparse
+from __future__ import annotations
+
 import asyncio
-import logging
-import signal
-import sys
+from pathlib import Path
 
-from packages.domain.db_config import Database, DatabaseConfig
-from packages.llm_gateway.config import LLMGatewayConfig
-from packages.llm_gateway.client import LLMMiddleware
-from packages.cognition.question_selector import FIFOQuestionSelector
-from packages.tool_broker.sandbox import SandboxExecutor
-from packages.memory.rules_engine import RulesEngine
-from packages.domain.services.curator_service import CuratorService
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+
+from apps.orchestrator.executor import StubToolExecutor
 from apps.orchestrator.orchestrator import Orchestrator
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
-log = logging.getLogger("noezema.orchestrator")
+from packages.domain.db.engine import DatabaseSettings
+from packages.llm_gateway.client import LLMMiddleware
+from packages.llm_gateway.config import LLMGatewayConfig, ModelProfile
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Noezema Orchestrator")
-    parser.add_argument(
-        "--config",
-        default=None,
-        help="Path to YAML config (db.url, llm.base_url, etc.)",
+def build_orchestrator(
+    session_factory: async_sessionmaker[AsyncSession], workspace_root: Path
+) -> tuple[Orchestrator, LLMMiddleware]:
+    """Assemble gateway + profile + executor + orchestrator (T3.29).
+
+    Shared by the manual entry point and the wake tick so both run the
+    exact same session pipeline. The caller closes the gateway.
+    """
+    llm_config = LLMGatewayConfig()
+    profile = ModelProfile(model_alias=llm_config.model, backend_name="local")
+    gateway = LLMMiddleware(llm_config)
+    orchestrator = Orchestrator(
+        session_factory=session_factory,
+        gateway=gateway,
+        profile=profile,
+        executor=StubToolExecutor(workspace_root),
     )
-    parser.add_argument(
-        "--once",
-        action="store_true",
-        help="Run a single session then exit",
-    )
-    parser.add_argument(
-        "--db-url",
-        default="postgresql+asyncpg://noezema:noezema_dev@localhost:5432/noezema",
-        help="Database URL",
-    )
-    parser.add_argument(
-        "--llm-base-url",
-        default="http://localhost:8080/v1",
-        help="LLM OpenAI-compatible base URL",
-    )
-    parser.add_argument(
-        "--llm-model",
-        default="qwen3.6-27b-q6",
-        help="Model name",
-    )
-    parser.add_argument(
-        "--loop-interval",
-        type=int,
-        default=30,
-        help="Seconds between loops (default: 30)",
-    )
-    return parser.parse_args()
+    return orchestrator, gateway
 
 
-async def run_once(orchestrator: Orchestrator) -> None:
-    """Run a single session and exit."""
-    session_id = await orchestrator.run_session()
-    log.info("Session completed: %s", session_id)
-
-
-async def run_loop(orchestrator: Orchestrator, interval: int) -> None:
-    """Continuous loop with graceful shutdown."""
-    stop_event = asyncio.Event()
-
-    def handle_signal():
-        log.info("Signal received, finishing current session...")
-        stop_event.set()
-
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, handle_signal)
-
-    while not stop_event.is_set():
-        try:
-            session_id = await orchestrator.run_session()
-            log.info("Session completed: %s — sleeping %ds", session_id, interval)
-            await asyncio.wait_for(stop_event.wait(), timeout=interval)
-        except Exception as e:
-            log.error("Session failed: %s — retrying in %ds", e, interval, exc_info=True)
-            await asyncio.wait_for(stop_event.wait(), timeout=interval)
-
-    log.info("Orchestrator stopped.")
-
-
-async def main() -> None:
-    args = parse_args()
-
-    # Init DB from env or CLI args
-    db_config = DatabaseConfig(url=args.db_url)
-    Database.init(db_config)
-    log.info("Database initialized: %s", args.db_url.replace("noezema_dev", "***"))
-
-    # Init LLM from env or CLI args (CLI overrides env)
-    llm_config = LLMGatewayConfig.from_env()
-    if args.llm_base_url != "http://localhost:8080/v1":
-        llm_config.base_url = args.llm_base_url
-    if args.llm_model != "qwen3.6-27b-q6":
-        llm_config.model = args.llm_model
-
-    log.info("LLM: %s @ %s", llm_config.model, llm_config.base_url)
-
-    orchestrator = Orchestrator(llm_config)
-
+async def _run() -> int:
+    settings = DatabaseSettings()
+    engine = create_async_engine(settings.database_url)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    orchestrator, gateway = build_orchestrator(factory, Path("/var/lib/noezema/workspace"))
     try:
-        if args.once:
-            await run_once(orchestrator)
-        else:
-            await run_loop(orchestrator, args.loop_interval)
+        outcome = await orchestrator.run_session()
     finally:
-        await orchestrator.close()
+        await gateway.close()
+        await engine.dispose()
+    print(
+        f"session {outcome.session_id} -> {outcome.final_state.value} "
+        f"steps={outcome.steps} evidence={outcome.evidence_count} "
+        f"reason={outcome.termination_reason}"
+    )
+    return 0 if outcome.final_state.value in ("succeeded", "succeeded_partial") else 1
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    raise SystemExit(asyncio.run(_run()))

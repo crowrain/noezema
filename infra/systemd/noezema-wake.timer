@@ -1,0 +1,23 @@
+# NOEZEMA wake tick timer (T3.29, §5.2.1).
+#
+# Ticks every 5 minutes — finer than the base schedule (default 1 h), so
+# the effective wake time is the snapshot's wake_schedule, not the timer
+# period. The timer stops together with noezema-runtime.target (PartOf of
+# the service), so a maintenance stop means no wakes; the admission gate
+# (activation slot) is the second line of defence during an offline change.
+[Unit]
+Description=NOEZEMA wake tick timer
+Documentation=man:noezemactl(1)
+Requires=noezema-wake.service
+Before=noezema-wake.service
+
+[Timer]
+OnBootSec=15s
+OnUnitActiveSec=5m
+AccuracySec=1m
+RandomizedDelaySec=30
+Persistent=false
+Unit=noezema-wake.service
+
+[Install]
+WantedBy=timers.target

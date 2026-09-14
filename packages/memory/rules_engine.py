@@ -1,154 +1,204 @@
-"""Deterministic grade computation from evidence set (§3.7, §6.4).
+"""Rules engine v1 — the ONLY producer of grade and confidence (T3.3, T3.4,
+§3.7, §8.7).
 
-NOT the LLM. Not the verifier. Grade = f(evidence_set, claim_type_rules, scope).
+A rule is an EXECUTABLE structure over the evidence set (not a text hint):
+allowed kinds, minimum support count, minimum independence groups, scope
+coverage, as_of requirement and volatility. The function is
+deterministic and versioned (``rules-v1``); the LLM never proposes a
+number, and an operator attestation is not an input — it cannot raise
+the grade.
 """
 
-import hashlib
-import json
+from __future__ import annotations
 
-from packages.domain.models.enums import (
-    EffectiveGrade, EpistemicStatus, EvidenceRelation, ClaimType,
-)
-from packages.domain.models.claim import Claim, Evidence, ClaimAssessment
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+
+from packages.domain.models.base import JsonDict
+from packages.domain.models.enums import EffectiveGrade, EpistemicStatus
+
+RULES_ENGINE_VERSION = "rules-v1"
+
+VOLATILITY_REVERIFY_DAYS = {"static": 90, "configurable": 30, "temporal": 30}
+
+GRADE_CONFIDENCE_BASE = {
+    EffectiveGrade.E0: 0.10,
+    EffectiveGrade.E1: 0.30,
+    EffectiveGrade.E2: 0.55,
+    EffectiveGrade.E3: 0.75,
+    EffectiveGrade.E4: 0.95,
+}
 
 
-class RulesEngine:
-    CLAIM_TYPE_RULES = {
-        ClaimType.LOCAL_OBSERVATION: {"min_grade": EffectiveGrade.E2, "min_evidence": 1},
-        ClaimType.COMPUTED_RESULT: {"min_grade": EffectiveGrade.E2, "min_evidence": 1},
-        ClaimType.FORMAL_THEOREM: {"min_grade": EffectiveGrade.E4, "min_evidence": 1},
-        ClaimType.EMPIRICAL_CONJECTURE: {"min_grade": EffectiveGrade.E3, "min_evidence": 2},
-        ClaimType.PROCEDURAL: {"min_grade": EffectiveGrade.E3, "min_evidence": 2},
-        ClaimType.EXTERNAL_FACT: {"min_grade": EffectiveGrade.E3, "min_evidence": 2},
-        ClaimType.TEMPORAL_FACT: {"min_grade": EffectiveGrade.E3, "min_evidence": 2},
-        ClaimType.SELF_MODEL: {"min_grade": EffectiveGrade.E2, "min_evidence": 1},
-    }
+@dataclass(frozen=True)
+class ClaimTypeRule:
+    """One executable claim-type rule (from config_snapshots.claim_type_rules)."""
+
+    min_grade_for_supported: EffectiveGrade
+    allowed_kinds: frozenset[str]
+    min_support_evidence: int
+    min_independence_groups: int
+    requires_scope: bool
+    requires_as_of: bool
+    volatility: str
 
     @classmethod
-    def assess(cls, claim: Claim, evidence: list[Evidence]) -> ClaimAssessment:
-        supports = [e for e in evidence if e.relation == EvidenceRelation.SUPPORTS]
-        counters = [e for e in evidence if e.relation == EvidenceRelation.COUNTERS]
-
-        evidence_set_hash = cls._compute_evidence_hash(evidence)
-        grade = cls._compute_grade(supports, counters, claim.claim_type)
-        epistemic = cls._compute_epistemic_status(grade, counters)
-        confidence = cls._compute_confidence(grade)
-
-        return ClaimAssessment(
-            claim_id=claim.id,
-            effective_grade=grade,
-            epistemic_status=epistemic,
-            rules_version=1,
-            rules_hash=cls._rules_hash(),
-            evidence_set_hash=evidence_set_hash,
-            confidence=confidence,
-            created_in_session=claim.created_in_session,
+    def from_payload(cls, claim_type: str, payload: JsonDict) -> ClaimTypeRule:
+        if not payload:
+            raise ValueError(f"no rule for claim_type {claim_type!r}")
+        return cls(
+            min_grade_for_supported=EffectiveGrade(payload["min_grade_for_supported"]),
+            allowed_kinds=frozenset(payload.get("allowed_kinds", [])),
+            min_support_evidence=int(payload.get("min_support_evidence", 1)),
+            min_independence_groups=int(payload.get("min_independence_groups", 1)),
+            requires_scope=bool(payload.get("requires_scope", False)),
+            requires_as_of=bool(payload.get("requires_as_of", False)),
+            volatility=str(payload.get("volatility", "static")),
         )
 
-    @classmethod
-    def _compute_grade(
-        cls, supports: list[Evidence], counters: list[Evidence], claim_type: ClaimType
-    ) -> EffectiveGrade:
-        if not supports:
-            return EffectiveGrade.E0
+    @property
+    def reverify_days(self) -> int:
+        return VOLATILITY_REVERIFY_DAYS.get(self.volatility, 90)
 
-        distinct = {e.identity_hash for e in supports}
-        kinds = {e.evidence_kind for e in supports}
 
-        if len(distinct) >= 2 and len(kinds) >= 2:
-            grade = EffectiveGrade.E3
-        elif len(distinct) >= 1:
-            grade = EffectiveGrade.E2
-        else:
-            grade = EffectiveGrade.E0
+class RuleValidationError(ValueError):
+    """The rule cannot evaluate this evidence set (role/relation
+    inconsistency, unknown claim type, ...)."""
 
-        # Counters don't lower grade — they affect epistemic status
-        return grade
 
-    @classmethod
-    def _compute_epistemic_status(
-        cls, grade: EffectiveGrade, counters: list[Evidence]
-    ) -> EpistemicStatus:
-        if not counters and grade.level >= 2:
-            return EpistemicStatus.SUPPORTED
-        elif counters and grade.level >= 2:
-            return EpistemicStatus.DISPUTED
-        elif grade.level >= 2:
-            return EpistemicStatus.SUPPORTED
-        else:
-            return EpistemicStatus.HYPOTHESIS
+@dataclass(frozen=True)
+class EvaluatedEvidence:
+    """One evidence row as the rules engine sees it."""
 
-    @classmethod
-    def _compute_confidence(cls, grade: EffectiveGrade) -> float:
-        return {
-            EffectiveGrade.E0: 0.0,
-            EffectiveGrade.E1: 0.3,
-            EffectiveGrade.E2: 0.6,
-            EffectiveGrade.E3: 0.85,
-            EffectiveGrade.E4: 0.99,
-        }.get(grade, 0.0)
+    identity_hash: str
+    kind: str
+    relation: str  # supports | counters
+    scope: JsonDict = field(default_factory=dict)
+    independence_group: str = "unknown"
 
-    @classmethod
-    def _compute_evidence_hash(cls, evidence: list[Evidence]) -> str:
-        items = sorted(
-            [(e.identity_hash, e.evidence_kind.value, e.relation.value) for e in evidence]
-        )
-        return hashlib.sha256(json.dumps(items).encode()).hexdigest()
 
-    @classmethod
-    def _rules_hash(cls) -> str:
-        return hashlib.sha256(
-            json.dumps(cls.CLAIM_TYPE_RULES, default=str, sort_keys=True).encode()
-        ).hexdigest()
+@dataclass(frozen=True)
+class AssessmentResult:
+    grade: EffectiveGrade
+    epistemic_status: EpistemicStatus
+    confidence: float
+    reverify_after_days: int
+    reasons: tuple[str, ...]
 
-    @classmethod
-    def assess_from_dicts(
-        cls,
-        claim_statement: str,
-        claim_type: str,
-        evidence_dicts: list[dict],
-    ) -> dict:
-        """Assess a claim from raw dicts (no Pydantic models needed).
 
-        Returns dict with: grade (EffectiveGrade), status (EpistemicStatus),
-        confidence (float), rules_hash, evidence_set_hash.
-        """
-        # Build pseudo-Evidence objects for grade computation
-        from collections import namedtuple
-        _Ev = namedtuple("_Ev", ["identity_hash", "evidence_kind", "relation"])
+def _scope_covers(evidence_scope: JsonDict, claim_scope: JsonDict) -> bool:
+    """The evidence scope must COVER the claim scope: every claim key is
+    present in the evidence scope with a compatible (equal-or-unset)
+    value."""
+    for key, value in claim_scope.items():
+        if key not in evidence_scope:
+            return False
+        if value is not None and evidence_scope[key] not in (None, value):
+            return False
+    return True
 
-        supports = []
-        counters = []
-        for ed in evidence_dicts:
-            ev = _Ev(
-                identity_hash=ed.get("hash", ed.get("identity_hash", "")),
-                evidence_kind=ed.get("kind", ed.get("evidence_kind", "unknown")),
-                relation=ed.get("relation", "supports"),
+
+def evaluate(
+    claim_type: str,
+    rule: ClaimTypeRule,
+    claim_scope: JsonDict,
+    evidences: list[EvaluatedEvidence],
+    *,
+    has_as_of: bool,
+) -> AssessmentResult:
+    """Deterministic assessment of an evidence set against one rule.
+
+    Raises RuleValidationError on role/relation inconsistency (a kind not
+    in the allowed set used as support) so the caller rejects the staging
+    op instead of silently mis-weighing it.
+    """
+    support = [e for e in evidences if e.relation == "supports"]
+    counter = [e for e in evidences if e.relation == "counters"]
+
+    # role/relation inconsistency: a support evidence of a kind the rule
+    # does not allow is rejected, not silently dropped (§14.3)
+    for e in support:
+        if e.kind not in rule.allowed_kinds:
+            raise RuleValidationError(
+                f"support evidence kind {e.kind!r} not allowed for {claim_type}"
             )
-            if ed.get("relation") == EvidenceRelation.COUNTERS:
-                counters.append(ev)
-            else:
-                supports.append(ev)
 
-        # Compute grade
-        try:
-            ct = ClaimType(claim_type)
-        except ValueError:
-            ct = ClaimType.EXTERNAL_FACT  # default
-        grade = cls._compute_grade(supports, counters, ct)
-        status = cls._compute_epistemic_status(grade, counters)
-        confidence = cls._compute_confidence(grade)
+    groups = sorted({e.independence_group for e in support})
+    scope_ok = (not rule.requires_scope) or (bool(claim_scope) and all(
+        _scope_covers(e.scope, claim_scope) for e in support
+    )) if support else (not rule.requires_scope or not claim_scope)
+    as_of_ok = (not rule.requires_as_of) or has_as_of
 
-        # Evidence set hash
-        items = sorted(
-            [(e.identity_hash, e.evidence_kind, e.relation) for e in supports + counters]
+    reverify = rule.reverify_days
+    if not support and not counter:
+        status = EpistemicStatus.DEFERRED if (rule.requires_as_of and not has_as_of) else EpistemicStatus.HYPOTHESIS
+        return AssessmentResult(
+            grade=EffectiveGrade.E0,
+            epistemic_status=status,
+            confidence=0.05,
+            reverify_after_days=reverify,
+            reasons=("no_evidence",),
         )
-        evidence_set_hash = hashlib.sha256(json.dumps(items).encode()).hexdigest()
 
-        return {
-            "grade": grade,
-            "status": status,
-            "confidence": confidence,
-            "rules_hash": cls._rules_hash(),
-            "evidence_set_hash": evidence_set_hash,
-        }
+    if not support:
+        # counter only: the claim is refuted, nothing is supported
+        return AssessmentResult(
+            grade=EffectiveGrade.E0,
+            epistemic_status=EpistemicStatus.REFUTED,
+            confidence=0.5,
+            reverify_after_days=reverify,
+            reasons=("counterevidence_only",),
+        )
+
+    meets = (
+        len(support) >= rule.min_support_evidence
+        and len(groups) >= rule.min_independence_groups
+        and scope_ok
+        and as_of_ok
+    )
+
+    if counter:
+        # unresolved counterevidence: disputed, capped at E1 (§3.7)
+        grade = EffectiveGrade.E1
+        status = EpistemicStatus.DISPUTED
+        reasons = ("counterevidence_unresolved",)
+    elif meets:
+        grade = rule.min_grade_for_supported
+        # extra independent groups lift the grade by one step (never past E4)
+        if len(groups) >= 2 * rule.min_independence_groups and grade.level < 4:
+            grade = EffectiveGrade(grade.value[0] + str(grade.level + 1))
+        status = EpistemicStatus.SUPPORTED
+        reasons = ("requirements_met",)
+    else:
+        # some support, requirements not met: hypothesis (integrity checked)
+        grade = EffectiveGrade.E1
+        status = EpistemicStatus.HYPOTHESIS
+        if len(support) < rule.min_support_evidence:
+            reasons = ("insufficient_evidence",)
+        elif len(groups) < rule.min_independence_groups:
+            reasons = ("insufficient_independence",)
+        elif not scope_ok:
+            reasons = ("scope_not_covered",)
+        else:
+            reasons = ("as_of_missing",)
+
+    confidence = GRADE_CONFIDENCE_BASE[grade]
+    if counter:
+        confidence *= 0.6
+    if rule.min_independence_groups:
+        confidence *= min(1.0, len(groups) / rule.min_independence_groups)
+
+    return AssessmentResult(
+        grade=grade,
+        epistemic_status=status,
+        confidence=round(min(1.0, max(0.0, confidence)), 4),
+        reverify_after_days=reverify,
+        reasons=reasons,
+    )
+
+
+def reverify_after(result: AssessmentResult, as_of: datetime | None, now: datetime) -> datetime:
+    """reverify_after is derived from claim type/volatility/as_of (T3.7).
+    Only the freshness status may change with time — never the grade."""
+    base = as_of if (as_of is not None and result.reverify_after_days == 30) else now
+    return base + timedelta(days=result.reverify_after_days)

@@ -1,0 +1,21 @@
+# NOEZEMA unit-state publish timer (T3.16, §8.7.1.1).
+#
+# Publishes the unit-state snapshot roughly every second. The web treats a
+# snapshot older than its ttl_seconds (15s) as UNHEALTHY (fail-closed), so
+# a dead publisher degrades the web within 15s.
+[Unit]
+Description=NOEZEMA unit-state publish timer
+Documentation=man:noezemactl(1)
+Requires=noezema-unit-state.service
+Before=noezema-unit-state.service
+
+[Timer]
+OnBootSec=1s
+OnUnitActiveSec=1s
+AccuracySec=1s
+RandomizedDelaySec=0
+Persistent=false
+Unit=noezema-unit-state.service
+
+[Install]
+WantedBy=timers.target

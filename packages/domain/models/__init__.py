@@ -1,64 +1,27 @@
-"""Domain models package — Pydantic schemas + SQLAlchemy ORM."""
+"""Domain models: enums (M1/T1.1) + ORM objects (M1/T1.4)."""
 
-# Pydantic schemas (existing)
-from packages.domain.models.enums import (
-    SessionState,
-    DecisionKind,
-    EvidenceKind,
-    EvidenceRelation,
-    EffectiveGrade,
-    EpistemicStatus,
-    ClaimType,
-    AuditEventType,
-    ToolName,
-)
-
-# Pydantic business models
-from packages.domain.models.session import Session
-from packages.domain.models.decision import Decision, ModelResponse
-from packages.domain.models.claim import (
-    Claim,
-    Evidence,
-    ClaimAssessment,
-    ClaimAssessmentHead,
-)
-
-# SQLAlchemy ORM
-from packages.domain.models.base import Base
-from packages.domain.models.orm_session import (
-    ORMQuestion,
-    ORMSession,
-    ORMAction,
-    ORMModelRun,
-    ORMAuditEvent,
-    ORMMessage,
-    ORMCommitAttempt,
-)
-from packages.domain.models.orm_claim import (
-    ORMClaim,
-    ORMClaimDependency,
-    ORMCounterevidenceResolution,
-    ORMEvidence,
-    ORMClaimAssessment,
-    ORMClaimAssessmentHead,
-    ORMConfigSnapshot,
-    ORMDomainRevision,
+from packages.domain.models import (
+    artifacts,
+    commit,
+    config,
+    enums,
+    events,
+    inbox,
+    memory,
+    questions,
+    sessions,
+    wake,
 )
 
 __all__ = [
-    # Enums
-    "SessionState", "DecisionKind", "EvidenceKind", "EvidenceRelation",
-    "EffectiveGrade", "EpistemicStatus", "ClaimType", "AuditEventType", "ToolName",
-    # Pydantic
-    "Session", "Decision", "ModelResponse",
-    "Claim", "Evidence", "ClaimAssessment", "ClaimAssessmentHead",
-    # ORM Base
-    "Base",
-    # ORM Session
-    "ORMQuestion", "ORMSession", "ORMAction", "ORMModelRun",
-    "ORMAuditEvent", "ORMMessage", "ORMCommitAttempt",
-    # ORM Claim
-    "ORMClaim", "ORMClaimDependency", "ORMCounterevidenceResolution",
-    "ORMEvidence", "ORMClaimAssessment", "ORMClaimAssessmentHead",
-    "ORMConfigSnapshot", "ORMDomainRevision",
+    "artifacts",
+    "commit",
+    "config",
+    "enums",
+    "events",
+    "inbox",
+    "memory",
+    "questions",
+    "sessions",
+    "wake",
 ]

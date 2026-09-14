@@ -1,32 +1,19 @@
-"""SQLAlchemy base and common mixins."""
+"""Declarative base for ORM models (T1.4)."""
 
-import uuid
+from __future__ import annotations
+
 from datetime import datetime
+from typing import Any
 
-from sqlalchemy import DateTime, Uuid
+from sqlalchemy import DateTime, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+JsonDict = dict[str, Any]
 
 
 class Base(DeclarativeBase):
-    """Declarative base for all models."""
     pass
 
 
-class TimestampMixin:
-    """Common timestamp columns."""
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=datetime.utcnow, server_default=None
-    )
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        default=datetime.utcnow,
-        onupdate=datetime.utcnow,
-        server_default=None,
-    )
-
-
-class UUIDPrimaryKeyMixin:
-    """Auto-generated UUIDv4 primary key."""
-    id: Mapped[uuid.UUID] = mapped_column(
-        Uuid, primary_key=True, default=uuid.uuid4
-    )
+def created_at_column() -> Mapped[datetime]:
+    return mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)

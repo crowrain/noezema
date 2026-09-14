@@ -1,24 +1,53 @@
-from os import environ
+"""LLM Gateway configuration and model profile (T1.7, §12)."""
 
-from pydantic import BaseModel, Field
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from packages.domain.models.base import JsonDict
 
 
-class LLMGatewayConfig(BaseModel):
-    base_url: str = Field(default="http://localhost:8080/v1")
-    model: str = Field(default="qwen3.6-35b")
-    max_tokens: int = Field(default=4096)
-    temperature: float = Field(default=0.7)
-    timeout: float = Field(default=120.0)
-    embedding_model: str = Field(default="")
-    tokenizer: str = Field(default="cl100k_base")
+@dataclass(frozen=True, slots=True)
+class ModelProfile:
+    """Reproducibility profile of the local model (§12).
 
-    @classmethod
-    def from_env(cls) -> "LLMGatewayConfig":
-        """Load config from environment variables."""
-        return cls(
-            base_url=environ.get("LLM_API_BASE", "http://localhost:8080/v1"),
-            model=environ.get("LLM_MODEL", "qwen3.6-35b"),
-            max_tokens=int(environ.get("LLM_MAX_TOKENS", "4096")),
-            temperature=float(environ.get("LLM_TEMPERATURE", "0.7")),
-            timeout=float(environ.get("LLM_TIMEOUT", "120")),
-        )
+    Hashes are optional in MVP (filled when the artifact is pinned);
+    the fingerprint is still computed deterministically from what is known.
+    """
+
+    model_alias: str
+    provider: str = "openai-compatible"
+    context_window: int = 32768
+    max_output_tokens: int = 4096
+    artifact_sha256: str | None = None
+    tokenizer_sha256: str | None = None
+    backend_name: str | None = None
+    backend_version: str | None = None
+
+    def to_dict(self) -> JsonDict:
+        return {
+            "provider": self.provider,
+            "model_alias": self.model_alias,
+            "context_window": self.context_window,
+            "max_output_tokens": self.max_output_tokens,
+            "artifact_sha256": self.artifact_sha256,
+            "tokenizer_sha256": self.tokenizer_sha256,
+            "backend": {"name": self.backend_name, "version": self.backend_version},
+        }
+
+
+class LLMGatewayConfig(BaseSettings):
+    """Gateway runtime settings (NOEZEMA_LLM_ env prefix)."""
+
+    model_config = SettingsConfigDict(env_prefix="NOEZEMA_LLM_", extra="ignore")
+
+    base_url: str = "http://127.0.0.1:8080/v1"
+    model: str = "thinker-local"
+    api_key: str = ""
+    timeout_seconds: float = 120.0
+    max_output_tokens: int = 4096
+    max_retries: int = 3
+    retry_base_delay: float = 1.0
+    retry_multiplier: float = 2.0

@@ -1,38 +1,50 @@
-"""FIFO Question Selector — MVP (§5.3.2)."""
+"""Question selector (T1.12).
 
-import uuid
+MVP = FIFO with an eligibility filter (ARCHITECTURE §5.3.2): the config
+snapshot declares ``curiosity.selector = "fifo"``. Score-based ranking and
+epsilon-diversity arrive in M5; the interface is already
+config-driven so the switch is a config change, not a rewrite.
+"""
 
-from packages.domain.models.enums import QuestionSource
+from __future__ import annotations
+
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from packages.domain.models.enums import QuestionOrigin, QuestionState
+from packages.domain.models.questions import ORMQuestion
+from packages.domain.repositories.questions import QuestionRepository
 
 
 class FIFOQuestionSelector:
-    """In-memory FIFO question queue for MVP.
+    """Select the next question: highest priority, oldest first."""
 
-    Later replaced by DB-backed selector with priority.
-    """
+    async def select(self, db: AsyncSession) -> ORMQuestion | None:
+        candidates = await QuestionRepository.list_candidates(db, limit=1)
+        if not candidates:
+            return None
+        question = candidates[0]
+        if not self.is_eligible(question):
+            return None
+        return question
 
-    def __init__(self):
-        self._queue: list[dict] = []
-        self._resolved: set[uuid.UUID] = set()
+    @staticmethod
+    def is_eligible(question: ORMQuestion) -> bool:
+        """MVP eligibility: candidate state + a verifiable path exists.
 
-    async def select_next(self) -> dict | None:
-        for q in self._queue:
-            if q["id"] not in self._resolved:
-                return q
-        return None
-
-    async def create_seeded(self, statement: str) -> uuid.UUID:
-        qid = uuid.uuid4()
-        self._queue.append({
-            "id": qid,
-            "statement": statement,
-            "source": QuestionSource.SEEDED.value,
-        })
-        return qid
-
-    async def mark_resolved(self, question_id: uuid.UUID):
-        self._resolved.add(question_id)
-
-    @property
-    def pending_count(self) -> int:
-        return len([q for q in self._queue if q["id"] not in self._resolved])
+        In the Sealed profile every seeded/message question has a
+        verifiable path (workspace, local corpus, python experiment);
+        budget checks happen in the orchestrator before wake.
+        """
+        if question.state != QuestionState.CANDIDATE.value:
+            return False
+        return question.origin in (
+            QuestionOrigin.SEEDED,
+            QuestionOrigin.MESSAGE,
+            QuestionOrigin.CONFLICT,
+            QuestionOrigin.UNKNOWN_TERM,
+            QuestionOrigin.UNVERIFIED_CLAIM,
+            QuestionOrigin.PREVIOUS_RESULT,
+            QuestionOrigin.LOCAL_CORPUS,
+            QuestionOrigin.MODEL_PROPOSAL,
+            QuestionOrigin.INVALID_ASSESSMENT,
+        )
