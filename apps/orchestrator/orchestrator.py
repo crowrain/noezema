@@ -66,7 +66,7 @@ from packages.domain.services.commit import FinalizeResult
 from packages.domain.services.commit import finalize as commit_finalize
 from packages.domain.services.commit import prepare as commit_prepare
 from packages.domain.services.config import ConfigService
-from packages.domain.services.lease import LeaseService
+from packages.domain.services.lease import DEFAULT_LEASE_TTL, LeaseHeartbeatGuard, LeaseLost, LeaseService
 from packages.domain.services.reconciler import reconcile_commit
 from packages.domain.services.reserve import HostReserveService, ReserveLimits
 from packages.domain.services.staging import StagingService
@@ -137,6 +137,7 @@ class Orchestrator:
         executor: ToolExecutor,
         selector: FIFOQuestionSelector | None = None,
         node_owner: str | None = None,
+        lease_ttl: timedelta | None = None,
     ) -> None:
         self.session_factory = session_factory
         self.gateway = gateway
@@ -145,6 +146,9 @@ class Orchestrator:
         self.selector = selector if selector is not None else FIFOQuestionSelector()
         self.prompts = {Role.EXPLORER: load_prompt(Role.EXPLORER), Role.CURATOR: load_prompt(Role.CURATOR)}
         self.node_owner = node_owner if node_owner is not None else f"node-{os.getpid()}"
+        # T3.30: the lease TTL is injectable for tests (scenario regression:
+        # an LLM call longer than the TTL must not starve the fenced commit)
+        self.lease = LeaseService(ttl=lease_ttl if lease_ttl is not None else DEFAULT_LEASE_TTL)
 
     async def run_session(self, question_id: uuid.UUID | None = None) -> SessionOutcome:
         """M2 session lifecycle (T2.15-T2.21):
@@ -314,8 +318,8 @@ class Orchestrator:
         await audit.record(
             AuditEventType.SESSION_STARTED, session_id=session.id, public_summary="session started"
         )
-        # T2.16: take the lease before any real work
-        lease = LeaseService()
+        # T2.16: take the lease before any real work (T3.30: shared instance)
+        lease = self.lease
         await lease.acquire(
             db, session.id, self.node_owner,
             phase_deadline=timedelta(seconds=int(limits.get("phase_deadline_seconds", 600))),
@@ -523,15 +527,28 @@ class Orchestrator:
                 policy_version=cap_profile.policy_version,
             )
             try:
-                response, record = await self.gateway.chat(
-                    system=explorer.text, user=user_ctx, response_schema=ModelResponse, fingerprint=fingerprint
-                )
+                # T3.30: renew the lease in the background while the model
+                # call is in flight (§5.2.3: TTL = several heartbeat intervals)
+                async with LeaseHeartbeatGuard(lease, db, session.id, self.node_owner):
+                    response, record = await self.gateway.chat(
+                        system=explorer.text, user=user_ctx, response_schema=ModelResponse, fingerprint=fingerprint
+                    )
             except LLMError as exc:
                 await audit.record(
                     AuditEventType.SESSION_FAILED,
                     session_id=session.id,
                     payload={"error": str(exc)[:500], "phase": "exploring"},
                     public_summary="LLM unavailable; host failure report",
+                )
+                raise
+            except LeaseLost as exc:
+                # T3.30: lease lost mid-call — abort; the reconciler resolves
+                # the session, never a guessed rollback (§5.2.3)
+                await audit.record(
+                    AuditEventType.SESSION_FAILED,
+                    session_id=session.id,
+                    payload={"error": str(exc)[:500], "phase": "exploring"},
+                    public_summary="lease lost during LLM call; host failure report",
                 )
                 raise
 
@@ -828,12 +845,15 @@ class Orchestrator:
             policy_version="sealed-m1-stub",
         )
         try:
-            proposal, record = await self.gateway.chat(
-                system=curator.text,
-                user=user,
-                response_schema=CuratorProposal,
-                fingerprint=fingerprint,
-            )
+            # T3.30: renew the lease in the background while the model
+            # call is in flight (§5.2.3: TTL = several heartbeat intervals)
+            async with LeaseHeartbeatGuard(self.lease, db, session.id, self.node_owner):
+                proposal, record = await self.gateway.chat(
+                    system=curator.text,
+                    user=user,
+                    response_schema=CuratorProposal,
+                    fingerprint=fingerprint,
+                )
         except LLMError as exc:
             # host-generated failure report (§6.5): curator unavailable
             await audit.record(
@@ -843,6 +863,16 @@ class Orchestrator:
                 public_summary="curator unavailable; host failure report, no claims proposed",
             )
             return 0, 0
+        except LeaseLost as exc:
+            # T3.30: lease lost mid-call — abort; the reconciler resolves
+            # the session, never a guessed rollback (§5.2.3)
+            await audit.record(
+                AuditEventType.SESSION_FAILED,
+                session_id=session.id,
+                payload={"error": str(exc)[:500], "phase": "consolidating"},
+                public_summary="lease lost during curator call; host failure report",
+            )
+            raise
 
         run = ORMModelRun(
             session_id=session.id,

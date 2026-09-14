@@ -365,9 +365,16 @@ host recovery. После этой вехи — merge MVP в `main`.
 | # | Задача |
 |---|---|
 | T3.29 | Пробуждение по расписанию + wake admission + backoff/pause (§5.2.1): секция `wake_schedule` в config snapshot (периодический интервал = MVP-случай cron, мин. интервал между сессиями, backoff base/multiplier/max, лимит disk quota, GPU) + `wake_scheduler_state` (миграция `0005`); tick — `noezemactl wake-tick` (systemd `noezema-wake.timer`, 5 мин): расписание читается из effective snapshot, не из таймера; wake admission (paused / не-терминальная сессия / unresolved commit attempt / активный activation slot / disk quota / GPU fail-closed) — пропуск с точной причиной в audit `wake_skipped` (никогда не в очередь); экспоненциальный backoff после failed-сессии; авто-pause после N последовательных неудач (sticky до операторного resume, resume сбрасывает failure-бухгалтерию); `wake_now` обходит расписание (интервал/gap/backoff), но не admission — тот же gate в web Command API (REJECTED с reason); состояние wake (backoff/pause) в /status; fail-closed на битый `wake_schedule` |
+| T3.30 | Фоновый heartbeat lease во время долгих операций + честное время в lease (§5.2.3, дефект из первой реальной MVP-сессии): (а) lease-таймстампы пишутся через `clock_timestamp()`, не `now()` — в долгой phase-1-транзакции `now()` = старт транзакции, и `lease_expires_at` был «зацементирован» на `txn_start + ttl`: любая сессия длиннее TTL проигрывала fenced commit независимо от heartbeat (первая реальная сессия, qwen36-35b-a3b-q6-mtp, LLM-вызов 47 с против TTL 30 с → `commit_lease_lost`); (б) `LeaseHeartbeatGuard` — background-task продление lease (интервал = ttl/3, §5.2.3 «TTL равен нескольким heartbeat intervals») вокруг explorer/curator LLM-вызовов; продление в транзакции вызывающего (отдельное соединение блокировалось бы на row-lock сессии), `progress=False` — watchdog прогресса не искажается; отказ продления (phase deadline) → `LeaseLost` на выходе guard, abort + reconciler (никогда не угаданный rollback); оркестратор: `Orchestrator(lease_ttl=...)` — инъекция TTL для тестов (регрессия: LLM-вызовы 2.5 с при TTL 1 с → SUCCEEDED) |
 
 **Gate M3** = gate этапа 3a (§19) + MVP-критерии §22.1 `[MVP]` (пункты 1–11, 13, 15, 19, 20, 21,
 23, 28, 30–34) — каждый со ссылкой на тест. После gate: tag `noezema-mvp`, merge в `main` (отдельное решение).
+
+**Серия реальных MVP-сессий** (замер нагрузки до M4, §M4): 1-я сессия 2026-09-14 (qwen36-35b-a3b-q6-mtp,
+llama.cpp на 192.168.1.48, «Сколько будет 6*7?»): sandbox `python.execute` 56 мс, ответ модели 2 шага,
+fenced commit отклонён по истёкшему lease → T3.30; куратор: `reasoning_content` съедает бюджет
+`max_output_tokens` (2048 → пустой content, `finish_reason=length`, 3 ретрая ~84 с) → операционное
+решение: `max_output_tokens ≥ 4096` для реальной сессии. Повторная сессия после T3.30 — продолжение серии.
 
 ---
 

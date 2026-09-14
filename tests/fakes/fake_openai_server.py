@@ -14,6 +14,8 @@ A scripted response entry is a JSON object:
     {"error": 500}  /  {"error": "timeout"} inject a transient HTTP failure
     {"error": "invalid_json"}               200 OK, but the content is not
                                             valid JSON (model hiccup)
+    {"delay_seconds": 2.5}                  (any entry) the server sleeps
+                                            before replying — a slow model
 
 The server is single-process and single-client by design (one session at a
 time in v1, ARCHITECTURE §5.2.1).
@@ -22,6 +24,7 @@ time in v1, ARCHITECTURE §5.2.1).
 from __future__ import annotations
 
 import argparse
+import asyncio
 import itertools
 import json
 import time
@@ -38,6 +41,7 @@ class ScriptedResponse(BaseModel):
     content: dict[str, Any] | None = None
     error: int | str | None = None
     finish_reason: str = "stop"
+    delay_seconds: float = 0.0  # T3.30: simulate a slow model (real local LLMs: 15–90 s)
 
 
 class Scenario(BaseModel):
@@ -85,6 +89,9 @@ async def chat_completions(body: dict[str, Any]) -> dict[str, Any]:
     if not queue:
         raise HTTPException(status_code=500, detail="no scripted responses left")
     scripted: dict[str, Any] = queue.pop(0)
+
+    if scripted.get("delay_seconds"):
+        await asyncio.sleep(float(scripted["delay_seconds"]))
 
     error = scripted.get("error")
     if error == "invalid_json":

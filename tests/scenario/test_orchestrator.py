@@ -6,6 +6,7 @@ Runs a real Sealed session against PostgreSQL + the deterministic fake LLM.
 from __future__ import annotations
 
 import uuid
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -66,6 +67,7 @@ def _make_orchestrator(
     scratch_url: str,
     fake: FakeLLM,
     workspace: Path,
+    lease_ttl: timedelta | None = None,
 ) -> tuple[Orchestrator, LLMMiddleware, object]:
     engine = create_async_engine(scratch_url)
     factory = async_sessionmaker(engine, expire_on_commit=False)
@@ -77,6 +79,7 @@ def _make_orchestrator(
         gateway=gateway,
         profile=ModelProfile(model_alias="fake-thinker"),
         executor=StubToolExecutor(workspace),
+        lease_ttl=lease_ttl,
     )
     return orch, gateway, engine
 
@@ -133,6 +136,40 @@ async def test_full_sealed_session(migrated_db, fake_llm: FakeLLM, tmp_path: Pat
     assert outcome.claims_proposed == 1
     assert outcome.termination_reason == "goal_reached"
 
+    assert await _session_state(scratch_url, outcome.session_id) == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_slow_llm_does_not_lose_commit_lease(migrated_db, fake_llm: FakeLLM, tmp_path: Path) -> None:
+    """T3.30 regression (first real MVP session, qwen36-35b-a3b-q6-mtp):
+
+    a model call longer than the lease TTL must not starve the fenced
+    commit — the background guard renews the lease mid-call (§5.2.3).
+    Without the guard this session ends commit_lease_lost → reconciled_abort.
+    """
+    scratch_url, _engine = migrated_db
+    question_id = await _seed_question(scratch_url)
+
+    # every model call takes 2.5 s — more than 2x the 1 s lease TTL below
+    fake_llm.script(
+        [
+            {"content": TOOL_PYTHON, "delay_seconds": 2.5},
+            {"content": TOOL_WRITE, "delay_seconds": 2.5},
+            {"content": COMPLETE, "delay_seconds": 2.5},
+            {"content": CURATOR_OK, "delay_seconds": 2.5},
+        ]
+    )
+    orch, gateway, engine = _make_orchestrator(
+        scratch_url, fake_llm, tmp_path / "ws", lease_ttl=timedelta(seconds=1)
+    )
+    try:
+        outcome = await orch.run_session(question_id)
+    finally:
+        await gateway.close()
+        await engine.dispose()
+
+    assert outcome.final_state is SessionState.SUCCEEDED
+    assert outcome.termination_reason == "goal_reached"
     assert await _session_state(scratch_url, outcome.session_id) == "succeeded"
 
     # causal chain rows
