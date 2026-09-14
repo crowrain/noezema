@@ -11,7 +11,7 @@
 | M1 контракты + LLM | ✅ выполнена | noezema-m1 | PR #4–#10; gate пройден: 112 тестов (86 unit ≥ 40), Sealed-сессия question→action→evidence→commit на fake LLM |
 | M2 изоляция + commit | ✅ выполнена | noezema-m2 | PR #11–#16: sandbox+runtime, policy engine, tool broker, artifact store+staging+freeze, commit boundary (prepared→fenced final tx) + reconciliation; gate пройден: 206 тестов, failpoints (kill до/после COMMIT, open final tx, stale finalizer, kill mid-action), security (сеть off, cap-drop, injection, ro rootfs) |
 | M3 память + web slice (MVP) | ✅ Gate M3 пройден (T3.29 закрыл пункт 1 §22.1); T3.30 — дефект lease из первой реальной сессии | noezema-m3 (на `ec6b4b0`, T3.29 — закрытие gate); noezema-mvp остаётся на `5d94b27` (создан до T3.29 — см. раздел Gate M3) | PR #17: память — модель (0004), evidence identity (§14.3), rules engine v1, independence (PSL+overlap), lifecycle heads (§14.1), apply в fenced tx. PR #18: context pack §5.4 + retrieval (fulltext russian, pending/invalid — отдельный лимит и метка в той же строке §5.4.2). PR #19: host recovery — noezemactl CLI, recovery policy schema v1 (jitter=0, JCS-хэш), fsync-safe transition journal + head + boot reconcile, offline rules (advisory lock, cohort+seal, atomic publish с UUIDv5 invalid-вопросами), fail-closed admission, resume-классификация (transient→retry_wait/0, permanent→resume_blocked/78, unclassified→degraded) + idempotent audit replay, policy change head + event stream, unit-state publisher, systemd units + CI-verify. PR #20: web slice — Query/Command + admin-token auth, fail-closed Command API на нездоровом hostе (423), SSE timeline (committed outbox + max_events), session detail, message TTL→expired, Host Status Adapter (recovery banner: none/retry_wait/degraded/blocked), минимальные HTML-страницы main/session. PR #21: failpoints/инварианты/resume/scenario-тесты. T3.29: wake scheduling + wake admission + backoff/pause (§5.2.1, пункт 1 §22.1): `wake_schedule` в snapshot (миграция 0005) + `wake_scheduler_state`, `noezemactl wake-tick` + `noezema-wake.timer`, admission (6 gates, skip с точной причиной в audit `wake_skipped`), экспоненциальный backoff, авто-pause после 3 неудач, wake_now — без расписания но с admission. T3.30: фоновый heartbeat lease во время долгих LLM-вызовов + `clock_timestamp()` в lease (дефект из первой реальной MVP-сессии — см. раздел ниже); 374 тест |
-| M4 зависимости + переоценка | 🔄 T4.1 закрыт (claim_dependencies: DAG cycle check при commit, graph revision, kind `research` по §8.6); T4.2 закрыт (cascade invalidation: closure manifest, barrier с durable курсором, idempotent батчи, blocked-путь, retrieval ancestor check); T4.3 закрыт (worker `system:reassessment`: runnable-предикат §5.9.1, lease/retry/blocked, insufficient→invalid+question, crash-lease recovery); T4.4 закрыт (writer admission: table gate §14.1 NOWAIT + jitter, session intent rules 1/4/5, T_escalate/T_worker_admission в scheduler); T4.5 закрыт (online activation §8.7.2: fenced lease + takeover, shadow heads fast path/pending, seal + DB-триггер sealed-интервала, atomic flip, post-publish manifest с deterministic UUIDv5, repair runner + T_repair_admission); T4.6–T4.9 — впереди | — | пороги M4 из замеров серии 2026-09-14 зафиксированы в PLAN (батч 32, SLO P95 200 с); 438 тестов |
+| M4 зависимости + переоценка | 🔄 T4.1 закрыт (claim_dependencies: DAG cycle check при commit, graph revision, kind `research` по §8.6); T4.2 закрыт (cascade invalidation: closure manifest, barrier с durable курсором, idempotent батчи, blocked-путь, retrieval ancestor check); T4.3 закрыт (worker `system:reassessment`: runnable-предикат §5.9.1, lease/retry/blocked, insufficient→invalid+question, crash-lease recovery); T4.4 закрыт (writer admission: table gate §14.1 NOWAIT + jitter, session intent rules 1/4/5, T_escalate/T_worker_admission в scheduler); T4.5 закрыт (online activation §8.7.2: fenced lease + takeover, shadow heads fast path/pending, seal + DB-триггер sealed-интервала, atomic flip, post-publish manifest с deterministic UUIDv5, repair runner + T_repair_admission); T4.6 закрыт (environment manifests §14 env-v2: content-addressed manifest_hash, versioned алгоритм env-independence-v1 — группы по (protocol, implementation, dataset lineage), отношения repeatability/reproducibility/independent_replication/variation/untracked, снапшот на оценке, `required_independence` в rules engine: E3 только через независимую репликацию); T4.7–T4.9 — впереди | — | пороги M4 из замеров серии 2026-09-14 зафиксированы в PLAN (батч 32, SLO P95 200 с); 461 тест |
 | M5 расширенный цикл | ⬜ не начата | — | |
 | M6 Research Proxy | ⬜ не начата | — | |
 | M7 полный веб + эксплуатация | ⬜ не начата | — | |
@@ -42,7 +42,7 @@
 | 11 | нет вслепую-ретраев | MVP | ✅ | test_tool_broker.py (§5.7 retry-классы: pure=2, idempotent=1, non_idempotent/observation=0 без вслепую-ретраев; idempotency key + different hash=incident/alert) + test_llm_gateway.py |
 | 12 | random backup point + root set | v1 | ⬜ | — |
 | 13 | partial success на safe boundary | MVP | ✅ | test_orchestrator.py::test_budget_exhausted_partial (succeeded_partial) |
-| 14 | каскадная инвалидация | v1 | 🔄 T4.1+T4.2+T4.3+T4.4+T4.5 | T4.1 (граф + цикл): test_claim_dependencies.py (unit: cycle check — чистая функция и через apply_claim_staging: циклическое evidential-ребро отклоняется с audit `dependency_edge_rejected`, claim всё же коммитится; research-ребро не в цикле и не двигает graph revision; evidential на non-current цель — отклонено §8.6; bad kind/self/missing/unparseable — отклонены) + test_orchestrator.py (scenario: полный цикл — curator-зависимость коммитится с bump `domain_revisions(dependency_graph)` 0→1 и audit-полями; цикл — ребро отклонено, graph revision не меняется) + test_staging_schema.py (ClaimDependencyProposal: closed kind, UUID, budget ≤10, дубликаты). T4.2 (barrier/closure/manifest): test_cascade.py (8: closure-ходы; inline cascade; idempotent replay; barrier lifecycle + crash-resume; graph-change → new generation; tamper → blocked; retrieval ancestor check; moved graph при старте). T4.3 (worker reassessment_jobs): test_reassessment.py (13: runnable-предикат — activating slot/чужой snapshot/backoff-отсрочка; head promotion через rules engine с audit и knowledge bump; insufficient data → invalid + UUIDv5 question; transient → retry с backoff; permanent → blocked + alert; expired-lease recovery; admission metrics; bounded batch + priority; mid-batch loss admission). T4.4 (writer admission): test_writer_admission.py (14: gate CAS §14.1 — acquire/release/expired-takeover/NOWAIT-конфликт + CHECK holder-полей; session intent — live lease, idempotent, clear, stale-очистка reconciler'ом после fencing; worker — deferral с jitter при gate-конфликте, уступка intent на входе и mid-batch (попытка не сгорает), release после батча; activation берёт gate до pointer; scheduler — T_escalate/T_worker_admission skip `reassessment_backlog`, свежая/blocked очереди не блокируют, fail-closed секция, SLO-метрики). T4.5 (online activation §8.7.2): test_online_activation.py (12: fenced lease — acquire/resume/takeover fence+1; quiesce — gate wait timeout, active session; shadow heads — fast path carry старой оценки / pending + activation jobs; deterministic UUIDv5 вопросы post-publish; atomic flip — pointer + bootstrap immutable; crash resume без смены fence; transient backoff + slot held; exhaustion → post_publish_blocked + alert + repair runner (repair CAS, phase=repair); superseded-закрытие без reactivation; T_repair_admission — skip repair_backlog; sealed-интервал триггер 45000). Остаток: T4.6–T4.9 |
+| 14 | каскадная инвалидация | v1 | 🔄 T4.1+T4.2+T4.3+T4.4+T4.5+T4.6 | T4.1 (граф + цикл): test_claim_dependencies.py (unit: cycle check — чистая функция и через apply_claim_staging: циклическое evidential-ребро отклоняется с audit `dependency_edge_rejected`, claim всё же коммитится; research-ребро не в цикле и не двигает graph revision; evidential на non-current цель — отклонено §8.6; bad kind/self/missing/unparseable — отклонены) + test_orchestrator.py (scenario: полный цикл — curator-зависимость коммитится с bump `domain_revisions(dependency_graph)` 0→1 и audit-полями; цикл — ребро отклонено, graph revision не меняется) + test_staging_schema.py (ClaimDependencyProposal: closed kind, UUID, budget ≤10, дубликаты). T4.2 (barrier/closure/manifest): test_cascade.py (8: closure-ходы; inline cascade; idempotent replay; barrier lifecycle + crash-resume; graph-change → new generation; tamper → blocked; retrieval ancestor check; moved graph при старте). T4.3 (worker reassessment_jobs): test_reassessment.py (13: runnable-предикат — activating slot/чужой snapshot/backoff-отсрочка; head promotion через rules engine с audit и knowledge bump; insufficient data → invalid + UUIDv5 question; transient → retry с backoff; permanent → blocked + alert; expired-lease recovery; admission metrics; bounded batch + priority; mid-batch loss admission). T4.4 (writer admission): test_writer_admission.py (14: gate CAS §14.1 — acquire/release/expired-takeover/NOWAIT-конфликт + CHECK holder-полей; session intent — live lease, idempotent, clear, stale-очистка reconciler'ом после fencing; worker — deferral с jitter при gate-конфликте, уступка intent на входе и mid-batch (попытка не сгорает), release после батча; activation берёт gate до pointer; scheduler — T_escalate/T_worker_admission skip `reassessment_backlog`, свежая/blocked очереди не блокируют, fail-closed секция, SLO-метрики). T4.5 (online activation §8.7.2): test_online_activation.py (12: fenced lease — acquire/resume/takeover fence+1; quiesce — gate wait timeout, active session; shadow heads — fast path carry старой оценки / pending + activation jobs; deterministic UUIDv5 вопросы post-publish; atomic flip — pointer + bootstrap immutable; crash resume без смены fence; transient backoff + slot held; exhaustion → post_publish_blocked + alert + repair runner (repair CAS, phase=repair); superseded-закрытие без reactivation; T_repair_admission — skip repair_backlog; sealed-интервал триггер 45000). T4.6 (environment independence §8.7.3): test_env_independence.py unit (17: ключ группы — только (protocol, implementation, dataset lineage), GPU/seed/data order группу не создают; untracked fail-closed; 6 исходов классификации; shared dataset lineage убивает independence; strongest-pair с variation; engine — E3 только через independent_replication ≥2 группы, repeatability/reproducibility/variation не проходят, причины insufficient_independence / independence_*_not_met; unknown relation → ValueError) + scenario (6: полный манифест §14 + manifest_hash + снапшот на оценке; 2 сессии = 1 манифест, нет ложной independence; repeatability — одна группа, E2; другой GPU — reproducibility, гипотеза; независимые implementation'ы — E3; shared lineage — variation + independence_independent_replication_not_met). Остаток: T4.7–T4.9 |
 | 15 | pending/invalid не current | MVP | ✅ | test_memory_service.py (lifecycle CHECK: pending/invalid ⇒ assessment/status NULL) + test_context_builder.py/test_retrieval.py (§5.4.2: отдельный лимит pending, метка в той же строке, исключение целиком если не хватает на метку) + test_invariants.py (pending/invalid не подаётся как current) + test_offline_rules.py (deferred→pending, removed-type→invalid) |
 | 16 | worker: priority, retry, no starvation | v1 | ⬜ | — |
 | 17 | repeatability/reproducibility/replication | v1 | ⬜ | — |
@@ -559,5 +559,85 @@ migration 0009, `apps/orchestrator/scheduler.py` (T_repair_admission),
   audit, свежий (1 ч) → wake; sealed-интервал: UPDATE head'ов в
   `ready` → 45000, условный return в preparing_heads разрешён).
   438 тестов.
+
+**Закрыто T4.6 (environment manifests + environment independence, §8.7.3, §14)** —
+`packages/memory/env_independence.py` (versioned алгоритм),
+`packages/memory/evidence.py` (env-v2), `packages/memory/rules_engine.py`
+(`required_independence`), migration 0010:
+- **Полный набор полей §14** (`normalizer_version='env-v2'`):
+  `protocol_hash` (canonical snapshot'а `prompts`), `implementation_hash`
+  (`noezema-impl-v1`), `code_lineage`/`dataset_hash`/`dataset_lineage`/
+  `dependency_hash` (у session-запусков None — нет датасета),
+  `toolchain_hash` (tool schema), `runtime_hash` (`tool_fingerprint()`),
+  `hardware_hash` (`hardware_fingerprint()`: canonical uname
+  system/machine/processor/node — другой хост = другое окружение,
+  консервативно), `seed` (bootstrap sampling seed 42),
+  `data_order_hash`. **`session_id` и `model_fingerprint` — НЕ поля
+  манифеста**: модель живёт в `model_runs`, сессия — не окружение.
+- **Content-addressed манифест**: `manifest_hash =
+  canonical_sha256(все 12 полей)` + уникальный индекс 0010 (двашаговый
+  add + backfill `env-legacy:{id}` для MVP-строк). Две сессии с
+  одинаковым конфигом = ОДИН манифест = одно окружение: их повторы —
+  не независимые доказательства.
+- **Versioned алгоритм `env-independence-v1`**
+  (`env_independence.py`): группы строятся ТОЛЬКО по
+  (protocol, implementation, dataset_lineage) — другой GPU/бэкенд/seed/
+  порядок данных группу НЕ создают. Отношения пар: `repeatability`
+  (метод+окружение равны, включая execution-ключ из 6 полей),
+  `reproducibility` (тот же метод, другое runtime/hardware/toolchain/
+  dependency/seed/data_order — переносимость, НЕ независимость),
+  `independent_replication` (независимый protocol ИЛИ implementation;
+  два ИЗВЕСТНЫХ равных dataset_lineage независимость убивают, если
+  claim data-dependent), `variation` (разные группы, тот же метод),
+  `untracked` (у любой стороны нет записанной lineage — fail-closed,
+  независимости не даёт ни в каком направлении), `none` (один
+  манифест). Отношение члена = сильнейшая пара (ранг
+  none=0 < untracked=variation=1 < repeatability=2 <
+  reproducibility=3 < independent_replication=4; тир — меньший id
+  counterpart'а, basis `pair:{id12}:{rel}`/`single`).
+- **Снапшот на оценке**: `environment_independence_snapshots`
+  (algorithm_version + rules_hash) + `environment_independence_members`
+  (group_id, relation, basis; PK snapshot+manifest, CASCADE). Оценка
+  фиксирует `environment_independence_snapshot_id` (и в audit
+  `claim_assessed`) — считается distinct GROUPS, а не хеши; строки
+  иммутабельны, без dedup (строка на каждую оценку). Строится и в
+  staging-commit (`service.py`), и в worker'е (`reassessment.py`).
+- **Rules engine `required_independence`** (scope-dependent критерий,
+  §8.7.3): `independent_replication` — ≥2 support-доказательств С
+  этим отношением в ≥2 разных группах; `reproducibility`/
+  `repeatability` — ≥2 support'ов с рангом ≥ порога. Не выполнено →
+  гипотеза с отдельной причиной `independence_{required}_not_met`
+  (после group-check, до scope-check). Bootstrap:
+  `empirical_conjecture` + `procedural` → `independent_replication`;
+  остальные типы — без требования (критерий переносимости,
+  `reproducibility`, доступен правилам, но в bootstrap не
+  используется).
+- Решения: (1) манифест content-addressed по `manifest_hash` (а не по
+  `session_id`) — дедуп между сессиями одного окружения; (2) группа =
+  lineage-тройка, execution-поля — в repeatability/reproducibility;
+  (3) `variation` рангом с `untracked` (1) — никаких положительных
+  отношений не даёт (регрессия KeyError закреплена тестом);
+  (4) регистрация host-experiment манифестов (hostctl) — deferred:
+  тесты сидят манифесты как trusted host (паттерн T4.5);
+  (5) independence-snapshot колонки в `session_staging` (спека) —
+  deferred, как и в MVP (манифесты — только в evidence);
+  (6) parent+children flush — два ЯВНЫХ flush (unit-of-work не
+  гарантирует порядок для свежего родителя + детей с composite PK).
+- Тесты: unit test_env_independence.py (17: ключ группы игнорирует
+  GPU/seed/data order и меняется на метод/lineage; untracked fail-
+  closed; классификация всех 6 исходов; shared lineage убивает
+  independence; strongest-pair с variation (регрессия); engine — E3
+  только через independent_replication, повторы одной группы и
+  группы-без-отношения — гипотеза с правильными причинами,
+  reproducibility-правило выполняется, unknown relation → ValueError)
+  + scenario test_env_independence.py (6: staging-commit — полный
+  манифест + manifest_hash + снапшот на оценке; две сессии одного
+  окружения — ОДИН манифест, один group, нет ложной independence;
+  repeatability-пара (разные инстансы данных, та же lineage) — одна
+  группа, E2 не выше; другой GPU — reproducibility, одна группа,
+  empirical_conjecture остаётся гипотезой (insufficient_independence);
+  независимые implementation'ы — две группы + E3 supported через
+  worker; общие dataset lineage — variation, гипотеза с причиной
+  independence_independent_replication_not_met). 461 тест.
 
 Merge в `main` — отдельное решение (не выполняется автоматически).

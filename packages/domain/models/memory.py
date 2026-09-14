@@ -227,6 +227,33 @@ class ORMEnvironmentManifest(Base):
     normalizer_version: Mapped[str] = mapped_column(Text, nullable=False, default="env-v1")
     created_at: Mapped[datetime] = created_at_column()
 
+    # T4.6 (§8.7.3): content hash of the FULL field set — content-
+    # addressed dedup (uq_environment_manifests_hash)
+    manifest_hash: Mapped[str] = mapped_column(Text, nullable=False, default="")
+
+
+class ORMEnvironmentIndependenceSnapshot(Base):
+    __tablename__ = "environment_independence_snapshots"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    algorithm_version: Mapped[str] = mapped_column(Text, nullable=False)
+    rules_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = created_at_column()
+
+
+class ORMEnvironmentIndependenceMember(Base):
+    __tablename__ = "environment_independence_members"
+
+    snapshot_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("environment_independence_snapshots.id", ondelete="CASCADE"), primary_key=True
+    )
+    environment_manifest_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("environment_manifests.id", ondelete="CASCADE"), primary_key=True
+    )
+    group_id: Mapped[str] = mapped_column(Text, nullable=False)
+    relation: Mapped[str] = mapped_column(Text, nullable=False)
+    basis: Mapped[str] = mapped_column(Text, nullable=False)
+
 
 class ORMCheckpoint(Base):
     __tablename__ = "checkpoints"

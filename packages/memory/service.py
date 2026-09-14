@@ -42,13 +42,18 @@ from packages.domain.models.memory import (
 )
 from packages.domain.models.sessions import ORMSession
 from packages.domain.services.audit import AuditService
+from packages.memory.env_independence import (
+    UNTRACKED_GROUP,
+    build_environment_independence_snapshot,
+)
 from packages.memory.evidence import (
     RULES_ENGINE_VERSION,
     computation_identity,
-    environment_manifest_hash,
     local_observation_identity,
+    manifest_content_hash,
     observation_artifact_hash,
     rules_hash,
+    session_environment_fields,
 )
 from packages.memory.rules_engine import (
     ClaimTypeRule,
@@ -215,12 +220,21 @@ class MemoryService:
         problems: list[str] = []
         counters = {"created": 0, "reused": 0, "added": 0, "deduped": 0, "assessments": 0}
 
-        env_hash = environment_manifest_hash(
-            str(session.id),
-            model_fingerprint if model_fingerprint is not None else {},
-            tool_schema_hash or "",
+        # §8.7.3 (T4.6): the FULL §14 environment manifest — content-
+        # addressed over the field set. The protocol is the session's
+        # prompt set (the effective config's prompts section); the seed
+        # is the LLM sampling seed (part of the execution environment,
+        # never of the independence group key).
+        protocol_hash = canonical_sha256(dict(self.snapshot.prompts or {}))
+        sampling = ((self.snapshot.model or {}).get("sampling")) or {}
+        seed = int(sampling["seed"]) if sampling.get("seed") is not None else None
+        env_fields = session_environment_fields(
+            protocol_hash=protocol_hash,
+            tool_schema_hash=tool_schema_hash or "",
+            seed=seed,
         )
-        env = await self._environment_manifest(db, env_hash)
+        env_hash = manifest_content_hash(env_fields)
+        env = await self._environment_manifest(db, env_hash, env_fields)
 
         # 1. claims (exact statement+type dedup against the corpus)
         claims: list[ORMClaim] = []
@@ -481,7 +495,7 @@ class MemoryService:
             )
             try:
                 ok = await self._assess(
-                    db, audit, session, claim, claim_scopes.get(claim.id, {}), all_evidence, env_hash, now
+                    db, audit, session, claim, claim_scopes.get(claim.id, {}), all_evidence, now
                 )
             except RuleValidationError as exc:
                 problems.append(f"assessment rejected for {claim.id}: {exc}")
@@ -543,12 +557,17 @@ class MemoryService:
         await db.flush()
         return artifact
 
-    async def _environment_manifest(self, db: AsyncSession, env_hash: str) -> ORMEnvironmentManifest:
+    async def _environment_manifest(
+        self, db: AsyncSession, env_hash: str, fields: JsonDict
+    ) -> ORMEnvironmentManifest:
+        """The environment manifest, content-addressed by its FULL §14
+        field set (T4.6): the same environment is ONE row regardless of
+        how many sessions ran in it."""
         existing = (
             (
                 await db.execute(
                     select(ORMEnvironmentManifest).where(
-                        ORMEnvironmentManifest.protocol_hash == env_hash
+                        ORMEnvironmentManifest.manifest_hash == env_hash
                     )
                 )
             )
@@ -557,7 +576,22 @@ class MemoryService:
         )
         if existing is not None:
             return existing
-        env = ORMEnvironmentManifest(id=uuid.uuid4(), protocol_hash=env_hash)
+        env = ORMEnvironmentManifest(
+            id=uuid.uuid4(),
+            protocol_hash=fields["protocol_hash"],
+            implementation_hash=fields["implementation_hash"],
+            code_lineage=fields["code_lineage"],
+            dataset_hash=fields["dataset_hash"],
+            dataset_lineage=fields["dataset_lineage"],
+            toolchain_hash=fields["toolchain_hash"],
+            dependency_hash=fields["dependency_hash"],
+            runtime_hash=fields["runtime_hash"],
+            hardware_hash=fields["hardware_hash"],
+            seed=fields["seed"],
+            data_order_hash=fields["data_order_hash"],
+            normalizer_version=fields["normalizer_version"],
+            manifest_hash=env_hash,
+        )
         db.add(env)
         await db.flush()
         return env
@@ -570,21 +604,36 @@ class MemoryService:
         claim: ORMClaim,
         claim_scope: JsonDict,
         all_evidence: list[ORMEvidence],
-        env_hash: str,
         now: datetime,
     ) -> bool:
         """One deterministic assessment + head upsert (same transaction)."""
         rule = self.rule(claim.claim_type)
+        # §8.7.3 (T4.6): the versioned environment-independence
+        # snapshot over the claim's environment manifests — the
+        # assessment fixes it and counts distinct groups, not hashes.
+        # Evidence without a tracked environment is the conservative
+        # untracked group, never a fake-independent one.
+        env_snapshot_id, env_mapping = await build_environment_independence_snapshot(
+            db, claim_id=claim.id, rules_hash=self._rules_hash
+        )
+        group_by_manifest = {mid: g for mid, (g, _r) in env_mapping.items()}
+        relation_by_manifest = {mid: r for mid, (_g, r) in env_mapping.items()}
         evs = [
             EvaluatedEvidence(
                 identity_hash=e.identity_hash,
                 kind=e.evidence_kind,
                 relation=e.relation,
                 scope=dict(e.scope or {}),
-                # conservative: session-generated evidence from the same
-                # environment is ONE independence group (no false
-                # independence); source evidence uses the snapshot groups
-                independence_group=f"env:{env_hash[:16]}",
+                independence_group=(
+                    group_by_manifest.get(e.environment_manifest_id, UNTRACKED_GROUP)
+                    if e.environment_manifest_id is not None
+                    else UNTRACKED_GROUP
+                ),
+                env_relation=(
+                    relation_by_manifest.get(e.environment_manifest_id, "none")
+                    if e.environment_manifest_id is not None
+                    else "none"
+                ),
             )
             for e in all_evidence
         ]
@@ -621,6 +670,7 @@ class MemoryService:
             epistemic_status=result.epistemic_status.value,
             rules_version=RULES_ENGINE_VERSION,
             rules_hash=self._rules_hash,
+            environment_independence_snapshot_id=env_snapshot_id,
             evidence_set_hash=_evidence_set_hash(all_evidence),
             assessed_scope=dict(claim_scope),
             confidence=result.confidence,
@@ -671,6 +721,9 @@ class MemoryService:
                 "confidence": result.confidence,
                 "reasons": list(result.reasons),
                 "rules_hash": self._rules_hash,
+                "environment_independence_snapshot_id": (
+                    str(env_snapshot_id) if env_snapshot_id is not None else None
+                ),
             },
             public_summary=f"claim assessed: {result.grade.value}/{result.epistemic_status.value}",
         )

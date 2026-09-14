@@ -76,6 +76,10 @@ from packages.domain.models.memory import (
 from packages.domain.models.questions import ORMQuestion
 from packages.domain.services.audit import AuditService
 from packages.memory.cascade import writer_gate
+from packages.memory.env_independence import (
+    UNTRACKED_GROUP,
+    build_environment_independence_snapshot,
+)
 from packages.memory.evidence import rules_hash
 from packages.memory.rules_engine import (
     RULES_ENGINE_VERSION,
@@ -412,13 +416,31 @@ async def _process_one_job(
         )
         return "completed"
 
+    # §8.7.3 (T4.6): the versioned environment-independence snapshot —
+    # the same groups/relations the commit path computes; the assessment
+    # fixes it. Evidence without a tracked environment is the
+    # conservative untracked group (never fake-independent).
+    env_snapshot_id, env_mapping = await build_environment_independence_snapshot(
+        db, claim_id=claim.id, rules_hash=rules_hash(dict(snapshot.claim_type_rules))
+    )
+    group_by_manifest = {mid: g for mid, (g, _r) in env_mapping.items()}
+    relation_by_manifest = {mid: r for mid, (_g, r) in env_mapping.items()}
     evs = [
         EvaluatedEvidence(
             identity_hash=e.identity_hash,
             kind=e.evidence_kind,
             relation=e.relation,
             scope=dict(e.scope or {}),
-            independence_group=_independence_group(e),
+            independence_group=(
+                group_by_manifest.get(e.environment_manifest_id, UNTRACKED_GROUP)
+                if e.environment_manifest_id is not None
+                else UNTRACKED_GROUP
+            ),
+            env_relation=(
+                relation_by_manifest.get(e.environment_manifest_id, "none")
+                if e.environment_manifest_id is not None
+                else "none"
+            ),
         )
         for e in evidence
     ]
@@ -490,6 +512,7 @@ async def _process_one_job(
         epistemic_status=result.epistemic_status.value,
         rules_version=RULES_ENGINE_VERSION,
         rules_hash=rules_hash(dict(snapshot.claim_type_rules)),
+        environment_independence_snapshot_id=env_snapshot_id,
         evidence_set_hash=_evidence_set_hash(list(evidence)),
         assessed_scope=dict(scope),
         confidence=result.confidence,
@@ -543,15 +566,6 @@ async def _process_one_job(
         ),
     )
     return "completed"
-
-
-def _independence_group(e: ORMEvidence) -> str:
-    """The same conservative grouping the commit path uses (T3.6):
-    evidence without a recorded environment belongs to one group,
-    never to a fake-independent one."""
-    if e.environment_manifest_id is not None:
-        return f"env:{e.environment_manifest_id.hex[:16]}"
-    return "env:untracked"
 
 
 async def _unlease(db: AsyncSession, jobs: tuple[ORMReassessmentJob, ...]) -> None:

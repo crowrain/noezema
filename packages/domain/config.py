@@ -180,6 +180,10 @@ BOOTSTRAP_PAYLOAD: dict[str, Any] = {
             "allowed_kinds": ["experiment_run"],
             "min_support_evidence": 2,
             "min_independence_groups": 2,
+            # §8.7.3: E3 — только independent replication (независимая
+            # реализация protocol/implementation + независимый dataset
+            # lineage), а не просто два разных окружения
+            "required_independence": "independent_replication",
             "requires_scope": True,
             "volatility": "static",
         },
@@ -188,6 +192,7 @@ BOOTSTRAP_PAYLOAD: dict[str, Any] = {
             "allowed_kinds": ["experiment_run", "computation"],
             "min_support_evidence": 2,
             "min_independence_groups": 2,
+            "required_independence": "independent_replication",
             "requires_scope": True,
             "volatility": "static",
         },
