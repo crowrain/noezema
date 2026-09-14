@@ -10,7 +10,7 @@
 | M0 каркас | ✅ выполнена | — | чистое дерево, скелет, CI, fake LLM, ADR-0001/0002/0003 |
 | M1 контракты + LLM | ✅ выполнена | noezema-m1 | PR #4–#10; gate пройден: 112 тестов (86 unit ≥ 40), Sealed-сессия question→action→evidence→commit на fake LLM |
 | M2 изоляция + commit | ✅ выполнена | noezema-m2 | PR #11–#16: sandbox+runtime, policy engine, tool broker, artifact store+staging+freeze, commit boundary (prepared→fenced final tx) + reconciliation; gate пройден: 206 тестов, failpoints (kill до/после COMMIT, open final tx, stale finalizer, kill mid-action), security (сеть off, cap-drop, injection, ro rootfs) |
-| M3 память + web slice (MVP) | ✅ Gate M3 (tag noezema-mvp) | 327 тест | PR #17: память — модель (0004), evidence identity (§14.3), rules engine v1, independence (PSL+overlap), lifecycle heads (§14.1), apply в fenced tx. PR #18: context pack §5.4 + retrieval (fulltext russian, pending/invalid — отдельный лимит и метка в той же строке §5.4.2). PR #19: host recovery — noezemactl CLI, recovery policy schema v1 (jitter=0, JCS-хэш), fsync-safe transition journal + head + boot reconcile, offline rules (advisory lock, cohort+seal, atomic publish с UUIDv5 invalid-вопросами), fail-closed admission, resume-классификация (transient→retry_wait/0, permanent→resume_blocked/78, unclassified→degraded) + idempotent audit replay, policy change head + event stream, unit-state publisher, systemd units + CI-verify. PR #20: web slice — Query/Command + admin-token auth, fail-closed Command API на нездоровом hostе (423), SSE timeline (committed outbox + max_events), session detail, message TTL→expired, Host Status Adapter (recovery banner: none/retry_wait/degraded/blocked), минимальные HTML-страницы main/session; 315 тест |
+| M3 память + web slice (MVP) | 🔄 Gate M3 не пройден полностью: пункт 1 §22.1 (пробуждение по расписанию, backoff) не реализован | noezema-mvp (существует, gate не полный — см. раздел Gate M3) | PR #17: память — модель (0004), evidence identity (§14.3), rules engine v1, independence (PSL+overlap), lifecycle heads (§14.1), apply в fenced tx. PR #18: context pack §5.4 + retrieval (fulltext russian, pending/invalid — отдельный лимит и метка в той же строке §5.4.2). PR #19: host recovery — noezemactl CLI, recovery policy schema v1 (jitter=0, JCS-хэш), fsync-safe transition journal + head + boot reconcile, offline rules (advisory lock, cohort+seal, atomic publish с UUIDv5 invalid-вопросами), fail-closed admission, resume-классификация (transient→retry_wait/0, permanent→resume_blocked/78, unclassified→degraded) + idempotent audit replay, policy change head + event stream, unit-state publisher, systemd units + CI-verify. PR #20: web slice — Query/Command + admin-token auth, fail-closed Command API на нездоровом hostе (423), SSE timeline (committed outbox + max_events), session detail, message TTL→expired, Host Status Adapter (recovery banner: none/retry_wait/degraded/blocked), минимальные HTML-страницы main/session. PR #21: failpoints/инварианты/resume/scenario-тесты; 327 тест |
 | M4 зависимости + переоценка | ⬜ не начата | — | |
 | M5 расширенный цикл | ⬜ не начата | — | |
 | M6 Research Proxy | ⬜ не начата | — | |
@@ -29,8 +29,8 @@
 
 | # | Критерий | Класс | Статус | Тест |
 |---|---|---|---|---|
-| 1 | пробуждение по расписанию, pause/backoff | MVP | ⬜ | — |
-| 2 | локальная LLM с fingerprint | MVP | 🔄 | test_llm_gateway.py, test_compat_and_roles.py (gateway+fingerprint; local model profile — PR #10) |
+| 1 | пробуждение по расписанию, pause/backoff | MVP | 🔄 | Частично (T3.23 controls): test_web_api.py (pause/resume/wake_now: durable node state, pause блокирует wake, wake_now — полная сессия). НЕТ (§5.2.1): расписания (cron + мин. интервал), wake-admission с точной причиной пропуска, экспоненциального backoff после failed-сессии, перехода в paused после серии неудач. Явной задачи wake-scheduler в плане M0–M3 нет (пропуск плана; целевое дерево: `apps/orchestrator/scheduler.py`, admission gates — T4.4/M4) |
+| 2 | локальная LLM с fingerprint | MVP | ✅ | test_llm_gateway.py (OpenAI-compatible gateway для локальных бэкендов llama.cpp/Ollama/vLLM, retries только транзиентные, token/latency/finish_reason, test_fingerprint_is_deterministic_and_versioned) + test_compat_and_roles.py (compat suite T1.11, versioned prompts, tool schema hash). Fingerprint (профиль модели + prompt version + tool schema hash + policy version → canonical sha256) пишется в `model_runs.model_fingerprint` (NOT NULL) на каждом explorer/curator-вызове (T1.7–T1.8). Оговорка MVP: artifact/tokenizer-хэши опциональны (None до пиннинга артефакта); ModelProfile собирается в коде из gateway-settings — секция `model` снапшота не подключена (T1.7 «через config snapshot» — частично) |
 | 3 | causal/idempotency ID в trusted host | MVP | ✅ | test_orchestrator.py (turn_id/action_id/idempotency_key генерирует хост) |
 | 4 | typed actions в sandbox | MVP | ✅ | test_sandbox_runtime.py + test_tool_broker_sandbox.py (одноразовый контейнер, cap-drop/network/ro-rootfs, shell/python в sandbox, overlay) + test_sandbox_security.py |
 | 5 | claim только с согласованным lifecycle | MVP | ✅ | test_memory_service.py (head current ⇔ assessment+epistemic_status NOT NULL, CHECK §14.1; dedup claim+evidence; supersede) + test_orchestrator.py (apply в fenced tx: claim→evidence→assessment→head одной транзакцией) |
@@ -84,11 +84,12 @@
 
 ## Gate M3 (этап 3a + MVP-критерии §22.1)
 
-Состояние: **PROSHED** (tag `noezema-mvp`). ruff + mypy (strict) + pytest (327) зелёные;
-`systemd-analyze verify` + hash-pin baseline-политики в CI.
+Состояние: **не пройден полностью**. Tag `noezema-mvp` существует (создан до выявления
+расхождения; не переставляется — решение за пользователем). ruff + mypy (strict) +
+pytest (327) зелёные; `systemd-analyze verify` + hash-pin baseline-политики в CI.
 
-Каждый MVP-пункт §22.1 `[MVP]` закрыт тестом (матрица выше, строки 1–11, 13, 15, 19, 20, 21,
-23, 28, 30–34). Ключевые failpoint/invariant-наборы:
+Закрыты со ссылками на тесты: строки 2–11, 13, 15, 19, 20, 21, 23, 28, 30–34 матрицы
+(см. матрицу выше). Ключевые failpoint/invariant-наборы:
 - `tests/security/test_invariants.py` — duplicate evidence не повышает grade; counterevidence
   меняет head в том же commit; offline publish — старый либо полный новый pointer+вопросы;
   pending/invalid не подаётся как current; grade только rules engine.
@@ -98,5 +99,37 @@
   start-limit); permanent → resume_blocked (exit 78); retained history ≠ active.
 - `tests/scenario/test_sealed_day.py` — полный Sealed-день (N сессий подряд): FIFO, staging,
   assessment, fenced commit, timeline.
+
+### Не закрыто
+
+**Пункт 1 — «пробуждение по расписанию, pause/backoff» (§5.2.1) — не реализован.**
+Реализована только часть T3.23 (controls): durable node state
+idle/paused/session_running (`system_constants`) и операторские pause/resume/wake_now;
+pause блокирует wake_now (test_web_api.py::test_pause_resume_commands,
+test_wake_now_runs_full_session). Отсутствует:
+- cron-подобное расписание с минимальным интервалом между сессиями (доверенный контур,
+  нет ни в коде, ни в systemd-timers);
+- admission перед пробуждением (нет незавершённой сессии с живым lease, нет unresolved
+  commit attempt, пустой activating slot, дисковая квота, не operator pause) с записью
+  точной причины пропуска в audit, а не постановкой в очередь;
+- экспоненциальный backoff после неудачной сессии; переход узла в `paused` после
+  нескольких неудач подряд;
+- семантика «обычный wake_now обходит расписание, но не admission».
+
+Номера задач плана: явной задачи wake-scheduler в M0–M3 **нет — это пропуск плана**
+(пункт 1 §22.1 помечен `[MVP]`, но ни одна T-задача M0–M3 его не закрывает). Целевое
+дерево плана предусматривает `apps/orchestrator/scheduler.py`; admission gates
+`T_worker_admission`/`T_repair_admission` в scheduler — T4.4 (M4). Для закрытия пункта 1
+нужна отдельная задача (новая T3.29 в M3 либо перенос в M4 — решение пользователя):
+scheduler + wake admission + backoff + systemd timer + тесты. Оценка объёма: ~300–500
+строк кода и 8–12 тестов (тик расписания стартует сессию; skip с audit-причиной на
+каждом admission gate; backoff после failed; `paused` после серии неудач; wake_now при
+pause отклонён).
+
+**Пункт 2 — «локальная LLM с fingerprint» — закрыт** (строка 2 матрицы ✅): реализован в
+M1 (PR #4–#10, T1.7–T1.11) и покрыт тестами. Оговорка MVP: хэши артефакта/токенизера
+опциональны (заполняются при пиннинге артефакта); ModelProfile собирается в коде из
+gateway-settings, а не из секции `model` снапшота (T1.7 «через config snapshot» —
+частично) — не блокирует пункт, но учтено при запуске реальной модели.
 
 Merge в `main` — отдельное решение (не выполняется автоматически).
