@@ -1,0 +1,43 @@
+# NOEZEMA offline rules change — the maintenance unit (T3.12, §8.7.1).
+#
+# Exactly ONE active instance. Host ownership is this systemd scope (a
+# private RuntimeDirectory); DB ownership is a session-level PostgreSQL
+# advisory lock on the scope (not a lease, not a fencing protocol).
+#
+#   start -> private RuntimeDirectory
+#   -> acquire /run/lock/noezema-host-transition.lock (bounded <= 2s)
+#   -> reconcile the active head; atomically create initial event +
+#      current record + single active head
+#   -> atomically publish the owner-bound active marker, release the flock
+#   -> stop noezema-runtime.target
+#   -> enumerate target.ConsistsOf and verify every member is inactive
+#   -> web stays up in read-only degraded observer mode
+#   -> pg_advisory_lock('noezema:offline_rules:' || scope)
+#   -> verify: no active session / unresolved commit / reconciling_commit
+#   -> if effective.payload_sha256 == requested: success (idempotent)
+#   -> upsert candidate by (base_snapshot_id, payload_sha256), mode=offline
+#   -> freeze cohort + activation manifest against the knowledge revision
+#   -> prepare shadow heads in deterministic batches
+#   -> verify the complete cohort; compute the canonical heads digest
+#   -> atomically persist the immutable verification seal + state=ready
+#   -> atomic publish (runtime_config_head -> knowledge): pointer flip +
+#      deterministic UUIDv5 invalid-head questions in ONE transaction
+#   -> cleanup
+[Unit]
+Description=NOEZEMA offline rules change (maintenance)
+Documentation=man:noezemactl(1)
+ConditionPathExists=/var/lib/noezema
+# exclusivity (exactly one active instance) is enforced by the bounded
+# /run/lock flock + the PostgreSQL advisory lock, not a unit self-conflict
+
+[Service]
+Type=oneshot
+User=root
+RuntimeDirectory=noezema-offline-rules
+RuntimeDirectoryMode=0750
+EnvironmentFile=-/etc/noezema/noezema.env
+# the payload to activate is read from a pinned file by the helper
+ExecStart=/usr/lib/noezema/venv/bin/python -m hostctl.cli offline-rules --reason "offline-change"
+
+[Install]
+WantedBy=multi-user.target

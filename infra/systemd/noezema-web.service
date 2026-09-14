@@ -1,0 +1,22 @@
+# NOEZEMA web (T3.13, §8.7.1.1).
+#
+# The web is NOT a runtime member: it stays up during an offline change in
+# read-only degraded observer mode. It is fail-closed on the unit-state
+# snapshot (TTL), any unresolved host transition, and an unhealthy
+# runtime. It is a member of the runtime target only for stop ordering.
+[Unit]
+Description=NOEZEMA web
+Documentation=man:noezemactl(1)
+After=network.target
+PartOf=noezema-runtime.target
+
+[Service]
+Type=simple
+User=noezema
+EnvironmentFile=-/etc/noezema/noezema.env
+ExecStart=/usr/lib/noezema/venv/bin/python -m apps.web.main
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

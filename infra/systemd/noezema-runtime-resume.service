@@ -1,0 +1,30 @@
+# NOEZEMA host resume trigger (T3.14, §8.7.1.1).
+#
+# The resume unit is a TRIGGER, not the checker: it runs one admission
+# probe and exits with the outcome code. Correctness lives in the runtime
+# units + admission, so a manual start cannot bypass the checks.
+#
+#   exit 0  -> retry_wait / resolved (the retry timer re-probes)
+#   exit 78 -> resume_blocked (permanent/inconsistent; the failure unit
+#              raises a critical alert instead of a silent node)
+[Unit]
+Description=NOEZEMA host resume trigger
+Documentation=man:noezemactl(1)
+After=network.target postgresql.service
+ConditionPathExists=/var/lib/noezema
+# an unclassified crash/signal/timeout uses the fast on-failure restarts;
+# exhausting that burst -> resume_degraded (NOT a permanent block)
+StartLimitIntervalSec=300
+StartLimitBurst=5
+OnFailure=noezema-resume-failure@%n.service
+
+[Service]
+Type=oneshot
+User=root
+EnvironmentFile=-/etc/noezema/noezema.env
+ExecStart=/usr/lib/noezema/venv/bin/python -m hostctl.cli resume-runtime --reason "resume-trigger"
+# 0 = retry_wait/resolved; 78 = resume_blocked -> the [Unit] OnFailure fires
+SuccessExitStatus=0
+
+[Install]
+WantedBy=multi-user.target

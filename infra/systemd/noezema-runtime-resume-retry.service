@@ -1,0 +1,18 @@
+# NOEZEMA resume retry (one probe, transient-first).
+#
+# Each activation runs one admission probe. A transient outcome (retry_wait)
+# exits 0 and the timer re-probes after the deterministic (jitter = 0)
+# backoff; a permanent outcome (resume_blocked) exits 78 and the failure
+# unit raises the critical alert.
+[Unit]
+Description=NOEZEMA resume retry probe
+Documentation=man:noezemactl(1)
+ConditionPathExists=/var/lib/noezema
+OnFailure=noezema-resume-failure@%n.service
+
+[Service]
+Type=oneshot
+User=root
+EnvironmentFile=-/etc/noezema/noezema.env
+ExecStart=/usr/lib/noezema/venv/bin/python -m hostctl.cli resume-runtime --reason "resume-retry"
+SuccessExitStatus=0

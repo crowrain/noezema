@@ -1,0 +1,15 @@
+# NOEZEMA unit-state publisher (T3.16, §8.7.1.1).
+#
+# Reads every noezema unit's active state and fsync-publishes the snapshot
+# to /run/noezema/unit-state.json (boot_id, inventory, ttl_seconds=15).
+# The web's unit-state source; a missing/old snapshot is unhealthy.
+[Unit]
+Description=NOEZEMA unit-state publisher
+Documentation=man:noezemactl(1)
+
+[Service]
+Type=oneshot
+User=root
+RuntimeDirectory=noezema
+RuntimeDirectoryMode=0755
+ExecStart=/usr/lib/noezema/venv/bin/python -m hostctl.cli publish-unit-state

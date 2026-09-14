@@ -1,0 +1,26 @@
+# NOEZEMA runtime admission gate (T3.13, §8.7.1.1).
+#
+# Fail-closed: the service exits non-zero unless EVERY admission condition
+# holds (head tuple + bootstrap seed hash, no unresolved host transition,
+# no active policy change, no stale marker, valid recovery policy). The
+# runtime target Requires this, so a failed admission keeps the whole
+# runtime down. A manual `systemctl start noezema-runtime.target` cannot
+# bypass the checks because the target requires this unit.
+[Unit]
+Description=NOEZEMA runtime admission (fail-closed)
+Documentation=man:noezemactl(1)
+Before=noezema-runtime.target
+ConditionPathExists=/var/lib/noezema
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=root
+EnvironmentFile=-/etc/noezema/noezema.env
+ExecStart=/usr/lib/noezema/venv/bin/python -m hostctl.cli resume-runtime --reason "admission-gate"
+# admission is a gate, not a long-running probe: a non-zero exit (78 =
+# resume_blocked) must keep the target down
+SuccessExitStatus=0
+
+[Install]
+WantedBy=multi-user.target
