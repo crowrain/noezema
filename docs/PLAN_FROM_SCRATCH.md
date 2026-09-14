@@ -429,7 +429,7 @@ sandbox ≤1 мс на тривиальном коде. Знание: 1–2 clai
 
 | # | Задача |
 |---|---|
-| T4.1 | `claim_dependencies`: направление `from depends on to`; DAG-цикл check при commit; graph revision при изменении evidential edges |
+| T4.1 ✅ | `claim_dependencies`: направление `from depends on to`; DAG-цикл check при commit (циклическое evidential-ребро отклоняется с audit, claim коммитится); graph revision только при изменении evidential edges (fencing по base из prepared-строки). Claim ID в контекст-паке `[c:<uuid>]`, `dependencies` в staging-схеме (evidential/research), migration 0006 (kind по §8.6), curator-v2. Тесты: test_claim_dependencies.py, test_staging_schema.py, test_orchestrator.py |
 | T4.2 | Cascade invalidation: closure вне блокировки, immutable closure manifest (root, graph rev, упорядоченные IDs, rank, count, sha256); barrier `discovering/active/closing/resolved/blocked`, durable cursor, идемпотентные батчи; final closure scan перед `resolved` |
 | T4.3 | `reassessment_jobs`: durable очередь, lease/retry/blocked, unique active job, runnable-предикат (effective pointer, пустой activating slot); worker `system:reassessment` (без LLM, без сети, без evidence) |
 | T4.4 | Writer admission: NOWAIT gate, уступление session intent, `T_escalate`, admission gates `T_worker_admission`/`T_repair_admission` в scheduler |

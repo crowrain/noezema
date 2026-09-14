@@ -242,6 +242,20 @@ class ClaimType(StrEnum):
     SELF_MODEL = "self_model"
 
 
+class DependencyKind(StrEnum):
+    """claim_dependencies.kind (T4.1, §8.6).
+
+    ``evidential`` edges form the DAG used by cascade invalidation
+    (cycle check at commit, graph revision bump). ``research`` is the
+    explicit marker for a research dependency (e.g. on a hypothesis,
+    which never serves as sufficient evidence); research edges do not
+    participate in the cycle check or the graph revision.
+    """
+
+    EVIDENTIAL = "evidential"
+    RESEARCH = "research"
+
+
 # ─── Questions (§9) ────────────────────────────────────────────────────────
 
 
@@ -373,6 +387,7 @@ class AuditEventType(StrEnum):
     CLAIM_REVISION = "claim_revision"
     CLAIM_ASSESSED = "claim_assessed"
     CLAIM_INVALIDATED = "claim_invalidated"
+    DEPENDENCY_EDGE_REJECTED = "dependency_edge_rejected"
     COMMIT_ATTEMPT_PREPARED = "commit_attempt_prepared"
     COMMIT_ATTEMPT_COMMITTED = "commit_attempt_committed"
     COMMIT_ATTEMPT_ABORTED = "commit_attempt_aborted"

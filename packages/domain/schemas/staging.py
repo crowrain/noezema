@@ -8,12 +8,34 @@ deterministic rules engine assigns them (§3.7).
 
 from __future__ import annotations
 
+import uuid
 from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from packages.domain.models.base import JsonDict
-from packages.domain.models.enums import ClaimType, EvidenceRelation, QuestionOrigin
+from packages.domain.models.enums import (
+    ClaimType,
+    DependencyKind,
+    EvidenceRelation,
+    QuestionOrigin,
+)
+
+#: hard cap on declared dependencies per claim (host-side budget)
+MAX_DEPENDENCIES_PER_CLAIM = 10
+
+
+class ClaimDependencyProposal(BaseModel):
+    """A dependency of the new claim on an EXISTING corpus claim (T4.1).
+
+    The target must be a claim ID the model saw in the knowledge
+    context; the host re-validates existence at the commit boundary.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    claim_id: uuid.UUID
+    kind: DependencyKind = DependencyKind.EVIDENTIAL
 
 
 class ClaimProposal(BaseModel):
@@ -23,6 +45,9 @@ class ClaimProposal(BaseModel):
     claim_type: ClaimType
     scope: JsonDict = Field(default_factory=dict)
     as_of: datetime | None = None
+    dependencies: list[ClaimDependencyProposal] = Field(
+        default_factory=list, max_length=MAX_DEPENDENCIES_PER_CLAIM
+    )
 
 
 class EvidenceLink(BaseModel):
@@ -62,6 +87,12 @@ class CuratorProposal(BaseModel):
         for i, claim in enumerate(self.claims):
             if claim.claim_type is ClaimType.TEMPORAL_FACT and claim.as_of is None:
                 problems.append(f"claim[{i}]: temporal_fact requires as_of")
+            seen: set[tuple[str, str]] = set()
+            for j, dep in enumerate(claim.dependencies):
+                key = (str(dep.claim_id), dep.kind.value)
+                if key in seen:
+                    problems.append(f"claim[{i}].dependencies[{j}]: duplicate {key[0][:8]}")
+                seen.add(key)
         if len(self.new_questions) > questions_max:
             problems.append(f"new_questions: {len(self.new_questions)} > {questions_max}")
         return problems

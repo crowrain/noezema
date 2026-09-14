@@ -70,7 +70,10 @@ class RetrievedClaim:
     @property
     def line(self) -> str:
         """The exact line that goes into the context (label + statement,
-        same line, §5.4.2)."""
+        same line, §5.4.2). The claim ID prefix (T4.1) lets the curator
+        reference the claim in `dependencies` proposals; the label and
+        the ID share the line, so the §5.4.2 all-or-nothing rule covers
+        both."""
         prefix = f"{self.label} " if self.label else ""
         status_text = self.epistemic_status.value if self.epistemic_status is not None else "unknown"
         meta = f" ({status_text}"
@@ -79,7 +82,7 @@ class RetrievedClaim:
         if self.confidence is not None:
             meta += f", p={self.confidence:.2f}"
         meta += ")"
-        return f"{prefix}{self.statement}{meta}"
+        return f"[c:{self.claim_id}] {prefix}{self.statement}{meta}"
 
 
 @dataclass(frozen=True)

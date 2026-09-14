@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.domain.canonical import canonical_sha256
@@ -36,6 +36,7 @@ from packages.domain.models.memory import (
     ORMClaim,
     ORMClaimAssessment,
     ORMClaimAssessmentHead,
+    ORMClaimDependency,
     ORMEnvironmentManifest,
     ORMEvidence,
 )
@@ -60,6 +61,49 @@ from packages.memory.rules_engine import (
 GLOBAL_SCOPE = "global"
 
 
+def _dependency_dict(value: Any) -> JsonDict | None:
+    """A JSONB element is native Python at runtime; guard non-dict values
+    (a malformed staging payload must reject the edge, not raise)."""
+    return value if isinstance(value, dict) else None
+
+
+def find_evidential_cycles(
+    existing: list[tuple[uuid.UUID, uuid.UUID]],
+    new: list[tuple[uuid.UUID, uuid.UUID]],
+) -> set[int]:
+    """Indices of ``new`` edges that would create a cycle in the
+    evidential DAG (T4.1, §8.6: cycles are forbidden for evidential
+    dependencies; the check runs at the commit boundary).
+
+    A new edge ``a -> b`` closes a cycle iff ``a`` is reachable from
+    ``b`` in (existing edges ∪ new edges). Pure and corpus-scale small,
+    so it is an in-memory DFS over one pre-fetched edge set."""
+    graph: dict[uuid.UUID, list[uuid.UUID]] = {}
+    for src, dst in existing:
+        graph.setdefault(src, []).append(dst)
+    for src, dst in new:
+        graph.setdefault(src, []).append(dst)
+    rejected: set[int] = set()
+    for i, (src, dst) in enumerate(new):
+        stack = [dst]
+        visited = {dst}
+        cyclic = False
+        while stack:
+            node = stack.pop()
+            for nxt in graph.get(node, ()):
+                if nxt == src:
+                    cyclic = True
+                    break
+                if nxt not in visited:
+                    visited.add(nxt)
+                    stack.append(nxt)
+            if cyclic:
+                break
+        if cyclic:
+            rejected.add(i)
+    return rejected
+
+
 @dataclass(frozen=True)
 class MemoryApplyResult:
     claims_created: int = 0
@@ -67,6 +111,11 @@ class MemoryApplyResult:
     evidence_added: int = 0
     evidence_deduped: int = 0
     assessments: int = 0
+    dependencies_added: int = 0
+    #: evidential subset — the graph revision is bumped only when these
+    #: actually change (T4.1, §8.6)
+    dependencies_evidential_added: int = 0
+    dependencies_rejected: tuple[str, ...] = ()
     problems: tuple[str, ...] = ()
 
 
@@ -176,6 +225,7 @@ class MemoryService:
         # 1. claims (exact statement+type dedup against the corpus)
         claims: list[ORMClaim] = []
         claim_scopes: dict[uuid.UUID, JsonDict] = {}
+        claim_deps: list[tuple[ORMClaim, list[Any]]] = []
         for row in claim_ops:
             payload = dict(row.payload)
             statement = str(payload.get("statement", ""))[:2000]
@@ -185,6 +235,8 @@ class MemoryService:
                 continue
             scope = dict(payload.get("scope") or {})
             as_of_raw = payload.get("as_of")
+            deps = payload.get("dependencies")
+            deps_list: list[Any] = list(deps) if isinstance(deps, list) else []
             existing_claim = (
                 (
                     await db.execute(
@@ -200,6 +252,7 @@ class MemoryService:
                 claims.append(existing_claim)
                 claim_scopes[existing_claim.id] = scope
                 counters["reused"] += 1
+                claim_deps.append((existing_claim, deps_list))
             else:
                 claim = ORMClaim(
                     id=uuid.uuid4(),
@@ -214,6 +267,7 @@ class MemoryService:
                 claims.append(claim)
                 claim_scopes[claim.id] = scope
                 counters["created"] += 1
+                claim_deps.append((claim, deps_list))
                 await audit.record(
                     AuditEventType.CLAIM_CREATED,
                     session_id=session.id,
@@ -224,6 +278,133 @@ class MemoryService:
                         "scope": scope,
                     },
                     public_summary=f"claim: {statement[:120]}",
+                )
+
+        # 1b. claim dependencies (T4.1, §8.6): the DAG cycle check runs
+        # at the commit boundary; a cyclic/invalid edge is rejected with
+        # audit, the claim itself still commits (conservative, no
+        # invariant is broken)
+        counters["deps"] = 0
+        deps_rejected: list[str] = []
+        dep_edges: list[tuple[ORMClaim, JsonDict]] = []
+        for claim, deps_list in claim_deps:
+            for d in deps_list:
+                dep = _dependency_dict(d)
+                if dep is None:
+                    deps_rejected.append(f"{claim.id}: unparseable dependency")
+                    continue
+                dep_edges.append((claim, dep))
+        if dep_edges:
+            proposed: list[tuple[uuid.UUID, uuid.UUID, str]] = []
+            for claim, d in dep_edges:
+                kind = str(d.get("kind", "evidential"))
+                if kind not in ("evidential", "research"):
+                    deps_rejected.append(f"{claim.id}: bad dependency kind {kind!r}")
+                    continue
+                raw = str(d.get("claim_id", ""))
+                try:
+                    to_id = uuid.UUID(raw)
+                except ValueError:
+                    deps_rejected.append(f"{claim.id}: bad dependency claim_id {raw!r}")
+                    continue
+                if to_id == claim.id:
+                    deps_rejected.append(f"{claim.id}: self-dependency")
+                    continue
+                target = await db.get(ORMClaim, to_id)
+                if target is None:
+                    deps_rejected.append(f"{claim.id}: dependency target {to_id} missing")
+                    continue
+                if kind == "evidential":
+                    # §8.6: pending/invalid claims are not acting
+                    # dependencies — the evidential edge to a
+                    # non-current target is refused (research edges
+                    # carry the explicit marker and are allowed)
+                    ok = (
+                        (
+                            await db.execute(
+                                text(
+                                    "SELECT 1 FROM claim_assessment_heads h "
+                                    "WHERE h.claim_id = :c "
+                                    "AND h.config_snapshot_id = :s "
+                                    "AND h.assessment_state = 'current'"
+                                ),
+                                {"c": to_id, "s": session.config_snapshot_id},
+                            )
+                        )
+                        .first()
+                        is not None
+                    )
+                    if not ok:
+                        deps_rejected.append(
+                            f"{claim.id}: evidential dependency on non-current claim {to_id}"
+                        )
+                        continue
+                proposed.append((claim.id, to_id, kind))
+
+            evidential = [(f, t) for (f, t, k) in proposed if k == "evidential"]
+            if evidential:
+                existing_rows = (
+                    await db.execute(
+                        text(
+                            "SELECT from_claim_id, to_claim_id FROM claim_dependencies "
+                            "WHERE kind = 'evidential'"
+                        )
+                    )
+                ).all()
+                existing: list[tuple[uuid.UUID, uuid.UUID]] = []
+                for r in existing_rows:
+                    f = r[0] if isinstance(r[0], uuid.UUID) else uuid.UUID(str(r[0]))
+                    t = r[1] if isinstance(r[1], uuid.UUID) else uuid.UUID(str(r[1]))
+                    existing.append((f, t))
+                cyclic = find_evidential_cycles(existing, evidential)
+                if cyclic:
+                    # drop exactly the cyclic evidential edges
+                    drop: set[tuple[uuid.UUID, uuid.UUID]] = set()
+                    ev_idx = 0
+                    for (f, t, k) in proposed:
+                        if k == "evidential":
+                            if ev_idx in cyclic:
+                                drop.add((f, t))
+                                deps_rejected.append(
+                                    f"{f}: evidential edge to {t} rejected (would create a cycle)"
+                                )
+                            ev_idx += 1
+                    proposed = [e for e in proposed if e[:2] not in drop]
+
+            for f, t, k in proposed:
+                exists = (
+                    (
+                        await db.execute(
+                            select(ORMClaimDependency).where(
+                                ORMClaimDependency.from_claim_id == f,
+                                ORMClaimDependency.to_claim_id == t,
+                                ORMClaimDependency.kind == k,
+                            )
+                        )
+                    )
+                    .scalars()
+                    .first()
+                )
+                if exists is not None:
+                    continue  # idempotent: the edge already exists
+                db.add(
+                    ORMClaimDependency(
+                        id=uuid.uuid4(),
+                        from_claim_id=f,
+                        to_claim_id=t,
+                        kind=k,
+                        created_in_session=session.id,
+                    )
+                )
+                counters["deps"] += 1
+                if k == "evidential":
+                    counters["deps_evidential"] = counters.get("deps_evidential", 0) + 1
+            if deps_rejected:
+                await audit.record(
+                    AuditEventType.DEPENDENCY_EDGE_REJECTED,
+                    session_id=session.id,
+                    payload={"edges": deps_rejected[:20]},
+                    public_summary=f"{len(deps_rejected)} dependency edge(s) rejected",
                 )
 
         # 2. evidence (identity recomputed by the trusted host)
@@ -314,6 +495,9 @@ class MemoryService:
             evidence_added=counters["added"],
             evidence_deduped=counters["deduped"],
             assessments=counters["assessments"],
+            dependencies_added=counters["deps"],
+            dependencies_evidential_added=counters.get("deps_evidential", 0),
+            dependencies_rejected=tuple(deps_rejected),
             problems=tuple(problems),
         )
 

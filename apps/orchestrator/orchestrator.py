@@ -223,6 +223,9 @@ class Orchestrator:
                 "evidence_added": result.evidence_added,
                 "evidence_deduped": result.evidence_deduped,
                 "assessments": result.assessments,
+                "dependencies_added": result.dependencies_added,
+                "dependencies_evidential_added": result.dependencies_evidential_added,
+                "dependencies_rejected": list(result.dependencies_rejected),
                 "problems": list(result.problems),
             }
 
@@ -407,7 +410,9 @@ class Orchestrator:
 
         # consolidating: curator (proposals go to session_staging, T2.13)
         await self._transition(db, audit, session, SessionState.CONSOLIDATING)
-        claims, _questions_created = await self._curator(db, audit, session, ctx, snapshot, staging)
+        claims, _questions_created = await self._curator(
+            db, audit, session, ctx, snapshot, staging, pack
+        )
 
         # reporting
         await self._transition(db, audit, session, SessionState.REPORTING)
@@ -826,6 +831,7 @@ class Orchestrator:
         ctx: SessionContext,
         snapshot: ORMConfigSnapshot,
         staging: StagingService,
+        pack: Any,
     ) -> tuple[int, int]:
         """Run the curator; host-validate the proposal. Returns
         (claims_proposed, questions_created)."""
@@ -834,8 +840,20 @@ class Orchestrator:
             f"[{i}] {e.kind.value} {e.identity_hash[:16]} {_cap_args(e.payload)}"
             for i, e in enumerate(ctx.evidence)
         )
+        # T4.1: the curator needs the existing claim IDs to declare
+        # `dependencies` — the context pack's claim sections carry them
+        # (each line is prefixed with [c:<claim_id>])
+        knowledge_lines: list[str] = []
+        if pack is not None:
+            for section in ("claims_evidence", "pending_claims", "contradictions"):
+                sec = pack.section(section)
+                if sec is not None and sec.content:
+                    knowledge_lines.extend(sec.content.splitlines())
+        knowledge = "\n".join(knowledge_lines) or "(пусто)"
         user = (
-            f"# Вопрос\n{ctx.question_text}\n\n# Evidence\n{ev_lines or '(пусто)'}\n\n"
+            f"# Вопрос\n{ctx.question_text}\n\n"
+            f"# Знание (claim ID в строке [c:...])\n{knowledge}\n\n"
+            f"# Evidence\n{ev_lines or '(пусто)'}\n\n"
             "Предложи изменения памяти (JSON по схеме)."
         )
         fingerprint = build_model_fingerprint(

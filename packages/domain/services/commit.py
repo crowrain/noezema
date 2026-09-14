@@ -140,15 +140,38 @@ async def finalize(
     | None = None,
 ) -> FinalizeResult:
     """The short fenced final transaction (caller's ``db``; the caller
-    commits/rolls back). Locks in canonical order, checks the fencing
-    predicate, applies memory + staging, bumps the knowledge revision,
-    and writes the terminal state + audit + outbox atomically.
+    commits/rolls back). Locks in canonical order (including the
+    dependency_graph row when the staging touches it, T4.1), checks the
+    fencing predicate, applies memory + staging, bumps the knowledge
+    revision (and the dependency_graph revision when evidential edges
+    changed), and writes the terminal state + audit + outbox atomically.
 
     ``apply_memory`` (M3) runs INSIDE this transaction, after the fencing
     predicate passes and before the staging rows are marked applied, so a
     rolled-back fence rolls back the memory writes too."""
-    # 1. locks in canonical order: session -> knowledge -> attempt
-    await lock_commit_set(db, session.id, attempt.id, touches_dependency_graph=False)
+    # 0. (T4.1) a commit TOUCHES the dependency graph when its recorded
+    # staging proposes at least one evidential claim-dependency edge:
+    # then the graph lock row participates (canonical order), the fence
+    # checks the graph revision against the prepare-time base, and the
+    # graph revision is bumped only when an evidential edge was actually
+    # written (research edges never touch the graph, §8.6).
+    touches_dependency_graph = (
+        await db.execute(
+            text(
+                "SELECT 1 FROM session_staging "
+                "WHERE session_id = :id AND op = 'claim' AND state = 'recorded' "
+                "AND jsonb_typeof(payload->'dependencies') = 'array' "
+                "AND jsonb_array_length(payload->'dependencies') > 0 "
+                "AND EXISTS (SELECT 1 FROM jsonb_array_elements(payload->'dependencies') d "
+                "              WHERE COALESCE(d->>'kind', 'evidential') = 'evidential') "
+                "LIMIT 1"
+            ),
+            {"id": session.id},
+        )
+    ).first() is not None
+
+    # 1. locks in canonical order: session -> knowledge -> [graph] -> attempt
+    await lock_commit_set(db, session.id, attempt.id, touches_dependency_graph=touches_dependency_graph)
 
     # 2. fencing predicate (§5.2.2)
     fence = (
@@ -157,6 +180,8 @@ async def finalize(
                 """
                 SELECT s.state, s.lease_owner, s.lease_expires_at,
                        r.revision AS knowledge_revision,
+                       (SELECT revision FROM domain_revisions
+                        WHERE scope = 'dependency_graph') AS dependency_graph_revision,
                        a.status AS attempt_status
                 FROM sessions s
                 JOIN domain_revisions r ON r.scope = 'knowledge'
@@ -185,6 +210,13 @@ async def finalize(
     if live is None:
         return FinalizeResult("lease_lost", attempt.id)
     if int(fence["knowledge_revision"]) != attempt.base_knowledge_revision:
+        return FinalizeResult("fencing_conflict", attempt.id)
+    # §5.2.2: (NOT touches_dependency_graph OR graph_rev = validated base)
+    # the scalar read is safe: the graph row is already locked by this
+    # transaction when (and only when) the commit touches it
+    if touches_dependency_graph and int(fence["dependency_graph_revision"]) != (
+        attempt.base_dependency_graph_revision
+    ):
         return FinalizeResult("fencing_conflict", attempt.id)
     if fence["attempt_status"] != "prepared":
         return FinalizeResult("fencing_conflict", attempt.id)
@@ -242,6 +274,22 @@ async def finalize(
         ),
         {"r": new_rev, "base": attempt.base_knowledge_revision},
     )
+    # (T4.1) dependency graph revision — bumped only when an evidential
+    # edge was actually written in this commit (the lock and the fence
+    # already ran when the staging TOUCHED the graph; a commit whose
+    # evidential edges were all rejected changes nothing)
+    new_graph_rev: int | None = None
+    if touches_dependency_graph and int(memory_payload.get("dependencies_evidential_added", 0)) > 0:
+        new_graph_rev = attempt.base_dependency_graph_revision + 1
+        bumped = await db.execute(
+            text(
+                "UPDATE domain_revisions SET revision = :r, updated_at = now() "
+                "WHERE scope = 'dependency_graph' AND revision = :base RETURNING 1"
+            ),
+            {"r": new_graph_rev, "base": attempt.base_dependency_graph_revision},
+        )
+        if bumped.first() is None:
+            raise RuntimeError("dependency_graph revision CAS failed")
 
     # 5. attempt -> committed + question terminal state
     attempt.status = "committed"
@@ -285,6 +333,7 @@ async def finalize(
         payload={
             "attempt_id": str(attempt.id),
             "knowledge_revision": new_rev,
+            "dependency_graph_revision": new_graph_rev,
             "memory": memory_payload,
         },
     )
