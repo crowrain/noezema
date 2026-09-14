@@ -376,7 +376,36 @@ fenced commit отклонён по истёкшему lease → T3.30; кура
 `max_output_tokens` (2048 → пустой content, `finish_reason=length`, 3 ретрая ~84 с) → операционное
 решение: `max_output_tokens ≥ 4096` для реальной сессии. 2-я сессия (после T3.30, 2026-09-14) —
 **SUCCEEDED**: explorer 68.9 с + 143.4 с (4.8×TTL, guard), куратор 24.4 с (out 1841, schema_valid),
-fenced commit 46 мс, claim «6*7=42» → E2/supported/0.55, вопрос → verified; замер: серия продолжается.
+fenced commit 46 мс, claim «6*7=42» → E2/supported/0.55, вопрос → verified.
+
+Результат серии (2026-09-14, БД `noezema_mvp`, накопление знания между сессиями):
+- **Проход 1 (бюджет 4096): 4/4 failed** — `LLMSchemaError` на первом explorer-вызове:
+  `reasoning_content` съел весь бюджет (проб минимального промпта: 15 000+ знаков reasoning,
+  `finish_reason=length`, content пуст; 3 ретрая ≈ 200–286 с/сессию). Поведение модели
+  дрейфует: длина reasoning на тривиальном вопросе выросла до 4100–4250 токенов (ср. 545–1841
+  во 2-й сессии). Авто-pause wake-планировщика сработал (4 последовательных неудач → sticky
+  `paused`); operator resume (RESUME: node_state→idle + сброс failure-бухгалтерии) восстановил
+  работу. Отказавшие сессии чисто откатились: в таблицах лишь wake-ledger + хост-лог.
+- **Проход 2 (бюджет 8192): 3 succeeded + 1 succeeded_partial** (wall 72–184 с):
+  | сессия | итог | LLM-вызовы (out/ток, с) | sandbox | commit |
+  |---|---|---|---|---|
+  | 42:6 | succeeded_partial (4 шага) | 702/10.8, 4222/65.9, 541/8.4, 2448/33.0, 4252/65.9 | ~0–1 мс ×2 | 50 мс |
+  | 12·13 | succeeded (2 шага) | 857/13.1, 1288/19.3, 3132/39.7 | ~0 мс | 22 мс |
+  | сумма 1..10 | succeeded (2 шага) | 4233/60.6, 4189/63.8, 2944/38.3 | ~0 мс | 21 мс |
+  | 7! | succeeded (3 шага) | 4226/63.5, 4184/64.4, 994/14.9, 2373/30.8 | ~0 мс | 21 мс |
+- **Замеры нагрузки (проход 2, 15 LLM-вызовов)**: throughput ≈ 68 ток/с (40 585 out-токенов за
+  592 с); LLM-задержка 8–66 с (линейно от длины вывода); wall сессии = LLM-время + 5–10 с
+  оверхеда; fenced commit 21–50 мс; sandbox `python.execute` ≤1 мс на тривиальном коде;
+  in-токены 600–1110/вызов (контекст-пак с накопленным знанием).
+- **Отклонения протокола модели** (защиты отработали): чужой инструмент `message.reply` с
+  неверными аргументами → policy DENIED (action_failed); free-text complete-reason вне closed
+  enum → `succeeded_partial` + вопрос `partially_answered` (claim всё же закоммичен, E2).
+- **Операционное решение**: `max_output_tokens = 8192` — обязательный минимум для
+  qwen36-35b-a3b-q6-mtp (бюджет ≥ P99(reasoning) + payload, с запасом); `reset_failure_state()`
+  планировщика — только failure-бухгалтерия, node_state снимает web RESUME (полная процедура).
+- Итог: 5 закоммиченных сессий, 5 claims (все computed_result, E2/supported/0.55),
+  вопросы: 4 verified + 1 partially_answered. Материал для порогов M4 (очередь, батч, SLO) —
+  собран; старт M4 — решение пользователя.
 
 ---
 

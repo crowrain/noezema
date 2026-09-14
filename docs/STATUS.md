@@ -189,4 +189,28 @@ assessment **E2 / supported / confidence 0.55** (только rules engine, rule
 `verified`, wake: `consecutive_failures=0, node_state=idle`. БД `noezema_mvp` сохранена как
 доказательство (фореинзика — в отчёте по сессии).
 
+**Серия реальных MVP-сессий и замеры нагрузки (M4-precondition, 2026-09-14)** — 4 вопроса
+в БД `noezema_mvp` (знание накапливается между сессиями; контекст-пак видит предыдущие
+claims). Проход 1 при `max_output_tokens=4096` — **4/4 failed**: `reasoning_content` съел
+весь бюджет на первом explorer-вызове (проб минимального промпта: 15 000+ знаков
+reasoning, `finish_reason=length`, content пуст; 3 ретрая, wall 196–286 с/сессию).
+Длина reasoning модели дрейфует (4100–4250 токенов на тривиальном вопросе против
+545–1841 во 2-й сессии) — 4096 оказалось меньше P99. Авто-pause wake-планировщика
+сработал по spec (4 неудачи → sticky `paused`); operator resume (web RESUME:
+node_state→idle + сброс failure-бухгалтерии; `reset_failure_state()` планировщика —
+только бухгалтерия, node_state снимает host/web-слой) восстановил работу; отказавшие
+сессии чисто откатились (в таблицах — только wake-ledger + хост-лог).
+Проход 2 при **8192** — **3 succeeded + 1 succeeded_partial** (wall 72–184 с):
+`42:6` → partial (модель вызвала чужой инструмент `message.reply` с неверными
+аргументами → policy DENIED; free-text complete-reason вне closed enum →
+`succeeded_partial` + `partially_answered`, claim закоммичен), `12·13`, `сумма 1..10`,
+`7!` → succeeded. Замеры (проход 2, 15 LLM-вызовов): throughput ≈ 68 ток/с
+(40 585 out-токенов за 592 с); задержка вызова 8–66 с (линейно от длины вывода);
+in-токены 600–1110; fenced commit 21–50 мс; sandbox ≤1 мс на тривиальном коде.
+Итог по БД: 5 закоммиченных сессий, 5 claims (computed_result, E2/supported/0.55),
+4 verified + 1 partially_answered, node_state=idle. Операционное решение:
+`max_output_tokens=8192` — обязательный минимум для qwen36-35b-a3b-q6-mtp.
+Материал для порогов M4 (очередь, батч, SLO) собран (PLAN, блок «Серия реальных
+MVP-сессий»); старт M4 — решение пользователя.
+
 Merge в `main` — отдельное решение (не выполняется автоматически).

@@ -96,6 +96,12 @@ cd /home/denis/dsh1/noezema-src && export UV_CACHE_DIR="$PWD/.uv-cache" \
 
 - Docker 29.8: `docker kill -s KILL` (не `-9`); `docker cp` не видит tmpfs — использовать
   bind-mount workspace хоста.
+- `created_at` строк, рождённых в долгой phase-1-транзакции (model_runs, audit и т.п.),
+  = `now()` = старт транзакции: внутри одной сессии все значения совпадают, хронологию
+  строить только по `audit_events.sequence`.
+- Локальные reasoning-модели: `reasoning_content` расходует `max_output_tokens`; длина
+  reasoning дрейфует между запусками — бюджет держать ≥ P99 (для qwen36-35b-a3b-q6-mtp
+  минимум 8192; при 4096 сессии падали `finish_reason=length` с пустым content).
 - PostgreSQL FTS: конфиг `russian` (не `simple` — падежи не матчатся); `plainto_tsquery`
   (не `to_tsquery` — `*` ломает разбор); `ts_rank(to_tsvector(...), tsquery)` — вектор первым.
 - ORM: атрибут `metadata` занят `DeclarativeBase` → `meta = mapped_column("metadata", ...)`.
