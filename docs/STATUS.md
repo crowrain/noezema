@@ -9,7 +9,7 @@
 |---|---|---|---|
 | M0 каркас | ✅ выполнена | — | чистое дерево, скелет, CI, fake LLM, ADR-0001/0002/0003 |
 | M1 контракты + LLM | ✅ выполнена | noezema-m1 | PR #4–#10; gate пройден: 112 тестов (86 unit ≥ 40), Sealed-сессия question→action→evidence→commit на fake LLM |
-| M2 изоляция + commit | 🔄 в работе | — | PR #11–#14: sandbox+runtime, policy engine, tool broker, artifact store+staging+freeze; commit boundary + reconciliation — PR #15, gate — PR #16 |
+| M2 изоляция + commit | 🔄 в работе | — | PR #11–#15: sandbox+runtime, policy engine, tool broker, artifact store+staging+freeze, commit boundary (prepared→fenced final tx) + reconciliation; gate + failpoint/security-тесты — PR #16 |
 | M3 память + web slice (MVP) | ⬜ не начата | — | |
 | M4 зависимости + переоценка | ⬜ не начата | — | |
 | M5 расширенный цикл | ⬜ не начата | — | |
@@ -25,8 +25,8 @@
 | 3 | causal/idempotency ID в trusted host | MVP | ✅ | test_orchestrator.py (turn_id/action_id/idempotency_key генерирует хост) |
 | 4 | typed actions в sandbox | MVP | 🔄 | test_sandbox_runtime.py + test_tool_broker_sandbox.py (одноразовый контейнер, cap-drop/network/ro-rootfs, shell/python в sandbox, overlay) |
 | 5 | claim только с согласованным lifecycle | MVP | ⬜ | — |
-| 6 | один fenced commit attempt | MVP | ⬜ | — |
-| 7 | lost COMMIT → reconciliation | MVP | ⬜ | — |
+| 6 | один fenced commit attempt | MVP | 🔄 | test_reconciler.py + test_orchestrator.py (prepared-строка до финального tx; fencing predicate: lease+revision+attempt=prepared; partial unique §14.2) |
+| 7 | lost COMMIT → reconciliation | MVP | 🔄 | test_reconciler.py (kill before COMMIT→aborted; after commit→accepted; open final tx→finalizer_in_progress; stale finalizer→fenced) |
 | 8 | failpoints → старый/полный checkpoint | MVP | ⬜ | — |
 | 9 | status/timeline/attempts/assessments + auth messages/controls | MVP (dependencies — v1) | 🔄 | test_web_api.py (status/timeline/messages/commands; attempts — M2, assessments — M3, auth — M7) |
 | 10 | раздельные messages/stop/abort/controls | MVP | ✅ | test_web_api.py (раздельные endpoints; closed enum; idempotency key; stop/abort флаги сессии) |
@@ -38,7 +38,7 @@
 | 16 | worker: priority, retry, no starvation | v1 | ⬜ | — |
 | 17 | repeatability/reproducibility/replication | v1 | ⬜ | — |
 | 18 | counterevidence resolutions | v1 | ⬜ | — |
-| 19 | unresolved attempt блокирует wake/GC | MVP | ⬜ | — |
+| 19 | unresolved attempt блокирует wake/GC | MVP | 🔄 | test_reconciler.py (unresolved prepared → reconciled_abort; wake/GC-блокировка — вместе с M3 durable knowledge) |
 | 20 | FIFO полный минимальный путь | MVP | ✅ | test_web_api.py::test_wake_now_runs_full_session + test_orchestrator.py::test_full_sealed_session + test_question_selector.py (durable knowledge — M3) |
 | 21 | sync head update + offline flip | MVP | ⬜ | — |
 | 22 | barrier crash-resume | v1 | ⬜ | — |

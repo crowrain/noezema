@@ -20,11 +20,13 @@ M2 state (after this PR):
 
 from __future__ import annotations
 
+import os
 import uuid
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from apps.orchestrator.evidence import observation_to_evidence
@@ -35,7 +37,9 @@ from packages.broker import ToolExecutor, check_idempotency
 from packages.cognition.question_selector import FIFOQuestionSelector
 from packages.domain.canonical import canonical_json_bytes
 from packages.domain.db.uow import transaction
+from packages.domain.models.artifacts import ORMWorkspaceManifest
 from packages.domain.models.base import JsonDict
+from packages.domain.models.commit import ORMCommitAttempt
 from packages.domain.models.config import ORMConfigSnapshot
 from packages.domain.models.enums import (
     ActionState,
@@ -57,8 +61,13 @@ from packages.domain.schemas.decision import ModelResponse
 from packages.domain.schemas.evidence import EvidenceRecord
 from packages.domain.schemas.staging import CuratorProposal
 from packages.domain.services.audit import AuditService
+from packages.domain.services.commit import FinalizeResult
+from packages.domain.services.commit import finalize as commit_finalize
+from packages.domain.services.commit import prepare as commit_prepare
 from packages.domain.services.config import ConfigService
-from packages.domain.services.reserve import HostReserveService
+from packages.domain.services.lease import LeaseService
+from packages.domain.services.reconciler import reconcile_commit
+from packages.domain.services.reserve import HostReserveService, ReserveLimits
 from packages.domain.services.staging import StagingService
 from packages.llm_gateway.client import LLMError, LLMMiddleware
 from packages.llm_gateway.config import ModelProfile
@@ -93,6 +102,25 @@ class SessionOutcome:
     termination_reason: str | None
 
 
+@dataclass(frozen=True)
+class CommitPlan:
+    """Everything the fenced final transaction needs (PR #15, §5.2.2)."""
+
+    session_id: uuid.UUID
+    question_id: uuid.UUID
+    terminal: SessionState
+    question_terminal: QuestionState
+    steps: int
+    evidence_count: int
+    claims: int
+    questions_created: int
+    termination_reason: str | None
+    max_claims: int
+    max_new_claims: int
+    max_evidence: int
+    max_questions: int
+
+
 class Orchestrator:
     def __init__(
         self,
@@ -101,6 +129,7 @@ class Orchestrator:
         profile: ModelProfile,
         executor: ToolExecutor,
         selector: FIFOQuestionSelector | None = None,
+        node_owner: str | None = None,
     ) -> None:
         self.session_factory = session_factory
         self.gateway = gateway
@@ -108,14 +137,116 @@ class Orchestrator:
         self.executor = executor
         self.selector = selector if selector is not None else FIFOQuestionSelector()
         self.prompts = {Role.EXPLORER: load_prompt(Role.EXPLORER), Role.CURATOR: load_prompt(Role.CURATOR)}
+        self.node_owner = node_owner if node_owner is not None else f"node-{os.getpid()}"
 
     async def run_session(self, question_id: uuid.UUID | None = None) -> SessionOutcome:
+        """M2 session lifecycle (T2.15-T2.21):
+
+        1. one transaction: waking -> ... -> COMMITTING (staging, manifest);
+        2. a separate transaction: durable ``commit_attempts(prepared)``;
+        3. the short fenced final transaction (locks in canonical order,
+           fencing predicate, apply staging, pointer, checkpoint, audit);
+        4. a failed fencing/lease outcome is resolved by the reconciler,
+           never by a guessed rollback.
+        """
+        # ── phase 1: lifecycle up to COMMITTING ───────────────────────────
         async with self.session_factory() as db, transaction(db):
-            return await self._run(db, question_id)
+            result = await self._run_to_committing(db, question_id)
+        if isinstance(result, SessionOutcome):
+            # early finish (no question, operator abort) — already terminal
+            return result
+        plan: CommitPlan = result
 
-    # ── main flow ─────────────────────────────────────────────────────────
+        # ── phase 2: durable prepared attempt ─────────────────────────────
+        attempt_id: uuid.UUID | None = None
+        try:
+            async with self.session_factory() as db, transaction(db):
+                audit = AuditService(db)
+                session = await db.get(ORMSession, plan.session_id)
+                manifest = (
+                    await db.get(ORMWorkspaceManifest, session.committed_workspace_manifest_id)
+                    if session is not None and session.committed_workspace_manifest_id is not None
+                    else None
+                )
+                if session is None:
+                    raise RuntimeError(f"session {plan.session_id} vanished before prepare")
+                attempt = await commit_prepare(db, audit, session, manifest, self.node_owner)
+                attempt_id = attempt.id
+        except Exception:
+            await self._abort_session(plan, "prepare_failed")
+            raise
 
-    async def _run(self, db: AsyncSession, question_id: uuid.UUID | None) -> SessionOutcome:
+        # ── phase 3: the fenced final transaction ─────────────────────────
+        staging = StagingService(
+            HostReserveService(
+                ReserveLimits(
+                    plan.max_claims, plan.max_new_claims, plan.max_evidence, plan.max_questions
+                )
+            )
+        )
+        finalize_result: FinalizeResult | None = None
+        async with self.session_factory() as db:
+            try:
+                async with transaction(db):
+                    audit = AuditService(db)
+                    session = await db.get(ORMSession, plan.session_id)
+                    attempt_row = await db.get(ORMCommitAttempt, attempt_id)
+                    if session is None or attempt_row is None:
+                        raise RuntimeError("session or attempt missing at finalize")
+                    finalize_result = await commit_finalize(
+                        db, audit, session, attempt_row, self.node_owner, staging,
+                        terminal=plan.terminal, steps=plan.steps,
+                        evidence_count=plan.evidence_count, claims=plan.claims,
+                        questions_created=plan.questions_created,
+                        termination_reason=plan.termination_reason,
+                        question_id=plan.question_id,
+                        question_terminal=plan.question_terminal.value,
+                    )
+            except Exception:
+                await db.rollback()
+                raise
+        assert finalize_result is not None
+
+        if finalize_result.outcome == "committed":
+            return SessionOutcome(
+                session_id=plan.session_id,
+                final_state=plan.terminal,
+                question_id=plan.question_id,
+                steps=plan.steps,
+                evidence_count=plan.evidence_count,
+                claims_proposed=max(plan.claims, finalize_result.applied_claims),
+                questions_created=finalize_result.applied_questions,
+                termination_reason=plan.termination_reason,
+            )
+
+        # fencing conflict / lease lost / attempt missing: the outcome is
+        # decided by the fenced reconciliation protocol (T2.20)
+        async with self.session_factory() as db, transaction(db):
+            audit = AuditService(db)
+            rec = await reconcile_commit(
+                db, audit, plan.session_id, original_owner=self.node_owner
+            )
+        final_state = (
+            SessionState.FAILED
+            if rec.outcome in ("aborted", "records_inconsistent", "no_attempt")
+            else plan.terminal
+        )
+        return SessionOutcome(
+            session_id=plan.session_id,
+            final_state=final_state,
+            question_id=plan.question_id,
+            steps=plan.steps,
+            evidence_count=plan.evidence_count,
+            claims_proposed=0,
+            questions_created=0,
+            termination_reason=f"commit_{finalize_result.outcome}",
+        )
+
+    # ── main flow (phase 1) ───────────────────────────────────────────────
+
+    async def _run_to_committing(
+        self, db: AsyncSession, question_id: uuid.UUID | None
+    ) -> SessionOutcome | CommitPlan:
         audit = AuditService(db)
 
         # waking: single-session enforcement (M1)
@@ -143,6 +274,12 @@ class Orchestrator:
         await SessionRepository.create(db, session)
         await audit.record(
             AuditEventType.SESSION_STARTED, session_id=session.id, public_summary="session started"
+        )
+        # T2.16: take the lease before any real work
+        lease = LeaseService()
+        await lease.acquire(
+            db, session.id, self.node_owner,
+            phase_deadline=timedelta(seconds=int(limits.get("phase_deadline_seconds", 600))),
         )
         for state in (SessionState.WAKING, SessionState.ORIENTING):
             await self._transition(db, audit, session, state)
@@ -184,7 +321,7 @@ class Orchestrator:
         await self._transition(db, audit, session, SessionState.EXPLORING)
         max_steps = int(limits.get("max_explorer_steps", 10))
         steps, stopped, aborted = await self._explorer_loop(
-            db, audit, session, ctx, max_steps, cap_profile, policy_engine, staging
+            db, audit, session, ctx, max_steps, cap_profile, policy_engine, staging, lease
         )
         if aborted:
             # ABORTING was set in the loop; finish as cancelled in the SAME
@@ -224,39 +361,51 @@ class Orchestrator:
             },
         )
 
-        # committing (M2 simple commit; the fenced transaction lands in
-        # PR #15): apply recorded staging, freeze the overlay, then finish
-        # in the same transaction.
+        # committing: freeze the overlay, then return the CommitPlan — the
+        # durable prepared attempt + the fenced final transaction run in
+        # SEPARATE transactions (T2.18/T2.19, §5.2.2).
         await self._transition(db, audit, session, SessionState.COMMITTING)
-        if ctx.complete_reason == CompleteReason.GOAL_REACHED.value:
-            final = SessionState.SUCCEEDED
-        else:
-            final = SessionState.SUCCEEDED_PARTIAL
-        applied_claims, applied_questions = await staging.apply_recorded(db, audit, session)
-        questions_created = applied_questions
-        claims = max(claims, applied_claims)
 
+        # T2.21: an unknown action outcome makes the session failed, not
+        # partial (the safe-boundary rule).
+        unknown_actions = (
+            await db.execute(
+                select(ORMAction).where(
+                    ORMAction.session_id == session.id,
+                    ORMAction.state == ActionState.OUTCOME_UNKNOWN.value,
+                )
+            )
+        ).scalars().all()
+
+        if ctx.complete_reason == CompleteReason.GOAL_REACHED.value and not unknown_actions:
+            final = SessionState.SUCCEEDED
+        elif not unknown_actions:
+            final = SessionState.SUCCEEDED_PARTIAL
+        else:
+            final = SessionState.FAILED
+
+        questions_created = 0  # counted by staging apply at finalize
         workspace_dir = getattr(self.executor, "workspace_dir", None)
         if workspace_dir is not None and Path(workspace_dir).is_dir():
             manifest = await freeze_workspace(db, session.id, Path(workspace_dir))
             session.committed_workspace_manifest_id = manifest.id
 
-        question.state = (
-            QuestionState.VERIFIED.value
-            if final is SessionState.SUCCEEDED
-            else QuestionState.PARTIALLY_ANSWERED.value
-        )
-        return await self._finish(
-            db,
-            audit,
-            session,
-            final,
-            question.id,
-            steps,
-            len(ctx.evidence),
-            claims,
-            questions_created,
-            termination_reason=ctx.complete_reason,
+        return CommitPlan(
+            session_id=session.id,
+            question_id=question.id,
+            terminal=final,
+            question_terminal=(
+                QuestionState.VERIFIED if final is SessionState.SUCCEEDED else QuestionState.PARTIALLY_ANSWERED
+            ),
+            steps=steps,
+            evidence_count=len(ctx.evidence),
+            claims=claims,
+            questions_created=questions_created,
+            termination_reason=ctx.complete_reason if final is not SessionState.FAILED else "unknown_action_outcome",
+            max_claims=int(limits.get("max_claims_assessed_per_session", 32)),
+            max_new_claims=int(limits.get("max_new_claims_per_session", 16)),
+            max_evidence=int(limits.get("max_evidence_items_per_session", 64)),
+            max_questions=int(limits.get("max_new_questions_per_session", 4)),
         )
 
     # ── explorer loop ─────────────────────────────────────────────────────
@@ -271,6 +420,7 @@ class Orchestrator:
         cap_profile: CapabilityProfile,
         policy_engine: PolicyEngine,
         staging: StagingService,
+        lease: LeaseService,
     ) -> tuple[int, bool, bool]:
         """Returns (steps_done, stop_requested, abort_requested)."""
         explorer = self.prompts[Role.EXPLORER]
@@ -281,6 +431,10 @@ class Orchestrator:
         abort_requested = False
         for step in range(1, max_steps + 1):
             steps = step
+
+            # T2.16: heartbeat + progress watchdog each step (conditional
+            # renewal; refused once the phase deadline has passed)
+            await lease.heartbeat(db, session.id, self.node_owner, progress=True)
 
             # operator abort check between steps
             await db.refresh(session)
@@ -712,6 +866,35 @@ class Orchestrator:
             questions_created=questions_created,
             termination_reason=termination_reason,
         )
+
+    async def _abort_session(self, plan: CommitPlan, reason: str) -> None:
+        """A prepare/finalize crash: resolve via the fenced reconciler in a
+        fresh transaction (never a guessed rollback)."""
+        from sqlalchemy import text
+
+        async with self.session_factory() as db, transaction(db):
+            audit = AuditService(db)
+            await db.execute(
+                text(
+                    "UPDATE sessions SET state = 'failed', finished_at = now(), "
+                    "lease_owner = NULL, lease_expires_at = NULL, termination_reason = :r "
+                    "WHERE id = :id AND state = 'committing'"
+                ),
+                {"id": plan.session_id, "r": reason},
+            )
+            await db.execute(
+                text(
+                    "UPDATE commit_attempts SET status = 'aborted', finished_at = now() "
+                    "WHERE session_id = :id AND status = 'prepared'"
+                ),
+                {"id": plan.session_id},
+            )
+            await audit.record(
+                AuditEventType.SESSION_FAILED,
+                session_id=plan.session_id,
+                payload={"reason": reason},
+                public_summary=f"session failed ({reason})",
+            )
 
 
 def _cap_args(value: object) -> str:

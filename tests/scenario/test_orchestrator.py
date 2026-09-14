@@ -180,6 +180,23 @@ async def test_full_sealed_session(migrated_db, fake_llm: FakeLLM, tmp_path: Pat
                     {"s": sid},
                 )
             ).fetchall()
+            # M2: the commit attempt went prepared -> committed in the
+            # fenced final transaction (T2.18/T2.19)
+            attempt = (
+                await conn.execute(
+                    text(
+                        "SELECT a.status, a.staging_hash IS NOT NULL, "
+                        "a.workspace_manifest_id IS NOT NULL "
+                        "FROM commit_attempts a JOIN sessions s ON s.commit_attempt_id = a.id "
+                        "WHERE s.id=:s"
+                    ),
+                    {"s": sid},
+                )
+            ).fetchall()
+            # M2: the knowledge revision was bumped in the same transaction
+            knowledge_rev = (
+                await conn.execute(text("SELECT revision FROM domain_revisions WHERE scope='knowledge'"))
+            ).scalar_one()
     finally:
         await engine.dispose()
 
@@ -198,6 +215,15 @@ async def test_full_sealed_session(migrated_db, fake_llm: FakeLLM, tmp_path: Pat
     # manifest
     assert len(manifest) == 1
     assert manifest[0][0] >= 1
+
+    # the fenced commit: one attempt, prepared -> committed, bound to the
+    # staging hash and the manifest
+    assert len(attempt) == 1
+    assert attempt[0][0] == "committed"
+    assert attempt[0][1] is True  # staging_hash set
+    assert attempt[0][2] is True  # workspace manifest bound
+    # the knowledge revision moved from the seed 0 to 1
+    assert knowledge_rev == 1
 
 
 @pytest.mark.asyncio
