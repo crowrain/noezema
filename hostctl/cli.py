@@ -224,6 +224,7 @@ def wake_tick(node_owner: str | None, data_root: str | None) -> None:
     from apps.orchestrator.main import build_orchestrator
     from apps.orchestrator.scheduler import (
         ReassessmentAdmissionError,
+        RepairAdmissionError,
         WakeScheduleError,
         WakeScheduler,
         data_root_from_env,
@@ -245,7 +246,12 @@ def wake_tick(node_owner: str | None, data_root: str | None) -> None:
                 decision = await WakeScheduler(db, node_owner=owner, data_root=root).decide(
                     source="scheduled", now=datetime.now(UTC)
                 )
-        except (ConfigError, WakeScheduleError, ReassessmentAdmissionError) as exc:
+        except (
+            ConfigError,
+            WakeScheduleError,
+            ReassessmentAdmissionError,
+            RepairAdmissionError,
+        ) as exc:
             # Fail-closed: a broken effective config must not start a session.
             click.echo(f"wake-tick: fail-closed ({type(exc).__name__}: {exc})", err=True)
             return 78
@@ -336,6 +342,120 @@ def reassessment_tick(batch_size: int, lease_seconds: int) -> None:
             f"processed={outcome.processed} completed={outcome.completed} "
             f"retried={outcome.retried} blocked={outcome.blocked} "
             f"deferred={outcome.deferred}"
+        )
+        return 0
+
+    try:
+        code = asyncio.run(_run())
+    finally:
+        asyncio.run(engine.dispose())
+    sys.exit(code)
+
+
+@main.command("activate-online")
+@click.option("--payload", "payload_file", required=True, type=click.Path(exists=True))
+@click.option("--reason", required=True)
+def activate_online(payload_file: str, reason: str) -> None:
+    """Run an ONLINE config change (T4.5, §8.7.2; runtime is live, root).
+
+    Crash-idempotent: the run resumes from the candidate state
+    (preparing_heads / ready / publishing / post_publish). The
+    activating slot quiesces the worker and sessions for the whole
+    prepare → flip → post-publish window; the slot clears in the
+    terminal cleanup. exit 1 means the activation failed (or is
+    blocked — the repair lane completes a post_publish_blocked
+    manifest).
+    """
+    import asyncio
+    import json
+    import os
+
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    import packages.memory.activation as act
+    from packages.domain.services.audit import AuditService
+
+    url = os.environ.get("NOEZEMA_DATABASE_URL", "")
+    if not url:
+        click.echo("NOEZEMA_DATABASE_URL is not set", err=True)
+        sys.exit(EXIT_USAGE_ERROR)
+
+    with open(payload_file, encoding="utf-8") as fh:
+        payload = json.load(fh)
+
+    engine = create_async_engine(url)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    async def _run() -> int:
+        async with factory() as db:
+            audit = AuditService(db)
+            try:
+                result = await act.run_online_change(db, audit, requested_payload=payload)
+            except act.ActivationError as exc:
+                click.echo(f"activate-online failed: {exc}", err=True)
+                return 1
+        click.echo(
+            f"activate-online: state={result.state} published={result.published} "
+            f"resumed={result.resumed} pending={result.pending_heads} "
+            f"questions={result.questions_created}"
+        )
+        return 0
+
+    try:
+        code = asyncio.run(_run())
+    finally:
+        asyncio.run(engine.dispose())
+    click.echo(f"activate-online: reason={reason} exit={code}")
+    sys.exit(code)
+
+
+@main.command("activation-repair-tick")
+@click.option("--batch-size", default=64, show_default=True, help="Bounded batch size.")
+def activation_repair_tick(batch_size: int) -> None:
+    """Run one repair batch over the post_publish_blocked manifest
+    (T4.5, §8.7.2; root).
+
+    The trusted repair lane: the slot is already cleared by the
+    terminal cleanup, so the batch CAS is the repair CAS (active =
+    candidate, activating IS NULL, state post_publish_blocked, due
+    cursor). A superseded pointer closes the remainder as
+    ``superseded``. No backlog → a no-op.
+    """
+    import asyncio
+    import os
+
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    import packages.memory.activation as act
+    from packages.domain.services.audit import AuditService
+
+    url = os.environ.get("NOEZEMA_DATABASE_URL", "")
+    if not url:
+        click.echo("NOEZEMA_DATABASE_URL is not set", err=True)
+        sys.exit(EXIT_USAGE_ERROR)
+
+    engine = create_async_engine(url)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    async def _run() -> int:
+        async with factory() as db:
+            audit = AuditService(db)
+            candidate = await act.find_repair_backlog(db)
+        if candidate is None:
+            click.echo("activation-repair-tick: no repair backlog")
+            return 0
+        async with factory() as db:
+            audit = AuditService(db)
+            try:
+                result = await act.run_activation_repair(
+                    db, audit, candidate=candidate, batch_size=batch_size
+                )
+            except act.ActivationError as exc:
+                click.echo(f"activation-repair-tick failed: {exc}", err=True)
+                return 1
+        click.echo(
+            f"activation-repair-tick: state={result.state} cursor={result.cursor} "
+            f"questions={result.questions_created} deferred={result.deferred}"
         )
         return 0
 

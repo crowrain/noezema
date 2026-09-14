@@ -61,6 +61,7 @@ REASON_NONTERMINAL_SESSION = "nonterminal_session"
 REASON_UNRESOLVED_COMMIT = "unresolved_commit_attempt"
 REASON_ACTIVATION_SLOT = "activation_slot_busy"
 REASON_REASSESSMENT_BACKLOG = "reassessment_backlog"
+REASON_REPAIR_BACKLOG = "repair_backlog"
 REASON_DISK_QUOTA = "disk_quota_exceeded"
 REASON_GPU = "gpu_unavailable"
 
@@ -188,6 +189,48 @@ class ReassessmentAdmission:
             t_escalate_seconds=raw["t_escalate_seconds"],
             t_worker_admission_seconds=raw["t_worker_admission_seconds"],
             queue_slo_seconds=raw["queue_slo_seconds"],
+        )
+
+
+class RepairAdmissionError(RuntimeError):
+    """The repair_admission section is missing or invalid (fail-closed)."""
+
+
+@dataclass(frozen=True)
+class RepairAdmission:
+    """Validated repair_admission section of the config snapshot
+    (§5.2.1 T_repair_admission, §8.7.2, T4.5).
+
+    ``t_repair_admission_seconds`` — the age of a runnable repair
+    backlog (a ``post_publish_blocked`` candidate that owns the
+    pointer, has a due cursor and is admission-runnable) beyond which
+    a wake is skipped with ``repair_backlog``. A fresh backlog does not
+    block the wake immediately — the repair runner is a separate
+    trusted lane, the session lane waits only for an old backlog.
+    ``repair_slo_seconds`` — the wall-clock SLO of the repair backlog
+    (operator metric).
+    """
+
+    t_repair_admission_seconds: int
+    repair_slo_seconds: int
+
+    @classmethod
+    def from_payload(cls, raw: Any) -> RepairAdmission:
+        if not isinstance(raw, Mapping):
+            raise RepairAdmissionError(
+                f"repair_admission must be an object, got {type(raw).__name__}"
+            )
+        for key in ("t_repair_admission_seconds", "repair_slo_seconds"):
+            value = raw.get(key)
+            if value is None:
+                raise RepairAdmissionError(f"repair_admission.{key} is missing")
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise RepairAdmissionError(
+                    f"repair_admission.{key} must be an int > 0, got {value!r}"
+                )
+        return cls(
+            t_repair_admission_seconds=raw["t_repair_admission_seconds"],
+            repair_slo_seconds=raw["repair_slo_seconds"],
         )
 
 
@@ -339,6 +382,25 @@ class WakeScheduler:
             )
         ).scalar_one_or_none()
         oldest_age = float(oldest) if oldest is not None else None
+        repair = RepairAdmission.from_payload(snapshot.repair_admission)
+        repair_age = (
+            await self.db.execute(
+                text(
+                    """
+                    SELECT EXTRACT(EPOCH FROM now() - c.post_publish_started_at)
+                    FROM config_snapshots c
+                    WHERE c.activation_mode = 'online'
+                      AND c.activation_state = 'post_publish_blocked'
+                      AND c.id = (
+                          SELECT active_config_snapshot_id FROM runtime_config_heads
+                          WHERE scope = 'global')
+                      AND c.post_publish_next_attempt_at IS NOT NULL
+                      AND c.post_publish_next_attempt_at <= now()
+                    """
+                )
+            )
+        ).scalar_one_or_none()
+        repair_age_f = float(repair_age) if repair_age is not None else None
         return {
             "consecutive_failures": state.consecutive_failures,
             "backoff_until": state.backoff_until.isoformat() if state.backoff_until else None,
@@ -351,6 +413,15 @@ class WakeScheduler:
                 "queue_slo_seconds": admission.queue_slo_seconds,
                 "slo_breached": oldest_age is not None and oldest_age > admission.queue_slo_seconds,
             },
+            # T4.5 (§8.7.2): the repair-backlog age metric (the
+            # post_publish_blocked manifest that owns the pointer and is
+            # admission-runnable)
+            "repair_backlog": {
+                "oldest_age_seconds": repair_age_f,
+                "repair_slo_seconds": repair.repair_slo_seconds,
+                "slo_breached": repair_age_f is not None
+                and repair_age_f > repair.repair_slo_seconds,
+            },
         }
 
     # ── admission ────────────────────────────────────────────────────────
@@ -359,6 +430,7 @@ class WakeScheduler:
         self,
         schedule: WakeSchedule,
         admission: ReassessmentAdmission,
+        repair: RepairAdmission,
         *,
         node_state: str,
     ) -> tuple[bool, str | None]:
@@ -422,6 +494,31 @@ class WakeScheduler:
         ).scalar_one_or_none()
         if oldest is not None and float(oldest) > admission.t_worker_admission_seconds:
             return False, REASON_REASSESSMENT_BACKLOG
+        # T4.5 (§5.2.1 T_repair_admission): a runnable repair backlog
+        # (a post_publish_blocked candidate owning the pointer with a
+        # due, admission-runnable cursor) OLDER than the threshold
+        # blocks the session lane — the node must repair the manifest
+        # before starting new research. A fresh backlog does not block
+        # the wake immediately (the repair runner is a separate lane).
+        repair_age = (
+            await self.db.execute(
+                text(
+                    """
+                    SELECT EXTRACT(EPOCH FROM now() - c.post_publish_started_at)
+                    FROM config_snapshots c
+                    WHERE c.activation_mode = 'online'
+                      AND c.activation_state = 'post_publish_blocked'
+                      AND c.id = (
+                          SELECT active_config_snapshot_id FROM runtime_config_heads
+                          WHERE scope = 'global')
+                      AND c.post_publish_next_attempt_at IS NOT NULL
+                      AND c.post_publish_next_attempt_at <= now()
+                    """
+                )
+            )
+        ).scalar_one_or_none()
+        if repair_age is not None and float(repair_age) > repair.t_repair_admission_seconds:
+            return False, REASON_REPAIR_BACKLOG
         if _du_bytes(self.data_root) > schedule.disk_quota_mb * 1024 * 1024:
             return False, REASON_DISK_QUOTA
         if schedule.gpu_required:
@@ -439,6 +536,7 @@ class WakeScheduler:
             snapshot = await ConfigService.get_effective(self.db)
             schedule = WakeSchedule.from_payload(snapshot.wake_schedule)
             admission = ReassessmentAdmission.from_payload(snapshot.reassessment_admission)
+            repair = RepairAdmission.from_payload(snapshot.repair_admission)
             state = await self._load_state()
             node_state = await self._load_node_state()
 
@@ -453,7 +551,9 @@ class WakeScheduler:
                 if not due:
                     return WakeDecision(action="wait", reason=wait_reason)
 
-            ok, reason = await self._admission(schedule, admission, node_state=node_state)
+            ok, reason = await self._admission(
+                schedule, admission, repair, node_state=node_state
+            )
             if not ok:
                 audit = AuditService(self.db)
                 await audit.record(

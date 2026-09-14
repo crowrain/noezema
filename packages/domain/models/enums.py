@@ -460,6 +460,15 @@ class AuditEventType(StrEnum):
     OPERATOR_COMMAND_REJECTED = "operator_command_rejected"
     CONFIG_SNAPSHOT_CREATED = "config_snapshot_created"
     CONFIG_ACTIVATED = "config_activated"
+    # T4.5 (§8.7.2): the online activation lifecycle
+    ACTIVATION_ACQUIRED = "activation_acquired"
+    ACTIVATION_TAKEOVER = "activation_takeover"
+    ACTIVATION_PUBLISHED = "activation_published"
+    ACTIVATION_POST_PUBLISH_BATCH = "activation_post_publish_batch"
+    ACTIVATION_POST_PUBLISH_COMPLETED = "activation_post_publish_completed"
+    ACTIVATION_POST_PUBLISH_BLOCKED = "activation_post_publish_blocked"
+    ACTIVATION_CLEANED_UP = "activation_cleaned_up"
+    ACTIVATION_SUPERSEDED = "activation_superseded"
     ALERT_RAISED = "alert_raised"
 
 

@@ -94,7 +94,15 @@ BOOTSTRAP_PAYLOAD: dict[str, Any] = {
         "phase_deadline_seconds": 600,
         "session_timeout_seconds": 1800,
     },
-    "activation_limits": {"offline_activation_max_invalid_questions": 100},
+    "activation_limits": {
+        "offline_activation_max_invalid_questions": 100,
+        # T4.5 (§8.7.2): the online post-publish manifest bound (the flip
+        # refuses to publish when the pending-head question backlog would
+        # exceed it — the rules change invalidates too much at once) and
+        # the post-publish/repair retry budget
+        "online_activation_max_pending_questions": 100,
+        "online_activation_max_attempts": 78,
+    },
     # Wake scheduling (§5.2.1, T3.29). Owned by the trusted boundary: the
     # sandbox never sees it. ``interval_seconds`` is the base periodic
     # schedule (MVP cron case "every N seconds");
@@ -132,6 +140,15 @@ BOOTSTRAP_PAYLOAD: dict[str, Any] = {
         "t_escalate_seconds": 7200,
         "t_worker_admission_seconds": 7200,
         "queue_slo_seconds": 172800,
+    },
+    # T4.5 (§8.7.2, §5.2.1): the effective runnable repair backlog (a
+    # post_publish_blocked candidate with a due cursor) has a wall-clock
+    # SLO; the wake is skipped while its age exceeds T_repair_admission
+    # (post_publish_blocked does NOT block the wake immediately — the
+    # threshold gives the repair runner its normal window).
+    "repair_admission": {
+        "t_repair_admission_seconds": 7200,
+        "repair_slo_seconds": 172800,
     },
     "claim_type_rules": {
         "local_observation": {

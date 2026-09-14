@@ -11,7 +11,7 @@
 | M1 контракты + LLM | ✅ выполнена | noezema-m1 | PR #4–#10; gate пройден: 112 тестов (86 unit ≥ 40), Sealed-сессия question→action→evidence→commit на fake LLM |
 | M2 изоляция + commit | ✅ выполнена | noezema-m2 | PR #11–#16: sandbox+runtime, policy engine, tool broker, artifact store+staging+freeze, commit boundary (prepared→fenced final tx) + reconciliation; gate пройден: 206 тестов, failpoints (kill до/после COMMIT, open final tx, stale finalizer, kill mid-action), security (сеть off, cap-drop, injection, ro rootfs) |
 | M3 память + web slice (MVP) | ✅ Gate M3 пройден (T3.29 закрыл пункт 1 §22.1); T3.30 — дефект lease из первой реальной сессии | noezema-m3 (на `ec6b4b0`, T3.29 — закрытие gate); noezema-mvp остаётся на `5d94b27` (создан до T3.29 — см. раздел Gate M3) | PR #17: память — модель (0004), evidence identity (§14.3), rules engine v1, independence (PSL+overlap), lifecycle heads (§14.1), apply в fenced tx. PR #18: context pack §5.4 + retrieval (fulltext russian, pending/invalid — отдельный лимит и метка в той же строке §5.4.2). PR #19: host recovery — noezemactl CLI, recovery policy schema v1 (jitter=0, JCS-хэш), fsync-safe transition journal + head + boot reconcile, offline rules (advisory lock, cohort+seal, atomic publish с UUIDv5 invalid-вопросами), fail-closed admission, resume-классификация (transient→retry_wait/0, permanent→resume_blocked/78, unclassified→degraded) + idempotent audit replay, policy change head + event stream, unit-state publisher, systemd units + CI-verify. PR #20: web slice — Query/Command + admin-token auth, fail-closed Command API на нездоровом hostе (423), SSE timeline (committed outbox + max_events), session detail, message TTL→expired, Host Status Adapter (recovery banner: none/retry_wait/degraded/blocked), минимальные HTML-страницы main/session. PR #21: failpoints/инварианты/resume/scenario-тесты. T3.29: wake scheduling + wake admission + backoff/pause (§5.2.1, пункт 1 §22.1): `wake_schedule` в snapshot (миграция 0005) + `wake_scheduler_state`, `noezemactl wake-tick` + `noezema-wake.timer`, admission (6 gates, skip с точной причиной в audit `wake_skipped`), экспоненциальный backoff, авто-pause после 3 неудач, wake_now — без расписания но с admission. T3.30: фоновый heartbeat lease во время долгих LLM-вызовов + `clock_timestamp()` в lease (дефект из первой реальной MVP-сессии — см. раздел ниже); 374 тест |
-| M4 зависимости + переоценка | 🔄 T4.1 закрыт (claim_dependencies: DAG cycle check при commit, graph revision, kind `research` по §8.6); T4.2 закрыт (cascade invalidation: closure manifest, barrier с durable курсором, idempotent батчи, blocked-путь, retrieval ancestor check); T4.3 закрыт (worker `system:reassessment`: runnable-предикат §5.9.1, lease/retry/blocked, insufficient→invalid+question, crash-lease recovery); T4.4 закрыт (writer admission: table gate §14.1 NOWAIT + jitter, session intent rules 1/4/5, T_escalate/T_worker_admission в scheduler); T4.5–T4.9 — впереди | — | пороги M4 из замеров серии 2026-09-14 зафиксированы в PLAN (батч 32, SLO P95 200 с); 426 тестов |
+| M4 зависимости + переоценка | 🔄 T4.1 закрыт (claim_dependencies: DAG cycle check при commit, graph revision, kind `research` по §8.6); T4.2 закрыт (cascade invalidation: closure manifest, barrier с durable курсором, idempotent батчи, blocked-путь, retrieval ancestor check); T4.3 закрыт (worker `system:reassessment`: runnable-предикат §5.9.1, lease/retry/blocked, insufficient→invalid+question, crash-lease recovery); T4.4 закрыт (writer admission: table gate §14.1 NOWAIT + jitter, session intent rules 1/4/5, T_escalate/T_worker_admission в scheduler); T4.5 закрыт (online activation §8.7.2: fenced lease + takeover, shadow heads fast path/pending, seal + DB-триггер sealed-интервала, atomic flip, post-publish manifest с deterministic UUIDv5, repair runner + T_repair_admission); T4.6–T4.9 — впереди | — | пороги M4 из замеров серии 2026-09-14 зафиксированы в PLAN (батч 32, SLO P95 200 с); 438 тестов |
 | M5 расширенный цикл | ⬜ не начата | — | |
 | M6 Research Proxy | ⬜ не начата | — | |
 | M7 полный веб + эксплуатация | ⬜ не начата | — | |
@@ -42,7 +42,7 @@
 | 11 | нет вслепую-ретраев | MVP | ✅ | test_tool_broker.py (§5.7 retry-классы: pure=2, idempotent=1, non_idempotent/observation=0 без вслепую-ретраев; idempotency key + different hash=incident/alert) + test_llm_gateway.py |
 | 12 | random backup point + root set | v1 | ⬜ | — |
 | 13 | partial success на safe boundary | MVP | ✅ | test_orchestrator.py::test_budget_exhausted_partial (succeeded_partial) |
-| 14 | каскадная инвалидация | v1 | 🔄 T4.1+T4.2+T4.3+T4.4 | T4.1 (граф + цикл): test_claim_dependencies.py (unit: cycle check — чистая функция и через apply_claim_staging: циклическое evidential-ребро отклоняется с audit `dependency_edge_rejected`, claim всё же коммитится; research-ребро не в цикле и не двигает graph revision; evidential на non-current цель — отклонено §8.6; bad kind/self/missing/unparseable — отклонены) + test_orchestrator.py (scenario: полный цикл — curator-зависимость коммитится с bump `domain_revisions(dependency_graph)` 0→1 и audit-полями; цикл — ребро отклонено, graph revision не меняется) + test_staging_schema.py (ClaimDependencyProposal: closed kind, UUID, budget ≤10, дубликаты). T4.2 (barrier/closure/manifest): test_cascade.py (8: closure-ходы; inline cascade; idempotent replay; barrier lifecycle + crash-resume; graph-change → new generation; tamper → blocked; retrieval ancestor check; moved graph при старте). T4.3 (worker reassessment_jobs): test_reassessment.py (13: runnable-предикат — activating slot/чужой snapshot/backoff-отсрочка; head promotion через rules engine с audit и knowledge bump; insufficient data → invalid + UUIDv5 question; transient → retry с backoff; permanent → blocked + alert; expired-lease recovery; admission metrics; bounded batch + priority; mid-batch loss admission). T4.4 (writer admission): test_writer_admission.py (14: gate CAS §14.1 — acquire/release/expired-takeover/NOWAIT-конфликт + CHECK holder-полей; session intent — live lease, idempotent, clear, stale-очистка reconciler'ом после fencing; worker — deferral с jitter при gate-конфликте, уступка intent на входе и mid-batch (попытка не сгорает), release после батча; activation берёт gate до pointer; scheduler — T_escalate/T_worker_admission skip `reassessment_backlog`, свежая/blocked очереди не блокируют, fail-closed секция, SLO-метрики). Остаток: T4.5–T4.9 |
+| 14 | каскадная инвалидация | v1 | 🔄 T4.1+T4.2+T4.3+T4.4+T4.5 | T4.1 (граф + цикл): test_claim_dependencies.py (unit: cycle check — чистая функция и через apply_claim_staging: циклическое evidential-ребро отклоняется с audit `dependency_edge_rejected`, claim всё же коммитится; research-ребро не в цикле и не двигает graph revision; evidential на non-current цель — отклонено §8.6; bad kind/self/missing/unparseable — отклонены) + test_orchestrator.py (scenario: полный цикл — curator-зависимость коммитится с bump `domain_revisions(dependency_graph)` 0→1 и audit-полями; цикл — ребро отклонено, graph revision не меняется) + test_staging_schema.py (ClaimDependencyProposal: closed kind, UUID, budget ≤10, дубликаты). T4.2 (barrier/closure/manifest): test_cascade.py (8: closure-ходы; inline cascade; idempotent replay; barrier lifecycle + crash-resume; graph-change → new generation; tamper → blocked; retrieval ancestor check; moved graph при старте). T4.3 (worker reassessment_jobs): test_reassessment.py (13: runnable-предикат — activating slot/чужой snapshot/backoff-отсрочка; head promotion через rules engine с audit и knowledge bump; insufficient data → invalid + UUIDv5 question; transient → retry с backoff; permanent → blocked + alert; expired-lease recovery; admission metrics; bounded batch + priority; mid-batch loss admission). T4.4 (writer admission): test_writer_admission.py (14: gate CAS §14.1 — acquire/release/expired-takeover/NOWAIT-конфликт + CHECK holder-полей; session intent — live lease, idempotent, clear, stale-очистка reconciler'ом после fencing; worker — deferral с jitter при gate-конфликте, уступка intent на входе и mid-batch (попытка не сгорает), release после батча; activation берёт gate до pointer; scheduler — T_escalate/T_worker_admission skip `reassessment_backlog`, свежая/blocked очереди не блокируют, fail-closed секция, SLO-метрики). T4.5 (online activation §8.7.2): test_online_activation.py (12: fenced lease — acquire/resume/takeover fence+1; quiesce — gate wait timeout, active session; shadow heads — fast path carry старой оценки / pending + activation jobs; deterministic UUIDv5 вопросы post-publish; atomic flip — pointer + bootstrap immutable; crash resume без смены fence; transient backoff + slot held; exhaustion → post_publish_blocked + alert + repair runner (repair CAS, phase=repair); superseded-закрытие без reactivation; T_repair_admission — skip repair_backlog; sealed-интервал триггер 45000). Остаток: T4.6–T4.9 |
 | 15 | pending/invalid не current | MVP | ✅ | test_memory_service.py (lifecycle CHECK: pending/invalid ⇒ assessment/status NULL) + test_context_builder.py/test_retrieval.py (§5.4.2: отдельный лимит pending, метка в той же строке, исключение целиком если не хватает на метку) + test_invariants.py (pending/invalid не подаётся как current) + test_offline_rules.py (deferred→pending, removed-type→invalid) |
 | 16 | worker: priority, retry, no starvation | v1 | ⬜ | — |
 | 17 | repeatability/reproducibility/replication | v1 | ⬜ | — |
@@ -440,5 +440,124 @@ migration 0008, `apps/orchestrator/scheduler.py` (admission gate'ы):
   очередь → wake; escalated (3600) но < admission (72000) → wake, затем
   skip; blocked job не блокирует; fail-closed валидация секции;
   status-метрики + SLO). 426 тестов.
+
+**Закрыто T4.5 (online activation, §8.7.2)** —
+`packages/memory/activation.py` (модуль активации, ~1500 строк),
+migration 0009, `apps/orchestrator/scheduler.py` (T_repair_admission),
+`hostctl` (`activate-online`, `activation-repair-tick`):
+- **Fenced lease** (`acquire_activation`, один tx): writer gate
+  (poll 0.25–0.5 с до `gate_wait_seconds`, по умолчанию 900 с) →
+  head FOR UPDATE → active sessions FOR UPDATE + count (7 активных
+  состояний — acquire отклонён, слот не занят) → commit_attempts
+  FOR UPDATE + count (unresolved — отклонён). Слот: пуст → fence+1
+  + `activation_acquired`; тот же кандидат + тот же owner + живой
+  lease → idempotent resume (fence без изменения, без события);
+  тот же кандидат + ИСТЁКШИЙ lease (свой или чужой) → recovery
+  takeover (fence+1, `activation_takeover` — старый раннер
+  fenced out); чужой кандидат или чужой ЖИВОЙ lease → ошибка.
+  Fence монотонен, takeover его только повышает, сбросов нет.
+- **Shadow heads** (`freeze_cohort_online` → `prepare_heads_online`
+  → `verify_and_seal_online`, батчи по 128, каждый батч — свой tx):
+  freeze — idempotent manifest `{cohort_revision, claim_ids}`;
+  prepare — fast path: claim_type-rule канонически не изменился и
+  base head current с оценкой → shadow head `current`, ссылающийся
+  на СТАРУЮ оценку (assessment id + epistemic_status),
+  `prepared_by='rules_activation'`; затронутый claim → head
+  `pending` (NULL-пара) + durable job (`reason='activation'`,
+  target=candidate, unique). Verify — отдельный tx: rev ==
+  cohort_revision, count == expected, digest 5 полей (отсортирован),
+  state → `ready` + seal (verified_at/heads_sha256/expected_count).
+  **Sealed-интервал** (`ready|publishing`) держит DB-триггер 0009
+  `trg_claim_assessment_heads_sealed` — UPDATE/INSERT/DELETE shadow
+  head'ов незакрытого кандидата отклонён с ERRCODE 45000 (rebuild-путь:
+  условный `ready → preparing_heads` разрешён — CHECK'и 0001
+  не запрещают, триггер смотрит только текущее состояние).
+- **Atomic flip** (`publish_online`, один tx): ready → publishing;
+  лимит pending questions ≤ `online_activation_max_pending_questions`
+  (100); head → knowledge FOR UPDATE, active == base, seal цел,
+  rev == cohort, manifest hash, cursor 0, state → `post_publish`,
+  **переезд pointer**, previous → `superseded` (кроме immutable
+  bootstrap — его CHECK держит `active` навсегда), knowledge bump,
+  `activation_published`.
+- **Post-publish manifest** (`run_post_publish`): gate берётся ОДИН
+  раз на весь прогон (освобождается в `finally` — worker и sessions
+  quiesced до терминального cleanup). Батчи по 64 (≤32 батча/прогон):
+  head lock → refresh → терминальный state → early return;
+  state check; tuple check (fenced — takeover — deferred, manifest
+  остаётся новому owner'у); backoff-окно → deferred; pending
+  пересчёт; completion = `cursor >= len(pending)` — терминальный
+  cleanup в той же tx (`active`); иначе — срез pending, вопросы
+  (deterministic UUIDv5 `activation-pending:{candidate}:{claim}`,
+  origin=previous_result), cursor + knowledge bump в одной tx,
+  `activation_post_publish_batch`. Transient ошибка → `attempts+1` +
+  backoff 30·2^min(n-1,7) (cap 3600, jitter ≤15 с) + `last_error`,
+  прогон reraise'ится — resume по тому же курсору. Бюджет исчерпан
+  (`online_activation_max_attempts`, bootstrap 78) → inline
+  терминальный cleanup `post_publish_blocked` (blocked_at,
+  next_attempt=now, `activation_post_publish_blocked` + alert
+  `post_publish_blocked`, слот очищен) — результат RETURNED, не
+  raised.
+- **Repair runner** (`run_activation_repair`): repair CAS
+  (активный == кандидат, activating IS NULL, mode online, state
+  post_publish_blocked, cursor == expected, next_attempt ≤ now);
+  **superseded-проверка ПЕРВОЙ** — pointer на новом конфиге →
+  закрыть остаток `superseded` (`activation_superseded`), старый
+  конфиг в `active` не возвращать никогда; completion → `active`
+  (`activation_post_publish_completed`, batch'и с `phase='repair'`);
+  permanent (LookupError/ValueError) → park
+  (`next_attempt_at=NULL`) + alert `repair_backlog_permanent_failure`
+  (до audited operator retry).
+- **Terminal cleanup** — ОДИН tx: state + слот/lease + audit
+  (`activation_cleaned_up` с outcome). «Терминальный state с
+  непустым слотом» — нарушение инварианта.
+- **Драйвер** (`run_online_change`, plain session, шаг = свой tx):
+  upsert → ранний выход «payload уже эффективен» ТОЛЬКО при
+  `active` (post_publish effective — manifest открыт, resume;
+  post_publish_blocked — repair lane, вернуть состояние, слот не
+  трогать) → слот/lease → prepare-блок (preparing/ready/publishing)
+  → flip (ready) → post-publish. Pre-publish `ActivationError` →
+  терминальный cleanup `failed` + reraise (слот очищен, pointer не
+  тронут); post-publish backoff/blocked — RETURNED; generic
+  (RuntimeError) — propagates без cleanup (crash-семантика: слот
+  держится, resume/idempotent takeover).
+- **`hostctl activate-online --payload <file> --reason`** — драйвер
+  (exit 1 при ActivationError); **`activation-repair-tick`** —
+  find_repair_backlog → no-op или один `run_activation_repair`.
+- **Scheduler** (T_repair_admission, §5.9.1): runnable blocked
+  backlog (владеет pointer, due, next_attempt не NULL) старше
+  `t_repair_admission_seconds` (bootstrap 7200) → wake SKIPPED
+  (reason `repair_backlog`); свежий backlog не блокирует (у repair
+  lane своё окно). `status()` — oldest age + `repair_slo_seconds`
+  (172800) + SLO-флаг.
+- Решения: (1) shadow heads — fast path (carry старой оценки) для
+  неизменённых claim_type + pending+job для затронутых; «затронут»
+  = canonical-сравнение entry claim_type_rules; (2) post-publish
+  follow-ups — deterministic UUIDv5 вопросы для pending head'ов
+  (origin=previous_result), replay-идемпотентность; (3) completion —
+  `cursor >=` пересчитанному числу pending (не зафиксированному
+  manifest — cohort может сдвинуться между прогонами); (4) normal-run
+  CAS держит слот занятым весь post-publish (quiesce), repair CAS —
+  post-cleanup по спеке; (5) previous → superseded только для
+  non-bootstrap (immutable CHECK); (6) sealed-интервал — DB-триггер
+  0009 (не только код); (7) пороги T_repair_admission 7200/172800 —
+  аналог T_worker_admission из замеров.
+- Тесты: test_online_activation.py (12: happy path mixed — fast
+  head'ы с carry + pending + jobs + deterministic вопросы +
+  audit'ы + worker досасывает activation jobs до `current`;
+  all-fast path — без jobs/вопросов, carry старой assessment id,
+  prepared_by=rules_activation; pre-publish failure → `failed` +
+  слот очищен + pointer не тронут; crash mid-prepare → idempotent
+  resume с НЕИЗМЕННЫМ fence; takeover → fence+1 + audit; gate wait
+  timeout → `draft` без слота, повтор — `active`; active session →
+  acquire отклонён (без слота), удаление session → успех;
+  post-publish transient → attempts=1 + backoff в будущем + слот
+  занят + pointer переехал, fast-forward → `active`; exhaustion
+  (budget=1) → `post_publish_blocked` + alert + cleanup, repair
+  runner → `active` + вопросы + batch'и phase=repair; pointer на
+  новом конфиге → repair закрывает `superseded` (не reactivates) +
+  audit; scheduler: старый (100 ч) backlog → skip `repair_backlog` +
+  audit, свежий (1 ч) → wake; sealed-интервал: UPDATE head'ов в
+  `ready` → 45000, условный return в preparing_heads разрешён).
+  438 тестов.
 
 Merge в `main` — отдельное решение (не выполняется автоматически).
