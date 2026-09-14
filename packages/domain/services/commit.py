@@ -182,6 +182,38 @@ async def finalize(
     if fence["attempt_status"] != "prepared":
         return FinalizeResult("fencing_conflict", attempt.id)
 
+    from datetime import datetime
+
+    # A FAILED terminal is a fenced ABORT, not a commit: the staging is
+    # discarded (never applied), the knowledge revision is not bumped,
+    # and the attempt ends aborted — no mixed state (T2.21 safe boundary).
+    if terminal is SessionState.FAILED:
+        attempt.status = "aborted"
+        attempt.finished_at = datetime.now(UTC)
+        session.state = terminal.value
+        session.termination_reason = termination_reason
+        session.finished_at = datetime.now(UTC)
+        session.lease_owner = None
+        session.lease_expires_at = None
+        await db.flush()
+        await audit.record(
+            AuditEventType.SESSION_FAILED,
+            session_id=session.id,
+            payload={
+                "attempt_id": str(attempt.id),
+                "reason": termination_reason,
+                "steps": steps,
+                "evidence": evidence_count,
+            },
+            public_summary=f"session failed at the commit boundary ({termination_reason})",
+        )
+        await audit.record(
+            AuditEventType.COMMIT_ATTEMPT_ABORTED,
+            session_id=session.id,
+            payload={"attempt_id": str(attempt.id), "reason": termination_reason},
+        )
+        return FinalizeResult("committed", attempt.id)
+
     # 3. apply staging (recorded -> applied) inside the same transaction
     applied_claims, applied_questions = await staging.apply_recorded(db, audit, session)
 
@@ -199,8 +231,6 @@ async def finalize(
 
     # 5. attempt -> committed + question terminal state
     attempt.status = "committed"
-    from datetime import datetime
-
     attempt.finished_at = datetime.now(UTC)
     if question_id is not None and question_terminal is not None:
         await db.execute(

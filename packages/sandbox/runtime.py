@@ -328,6 +328,13 @@ class ContainerSandboxRuntime:
             timed_out=rc == 124,
         )
 
+    async def is_running(self, handle: SandboxHandle) -> bool:
+        """Whether the sandbox container is still alive."""
+        rc, out, _err = await self._run(
+            ["inspect", "-f", "{{.State.Running}}", handle.container_name], timeout=15.0
+        )
+        return rc == 0 and out.strip() == "true"
+
     async def collect_workspace(self, handle: SandboxHandle) -> Path:
         # the workspace is a host bind mount: it is already on the host
         return handle.workspace_dir

@@ -175,8 +175,22 @@ class SandboxToolBroker:
             else:  # pragma: no cover
                 obs = Observation(tool=tool, ok=False, error="unreachable")
         except SandboxError as exc:
-            # engine-level failure: transient, retryable per class policy
-            obs = Observation(tool=tool, ok=False, error=f"sandbox: {exc}"[:500], transient=True)
+            # engine-level failure: transient, retryable per class policy;
+            # but if the container is gone mid-command the outcome is
+            # UNKNOWN (never a clean failure, never retried)
+            container_gone = False
+            if tool in ("shell.execute", "python.execute"):
+                try:
+                    container_gone = not await self.runtime.is_running(self.handle)
+                except Exception:
+                    container_gone = False
+            obs = Observation(
+                tool=tool,
+                ok=False,
+                error=f"sandbox: {exc}"[:500],
+                transient=not container_gone,
+                result_unknown=container_gone,
+            )
         except ValueError as exc:
             obs = Observation(tool=tool, ok=False, error=str(exc)[:500])
         except Exception as exc:  # infra failure
@@ -200,12 +214,19 @@ class SandboxToolBroker:
         }
         if result.timed_out:
             return Observation(tool=tool, ok=False, data=data, error="timeout")
-        return Observation(
-            tool=tool,
-            ok=result.exit_code == 0,
-            data=data,
-            error=None if result.exit_code == 0 else f"exit code {result.exit_code}",
-        )
+        if result.exit_code == 0:
+            return Observation(tool=tool, ok=True, data=data)
+        # a failed exec where the CONTAINER IS GONE is not a result — the
+        # command may have executed partially (T2.22 failpoint)
+        if not await self.runtime.is_running(self.handle):
+            return Observation(
+                tool=tool,
+                ok=False,
+                data=data,
+                error="container gone mid-execution",
+                result_unknown=True,
+            )
+        return Observation(tool=tool, ok=False, data=data, error=f"exit code {result.exit_code}")
 
     def _workspace(self, tool: str, arguments: JsonDict) -> Observation:
         root = self.handle.workspace_dir.resolve()

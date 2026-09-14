@@ -22,6 +22,11 @@ class Observation:
     # I/O) rather than a tool result (e.g. a nonzero exit code). Only
     # transient failures are candidates for retry under the class policy.
     transient: bool = False
+    # True when the execution process was lost (e.g. the sandbox died
+    # mid-command) so the outcome genuinely cannot be known: the action
+    # must be marked outcome_unknown, NEVER retried and NEVER reported
+    # as a clean failure.
+    result_unknown: bool = False
     # set when the idempotency key matched an already-completed action
     replayed: bool = False
     # the repeatability class of the executed tool (§5.7)

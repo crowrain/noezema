@@ -9,12 +9,21 @@
 |---|---|---|---|
 | M0 каркас | ✅ выполнена | — | чистое дерево, скелет, CI, fake LLM, ADR-0001/0002/0003 |
 | M1 контракты + LLM | ✅ выполнена | noezema-m1 | PR #4–#10; gate пройден: 112 тестов (86 unit ≥ 40), Sealed-сессия question→action→evidence→commit на fake LLM |
-| M2 изоляция + commit | 🔄 в работе | — | PR #11–#15: sandbox+runtime, policy engine, tool broker, artifact store+staging+freeze, commit boundary (prepared→fenced final tx) + reconciliation; gate + failpoint/security-тесты — PR #16 |
+| M2 изоляция + commit | ✅ выполнена | noezema-m2 | PR #11–#16: sandbox+runtime, policy engine, tool broker, artifact store+staging+freeze, commit boundary (prepared→fenced final tx) + reconciliation; gate пройден: 206 тестов, failpoints (kill до/после COMMIT, open final tx, stale finalizer, kill mid-action), security (сеть off, cap-drop, injection, ro rootfs) |
 | M3 память + web slice (MVP) | ⬜ не начата | — | |
 | M4 зависимости + переоценка | ⬜ не начата | — | |
 | M5 расширенный цикл | ⬜ не начата | — | |
 | M6 Research Proxy | ⬜ не начата | — | |
 | M7 полный веб + эксплуатация | ⬜ не начата | — | |
+
+## Gate M2 (§19, этап 2) — пройден (noezema-m2)
+
+| Критерий | Тест |
+|---|---|
+| неизвестный ответ COMMIT reconciled | tests/scenario/test_reconciler.py (4 failpoint-сценария) |
+| нет mixed state (старый либо полный checkpoint) | tests/scenario/test_failpoints.py::test_unknown_action_fails_session_at_commit (staging не применён, ревизия не поднимается) + test_orchestrator.py::test_full_sealed_session (полный: staging + manifest + ревизия одной транзакцией) |
+| partial success только на safe boundary | tests/scenario/test_orchestrator.py::test_budget_exhausted_partial + test_failpoints.py (unknown action → failed, не partial) |
+| живой finalizer не принят за rollback | tests/scenario/test_reconciler.py::test_open_final_tx_yields_finalizer_in_progress |
 
 ## Матрица §22.1 (техническая приёмка)
 
@@ -23,11 +32,11 @@
 | 1 | пробуждение по расписанию, pause/backoff | MVP | ⬜ | — |
 | 2 | локальная LLM с fingerprint | MVP | 🔄 | test_llm_gateway.py, test_compat_and_roles.py (gateway+fingerprint; local model profile — PR #10) |
 | 3 | causal/idempotency ID в trusted host | MVP | ✅ | test_orchestrator.py (turn_id/action_id/idempotency_key генерирует хост) |
-| 4 | typed actions в sandbox | MVP | 🔄 | test_sandbox_runtime.py + test_tool_broker_sandbox.py (одноразовый контейнер, cap-drop/network/ro-rootfs, shell/python в sandbox, overlay) |
+| 4 | typed actions в sandbox | MVP | ✅ | test_sandbox_runtime.py + test_tool_broker_sandbox.py (одноразовый контейнер, cap-drop/network/ro-rootfs, shell/python в sandbox, overlay) + test_sandbox_security.py |
 | 5 | claim только с согласованным lifecycle | MVP | ⬜ | — |
-| 6 | один fenced commit attempt | MVP | 🔄 | test_reconciler.py + test_orchestrator.py (prepared-строка до финального tx; fencing predicate: lease+revision+attempt=prepared; partial unique §14.2) |
-| 7 | lost COMMIT → reconciliation | MVP | 🔄 | test_reconciler.py (kill before COMMIT→aborted; after commit→accepted; open final tx→finalizer_in_progress; stale finalizer→fenced) |
-| 8 | failpoints → старый/полный checkpoint | MVP | ⬜ | — |
+| 6 | один fenced commit attempt | MVP | ✅ | test_orchestrator.py (prepared-строка до финального tx; fencing predicate: lease+revision+attempt=prepared; partial unique §14.2) + test_reconciler.py |
+| 7 | lost COMMIT → reconciliation | MVP | ✅ | test_reconciler.py (kill before COMMIT→aborted; after commit→accepted; open final tx→finalizer_in_progress; stale finalizer→fenced) + reconcile_with_retries (backoff+jitter, fresh conn) |
+| 8 | failpoints → старый/полный checkpoint | MVP | ✅ | test_failpoints.py (kill mid-action → outcome_unknown → session failed, staging не применён, ревизия не поднимается = полный старый checkpoint) + test_reconciler.py |
 | 9 | status/timeline/attempts/assessments + auth messages/controls | MVP (dependencies — v1) | 🔄 | test_web_api.py (status/timeline/messages/commands; attempts — M2, assessments — M3, auth — M7) |
 | 10 | раздельные messages/stop/abort/controls | MVP | ✅ | test_web_api.py (раздельные endpoints; closed enum; idempotency key; stop/abort флаги сессии) |
 | 11 | нет вслепую-ретраев | MVP | 🔄 | test_tool_broker.py (§5.7 retry-классы: observation/non_idempotent без ретраев; idempotency key + conflict=incident) + test_llm_gateway.py |

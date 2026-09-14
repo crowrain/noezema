@@ -603,6 +603,28 @@ class Orchestrator:
             )
 
             obs = await self.executor.execute(tool_name, args, db=db)
+            if obs.result_unknown:
+                # the execution process was lost: the outcome genuinely
+                # cannot be known (T2.22). Never retried, never reported
+                # as a clean failure — and it makes the session failed at
+                # the commit boundary (T2.21 safe-boundary rule).
+                action.state = ActionState.OUTCOME_UNKNOWN.value
+                action.error_code = obs.error
+                action.finished_at = datetime.now(UTC)
+                await audit.record(
+                    AuditEventType.ACTION_OUTCOME_UNKNOWN,
+                    session_id=session.id,
+                    payload={
+                        "action_id": str(action.id),
+                        "tool": tool_name,
+                        "error": obs.error,
+                    },
+                    public_summary=f"action outcome unknown: {tool_name}",
+                )
+                ctx.observations.append(
+                    f"[{step}] {tool_name}: РЕЗУЛЬТАТ НЕИЗВЕСТЕН (процесс потерян)"
+                )
+                continue
             action.state = ActionState.COMPLETED.value if obs.ok else ActionState.FAILED.value
             action.error_code = obs.error
             action.finished_at = datetime.now(UTC)

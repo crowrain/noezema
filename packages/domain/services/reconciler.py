@@ -31,6 +31,9 @@ was broken and requires a human.
 
 from __future__ import annotations
 
+import asyncio
+import random
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 from uuid import UUID
@@ -47,6 +50,7 @@ ReconcileOutcome = Literal[
     "finalizer_in_progress",
     "records_inconsistent",
     "no_attempt",
+    "database_unavailable",
 ]
 
 
@@ -198,3 +202,45 @@ async def _mark_failed(
         session_id=session_id,
         payload={"reason": reason, "outcome": "aborted"},
     )
+
+
+TRANSIENT_OUTCOMES = ("finalizer_in_progress", "database_unavailable")
+
+
+async def reconcile_with_retries(
+    make_db: Callable[[], Any],
+    audit_factory: Callable[[Any], AuditService],
+    session_id: UUID,
+    *,
+    original_owner: str | None = None,
+    lock_timeout_ms: int = 2000,
+    max_probes: int = 5,
+    base_delay: float = 0.5,
+    sleep: Callable[[float], Any] = asyncio.sleep,
+) -> ReconcileResult:
+    """Probe loop for the reconciliation worker (T2.20): every probe uses
+    a FRESH connection (a dead connection must never decide the outcome);
+    transient outcomes (``finalizer_in_progress``,
+    ``database_unavailable``) retry with exponential backoff + jitter;
+    terminal outcomes stop the loop."""
+    result = ReconcileResult("finalizer_in_progress", "no probe run")
+    for probe in range(max_probes):
+        try:
+            async with make_db() as db, db.begin():
+                result = await reconcile_commit(
+                    db,
+                    audit_factory(db),
+                    session_id,
+                    original_owner=original_owner,
+                    lock_timeout_ms=lock_timeout_ms,
+                )
+        except LockTimeoutError:
+            result = ReconcileResult("finalizer_in_progress", "row lock timeout")
+        except Exception as exc:  # database_unavailable etc.
+            result = ReconcileResult("database_unavailable", str(exc)[:200])
+        if result.outcome not in TRANSIENT_OUTCOMES:
+            return result
+        if probe + 1 < max_probes:
+            delay = base_delay * (2**probe) + random.uniform(0, 0.25)
+            await sleep(delay)
+    return result

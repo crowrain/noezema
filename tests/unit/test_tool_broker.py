@@ -181,9 +181,12 @@ async def test_sandbox_exec_maps_exit_code(tmp_path: Path) -> None:
     async def fake_exec(h, cmd, timeout=None):
         return ExecResult(exit_code=3, stdout="out", stderr="err", timed_out=False)
 
+    async def fake_running(h) -> bool:
+        return True  # the container survived: a plain exit-code result
+
     from types import SimpleNamespace
 
-    broker.runtime = SimpleNamespace(exec=fake_exec)  # type: ignore[assignment]
+    broker.runtime = SimpleNamespace(exec=fake_exec, is_running=fake_running)  # type: ignore[assignment]
     obs = await broker.execute("shell.execute", {"command": "false"})
     assert not obs.ok
     assert obs.data["exit_code"] == 3
