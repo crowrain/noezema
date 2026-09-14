@@ -159,6 +159,27 @@ async def test_full_sealed_session(migrated_db, fake_llm: FakeLLM, tmp_path: Pat
             question_state = (
                 await conn.execute(text("SELECT state FROM questions WHERE id=:q"), {"q": str(question_id)})
             ).scalar_one()
+            # M2: staging rows recorded + applied at commit
+            staging = (
+                await conn.execute(
+                    text(
+                        "SELECT op, state FROM session_staging "
+                        "WHERE session_id=:s ORDER BY created_at"
+                    ),
+                    {"s": sid},
+                )
+            ).fetchall()
+            # M2: the frozen overlay manifest is attached to the session
+            manifest = (
+                await conn.execute(
+                    text(
+                        "SELECT m.entry_count FROM workspace_manifests m "
+                        "JOIN sessions s ON s.committed_workspace_manifest_id = m.id "
+                        "WHERE s.id=:s"
+                    ),
+                    {"s": sid},
+                )
+            ).fetchall()
     finally:
         await engine.dispose()
 
@@ -167,6 +188,16 @@ async def test_full_sealed_session(migrated_db, fake_llm: FakeLLM, tmp_path: Pat
     assert audit >= 8
     assert outbox == audit  # every audit event has an outbox twin
     assert question_state == QuestionState.VERIFIED.value
+
+    # the curator's claim + question went through session_staging and were
+    # applied at the commit boundary
+    assert len(staging) == 2
+    assert {row[0] for row in staging} == {"claim", "question"}
+    assert all(row[1] == "applied" for row in staging)
+    # the stub executor's workspace (with notes.md) was frozen into the
+    # manifest
+    assert len(manifest) == 1
+    assert manifest[0][0] >= 1
 
 
 @pytest.mark.asyncio

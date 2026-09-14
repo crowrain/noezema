@@ -64,6 +64,8 @@ class ToolExecutor(Protocol):
     """What the orchestrator sees: the dev stub executor or the sandboxed
     broker — one contract (T2.7)."""
 
+    workspace_dir: Path
+
     async def execute(
         self, tool: str, arguments: JsonDict, *, db: AsyncSession | None = None
     ) -> Observation: ...
@@ -118,6 +120,11 @@ class SandboxToolBroker:
         self.profile = profile
         self.runtime = runtime
         self.staging = staging_writer if staging_writer is not None else DeferredStagingWriter()
+
+    @property
+    def workspace_dir(self) -> Path:
+        # the per-session overlay on the host (T2.12 freeze input)
+        return self.handle.workspace_dir
 
     # ── public ────────────────────────────────────────────────────────────
 

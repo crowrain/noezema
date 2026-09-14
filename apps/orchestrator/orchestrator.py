@@ -23,12 +23,14 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from apps.orchestrator.evidence import observation_to_evidence
 from apps.orchestrator.executor import arguments_hash
 from apps.orchestrator.state_machine import transition
+from packages.artifacts import freeze_workspace
 from packages.broker import ToolExecutor, check_idempotency
 from packages.cognition.question_selector import FIFOQuestionSelector
 from packages.domain.canonical import canonical_json_bytes
@@ -56,6 +58,8 @@ from packages.domain.schemas.evidence import EvidenceRecord
 from packages.domain.schemas.staging import CuratorProposal
 from packages.domain.services.audit import AuditService
 from packages.domain.services.config import ConfigService
+from packages.domain.services.reserve import HostReserveService
+from packages.domain.services.staging import StagingService
 from packages.llm_gateway.client import LLMError, LLMMiddleware
 from packages.llm_gateway.config import ModelProfile
 from packages.llm_gateway.fingerprint import build_model_fingerprint
@@ -131,6 +135,9 @@ class Orchestrator:
         except ProfileError as exc:
             raise RuntimeError(f"capability profile unavailable: {exc}") from exc
         policy_engine = PolicyEngine(cap_profile)
+        # staging is the only isolation mechanism for model-proposed
+        # changes (§5.2.2); the reserve is checked before each record
+        staging = StagingService(HostReserveService.for_snapshot(snapshot))
 
         session = ORMSession(state=SessionState.CREATED.value, config_snapshot_id=snapshot.id)
         await SessionRepository.create(db, session)
@@ -157,7 +164,8 @@ class Orchestrator:
         question = await self._select_question(db, question_id)
         if question is None:
             return await self._finish(
-                db, audit, session, SessionState.FAILED, None, 0, 0, 0, termination_reason="no_question"
+                db, audit, session, SessionState.FAILED, None, 0, 0, 0, 0,
+                termination_reason="no_question",
             )
         session.question_id = question.id
         question.state = QuestionState.RESEARCHING.value
@@ -176,7 +184,7 @@ class Orchestrator:
         await self._transition(db, audit, session, SessionState.EXPLORING)
         max_steps = int(limits.get("max_explorer_steps", 10))
         steps, stopped, aborted = await self._explorer_loop(
-            db, audit, session, ctx, max_steps, cap_profile, policy_engine
+            db, audit, session, ctx, max_steps, cap_profile, policy_engine, staging
         )
         if aborted:
             # ABORTING was set in the loop; finish as cancelled in the SAME
@@ -190,6 +198,7 @@ class Orchestrator:
                 steps,
                 len(ctx.evidence),
                 0,
+                0,
                 termination_reason="operator_abort",
             )
         if stopped:
@@ -198,9 +207,9 @@ class Orchestrator:
         # verifying (MVP: no-op; verifier profile lands in M5)
         await self._transition(db, audit, session, SessionState.VERIFYING)
 
-        # consolidating: curator
+        # consolidating: curator (proposals go to session_staging, T2.13)
         await self._transition(db, audit, session, SessionState.CONSOLIDATING)
-        claims, _questions_created = await self._curator(db, audit, session, ctx, snapshot)
+        claims, _questions_created = await self._curator(db, audit, session, ctx, snapshot, staging)
 
         # reporting
         await self._transition(db, audit, session, SessionState.REPORTING)
@@ -215,12 +224,23 @@ class Orchestrator:
             },
         )
 
-        # committing (M1 simple commit)
+        # committing (M2 simple commit; the fenced transaction lands in
+        # PR #15): apply recorded staging, freeze the overlay, then finish
+        # in the same transaction.
         await self._transition(db, audit, session, SessionState.COMMITTING)
         if ctx.complete_reason == CompleteReason.GOAL_REACHED.value:
             final = SessionState.SUCCEEDED
         else:
             final = SessionState.SUCCEEDED_PARTIAL
+        applied_claims, applied_questions = await staging.apply_recorded(db, audit, session)
+        questions_created = applied_questions
+        claims = max(claims, applied_claims)
+
+        workspace_dir = getattr(self.executor, "workspace_dir", None)
+        if workspace_dir is not None and Path(workspace_dir).is_dir():
+            manifest = await freeze_workspace(db, session.id, Path(workspace_dir))
+            session.committed_workspace_manifest_id = manifest.id
+
         question.state = (
             QuestionState.VERIFIED.value
             if final is SessionState.SUCCEEDED
@@ -235,6 +255,7 @@ class Orchestrator:
             steps,
             len(ctx.evidence),
             claims,
+            questions_created,
             termination_reason=ctx.complete_reason,
         )
 
@@ -249,6 +270,7 @@ class Orchestrator:
         max_steps: int,
         cap_profile: CapabilityProfile,
         policy_engine: PolicyEngine,
+        staging: StagingService,
     ) -> tuple[int, bool, bool]:
         """Returns (steps_done, stop_requested, abort_requested)."""
         explorer = self.prompts[Role.EXPLORER]
@@ -441,7 +463,7 @@ class Orchestrator:
                 },
             )
 
-            await self._apply_host_side(db, audit, session, tool_name, args)
+            await self._apply_host_side(db, audit, session, tool_name, args, staging)
 
             evidence = observation_to_evidence(obs, args)
             if evidence is not None:
@@ -496,6 +518,7 @@ class Orchestrator:
         session: ORMSession,
         ctx: SessionContext,
         snapshot: ORMConfigSnapshot,
+        staging: StagingService,
     ) -> tuple[int, int]:
         """Run the curator; host-validate the proposal. Returns
         (claims_proposed, questions_created)."""
@@ -555,18 +578,25 @@ class Orchestrator:
             )
             return 0, 0
 
-        questions_created = 0
-        for q in proposal.new_questions:
-            await QuestionRepository.create(
+        # T2.13: proposals go to session_staging, applied at commit
+        for claim in proposal.claims:
+            await staging.record(
                 db,
-                ORMQuestion(
-                    text=q.text,
-                    origin=q.origin.value,
-                    origin_config_snapshot_id=snapshot.id,
-                    parent_id=session.question_id,
-                ),
+                audit,
+                session,
+                "claim",
+                claim.model_dump(mode="json"),
+                proposed_claims=1,
             )
-            questions_created += 1
+        for q in proposal.new_questions:
+            await staging.record(
+                db,
+                audit,
+                session,
+                "question",
+                {"text": q.text, "origin": q.origin.value},
+                proposed_questions=1,
+            )
 
         await audit.record(
             AuditEventType.CLAIM_CREATED,
@@ -577,9 +607,9 @@ class Orchestrator:
                 "new_questions": [q.model_dump(mode="json") for q in proposal.new_questions],
                 "summary": proposal.summary,
             },
-            public_summary=f"curator: {len(proposal.claims)} claims, {questions_created} questions",
+            public_summary=f"curator: {len(proposal.claims)} claims, {len(proposal.new_questions)} questions",
         )
-        return len(proposal.claims), questions_created
+        return len(proposal.claims), len(proposal.new_questions)
 
     async def _apply_host_side(
         self,
@@ -588,28 +618,24 @@ class Orchestrator:
         session: ORMSession,
         tool: str,
         args: JsonDict,
+        staging: StagingService,
     ) -> None:
-        """Host-side effects of host-deferred tools (T1.18)."""
+        """Host-side effects of host-deferred tools (T1.18, T2.13)."""
         if tool == "question.create":
             text = str(args.get("text", "")).strip()
             if text:
                 origin = str(args.get("origin", QuestionOrigin.MODEL_PROPOSAL.value))
                 try:
-                    origin_enum = QuestionOrigin(origin)
+                    QuestionOrigin(origin)
                 except ValueError:
-                    origin_enum = QuestionOrigin.MODEL_PROPOSAL
-                question = ORMQuestion(
-                    text=text[:2000],
-                    origin=origin_enum.value,
-                    origin_config_snapshot_id=session.config_snapshot_id,
-                    parent_id=session.question_id,
-                )
-                await QuestionRepository.create(db, question)
-                await audit.record(
-                    AuditEventType.SESSION_STATE_CHANGED,
-                    session_id=session.id,
-                    payload={"question_text": text[:300]},
-                    public_summary="model proposed a new question",
+                    origin = QuestionOrigin.MODEL_PROPOSAL.value
+                await staging.record(
+                    db,
+                    audit,
+                    session,
+                    "question",
+                    {"text": text[:2000], "origin": origin},
+                    proposed_questions=1,
                 )
         elif tool == "message.reply":
             message_id = args.get("message_id")
@@ -654,6 +680,7 @@ class Orchestrator:
         steps: int,
         evidence_count: int,
         claims: int,
+        questions_created: int,
         *,
         termination_reason: str | None,
     ) -> SessionOutcome:
@@ -682,7 +709,7 @@ class Orchestrator:
             steps=steps,
             evidence_count=evidence_count,
             claims_proposed=claims,
-            questions_created=0,
+            questions_created=questions_created,
             termination_reason=termination_reason,
         )
 
