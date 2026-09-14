@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop, impl/from-scratch]
+  pull_request:
+    branches: [main, impl/from-scratch]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install --upgrade uv
+      - run: uv pip install --system ".[dev]"
+      - name: ruff
+        run: ruff check .
+
+  types:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install --upgrade uv
+      - run: uv pip install --system ".[dev]"
+      - name: mypy
+        run: mypy packages apps hostctl
+
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_DB: noezema
+          POSTGRES_USER: noezema
+          POSTGRES_PASSWORD: noezema_dev
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      NOEZEMA_TEST_DATABASE_URL: postgresql+asyncpg://noezema:noezema_dev@localhost:5432/noezema
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install --upgrade uv
+      - run: uv pip install --system ".[dev]"
+      - name: Run tests
+        run: python -m pytest -v --tb=short
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build dev image
+        run: docker build -f Dockerfile -t noezema-dev:ci .
