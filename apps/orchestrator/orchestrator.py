@@ -172,7 +172,21 @@ class Orchestrator:
         # exploring
         await self._transition(db, audit, session, SessionState.EXPLORING)
         max_steps = int(limits.get("max_explorer_steps", 10))
-        steps, stopped = await self._explorer_loop(db, audit, session, ctx, max_steps)
+        steps, stopped, aborted = await self._explorer_loop(db, audit, session, ctx, max_steps)
+        if aborted:
+            # ABORTING was set in the loop; finish as cancelled in the SAME
+            # transaction so the audit trail of the aborted session survives.
+            return await self._finish(
+                db,
+                audit,
+                session,
+                SessionState.CANCELLED,
+                question.id,
+                steps,
+                len(ctx.evidence),
+                0,
+                termination_reason="operator_abort",
+            )
         if stopped:
             await self._transition(db, audit, session, SessionState.STOPPING)
 
@@ -228,11 +242,12 @@ class Orchestrator:
         session: ORMSession,
         ctx: SessionContext,
         max_steps: int,
-    ) -> tuple[int, bool]:
-        """Returns (steps_done, stop_requested)."""
+    ) -> tuple[int, bool, bool]:
+        """Returns (steps_done, stop_requested, abort_requested)."""
         explorer = self.prompts[Role.EXPLORER]
         steps = 0
         stop_requested = False
+        abort_requested = False
         for step in range(1, max_steps + 1):
             steps = step
 
@@ -240,7 +255,8 @@ class Orchestrator:
             await db.refresh(session)
             if session.abort_requested_at is not None:
                 await self._transition(db, audit, session, SessionState.ABORTING)
-                raise _AbortRequested()
+                abort_requested = True
+                break
             if session.stop_requested_at is not None:
                 stop_requested = True
                 ctx.complete_reason = CompleteReason.OPERATOR_STOP.value
@@ -348,7 +364,7 @@ class Orchestrator:
         else:
             # loop exhausted without complete
             ctx.complete_reason = CompleteReason.BUDGET_EXHAUSTED.value
-        return steps, stop_requested
+        return steps, stop_requested, abort_requested
 
     # ── helpers ───────────────────────────────────────────────────────────
 
@@ -578,10 +594,6 @@ class Orchestrator:
             questions_created=0,
             termination_reason=termination_reason,
         )
-
-
-class _AbortRequested(Exception):
-    """Internal: abort requested mid-loop."""
 
 
 def _cap_args(value: object) -> str:

@@ -41,6 +41,7 @@ class ORMSession(Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     termination_reason: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = created_at_column()
 
     def __repr__(self) -> str:
         return f"<ORMSession {self.state} {self.id}>"

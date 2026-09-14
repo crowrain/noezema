@@ -77,7 +77,8 @@ def upgrade() -> None:
             config_snapshot_id            uuid NOT NULL REFERENCES config_snapshots(id),
             started_at                    timestamptz,
             finished_at                   timestamptz,
-            termination_reason            text
+            termination_reason            text,
+            created_at                    timestamptz NOT NULL DEFAULT now()
         )
         """
     )
