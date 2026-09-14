@@ -155,6 +155,22 @@ class AuditEventType(StrEnum):
     RECONCILIATION = "reconciliation"
     OPERATOR_COMMAND = "operator_command"
     HOST_EVENT = "host_event"
+    # Stage 3b: reassessment, dependency barriers, online activation
+    REASSESSMENT_JOB_CREATED = "reassessment_job_created"
+    REASSESSMENT_JOB_LEASED = "reassessment_job_leased"
+    REASSESSMENT_JOB_COMPLETED = "reassessment_job_completed"
+    REASSESSMENT_JOB_RETRY = "reassessment_job_retry"
+    REASSESSMENT_JOB_BLOCKED = "reassessment_job_blocked"
+    DEPENDENCY_INVALIDATED = "dependency_invalidated"
+    CLOSURE_MANIFEST_CREATED = "closure_manifest_created"
+    BARRIER_CREATED = "barrier_created"
+    BARRIER_BATCH_APPLIED = "barrier_batch_applied"
+    BARRIER_GENERATION_ADVANCED = "barrier_generation_advanced"
+    BARRIER_RESOLVED = "barrier_resolved"
+    BARRIER_BLOCKED = "barrier_blocked"
+    CONFIG_ACTIVATION_ACQUIRED = "config_activation_acquired"
+    CONFIG_ACTIVATION_PUBLISHED = "config_activation_published"
+    CONFIG_ACTIVATION_FAILED = "config_activation_failed"
 
 
 class ToolName(StrEnum):
@@ -215,3 +231,57 @@ class ClaimRelation(StrEnum):
     SUPPORTS = "supports"
     COUNTERS = "counters"
     DEPENDS_ON = "depends_on"
+
+
+class ReassessmentJobStatus(StrEnum):
+    QUEUED = "queued"
+    LEASED = "leased"
+    RETRY = "retry"
+    BLOCKED = "blocked"
+    COMPLETED = "completed"
+
+    @property
+    def is_active(self) -> bool:
+        """queued | leased | retry — one per claim/target config (unique constraint)."""
+        return self in {self.QUEUED, self.LEASED, self.RETRY}
+
+    @property
+    def is_runnable(self) -> bool:
+        """runnable subset: scheduled and within retry budget (checked in code)."""
+        return self in {self.QUEUED}
+
+
+class ReassessmentErrorClass(StrEnum):
+    TRANSIENT = "transient"
+    DETERMINISTIC = "deterministic"
+    PERMANENT = "permanent"
+
+
+class ReassessmentJobReason(StrEnum):
+    INVALIDATION = "invalidation"
+    RULES_CHANGE = "rules_change"
+    REVERIFY_DEADLINE = "reverify_deadline"
+    OPERATOR = "operator"
+    REPAIR = "repair"
+
+
+# Priority bands (lower = first). Spec §5.9.1:
+# 0 — reverse dependencies of active questions
+# 1 — external / temporal facts
+# 2 — everything else
+JOB_PRIORITY_ACTIVE_QUESTION_DEP = 0
+JOB_PRIORITY_EXTERNAL_TEMPORAL = 1
+JOB_PRIORITY_DEFAULT = 2
+
+
+class BarrierStatus(StrEnum):
+    DISCOVERING = "discovering"
+    ACTIVE = "active"
+    CLOSING = "closing"
+    RESOLVED = "resolved"
+    BLOCKED = "blocked"
+
+    @property
+    def is_open(self) -> bool:
+        """GC roots that must survive crash recovery."""
+        return self in {self.DISCOVERING, self.ACTIVE, self.CLOSING}
