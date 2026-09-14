@@ -62,6 +62,7 @@ from packages.memory.rules_engine import (
     evaluate,
     reverify_after,
 )
+from packages.memory.source_graph import build_source_independence_snapshot
 
 GLOBAL_SCOPE = "global"
 
@@ -616,6 +617,13 @@ class MemoryService:
         env_snapshot_id, env_mapping = await build_environment_independence_snapshot(
             db, claim_id=claim.id, rules_hash=self._rules_hash
         )
+        # §11.3 (T4.7): the versioned source-independence snapshot over
+        # the claim's sources — source-based evidence gets the SOURCE
+        # group (the provenance of the data), execution evidence gets the
+        # environment group, neither → the conservative untracked group.
+        src_snapshot_id, src_mapping = await build_source_independence_snapshot(
+            db, claim_id=claim.id
+        )
         group_by_manifest = {mid: g for mid, (g, _r) in env_mapping.items()}
         relation_by_manifest = {mid: r for mid, (_g, r) in env_mapping.items()}
         evs = [
@@ -625,9 +633,13 @@ class MemoryService:
                 relation=e.relation,
                 scope=dict(e.scope or {}),
                 independence_group=(
-                    group_by_manifest.get(e.environment_manifest_id, UNTRACKED_GROUP)
-                    if e.environment_manifest_id is not None
-                    else UNTRACKED_GROUP
+                    src_mapping[e.source_id][0]
+                    if e.source_id is not None and e.source_id in src_mapping
+                    else (
+                        group_by_manifest.get(e.environment_manifest_id, UNTRACKED_GROUP)
+                        if e.environment_manifest_id is not None
+                        else UNTRACKED_GROUP
+                    )
                 ),
                 env_relation=(
                     relation_by_manifest.get(e.environment_manifest_id, "none")
@@ -671,6 +683,7 @@ class MemoryService:
             rules_version=RULES_ENGINE_VERSION,
             rules_hash=self._rules_hash,
             environment_independence_snapshot_id=env_snapshot_id,
+            source_independence_snapshot_id=src_snapshot_id,
             evidence_set_hash=_evidence_set_hash(all_evidence),
             assessed_scope=dict(claim_scope),
             confidence=result.confidence,
@@ -723,6 +736,9 @@ class MemoryService:
                 "rules_hash": self._rules_hash,
                 "environment_independence_snapshot_id": (
                     str(env_snapshot_id) if env_snapshot_id is not None else None
+                ),
+                "source_independence_snapshot_id": (
+                    str(src_snapshot_id) if src_snapshot_id is not None else None
                 ),
             },
             public_summary=f"claim assessed: {result.grade.value}/{result.epistemic_status.value}",

@@ -469,6 +469,8 @@ class AuditEventType(StrEnum):
     ACTIVATION_POST_PUBLISH_BLOCKED = "activation_post_publish_blocked"
     ACTIVATION_CLEANED_UP = "activation_cleaned_up"
     ACTIVATION_SUPERSEDED = "activation_superseded"
+    # T4.7 (§11.3, §14): the full source graph
+    SOURCE_GRAPH_CHANGED = "source_graph_changed"
     ALERT_RAISED = "alert_raised"
 
 

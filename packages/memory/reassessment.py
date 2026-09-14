@@ -89,6 +89,7 @@ from packages.memory.rules_engine import (
     reverify_after,
 )
 from packages.memory.service import MemoryService, _evidence_set_hash
+from packages.memory.source_graph import build_source_independence_snapshot
 from packages.memory.writer_gate import (
     GATE_PRIORITY_WORKER,
     OWNER_WORKER,
@@ -423,6 +424,12 @@ async def _process_one_job(
     env_snapshot_id, env_mapping = await build_environment_independence_snapshot(
         db, claim_id=claim.id, rules_hash=rules_hash(dict(snapshot.claim_type_rules))
     )
+    # §11.3 (T4.7): the source-independence snapshot — the same groups
+    # the commit path computes (source-based evidence → source group,
+    # execution evidence → environment group, neither → untracked)
+    src_snapshot_id, src_mapping = await build_source_independence_snapshot(
+        db, claim_id=claim.id
+    )
     group_by_manifest = {mid: g for mid, (g, _r) in env_mapping.items()}
     relation_by_manifest = {mid: r for mid, (_g, r) in env_mapping.items()}
     evs = [
@@ -432,9 +439,13 @@ async def _process_one_job(
             relation=e.relation,
             scope=dict(e.scope or {}),
             independence_group=(
-                group_by_manifest.get(e.environment_manifest_id, UNTRACKED_GROUP)
-                if e.environment_manifest_id is not None
-                else UNTRACKED_GROUP
+                src_mapping[e.source_id][0]
+                if e.source_id is not None and e.source_id in src_mapping
+                else (
+                    group_by_manifest.get(e.environment_manifest_id, UNTRACKED_GROUP)
+                    if e.environment_manifest_id is not None
+                    else UNTRACKED_GROUP
+                )
             ),
             env_relation=(
                 relation_by_manifest.get(e.environment_manifest_id, "none")
@@ -513,6 +524,7 @@ async def _process_one_job(
         rules_version=RULES_ENGINE_VERSION,
         rules_hash=rules_hash(dict(snapshot.claim_type_rules)),
         environment_independence_snapshot_id=env_snapshot_id,
+        source_independence_snapshot_id=src_snapshot_id,
         evidence_set_hash=_evidence_set_hash(list(evidence)),
         assessed_scope=dict(scope),
         confidence=result.confidence,
@@ -559,6 +571,9 @@ async def _process_one_job(
             "epistemic_status": result.epistemic_status.value,
             "confidence": result.confidence,
             "reasons": list(result.reasons),
+            "source_independence_snapshot_id": (
+                str(src_snapshot_id) if src_snapshot_id is not None else None
+            ),
         },
         public_summary=(
             f"reassessment {claim.id}: {result.grade.value}/"

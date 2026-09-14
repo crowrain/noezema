@@ -27,6 +27,9 @@ from packages.domain.models.base import JsonDict
 RULES_ENGINE_VERSION = "rules-v1"
 URI_NORMALIZER_VERSION = "uri-normalizer-v1"
 INDEPENDENCE_ALGORITHM_VERSION = "independence-v1"
+#: T4.7 (§11.3): the full source-graph algorithm (parent sources,
+#: dependency edges, operator corrections, identical content hashes)
+SOURCE_GRAPH_ALGORITHM_VERSION = "independence-v2"
 ENVIRONMENT_NORMALIZER_VERSION = "env-v2"
 
 # §8.7.3: the framework implementation identity of a session run. Bumped

@@ -255,6 +255,62 @@ class ORMEnvironmentIndependenceMember(Base):
     basis: Mapped[str] = mapped_column(Text, nullable=False)
 
 
+class ORMSourceDependencyEdge(Base):
+    """A source points at another source (T4.7, §11.3, §14): link to a
+    primary source, derived content, quote, republish — a merge basis of
+    the source-independence algorithm."""
+
+    __tablename__ = "source_dependency_edges"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    from_source_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("sources.id", ondelete="CASCADE"), nullable=False
+    )
+    to_source_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("sources.id", ondelete="CASCADE"), nullable=False
+    )
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    basis_artifact_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("artifacts.id", ondelete="SET NULL")
+    )
+    origin: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = created_at_column()
+
+    __table_args__ = (
+        CheckConstraint(
+            "kind IN ('link_to_primary','derived_from','quote_of','republish_of')"
+        ),
+    )
+
+
+class ORMSourceGraphCorrection(Base):
+    """An operator correction of the source graph (T4.7, §11.3): it
+    changes the independence classification (merge / split) with a
+    verifiable provenance chain — but is NOT evidence for a claim, and
+    an operator attestation without one never splits a group."""
+
+    __tablename__ = "source_graph_corrections"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    actor: Mapped[str] = mapped_column(Text, nullable=False)
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    from_source_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("sources.id", ondelete="CASCADE"), nullable=False
+    )
+    to_source_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("sources.id", ondelete="CASCADE"), nullable=False
+    )
+    basis_artifact_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("artifacts.id", ondelete="SET NULL")
+    )
+    rules_version: Mapped[str] = mapped_column(Text, nullable=False)
+    valid: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    reason_audit_event_id: Mapped[uuid.UUID | None] = mapped_column()
+    created_at: Mapped[datetime] = created_at_column()
+
+    __table_args__ = (CheckConstraint("kind IN ('merge','split')"),)
+
+
 class ORMCheckpoint(Base):
     __tablename__ = "checkpoints"
 
