@@ -195,6 +195,101 @@ def offline_rules(payload_file: str, reason: str, host_lib: str) -> None:
     sys.exit(code)
 
 
+@main.command("wake-tick")
+@click.option("--node-owner", default=None, help="Node identity (default: $NOEZEMA_NODE_OWNER).")
+@click.option(
+    "--data-root",
+    type=click.Path(),
+    default=None,
+    help="Node data root for the disk quota gate (default: $NOEZEMA_DATA_ROOT).",
+)
+def wake_tick(node_owner: str | None, data_root: str | None) -> None:
+    """Evaluate one wake tick (T3.29, §5.2.1) and run a session if admitted.
+
+    The schedule, admission gates and backoff live in the effective config
+    snapshot (wake_schedule). wait/skip is not an error; a non-zero exit
+    means the admitted session failed or the node is misconfigured.
+    """
+    import asyncio
+    import os
+
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    url = os.environ.get("NOEZEMA_DATABASE_URL", "")
+    if not url:
+        click.echo("NOEZEMA_DATABASE_URL is not set", err=True)
+        sys.exit(EXIT_USAGE_ERROR)
+
+    from apps.orchestrator.main import build_orchestrator
+    from apps.orchestrator.scheduler import (
+        WakeScheduleError,
+        WakeScheduler,
+        data_root_from_env,
+        node_owner_from_env,
+    )
+    from packages.domain.services.config import ConfigError
+
+    owner = node_owner or node_owner_from_env()
+    root = Path(data_root) if data_root else data_root_from_env()
+
+    engine = create_async_engine(url)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    async def _tick() -> int:
+        from datetime import UTC, datetime
+
+        try:
+            async with factory() as db:
+                decision = await WakeScheduler(db, node_owner=owner, data_root=root).decide(
+                    source="scheduled", now=datetime.now(UTC)
+                )
+        except (ConfigError, WakeScheduleError) as exc:
+            # Fail-closed: a broken effective config must not start a session.
+            click.echo(f"wake-tick: fail-closed ({type(exc).__name__}: {exc})", err=True)
+            return 78
+        if decision.action != "wake":
+            click.echo(f"wake-tick: {decision.action} ({decision.reason})")
+            return 0
+
+        async with factory() as db, db.begin():
+            await db.execute(
+                text(
+                    "INSERT INTO system_constants (key, value) VALUES ('node_state', :v) "
+                    "ON CONFLICT (key) DO UPDATE SET value = :v"
+                ),
+                {"v": "session_running"},
+            )
+
+        orchestrator, gateway = build_orchestrator(factory, root / "workspace")
+        try:
+            outcome = await orchestrator.run_session()
+        except Exception as exc:
+            # Infra failure around the session; the session row is left to the
+            # reconciler, and the failure counts for the backoff.
+            final_state = "failed"
+            click.echo(f"wake-tick: session error ({type(exc).__name__}: {exc})", err=True)
+        else:
+            final_state = outcome.final_state.value
+        finally:
+            await gateway.close()
+
+        async with factory() as db:
+            node_state = await WakeScheduler(db, node_owner=owner, data_root=root).record_session_result(
+                final_state=final_state, now=datetime.now(UTC)
+            )
+        click.echo(f"wake-tick: session -> {final_state} (node_state={node_state})")
+        return 0 if final_state in ("succeeded", "succeeded_partial") else 1
+
+    async def _run() -> int:
+        try:
+            return await _tick()
+        finally:
+            await engine.dispose()
+
+    sys.exit(asyncio.run(_run()))
+
+
 @main.command("show-policy")
 @click.option("--host-lib", type=click.Path(), default=str(DEFAULT_HOST_LIB))
 def show_policy(host_lib: str) -> None:

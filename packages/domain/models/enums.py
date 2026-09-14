@@ -351,6 +351,7 @@ class HostPolicyChangeState(StrEnum):
 
 
 class AuditEventType(StrEnum):
+    WAKE_SKIPPED = "wake_skipped"
     SESSION_STARTED = "session_started"
     SESSION_STATE_CHANGED = "session_state_changed"
     SESSION_COMMITTED = "session_committed"

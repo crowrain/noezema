@@ -89,6 +89,24 @@ BOOTSTRAP_PAYLOAD: dict[str, Any] = {
         "session_timeout_seconds": 1800,
     },
     "activation_limits": {"offline_activation_max_invalid_questions": 100},
+    # Wake scheduling (§5.2.1, T3.29). Owned by the trusted boundary: the
+    # sandbox never sees it. ``interval_seconds`` is the base periodic
+    # schedule (MVP cron case "every N seconds");
+    # ``min_session_interval_seconds`` is the enforced minimum gap between
+    # sessions; ``backoff_*`` — exponential backoff after a failed session;
+    # ``max_consecutive_failures`` — the node goes to ``paused`` after that
+    # many consecutive failed sessions; ``disk_quota_mb`` / ``gpu_required``
+    # — wake admission gates.
+    "wake_schedule": {
+        "interval_seconds": 3600,
+        "min_session_interval_seconds": 600,
+        "backoff_base_seconds": 60,
+        "backoff_multiplier": 2,
+        "backoff_max_seconds": 86400,
+        "max_consecutive_failures": 3,
+        "disk_quota_mb": 1024,
+        "gpu_required": False,
+    },
     "claim_type_rules": {
         "local_observation": {
             "min_grade_for_supported": "E2",

@@ -135,11 +135,13 @@ async def upsert_candidate(
                         id, base_snapshot_id, payload_sha256, sha256,
                         activation_mode, activation_state,
                         model, embeddings, prompts, policy, curiosity,
-                        token_budgets, session_limits, activation_limits, claim_type_rules
+                        token_budgets, session_limits, activation_limits, claim_type_rules,
+                        wake_schedule
                     ) VALUES (
                         :id, :base, :payload_sha, :sha, 'offline', 'draft',
                         :model, :embeddings, :prompts, :policy, :curiosity,
-                        :token_budgets, :session_limits, :activation_limits, :claim_type_rules
+                        :token_budgets, :session_limits, :activation_limits, :claim_type_rules,
+                        :wake_schedule
                     )
                     ON CONFLICT (base_snapshot_id, payload_sha256)
                     WHERE activation_mode = 'offline' AND activation_state <> 'failed'
@@ -161,6 +163,11 @@ async def upsert_candidate(
                     "session_limits": _json(requested_payload.get("session_limits")),
                     "activation_limits": _json(requested_payload.get("activation_limits")),
                     "claim_type_rules": _json(requested_payload.get("claim_type_rules")),
+                    # T3.29: inherit the wake schedule from the base snapshot
+                    # when the requested payload does not set it explicitly.
+                    "wake_schedule": _json(
+                        requested_payload.get("wake_schedule", base_snapshot.wake_schedule)
+                    ),
                 },
             )
         )

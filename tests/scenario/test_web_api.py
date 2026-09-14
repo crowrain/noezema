@@ -7,6 +7,7 @@ drives a full session through the operator command API.
 from __future__ import annotations
 
 import asyncio
+import uuid
 from pathlib import Path
 
 import httpx
@@ -259,3 +260,108 @@ async def test_wake_now_without_orchestrator(migrated_db, fake_llm: FakeLLM, tmp
         assert r.json()["state"] == "rejected"
         assert "orchestrator not attached" in r.json()["result"]["reason"]
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_wake_now_rejected_by_admission(migrated_db, fake_llm: FakeLLM, tmp_path: Path) -> None:
+    """T3.29 (§5.2.1): wake_now bypasses the schedule timing but never
+    the admission gates — a nonterminal session rejects the wake and the
+    skip is audited."""
+    scratch_url, _engine = migrated_db
+    app, engine, factory, _gw = await _make_app(
+        scratch_url, fake_llm, tmp_path / "ws", with_orchestrator=True
+    )
+    try:
+        from sqlalchemy import text
+
+        async with factory() as db, transaction(db):
+            bootstrap_id = (
+                await db.execute(
+                    text("SELECT id FROM config_snapshots WHERE activation_mode = 'bootstrap'")
+                )
+            ).scalar_one()
+            await db.execute(
+                text("INSERT INTO sessions (id, state, config_snapshot_id) VALUES (:id, 'waking', :c)"),
+                {"id": uuid.uuid4(), "c": str(bootstrap_id)},
+            )
+        async with _client(app) as client:
+            r = await client.post(
+                "/api/v1/commands",
+                json={"type": "wake_now", "idempotency_key": "w3"},
+            )
+            assert r.status_code == 202
+            assert r.json()["state"] == "rejected"
+            assert r.json()["result"]["reason"] == "nonterminal_session"
+
+        # the skip is audited (session_id NULL, payload carries the reason)
+        async with engine.connect() as conn:
+            payload = (
+                await conn.execute(
+                    text(
+                        "SELECT payload FROM audit_events "
+                        "WHERE type = 'wake_skipped' AND session_id IS NULL"
+                    )
+                )
+            ).scalar_one()
+        assert payload["reason"] == "nonterminal_session"
+        assert payload["source"] == "wake_now"
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_resume_clears_failure_bookkeeping(migrated_db, fake_llm: FakeLLM, tmp_path: Path) -> None:
+    """T3.29 (§5.2.1): the operator RESUME clears the auto-pause
+    bookkeeping, so the node is eligible for the next scheduled tick."""
+    scratch_url, _engine = migrated_db
+    app, engine, factory, _gw = await _make_app(scratch_url, fake_llm, tmp_path / "ws")
+    try:
+        from sqlalchemy import text
+
+        async with _client(app) as client:
+            # operator pause first (in-memory + DB state flip)
+            r = await client.post(
+                "/api/v1/commands",
+                json={"type": "pause", "idempotency_key": "p1"},
+            )
+            assert r.json()["state"] == "completed"
+
+        # then simulate the auto-pause failure bookkeeping on top of it
+        async with factory() as db, transaction(db):
+            await db.execute(
+                text(
+                    "UPDATE wake_scheduler_state SET consecutive_failures = 3, "
+                    "backoff_until = now() + interval '1 hour', last_failure_at = now(), "
+                    "paused_reason = 'consecutive_failures' WHERE node_id = 'local-node'"
+                )
+            )
+        async with _client(app) as client:
+            r = await client.post(
+                "/api/v1/commands",
+                json={"type": "resume", "idempotency_key": "r1"},
+            )
+            assert r.status_code == 202
+            assert r.json()["state"] == "completed"
+            assert r.json()["result"]["node_state"] == "idle"
+
+        # the bookkeeping row is cleared
+        async with engine.connect() as conn:
+            row = (
+                await conn.execute(
+                    text(
+                        "SELECT consecutive_failures, backoff_until, paused_reason "
+                        "FROM wake_scheduler_state WHERE node_id = 'local-node'"
+                    )
+                )
+            ).mappings().one()
+        assert row["consecutive_failures"] == 0
+        assert row["backoff_until"] is None
+        assert row["paused_reason"] is None
+
+        # and the status view exposes the wake bookkeeping
+        async with _client(app) as client:
+            r = await client.get("/api/v1/status")
+            assert r.json()["wake"]["consecutive_failures"] == 0
+            assert r.json()["wake"]["paused_reason"] is None
+    finally:
+        await engine.dispose()

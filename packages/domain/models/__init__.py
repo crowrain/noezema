@@ -10,6 +10,7 @@ from packages.domain.models import (
     memory,
     questions,
     sessions,
+    wake,
 )
 
 __all__ = [
@@ -22,4 +23,5 @@ __all__ = [
     "memory",
     "questions",
     "sessions",
+    "wake",
 ]

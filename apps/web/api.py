@@ -39,7 +39,8 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
-from apps.orchestrator.orchestrator import Orchestrator
+from apps.orchestrator.orchestrator import Orchestrator, SessionOutcome
+from apps.orchestrator.scheduler import WakeScheduler, data_root_from_env, node_owner_from_env
 from apps.web.host_status import HostStatus, HostStatusAdapter
 from packages.domain.db.engine import DatabaseSettings
 from packages.domain.db.uow import transaction
@@ -167,7 +168,7 @@ class _Node:
 
     def __init__(self) -> None:
         self.state: str = "idle"
-        self.session_task: asyncio.Task[object] | None = None
+        self.session_task: asyncio.Task[SessionOutcome] | None = None
         self.last_error: str | None = None
         self._resets: set[asyncio.Task[None]] = set()
 
@@ -217,6 +218,9 @@ def create_app(
             host_lib_base=Path(os.environ.get("NOEZEMA_HOST_LIB", "/var/lib/noezema")),
             unit_state_path=Path(os.environ.get("NOEZEMA_UNIT_STATE", "/run/noezema/unit-state.json")),
         )
+    # T3.29: wake scheduler identity (wake admission + backoff, §5.2.1)
+    _node_owner = node_owner_from_env()
+    _data_root = data_root_from_env()
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -283,6 +287,8 @@ def create_app(
                     else None
                 ),
                 "counts": counts,
+                # T3.29: wake bookkeeping (backoff/pause observability)
+                "wake": await WakeScheduler(db, node_owner=_node_owner, data_root=_data_root).status(),
             }
         # T3.20/T3.24: host status (recovery banner + warnings) is a host
         # view, not a DB query — it must survive a DB outage (fail-closed)
@@ -410,6 +416,8 @@ def create_app(
                 return OperatorCommandState.REJECTED, {"reason": "session is running; stop_gracefully instead"}
             node.state = "paused"
             await _save_node_state(db, node.state)
+            # T3.29: explain the pause for the wake admission audit
+            await _set_pause_reason(db, "operator")
             return OperatorCommandState.COMPLETED, {"node_state": "paused"}
 
         if ctype is OperatorCommandType.RESUME:
@@ -417,6 +425,16 @@ def create_app(
                 return OperatorCommandState.REJECTED, {"reason": "node is not paused"}
             node.state = "idle"
             await _save_node_state(db, node.state)
+            # T3.29: the operator resume clears the failure bookkeeping, so
+            # the node is eligible for the next scheduled tick immediately.
+            await db.execute(
+                text(
+                    "UPDATE wake_scheduler_state SET consecutive_failures = 0, "
+                    "backoff_until = NULL, last_failure_at = NULL, paused_reason = NULL, "
+                    "updated_at = now() WHERE node_id = :n"
+                ),
+                {"n": _node_owner},
+            )
             return OperatorCommandState.COMPLETED, {"node_state": "idle"}
 
         if ctype is OperatorCommandType.WAKE_NOW:
@@ -426,14 +444,26 @@ def create_app(
                 return OperatorCommandState.REJECTED, {"reason": "a session is already running"}
             if orchestrator is None:
                 return OperatorCommandState.REJECTED, {"reason": "orchestrator not attached"}
+            # T3.29 (§5.2.1): wake_now bypasses the schedule timing (interval,
+            # minimum gap, backoff) but NOT admission. Evaluated on a fresh
+            # session so the request transaction stays intact.
+            async with factory() as sdb:
+                decision = await WakeScheduler(sdb, node_owner=_node_owner, data_root=_data_root).decide(
+                    source="wake_now", now=_now()
+                )
+            if decision.action != "wake":
+                return OperatorCommandState.REJECTED, {
+                    "reason": decision.reason,
+                    "paused_reason": decision.detail,
+                }
             node.state = "session_running"
             await _save_node_state(db, node.state)
 
-            def _reset(task: asyncio.Task[object]) -> None:
+            def _reset(task: asyncio.Task[SessionOutcome]) -> None:
                 # runs on the event loop after the session task settles
                 if not task.cancelled() and task.exception() is not None:
                     node.last_error = str(task.exception())[:500]
-                reset_task = asyncio.ensure_future(_reset_node_state())
+                reset_task = asyncio.ensure_future(_record_session_outcome(task))
                 node._resets.add(reset_task)
                 reset_task.add_done_callback(node._resets.discard)
 
@@ -458,10 +488,29 @@ def create_app(
             "reason": "not available in M1 (config snapshot / checkpoints land later)"
         }
 
-    async def _reset_node_state() -> None:
-        async with factory() as db, transaction(db):
-            node.state = "idle"
-            await _save_node_state(db, node.state)
+    async def _set_pause_reason(db: AsyncSession, reason: str) -> None:
+        await db.execute(
+            text(
+                "INSERT INTO wake_scheduler_state (node_id, paused_reason) VALUES (:n, :r) "
+                "ON CONFLICT (node_id) DO UPDATE SET paused_reason = :r"
+            ),
+            {"n": _node_owner, "r": reason},
+        )
+
+    async def _record_session_outcome(task: asyncio.Task[SessionOutcome]) -> None:
+        # T3.29 (§5.2.1): apply the backoff/pause rules to the finished
+        # session and set the resulting node state.
+        if task.cancelled():
+            final_state = "cancelled"
+        elif task.exception() is not None:
+            final_state = "failed"
+        else:
+            final_state = task.result().final_state.value
+        async with factory() as db:
+            new_state = await WakeScheduler(db, node_owner=_node_owner, data_root=_data_root).record_session_result(
+                final_state=final_state, now=_now()
+            )
+        node.state = new_state
 
     # ── T3.22: message lifecycle (lazy TTL -> expired) ────────────────────
 

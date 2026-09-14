@@ -360,6 +360,12 @@ host recovery. После этой вехи — merge MVP в `main`.
 | T3.27 | Host resume: outage DB любой длительности — `retry_wait` (без расхода start limit); unclassified crash-loop — `resume_degraded`; permanent — `resume_blocked`; timer lateness; orphan/multiple-unresolved; retained history ≠ active |
 | T3.28 | Scenario: полный Sealed-день (N сессий подряд) — FIFO, staging, assessment, commit, timeline в web |
 
+**K6. Wake scheduling (MVP-дополнение, пункт 1 §22.1; пропуск плана — задача добавлена ретроспективно)**
+
+| # | Задача |
+|---|---|
+| T3.29 | Пробуждение по расписанию + wake admission + backoff/pause (§5.2.1): секция `wake_schedule` в config snapshot (периодический интервал = MVP-случай cron, мин. интервал между сессиями, backoff base/multiplier/max, лимит disk quota, GPU) + `wake_scheduler_state` (миграция `0005`); tick — `noezemactl wake-tick` (systemd `noezema-wake.timer`, 5 мин): расписание читается из effective snapshot, не из таймера; wake admission (paused / не-терминальная сессия / unresolved commit attempt / активный activation slot / disk quota / GPU fail-closed) — пропуск с точной причиной в audit `wake_skipped` (никогда не в очередь); экспоненциальный backoff после failed-сессии; авто-pause после N последовательных неудач (sticky до операторного resume, resume сбрасывает failure-бухгалтерию); `wake_now` обходит расписание (интервал/gap/backoff), но не admission — тот же gate в web Command API (REJECTED с reason); состояние wake (backoff/pause) в /status; fail-closed на битый `wake_schedule` |
+
 **Gate M3** = gate этапа 3a (§19) + MVP-критерии §22.1 `[MVP]` (пункты 1–11, 13, 15, 19, 20, 21,
 23, 28, 30–34) — каждый со ссылкой на тест. После gate: tag `noezema-mvp`, merge в `main` (отдельное решение).
 
@@ -576,7 +582,7 @@ decision-ответов по seed), поддержка json_schema, ошибки
 | M0 | 10 | 4–5 |
 | M1 | 18 | 15–20 |
 | M2 | 23 | 25–35 (commit boundary + failpoints) |
-| M3 | 28 | 30–40 (host-контур — 40%) |
+| M3 | 29 | 30–40 (host-контур — 40%) |
 | M4 | 9 | 30–40 (activation + worker + barrier) |
 | M5 | 6 | 20–25 |
 | M6 | 4 | 10–15 |
@@ -608,7 +614,7 @@ MVP (M0–M3) ≈ **70–100 чел.-дней**. При одном разраб�
 
 Каждый пункт — с ссылкой на тест в `docs/STATUS.md`:
 
-- [ ] 1. Пробуждение по расписанию, pause/backoff
+- [x] 1. Пробуждение по расписанию, pause/backoff (T3.29)
 - [ ] 2. Локальная LLM с fingerprint
 - [ ] 3. Causal/idempotency ID только в trusted host
 - [ ] 4. Typed actions в sandbox

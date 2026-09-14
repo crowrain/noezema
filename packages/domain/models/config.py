@@ -44,6 +44,9 @@ class ORMConfigSnapshot(Base):
     session_limits: Mapped[JsonDict] = mapped_column(JSONB, nullable=False)
     activation_limits: Mapped[JsonDict] = mapped_column(JSONB, nullable=False)
     claim_type_rules: Mapped[JsonDict] = mapped_column(JSONB, nullable=False)
+    # T3.29 (§5.2.1): wake schedule + admission limits + backoff (trusted
+    # boundary; the sandbox never sees it)
+    wake_schedule: Mapped[JsonDict] = mapped_column(JSONB, nullable=False, default=dict)
     created_at: Mapped[datetime] = created_at_column()
 
 
