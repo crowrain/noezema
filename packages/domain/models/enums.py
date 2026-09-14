@@ -471,6 +471,9 @@ class AuditEventType(StrEnum):
     ACTIVATION_SUPERSEDED = "activation_superseded"
     # T4.7 (§11.3, §14): the full source graph
     SOURCE_GRAPH_CHANGED = "source_graph_changed"
+    # T4.8 (§8.7.4): counterevidence resolutions
+    COUNTER_RESOLUTION_CREATED = "counter_resolution_created"
+    COUNTER_RESOLUTION_INVALIDATED = "counter_resolution_invalidated"
     ALERT_RAISED = "alert_raised"
 
 

@@ -103,6 +103,9 @@ class EvaluatedEvidence:
     # has with the rest of the set (env_independence snapshot member);
     # "none" when the evidence has no tracked environment
     env_relation: str = "none"
+    # §8.7.4 (T4.8): the counters evidence has a VALID
+    # counterevidence_resolution — it does not cap the grade
+    resolved: bool = False
 
 
 def _relation_met(support: list[EvaluatedEvidence], required: str) -> bool:
@@ -158,7 +161,11 @@ def evaluate(
     op instead of silently mis-weighing it.
     """
     support = [e for e in evidences if e.relation == "supports"]
-    counter = [e for e in evidences if e.relation == "counters"]
+    # §8.7.4: only UNRESOLVED counterevidence counts against the claim —
+    # a counter with a valid resolution (verifiable basis) is out
+    # (counterevidence_unresolved == false)
+    counter = [e for e in evidences if e.relation == "counters" and not e.resolved]
+    resolved_counters = sum(1 for e in evidences if e.relation == "counters" and e.resolved)
 
     # role/relation inconsistency: a support evidence of a kind the rule
     # does not allow is rejected, not silently dropped (§14.3)
@@ -210,7 +217,7 @@ def evaluate(
         # unresolved counterevidence: disputed, capped at E1 (§3.7)
         grade = EffectiveGrade.E1
         status = EpistemicStatus.DISPUTED
-        reasons = ("counterevidence_unresolved",)
+        reasons: tuple[str, ...] = ("counterevidence_unresolved",)
     elif meets:
         grade = rule.min_grade_for_supported
         # extra independent groups lift the grade by one step (never past E4)
@@ -218,6 +225,8 @@ def evaluate(
             grade = EffectiveGrade(grade.value[0] + str(grade.level + 1))
         status = EpistemicStatus.SUPPORTED
         reasons = ("requirements_met",)
+        if resolved_counters:
+            reasons = (*reasons, "counterevidence_resolved")
     else:
         # some support, requirements not met: hypothesis (integrity checked)
         grade = EffectiveGrade.E1

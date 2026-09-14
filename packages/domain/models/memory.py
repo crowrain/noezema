@@ -311,6 +311,41 @@ class ORMSourceGraphCorrection(Base):
     __table_args__ = (CheckConstraint("kind IN ('merge','split')"),)
 
 
+class ORMCounterevidenceResolution(Base):
+    """A resolution of ONE counterevidence (T4.8, §8.7.4): a separate
+    audited entity with exactly one verifiable basis — an evidence row
+    or a valid source-graph correction. It is not a model flag: the
+    rules engine counts only UNRESOLVED counters against the claim."""
+
+    __tablename__ = "counterevidence_resolutions"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    evidence_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("evidence.id", ondelete="CASCADE"), nullable=False
+    )
+    basis_evidence_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("evidence.id", ondelete="SET NULL")
+    )
+    basis_correction_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("source_graph_corrections.id", ondelete="SET NULL")
+    )
+    actor: Mapped[str] = mapped_column(Text, nullable=False)
+    rules_version: Mapped[str] = mapped_column(Text, nullable=False)
+    reason_audit_event_id: Mapped[uuid.UUID | None] = mapped_column()
+    valid: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_in_session: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("sessions.id", ondelete="SET NULL")
+    )
+    created_at: Mapped[datetime] = created_at_column()
+
+    __table_args__ = (
+        CheckConstraint(
+            "(basis_evidence_id IS NULL) <> (basis_correction_id IS NULL)",
+            name="counterevidence_resolutions_basis_xor_check",
+        ),
+    )
+
+
 class ORMCheckpoint(Base):
     __tablename__ = "checkpoints"
 

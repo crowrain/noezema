@@ -430,6 +430,20 @@ async def _process_one_job(
     src_snapshot_id, src_mapping = await build_source_independence_snapshot(
         db, claim_id=claim.id
     )
+    # §8.7.4 (T4.8): a counters evidence with a VALID resolution
+    # does not cap the grade (counterevidence_unresolved == false)
+    resolved_counter_ids = {
+        row[0]
+        for row in (
+            await db.execute(
+                text(
+                    "SELECT evidence_id FROM counterevidence_resolutions "
+                    "WHERE valid AND evidence_id = ANY(:ids)"
+                ),
+                {"ids": [e.id for e in evidence]},
+            )
+        ).all()
+    }
     group_by_manifest = {mid: g for mid, (g, _r) in env_mapping.items()}
     relation_by_manifest = {mid: r for mid, (_g, r) in env_mapping.items()}
     evs = [
@@ -452,6 +466,7 @@ async def _process_one_job(
                 if e.environment_manifest_id is not None
                 else "none"
             ),
+            resolved=e.id in resolved_counter_ids,
         )
         for e in evidence
     ]
