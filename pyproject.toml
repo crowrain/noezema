@@ -1,23 +1,19 @@
 [project]
 name = "noezema"
-version = "0.1.0-dev"
+version = "0.2.0-dev0"
 description = "Local-first autonomous thinker"
 readme = "README.md"
-license = {text = "Apache-2.0"}
+license = { text = "Apache-2.0" }
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.32",
     "pydantic>=2.9",
     "pydantic-settings>=2.6",
-    "sqlalchemy[asyncio]>=2.0",
+    "sqlalchemy[asyncio]>=2.0.30",
     "asyncpg>=0.30",
     "alembic>=1.14",
     "httpx>=0.28",
-    "aiofiles>=24.1",
-    "python-multipart>=0.0.17",
-    "rq>=2.1",
-    "redis>=5.0",
 ]
 
 [project.optional-dependencies]
@@ -29,17 +25,38 @@ dev = [
     "mypy>=1.13",
 ]
 
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["packages", "apps", "hostctl"]
+
 [tool.ruff]
-target-version = "py311"
 line-length = 120
+target-version = "py311"
+extend-exclude = [".venv", "build", "dist"]
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "UP", "B", "C4", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unreachable = true
+pretty = true
+exclude = ["tests/"]
+
+[[tool.mypy.overrides]]
+module = ["asyncpg.*", "alembic.*"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-
-[tool.hatch.build.targets.wheel]
-packages = ["packages", "apps"]
-
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+markers = [
+    "unit: unit tests (fast, no external services)",
+    "scenario: multi-step session scenarios (postgres + fake LLM required)",
+    "security: invariant and failpoint tests",
+    "compat: LLM model compatibility suite",
+]
