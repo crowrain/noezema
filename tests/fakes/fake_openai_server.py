@@ -12,6 +12,8 @@ A scripted response entry is a JSON object:
     {"content": {...}}                      reply serialized as canonical JSON
                                             (for json_schema structured output)
     {"error": 500}  /  {"error": "timeout"} inject a transient HTTP failure
+    {"error": "invalid_json"}               200 OK, but the content is not
+                                            valid JSON (model hiccup)
 
 The server is single-process and single-client by design (one session at a
 time in v1, ARCHITECTURE §5.2.1).
@@ -85,20 +87,25 @@ async def chat_completions(body: dict[str, Any]) -> dict[str, Any]:
     scripted: dict[str, Any] = queue.pop(0)
 
     error = scripted.get("error")
-    if error is not None:
-        code = error if isinstance(error, int) else 500
-        raise HTTPException(status_code=code, detail="injected failure")
+    if error == "invalid_json":
+        # 200 OK, but the model "produced" non-JSON content for a structured
+        # request — simulates a model hiccup the gateway must recover from.
+        message = "this is definitely not json"
+    else:
+        if error is not None:
+            code = error if isinstance(error, int) else 500
+            raise HTTPException(status_code=code, detail="injected failure")
 
-    message: str | None = scripted.get("message")
-    content = scripted.get("content")
-    if content is not None:
-        message = json.dumps(content, sort_keys=True, separators=(",", ":"))
-    if message is None:
-        raise HTTPException(status_code=500, detail="scripted response has no message/content")
+        message: str | None = scripted.get("message")
+        content = scripted.get("content")
+        if content is not None:
+            message = json.dumps(content, sort_keys=True, separators=(",", ":"))
+        if message is None:
+            raise HTTPException(status_code=500, detail="scripted response has no message/content")
 
-    response_format = body.get("response_format") or {}
-    if response_format.get("type") == "json_schema":
-        json.loads(message)  # must be valid JSON for structured-output scenarios
+        response_format = body.get("response_format") or {}
+        if response_format.get("type") == "json_schema":
+            json.loads(message)  # must be valid JSON for structured-output scenarios
 
     return {
         "id": f"fake-cmplt-{next(_state['seq'])}",
