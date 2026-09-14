@@ -1,5 +1,5 @@
-"""Domain schemas: Pydantic contracts (decision envelope from M1/T1.2)."""
+"""Domain schemas: Pydantic contracts (decision + staging, M1)."""
 
-from packages.domain.schemas import decision
+from packages.domain.schemas import decision, staging
 
-__all__ = ["decision"]
+__all__ = ["decision", "staging"]
