@@ -14,12 +14,13 @@ import socket
 import subprocess
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
 import pytest
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -93,6 +94,57 @@ def test_db_url() -> str:
     if not url:
         pytest.skip("NOEZEMA_TEST_DATABASE_URL is not set")
     return url
+
+
+@pytest.fixture()
+async def migrated_db(test_db_url: str) -> AsyncIterator[tuple[str, AsyncEngine]]:
+    """Scratch database with `alembic upgrade head` applied.
+
+    Yields (scratch_url, engine). The engine is disposed and the database
+    dropped on teardown.
+    """
+    import secrets
+    import subprocess
+    from urllib.parse import urlparse
+
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    parts = urlparse(test_db_url)
+    dbname = f"noezema_mig_{secrets.token_hex(4)}"
+    scratch_url = parts._replace(path=f"/{dbname}").geturl()
+
+    admin = create_async_engine(test_db_url, isolation_level="AUTOCOMMIT")
+    from sqlalchemy import text
+
+    async with admin.connect() as conn:
+        await conn.execute(text(f'CREATE DATABASE "{dbname}"'))
+    await admin.dispose()
+
+    engine = None
+    try:
+        env = dict(os.environ)
+        env["NOEZEMA_DATABASE_URL"] = scratch_url
+        proc = subprocess.run(
+            [sys.executable, "-m", "alembic", "-c", "alembic.ini", "upgrade", "head"],
+            cwd=REPO_ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        assert proc.returncode == 0, f"alembic failed:\n{proc.stdout}\n{proc.stderr}"
+
+        engine = create_async_engine(scratch_url)
+        yield scratch_url, engine
+    finally:
+        if engine is not None:
+            await engine.dispose()
+        admin = create_async_engine(test_db_url, isolation_level="AUTOCOMMIT")
+        try:
+            async with admin.connect() as conn:
+                await conn.execute(text(f'DROP DATABASE "{dbname}"'))
+        finally:
+            await admin.dispose()
 
 
 @asynccontextmanager
