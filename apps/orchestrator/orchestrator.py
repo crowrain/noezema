@@ -25,6 +25,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -119,6 +120,12 @@ class CommitPlan:
     max_new_claims: int
     max_evidence: int
     max_questions: int
+    # M3: the session's observations (evidence identity is recomputed by
+    # the trusted host at the commit boundary) and the environment
+    config_snapshot_id: uuid.UUID
+    evidence_records: tuple[Any, ...] = ()
+    model_fingerprint: JsonDict | None = None
+    tool_schema_hash: str | None = None
 
 
 class Orchestrator:
@@ -184,6 +191,37 @@ class Orchestrator:
                 )
             )
         )
+        # M3: memory apply runs INSIDE the fenced final transaction (the
+        # rules engine is the only grade/confidence producer, §3.7)
+        from packages.memory import MemoryService
+
+        async def _memory_snapshot() -> ORMConfigSnapshot:
+            async with self.session_factory() as probe:
+                snap = await probe.get(ORMConfigSnapshot, plan.config_snapshot_id)
+                if snap is None:
+                    raise RuntimeError("config snapshot missing at finalize")
+                return snap
+
+        snapshot = await _memory_snapshot()
+        memory = MemoryService(snapshot)
+
+        async def apply_memory(
+            db: AsyncSession, audit: AuditService, session: ORMSession
+        ) -> JsonDict:
+            result = await memory.apply_claim_staging(
+                db, audit, session, list(plan.evidence_records),
+                model_fingerprint=plan.model_fingerprint,
+                tool_schema_hash=plan.tool_schema_hash,
+            )
+            return {
+                "claims_created": result.claims_created,
+                "claims_reused": result.claims_reused,
+                "evidence_added": result.evidence_added,
+                "evidence_deduped": result.evidence_deduped,
+                "assessments": result.assessments,
+                "problems": list(result.problems),
+            }
+
         finalize_result: FinalizeResult | None = None
         async with self.session_factory() as db:
             try:
@@ -201,6 +239,7 @@ class Orchestrator:
                         termination_reason=plan.termination_reason,
                         question_id=plan.question_id,
                         question_terminal=plan.question_terminal.value,
+                        apply_memory=apply_memory,
                     )
             except Exception:
                 await db.rollback()
@@ -390,6 +429,12 @@ class Orchestrator:
             manifest = await freeze_workspace(db, session.id, Path(workspace_dir))
             session.committed_workspace_manifest_id = manifest.id
 
+        explorer_fp = build_model_fingerprint(
+            self.profile,
+            prompt_version=self.prompts[Role.EXPLORER].version,
+            tool_schema_hash=tool_schema_hash(sorted(cap_profile.tools)),
+            policy_version=cap_profile.policy_version,
+        )
         return CommitPlan(
             session_id=session.id,
             question_id=question.id,
@@ -406,6 +451,10 @@ class Orchestrator:
             max_new_claims=int(limits.get("max_new_claims_per_session", 16)),
             max_evidence=int(limits.get("max_evidence_items_per_session", 64)),
             max_questions=int(limits.get("max_new_questions_per_session", 4)),
+            config_snapshot_id=snapshot.id,
+            evidence_records=tuple(ctx.evidence),
+            model_fingerprint=explorer_fp,
+            tool_schema_hash=tool_schema_hash(sorted(cap_profile.tools)),
         )
 
     # ── explorer loop ─────────────────────────────────────────────────────
@@ -763,6 +812,21 @@ class Orchestrator:
                 "claim",
                 claim.model_dump(mode="json"),
                 proposed_claims=1,
+            )
+        # evidence links (M3): the only channel for evidence changes; the
+        # trusted host recomputes every identity at the commit boundary
+        for link in proposal.evidence_links:
+            await staging.record(
+                db,
+                audit,
+                session,
+                "evidence",
+                {
+                    "evidence_index": link.evidence_index,
+                    "claim_index": link.claim_index,
+                    "relation": link.relation.value,
+                },
+                proposed_evidence=1,
             )
         for q in proposal.new_questions:
             await staging.record(

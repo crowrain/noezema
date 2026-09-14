@@ -197,6 +197,31 @@ async def test_full_sealed_session(migrated_db, fake_llm: FakeLLM, tmp_path: Pat
             knowledge_rev = (
                 await conn.execute(text("SELECT revision FROM domain_revisions WHERE scope='knowledge'"))
             ).scalar_one()
+            # M3: the memory model was applied inside the fenced tx — the
+            # claim, its evidence, the assessment and the current head
+            claims = (
+                await conn.execute(
+                    text("SELECT statement, claim_type FROM claims WHERE created_in_session=:s"),
+                    {"s": sid},
+                )
+            ).fetchall()
+            evidence = (
+                await conn.execute(
+                    text("SELECT evidence_kind, relation FROM evidence WHERE created_in_session=:s"),
+                    {"s": sid},
+                )
+            ).fetchall()
+            heads = (
+                await conn.execute(
+                    text(
+                        "SELECT h.assessment_state, h.epistemic_status, a.effective_grade, a.confidence "
+                        "FROM claim_assessment_heads h "
+                        "JOIN claims c ON c.id = h.claim_id AND c.created_in_session=:s "
+                        "JOIN claim_assessments a ON a.id = h.current_assessment_id"
+                    ),
+                    {"s": sid},
+                )
+            ).fetchall()
     finally:
         await engine.dispose()
 
@@ -206,11 +231,23 @@ async def test_full_sealed_session(migrated_db, fake_llm: FakeLLM, tmp_path: Pat
     assert outbox == audit  # every audit event has an outbox twin
     assert question_state == QuestionState.VERIFIED.value
 
-    # the curator's claim + question went through session_staging and were
-    # applied at the commit boundary
-    assert len(staging) == 2
-    assert {row[0] for row in staging} == {"claim", "question"}
+    # the curator's claim + evidence link + question went through
+    # session_staging and were applied at the commit boundary
+    assert len(staging) == 3
+    assert {row[0] for row in staging} == {"claim", "evidence", "question"}
     assert all(row[1] == "applied" for row in staging)
+
+    # M3: the memory model was applied inside the fenced final tx
+    assert len(claims) == 1
+    assert claims[0][1] == "computed_result"
+    assert len(evidence) == 1
+    assert evidence[0] == ("computation", "supports")
+    assert len(heads) == 1
+    state, epistemic, grade, confidence = heads[0]
+    assert state == "current"
+    assert epistemic == "supported"
+    assert grade == "E2"
+    assert confidence == 0.55
     # the stub executor's workspace (with notes.md) was frozen into the
     # manifest
     assert len(manifest) == 1

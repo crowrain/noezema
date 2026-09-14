@@ -10,7 +10,7 @@
 | M0 каркас | ✅ выполнена | — | чистое дерево, скелет, CI, fake LLM, ADR-0001/0002/0003 |
 | M1 контракты + LLM | ✅ выполнена | noezema-m1 | PR #4–#10; gate пройден: 112 тестов (86 unit ≥ 40), Sealed-сессия question→action→evidence→commit на fake LLM |
 | M2 изоляция + commit | ✅ выполнена | noezema-m2 | PR #11–#16: sandbox+runtime, policy engine, tool broker, artifact store+staging+freeze, commit boundary (prepared→fenced final tx) + reconciliation; gate пройден: 206 тестов, failpoints (kill до/после COMMIT, open final tx, stale finalizer, kill mid-action), security (сеть off, cap-drop, injection, ro rootfs) |
-| M3 память + web slice (MVP) | ⬜ не начата | — | |
+| M3 память + web slice (MVP) | 🔄 в работе | — | PR #17: память — модель (0004), evidence identity (§14.3), rules engine v1 (единственный производитель grade/confidence), independence (PSL+overlap), lifecycle heads (§14.1), apply в fenced tx; 243 теста |
 | M4 зависимости + переоценка | ⬜ не начата | — | |
 | M5 расширенный цикл | ⬜ не начата | — | |
 | M6 Research Proxy | ⬜ не начата | — | |
@@ -33,7 +33,7 @@
 | 2 | локальная LLM с fingerprint | MVP | 🔄 | test_llm_gateway.py, test_compat_and_roles.py (gateway+fingerprint; local model profile — PR #10) |
 | 3 | causal/idempotency ID в trusted host | MVP | ✅ | test_orchestrator.py (turn_id/action_id/idempotency_key генерирует хост) |
 | 4 | typed actions в sandbox | MVP | ✅ | test_sandbox_runtime.py + test_tool_broker_sandbox.py (одноразовый контейнер, cap-drop/network/ro-rootfs, shell/python в sandbox, overlay) + test_sandbox_security.py |
-| 5 | claim только с согласованным lifecycle | MVP | ⬜ | — |
+| 5 | claim только с согласованным lifecycle | MVP | ✅ | test_memory_service.py (head current ⇔ assessment+epistemic_status NOT NULL, CHECK §14.1; dedup claim+evidence; supersede) + test_orchestrator.py (apply в fenced tx: claim→evidence→assessment→head одной транзакцией) |
 | 6 | один fenced commit attempt | MVP | ✅ | test_orchestrator.py (prepared-строка до финального tx; fencing predicate: lease+revision+attempt=prepared; partial unique §14.2) + test_reconciler.py |
 | 7 | lost COMMIT → reconciliation | MVP | ✅ | test_reconciler.py (kill before COMMIT→aborted; after commit→accepted; open final tx→finalizer_in_progress; stale finalizer→fenced) + reconcile_with_retries (backoff+jitter, fresh conn) |
 | 8 | failpoints → старый/полный checkpoint | MVP | ✅ | test_failpoints.py (kill mid-action → outcome_unknown → session failed, staging не применён, ревизия не поднимается = полный старый checkpoint) + test_reconciler.py |
@@ -43,13 +43,13 @@
 | 12 | random backup point + root set | v1 | ⬜ | — |
 | 13 | partial success на safe boundary | MVP | ✅ | test_orchestrator.py::test_budget_exhausted_partial (succeeded_partial) |
 | 14 | каскадная инвалидация | v1 | ⬜ | — |
-| 15 | pending/invalid не current | MVP | ⬜ | — |
+| 15 | pending/invalid не current | MVP | 🔄 | test_memory_service.py (lifecycle CHECK: pending/invalid ⇒ assessment/status NULL) + MemoryService.pending_invalid_claims (§8.6); сам переход в pending/invalid — с offline activation (PR #19) |
 | 16 | worker: priority, retry, no starvation | v1 | ⬜ | — |
 | 17 | repeatability/reproducibility/replication | v1 | ⬜ | — |
 | 18 | counterevidence resolutions | v1 | ⬜ | — |
 | 19 | unresolved attempt блокирует wake/GC | MVP | 🔄 | test_reconciler.py (unresolved prepared → reconciled_abort; wake/GC-блокировка — вместе с M3 durable knowledge) |
 | 20 | FIFO полный минимальный путь | MVP | ✅ | test_web_api.py::test_wake_now_runs_full_session + test_orchestrator.py::test_full_sealed_session + test_question_selector.py (durable knowledge — M3) |
-| 21 | sync head update + offline flip | MVP | ⬜ | — |
+| 21 | sync head update + offline flip | MVP | 🔄 | test_orchestrator.py + test_memory_service.py (sync head update в fenced tx: новый assessment + head→current, old superseded); offline flip — PR #19 |
 | 22 | barrier crash-resume | v1 | ⬜ | — |
 | 23 | session limits + host reserve | MVP | 🔄 | test_orchestrator.py (max_explorer_steps из config) + test_staging_reserve.py (host reserve: staging_budget_exceeded ДО записи) |
 | 24 | online activation | v1 | ⬜ | — |

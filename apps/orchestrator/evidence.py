@@ -33,7 +33,13 @@ def observation_to_evidence(observation: Observation, arguments: JsonDict) -> Ev
         return EvidenceRecord(
             kind=EvidenceKind.COMPUTATION,
             identity_hash=identity,
-            payload={"exit_code": data.get("exit_code"), "stdout": str(data.get("stdout", ""))[:2000]},
+            payload={
+                "exit_code": data.get("exit_code"),
+                "stdout": str(data.get("stdout", ""))[:2000],
+                # the exact input (M3: the trusted host recomputes the
+                # durable identity from result + inputs + tool fingerprint)
+                "code": str(arguments.get("code", ""))[:4000],
+            },
             note="python.execute (M1 stub executor)",
         )
 

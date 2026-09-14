@@ -21,9 +21,10 @@ reconciler, not a guessed rollback, decides the outcome).
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC
-from typing import Literal
+from typing import Any, Literal
 from uuid import UUID
 
 from sqlalchemy import text
@@ -135,11 +136,17 @@ async def finalize(
     termination_reason: str | None,
     question_id: UUID | None = None,
     question_terminal: str | None = None,
+    apply_memory: Callable[[AsyncSession, AuditService, ORMSession], Awaitable[dict[str, Any]]]
+    | None = None,
 ) -> FinalizeResult:
     """The short fenced final transaction (caller's ``db``; the caller
     commits/rolls back). Locks in canonical order, checks the fencing
-    predicate, applies staging, bumps the knowledge revision, and writes
-    the terminal state + audit + outbox atomically."""
+    predicate, applies memory + staging, bumps the knowledge revision,
+    and writes the terminal state + audit + outbox atomically.
+
+    ``apply_memory`` (M3) runs INSIDE this transaction, after the fencing
+    predicate passes and before the staging rows are marked applied, so a
+    rolled-back fence rolls back the memory writes too."""
     # 1. locks in canonical order: session -> knowledge -> attempt
     await lock_commit_set(db, session.id, attempt.id, touches_dependency_graph=False)
 
@@ -214,7 +221,14 @@ async def finalize(
         )
         return FinalizeResult("committed", attempt.id)
 
-    # 3. apply staging (recorded -> applied) inside the same transaction
+    # 3a. M3: apply the memory model (claims, evidence, assessments,
+    # heads) INSIDE the fenced transaction, before the staging rows are
+    # marked applied. A rolled-back fence rolls these back too.
+    memory_payload: dict[str, Any] = {}
+    if apply_memory is not None:
+        memory_payload = await apply_memory(db, audit, session)
+
+    # 3b. apply staging (recorded -> applied) inside the same transaction
     applied_claims, applied_questions = await staging.apply_recorded(db, audit, session)
 
     # 4. workspace pointer + knowledge revision bump
@@ -268,7 +282,11 @@ async def finalize(
     await audit.record(
         AuditEventType.COMMIT_ATTEMPT_COMMITTED,
         session_id=session.id,
-        payload={"attempt_id": str(attempt.id), "knowledge_revision": new_rev},
+        payload={
+            "attempt_id": str(attempt.id),
+            "knowledge_revision": new_rev,
+            "memory": memory_payload,
+        },
     )
     return FinalizeResult(
         "committed",

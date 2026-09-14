@@ -1,5 +1,25 @@
 """Domain models: enums (M1/T1.1) + ORM objects (M1/T1.4)."""
 
-from packages.domain.models import config, enums, events, inbox, questions, sessions
+from packages.domain.models import (
+    artifacts,
+    commit,
+    config,
+    enums,
+    events,
+    inbox,
+    memory,
+    questions,
+    sessions,
+)
 
-__all__ = ["config", "enums", "events", "inbox", "questions", "sessions"]
+__all__ = [
+    "artifacts",
+    "commit",
+    "config",
+    "enums",
+    "events",
+    "inbox",
+    "memory",
+    "questions",
+    "sessions",
+]
