@@ -223,6 +223,7 @@ def wake_tick(node_owner: str | None, data_root: str | None) -> None:
 
     from apps.orchestrator.main import build_orchestrator
     from apps.orchestrator.scheduler import (
+        ReassessmentAdmissionError,
         WakeScheduleError,
         WakeScheduler,
         data_root_from_env,
@@ -244,7 +245,7 @@ def wake_tick(node_owner: str | None, data_root: str | None) -> None:
                 decision = await WakeScheduler(db, node_owner=owner, data_root=root).decide(
                     source="scheduled", now=datetime.now(UTC)
                 )
-        except (ConfigError, WakeScheduleError) as exc:
+        except (ConfigError, WakeScheduleError, ReassessmentAdmissionError) as exc:
             # Fail-closed: a broken effective config must not start a session.
             click.echo(f"wake-tick: fail-closed ({type(exc).__name__}: {exc})", err=True)
             return 78
@@ -288,6 +289,61 @@ def wake_tick(node_owner: str | None, data_root: str | None) -> None:
             await engine.dispose()
 
     sys.exit(asyncio.run(_run()))
+
+
+@main.command("reassessment-tick")
+@click.option("--batch-size", default=8, show_default=True, help="Bounded batch size.")
+@click.option(
+    "--lease-seconds", default=300, show_default=True, help="Per-job lease TTL."
+)
+def reassessment_tick(batch_size: int, lease_seconds: int) -> None:
+    """Run one reassessment worker batch (T4.3/T4.4, §5.9.1).
+
+    The liveness driver: the scheduler (wake-tick) runs sessions and
+    SKIPS them while the dependency-critical queue is over
+    ``T_worker_admission``; this command (its own timer in v1) drains the
+    queue in the window between sessions. Crash-recovery of expired job
+    leases runs first. The worker takes the writer gate NOWAIT and
+    yields to the session commit intent — it never fights a session.
+    """
+    import asyncio
+    import os
+
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    url = os.environ.get("NOEZEMA_DATABASE_URL", "")
+    if not url:
+        click.echo("NOEZEMA_DATABASE_URL is not set", err=True)
+        sys.exit(EXIT_USAGE_ERROR)
+
+    from packages.memory.reassessment import (
+        recover_expired_leases,
+        run_reassessment_batch,
+    )
+
+    engine = create_async_engine(url)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    async def _run() -> int:
+        async with factory() as db:
+            recovered = await recover_expired_leases(db)
+        async with factory() as db:
+            outcome = await run_reassessment_batch(
+                db, batch_size=batch_size, lease_seconds=lease_seconds
+            )
+        click.echo(
+            f"reassessment-tick: recovered={recovered} "
+            f"processed={outcome.processed} completed={outcome.completed} "
+            f"retried={outcome.retried} blocked={outcome.blocked} "
+            f"deferred={outcome.deferred}"
+        )
+        return 0
+
+    try:
+        code = asyncio.run(_run())
+    finally:
+        asyncio.run(engine.dispose())
+    sys.exit(code)
 
 
 @main.command("show-policy")

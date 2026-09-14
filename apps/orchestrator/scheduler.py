@@ -60,6 +60,7 @@ REASON_PAUSED = "paused"
 REASON_NONTERMINAL_SESSION = "nonterminal_session"
 REASON_UNRESOLVED_COMMIT = "unresolved_commit_attempt"
 REASON_ACTIVATION_SLOT = "activation_slot_busy"
+REASON_REASSESSMENT_BACKLOG = "reassessment_backlog"
 REASON_DISK_QUOTA = "disk_quota_exceeded"
 REASON_GPU = "gpu_unavailable"
 
@@ -144,6 +145,49 @@ class WakeSchedule:
             max_consecutive_failures=raw["max_consecutive_failures"],
             disk_quota_mb=raw["disk_quota_mb"],
             gpu_required=raw["gpu_required"],
+        )
+
+
+class ReassessmentAdmissionError(RuntimeError):
+    """The reassessment_admission section is missing or invalid (fail-closed)."""
+
+
+@dataclass(frozen=True)
+class ReassessmentAdmission:
+    """Validated reassessment_admission section of the config snapshot
+    (§5.9.1, T4.4).
+
+    ``t_escalate_seconds`` — a runnable job OLDER than this is
+    dependency-critical regardless of its original reason (derived at
+    admission time, no row mutation).
+    ``t_worker_admission_seconds`` — a wake is skipped while the oldest
+    runnable dependency-critical job is older than this.
+    ``queue_slo_seconds`` — the wall-clock SLO of the runnable queue
+    (operator metric; a long-non-empty queue is a memory degradation).
+    """
+
+    t_escalate_seconds: int
+    t_worker_admission_seconds: int
+    queue_slo_seconds: int
+
+    @classmethod
+    def from_payload(cls, raw: Any) -> ReassessmentAdmission:
+        if not isinstance(raw, Mapping):
+            raise ReassessmentAdmissionError(
+                f"reassessment_admission must be an object, got {type(raw).__name__}"
+            )
+        for key in ("t_escalate_seconds", "t_worker_admission_seconds", "queue_slo_seconds"):
+            value = raw.get(key)
+            if value is None:
+                raise ReassessmentAdmissionError(f"reassessment_admission.{key} is missing")
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ReassessmentAdmissionError(
+                    f"reassessment_admission.{key} must be an int > 0, got {value!r}"
+                )
+        return cls(
+            t_escalate_seconds=raw["t_escalate_seconds"],
+            t_worker_admission_seconds=raw["t_worker_admission_seconds"],
+            queue_slo_seconds=raw["queue_slo_seconds"],
         )
 
 
@@ -273,16 +317,51 @@ class WakeScheduler:
     async def status(self) -> JsonDict:
         """Operator-visible wake state (for the web /status endpoint)."""
         state = await self._load_state()
+        snapshot = await ConfigService.get_effective(self.db)
+        admission = ReassessmentAdmission.from_payload(snapshot.reassessment_admission)
+        oldest = (
+            await self.db.execute(
+                text(
+                    """
+                    SELECT MAX(EXTRACT(EPOCH FROM now() - j.enqueued_at))
+                    FROM reassessment_jobs j
+                    WHERE j.status IN ('queued','retry')
+                      AND (j.next_attempt_at IS NULL OR j.next_attempt_at <= now())
+                      AND j.attempts < j.max_attempts
+                      AND j.target_config_snapshot_id = (
+                          SELECT active_config_snapshot_id FROM runtime_config_heads
+                          WHERE scope = 'global')
+                      AND (
+                          SELECT activating_config_snapshot_id FROM runtime_config_heads
+                          WHERE scope = 'global') IS NULL
+                    """
+                )
+            )
+        ).scalar_one_or_none()
+        oldest_age = float(oldest) if oldest is not None else None
         return {
             "consecutive_failures": state.consecutive_failures,
             "backoff_until": state.backoff_until.isoformat() if state.backoff_until else None,
             "last_session_state": state.last_session_state,
             "paused_reason": state.paused_reason,
+            # T4.4 (§5.9.1): the runnable-queue depth/age metrics; the SLO
+            # is pinned in the config snapshot
+            "reassessment_queue": {
+                "oldest_runnable_age_seconds": oldest_age,
+                "queue_slo_seconds": admission.queue_slo_seconds,
+                "slo_breached": oldest_age is not None and oldest_age > admission.queue_slo_seconds,
+            },
         }
 
     # ── admission ────────────────────────────────────────────────────────
 
-    async def _admission(self, schedule: WakeSchedule, *, node_state: str) -> tuple[bool, str | None]:
+    async def _admission(
+        self,
+        schedule: WakeSchedule,
+        admission: ReassessmentAdmission,
+        *,
+        node_state: str,
+    ) -> tuple[bool, str | None]:
         """The authoritative §5.2.1 admission list. First failure wins.
 
         Returns (ok, reason). The paused_reason detail is carried by the
@@ -314,6 +393,35 @@ class WakeScheduler:
         ).scalar_one_or_none()
         if activating is not None:
             return False, REASON_ACTIVATION_SLOT
+        # T4.4 (§5.9.1 liveness): the wake does not start while the oldest
+        # runnable dependency-critical reassessment job is older than
+        # T_worker_admission. A job is dependency-critical when its age
+        # exceeds T_escalate (the escalation rule, derived — the reason
+        # column is not mutated). The queue gets the window BETWEEN
+        # sessions and never fights the active one.
+        oldest = (
+            await self.db.execute(
+                text(
+                    """
+                    SELECT MAX(EXTRACT(EPOCH FROM now() - j.enqueued_at))
+                    FROM reassessment_jobs j
+                    WHERE j.status IN ('queued','retry')
+                      AND (j.next_attempt_at IS NULL OR j.next_attempt_at <= now())
+                      AND j.attempts < j.max_attempts
+                      AND j.target_config_snapshot_id = (
+                          SELECT active_config_snapshot_id FROM runtime_config_heads
+                          WHERE scope = 'global')
+                      AND (
+                          SELECT activating_config_snapshot_id FROM runtime_config_heads
+                          WHERE scope = 'global') IS NULL
+                      AND EXTRACT(EPOCH FROM now() - j.enqueued_at) > :t_esc
+                    """
+                ),
+                {"t_esc": admission.t_escalate_seconds},
+            )
+        ).scalar_one_or_none()
+        if oldest is not None and float(oldest) > admission.t_worker_admission_seconds:
+            return False, REASON_REASSESSMENT_BACKLOG
         if _du_bytes(self.data_root) > schedule.disk_quota_mb * 1024 * 1024:
             return False, REASON_DISK_QUOTA
         if schedule.gpu_required:
@@ -330,6 +438,7 @@ class WakeScheduler:
         async with transaction(self.db):
             snapshot = await ConfigService.get_effective(self.db)
             schedule = WakeSchedule.from_payload(snapshot.wake_schedule)
+            admission = ReassessmentAdmission.from_payload(snapshot.reassessment_admission)
             state = await self._load_state()
             node_state = await self._load_node_state()
 
@@ -344,7 +453,7 @@ class WakeScheduler:
                 if not due:
                     return WakeDecision(action="wait", reason=wait_reason)
 
-            ok, reason = await self._admission(schedule, node_state=node_state)
+            ok, reason = await self._admission(schedule, admission, node_state=node_state)
             if not ok:
                 audit = AuditService(self.db)
                 await audit.record(

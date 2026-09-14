@@ -113,6 +113,26 @@ BOOTSTRAP_PAYLOAD: dict[str, Any] = {
         "disk_quota_mb": 1024,
         "gpu_required": False,
     },
+    # Reassessment admission (§5.9.1, T4.4). The thresholds are pinned in the
+    # config snapshot per spec ("порог допуска, T_escalate, retry budget и
+    # SLO фиксируются в конфигурации"). Derived from the 2026-09-14 load
+    # series (PLAN M4 thresholds): wake interval 3600 s, session wall P95
+    # <= 200 s — "not more than 2 wake intervals behind": both thresholds
+    # default to 2 * 3600 = 7200 s.
+    # ``t_escalate_seconds`` — a runnable job OLDER than this is treated as
+    # dependency-critical regardless of its original reason (no row
+    # mutation: the predicate is derived at admission time).
+    # ``t_worker_admission_seconds`` — a wake is SKIPPED while the oldest
+    # runnable dependency-critical job is older than this: the queue gets
+    # the window between sessions and never fights the active one.
+    # ``queue_slo_seconds`` — the wall-clock SLO of the runnable queue
+    # (depth/age/attempts are operator metrics; a long-non-empty queue is a
+    # memory degradation, §5.9.1).
+    "reassessment_admission": {
+        "t_escalate_seconds": 7200,
+        "t_worker_admission_seconds": 7200,
+        "queue_slo_seconds": 172800,
+    },
     "claim_type_rules": {
         "local_observation": {
             "min_grade_for_supported": "E2",

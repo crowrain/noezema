@@ -408,8 +408,16 @@ class Orchestrator:
         # verifying (MVP: no-op; verifier profile lands in M5)
         await self._transition(db, audit, session, SessionState.VERIFYING)
 
-        # consolidating: curator (proposals go to session_staging, T2.13)
+        # consolidating: curator (proposals go to session_staging, T2.13).
+        # T4.4 (§5.9.1 rule 1, §5.2.2 step 4): the priority writer intent
+        # is registered under the live lease BEFORE the heavy validation —
+        # the reassessment worker yields to it for the rest of the
+        # consolidation/reporting/committing span (cleared in the
+        # terminal transaction).
         await self._transition(db, audit, session, SessionState.CONSOLIDATING)
+        from packages.memory.writer_gate import register_session_intent
+
+        await register_session_intent(db, session.id)
         claims, _questions_created = await self._curator(
             db, audit, session, ctx, snapshot, staging, pack
         )
@@ -1076,7 +1084,8 @@ class Orchestrator:
             await db.execute(
                 text(
                     "UPDATE sessions SET state = 'failed', finished_at = now(), "
-                    "lease_owner = NULL, lease_expires_at = NULL, termination_reason = :r "
+                    "lease_owner = NULL, lease_expires_at = NULL, termination_reason = :r, "
+                    "commit_intent_at = NULL "
                     "WHERE id = :id AND state = 'committing'"
                 ),
                 {"id": plan.session_id, "r": reason},

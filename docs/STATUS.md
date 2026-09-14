@@ -11,7 +11,7 @@
 | M1 контракты + LLM | ✅ выполнена | noezema-m1 | PR #4–#10; gate пройден: 112 тестов (86 unit ≥ 40), Sealed-сессия question→action→evidence→commit на fake LLM |
 | M2 изоляция + commit | ✅ выполнена | noezema-m2 | PR #11–#16: sandbox+runtime, policy engine, tool broker, artifact store+staging+freeze, commit boundary (prepared→fenced final tx) + reconciliation; gate пройден: 206 тестов, failpoints (kill до/после COMMIT, open final tx, stale finalizer, kill mid-action), security (сеть off, cap-drop, injection, ro rootfs) |
 | M3 память + web slice (MVP) | ✅ Gate M3 пройден (T3.29 закрыл пункт 1 §22.1); T3.30 — дефект lease из первой реальной сессии | noezema-m3 (на `ec6b4b0`, T3.29 — закрытие gate); noezema-mvp остаётся на `5d94b27` (создан до T3.29 — см. раздел Gate M3) | PR #17: память — модель (0004), evidence identity (§14.3), rules engine v1, independence (PSL+overlap), lifecycle heads (§14.1), apply в fenced tx. PR #18: context pack §5.4 + retrieval (fulltext russian, pending/invalid — отдельный лимит и метка в той же строке §5.4.2). PR #19: host recovery — noezemactl CLI, recovery policy schema v1 (jitter=0, JCS-хэш), fsync-safe transition journal + head + boot reconcile, offline rules (advisory lock, cohort+seal, atomic publish с UUIDv5 invalid-вопросами), fail-closed admission, resume-классификация (transient→retry_wait/0, permanent→resume_blocked/78, unclassified→degraded) + idempotent audit replay, policy change head + event stream, unit-state publisher, systemd units + CI-verify. PR #20: web slice — Query/Command + admin-token auth, fail-closed Command API на нездоровом hostе (423), SSE timeline (committed outbox + max_events), session detail, message TTL→expired, Host Status Adapter (recovery banner: none/retry_wait/degraded/blocked), минимальные HTML-страницы main/session. PR #21: failpoints/инварианты/resume/scenario-тесты. T3.29: wake scheduling + wake admission + backoff/pause (§5.2.1, пункт 1 §22.1): `wake_schedule` в snapshot (миграция 0005) + `wake_scheduler_state`, `noezemactl wake-tick` + `noezema-wake.timer`, admission (6 gates, skip с точной причиной в audit `wake_skipped`), экспоненциальный backoff, авто-pause после 3 неудач, wake_now — без расписания но с admission. T3.30: фоновый heartbeat lease во время долгих LLM-вызовов + `clock_timestamp()` в lease (дефект из первой реальной MVP-сессии — см. раздел ниже); 374 тест |
-| M4 зависимости + переоценка | 🔄 T4.1 закрыт (claim_dependencies: DAG cycle check при commit, graph revision, kind `research` по §8.6); T4.2 закрыт (cascade invalidation: closure manifest, barrier с durable курсором, idempotent батчи, blocked-путь, retrieval ancestor check); T4.3 закрыт (worker `system:reassessment`: runnable-предикат §5.9.1, lease/retry/blocked, insufficient→invalid+question, crash-lease recovery); T4.4–T4.9 — впереди | — | пороги M4 из замеров серии 2026-09-14 зафиксированы в PLAN (батч 32, SLO P95 200 с); 412 тестов |
+| M4 зависимости + переоценка | 🔄 T4.1 закрыт (claim_dependencies: DAG cycle check при commit, graph revision, kind `research` по §8.6); T4.2 закрыт (cascade invalidation: closure manifest, barrier с durable курсором, idempotent батчи, blocked-путь, retrieval ancestor check); T4.3 закрыт (worker `system:reassessment`: runnable-предикат §5.9.1, lease/retry/blocked, insufficient→invalid+question, crash-lease recovery); T4.4 закрыт (writer admission: table gate §14.1 NOWAIT + jitter, session intent rules 1/4/5, T_escalate/T_worker_admission в scheduler); T4.5–T4.9 — впереди | — | пороги M4 из замеров серии 2026-09-14 зафиксированы в PLAN (батч 32, SLO P95 200 с); 426 тестов |
 | M5 расширенный цикл | ⬜ не начата | — | |
 | M6 Research Proxy | ⬜ не начата | — | |
 | M7 полный веб + эксплуатация | ⬜ не начата | — | |
@@ -42,7 +42,7 @@
 | 11 | нет вслепую-ретраев | MVP | ✅ | test_tool_broker.py (§5.7 retry-классы: pure=2, idempotent=1, non_idempotent/observation=0 без вслепую-ретраев; idempotency key + different hash=incident/alert) + test_llm_gateway.py |
 | 12 | random backup point + root set | v1 | ⬜ | — |
 | 13 | partial success на safe boundary | MVP | ✅ | test_orchestrator.py::test_budget_exhausted_partial (succeeded_partial) |
-| 14 | каскадная инвалидация | v1 | 🔄 T4.1+T4.2+T4.3 | T4.1 (граф + цикл): test_claim_dependencies.py (unit: cycle check — чистая функция и через apply_claim_staging: циклическое evidential-ребро отклоняется с audit `dependency_edge_rejected`, claim всё же коммитится; research-ребро не в цикле и не двигает graph revision; evidential на non-current цель — отклонено §8.6; bad kind/self/missing/unparseable — отклонены) + test_orchestrator.py (scenario: полный цикл — curator-зависимость коммитится с bump `domain_revisions(dependency_graph)` 0→1 и audit-полями; цикл — ребро отклонено, graph revision не меняется) + test_staging_schema.py (ClaimDependencyProposal: closed kind, UUID, budget ≤10, дубликаты). T4.2 (barrier/closure/manifest): test_cascade.py (8: closure-ходы; inline cascade; idempotent replay; barrier lifecycle + crash-resume; graph-change → new generation; tamper → blocked; retrieval ancestor check; moved graph при старте). T4.3 (worker reassessment_jobs): test_reassessment.py (13: runnable-предикат — activating slot/чужой snapshot/backoff-отсрочка; head promotion через rules engine с audit и knowledge bump; insufficient data → invalid + UUIDv5 question; transient → retry с backoff; permanent → blocked + alert; expired-lease recovery; admission metrics; bounded batch + priority; mid-batch loss admission). Остаток: T4.4–T4.9 |
+| 14 | каскадная инвалидация | v1 | 🔄 T4.1+T4.2+T4.3+T4.4 | T4.1 (граф + цикл): test_claim_dependencies.py (unit: cycle check — чистая функция и через apply_claim_staging: циклическое evidential-ребро отклоняется с audit `dependency_edge_rejected`, claim всё же коммитится; research-ребро не в цикле и не двигает graph revision; evidential на non-current цель — отклонено §8.6; bad kind/self/missing/unparseable — отклонены) + test_orchestrator.py (scenario: полный цикл — curator-зависимость коммитится с bump `domain_revisions(dependency_graph)` 0→1 и audit-полями; цикл — ребро отклонено, graph revision не меняется) + test_staging_schema.py (ClaimDependencyProposal: closed kind, UUID, budget ≤10, дубликаты). T4.2 (barrier/closure/manifest): test_cascade.py (8: closure-ходы; inline cascade; idempotent replay; barrier lifecycle + crash-resume; graph-change → new generation; tamper → blocked; retrieval ancestor check; moved graph при старте). T4.3 (worker reassessment_jobs): test_reassessment.py (13: runnable-предикат — activating slot/чужой snapshot/backoff-отсрочка; head promotion через rules engine с audit и knowledge bump; insufficient data → invalid + UUIDv5 question; transient → retry с backoff; permanent → blocked + alert; expired-lease recovery; admission metrics; bounded batch + priority; mid-batch loss admission). T4.4 (writer admission): test_writer_admission.py (14: gate CAS §14.1 — acquire/release/expired-takeover/NOWAIT-конфликт + CHECK holder-полей; session intent — live lease, idempotent, clear, stale-очистка reconciler'ом после fencing; worker — deferral с jitter при gate-конфликте, уступка intent на входе и mid-batch (попытка не сгорает), release после батча; activation берёт gate до pointer; scheduler — T_escalate/T_worker_admission skip `reassessment_backlog`, свежая/blocked очереди не блокируют, fail-closed секция, SLO-метрики). Остаток: T4.5–T4.9 |
 | 15 | pending/invalid не current | MVP | ✅ | test_memory_service.py (lifecycle CHECK: pending/invalid ⇒ assessment/status NULL) + test_context_builder.py/test_retrieval.py (§5.4.2: отдельный лимит pending, метка в той же строке, исключение целиком если не хватает на метку) + test_invariants.py (pending/invalid не подаётся как current) + test_offline_rules.py (deferred→pending, removed-type→invalid) |
 | 16 | worker: priority, retry, no starvation | v1 | ⬜ | — |
 | 17 | repeatability/reproducibility/replication | v1 | ⬜ | — |
@@ -374,5 +374,71 @@ MVP-сессий»); старт M4 — решение пользователя.
   крадётся; admission metrics (count/age, slot busy → 0); bounded
   batch + priority; mid-batch loss admission → job в очередь, попытка
   не сгорела). 412 тестов.
+
+**Закрыто T4.4 (writer admission, §5.9.1, §14.1)** —
+`packages/memory/writer_gate.py` (табличный gate + session intent),
+migration 0008, `apps/orchestrator/scheduler.py` (admission gate'ы):
+- **`knowledge_write_gate` §14.1** (0008: пересобрана из MVP-черновика
+  0003, drop+recreate — application data не хранилось): scope PK
+  ('global'), holder = `(owner_kind, owner_id, priority)` +
+  `acquired_at`/`lease_expires_at`, CHECK «поля holder'а движутся
+  вместе» (частичное заполнение невозможно), `priority ≥ 0`. Приоритеты:
+  worker 0 < cascade 1 < activation 2 < session 3 (session не берёт gate
+  — см. ниже).
+- **Протокол CAS** (`acquire_writer_gate`, один UPDATE, NOWAIT по
+  построению): пустой slot ИЛИ истёкший lease ИЛИ тот же owner —
+  acquired; живой чужой holder — False (конфликт). `release_writer_gate`
+  — только текущим holder'ом (условное). Crash-окно = lease TTL
+  (worker: 600 с); holder-строка после краха не блокирует вечно.
+- **Session commit intent (rule 1, 4, 5)** — session НЕ берёт gate:
+  `register_session_intent` (вход в consolidating, phase-1 tx
+  оркестратора; только под живым lease, `state='committing'`,
+  идемпотентно) ставит `sessions.commit_intent_at`; worker при живом
+  intent не батчит (admission) и не коммитит (mid-batch — job обратно в
+  очередь, попытка не сгорает). Очистка intent в терминальных tx:
+  finalize success/failed (commit.py), `_abort_session` (оркестратор),
+  `_mark_failed` (reconciler, после lease fencing — stale intent
+  не остаётся после crash). Финальная защита session — fencing
+  knowledge revision (rule 6).
+- **Worker** (reassessment.py): в lease tx — table gate NOWAIT →
+  конфликт: due runnable jobs отсрочены jitter'ом 5–15 с
+  (`next_attempt_at`, без lease, без attempt) и батч возвращается
+  deferred; живой session intent → deferred (gate освобождён); дальше —
+  canonical head lock + lease как в T4.3. После батча — release tx
+  (no-op, если holder сменился).
+- **Scheduler** (§5.9.1 liveness): `ReassessmentAdmission` (секция
+  `reassessment_admission` bootstrap payload: `t_escalate_seconds=7200`,
+  `t_worker_admission_seconds=7200`, `queue_slo_seconds=172800` — из
+  замеров 2026-09-14: 2 интервала wake и SLO памяти; fail-closed как
+  WakeSchedule). Wake SKIPPED (reason `reassessment_backlog`), если
+  старейший runnable job старше `t_escalate` (dependency-critical по
+  выводу — reason column не мутируется) И старше
+  `t_worker_admission`; blocked jobs не участвуют. `status()` — метрики
+  depth/age + SLO-флаг (операторский контур M7).
+- **`hostctl reassessment-tick`** — драйвер worker'а между сессиями
+  (recovery expired leases + bounded batch; v1 — свой таймер, wake-tick
+  и reassessment-tick раздельны).
+- Решения: (1) gate = табличный CAS NOWAIT (не advisory) — живой holder
+  виден worker'у через SELECT и не даёт «молчаливого» пропуска; advisory
+  lock сохраняется как mutex класса writers (cascade/barrier/worker);
+  (2) session — intent, не gate: её защита — fencing (rule 6), gate'у не
+  нужно знать о каждой session; (3) deferral при gate-конфликте — jitter
+  только due jobs, не lease/attempt (конфликт ≠ ошибка); (4)
+  dependency-critical — вывод, не запись (reason column — причина
+  enqueue, не статус критичности); (5) T_repair_admission — T4.5
+  (repair-очереди ещё нет); (6) gate-lease 600 с = crash-окно, batch
+  ≤8 jobs × 300 s lease не выходит за него при нормальной работе.
+- Тесты: test_writer_admission.py (14: gate acquire/release/
+  expired-takeover/NOWAIT-конфликт; CHECK holder-полей; intent требует
+  live lease + idempotent + clear; reconciler снимает stale intent
+  (fencing); worker defers при gate-конфликте с jitter (jobs queued,
+  attempts=0, next_attempt_at 5–15 с) и после освобождения gate работает
+  нормально; worker уступает intent на входе (без lease, без jitter);
+  mid-batch intent → job2 в очередь, попытка восстановлена, gate
+  освобождён; activation берёт gate до pointer (T4.5 preview);
+  scheduler: бэклог 10 ч → skip `reassessment_backlog` + audit; свежая
+  очередь → wake; escalated (3600) но < admission (72000) → wake, затем
+  skip; blocked job не блокирует; fail-closed валидация секции;
+  status-метрики + SLO). 426 тестов.
 
 Merge в `main` — отдельное решение (не выполняется автоматически).

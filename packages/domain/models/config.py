@@ -47,6 +47,9 @@ class ORMConfigSnapshot(Base):
     # T3.29 (§5.2.1): wake schedule + admission limits + backoff (trusted
     # boundary; the sandbox never sees it)
     wake_schedule: Mapped[JsonDict] = mapped_column(JSONB, nullable=False, default=dict)
+    # T4.4 (§5.9.1): reassessment admission thresholds (T_escalate,
+    # T_worker_admission, queue SLO) — pinned in the snapshot
+    reassessment_admission: Mapped[JsonDict] = mapped_column(JSONB, nullable=False, default=dict)
     created_at: Mapped[datetime] = created_at_column()
 
 

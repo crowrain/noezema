@@ -34,10 +34,13 @@ Protocol:
   queue, restoring the consumed attempt (the atomic job tx either
   committed — job completed — or rolled back).
 
-The writer admission of §5.9.1 (session commit intent, NOWAIT gate
-yield with jitter, ``T_escalate``/``T_worker_admission`` gates) is
-formalized by T4.4; this worker already yields on the shared advisory
-gate and on the activating slot, which is the race it must not lose.
+The writer admission of §5.9.1 (T4.4): the worker takes the
+``knowledge_write_gate`` NOWAIT (a live foreign holder defers the batch
+with jitter, rule 3), yields to the session commit intent at admission
+AND mid-batch (rule 4: the prepared batch is not committed, jobs go back
+to the queue with the attempt restored), and the ``T_escalate`` /
+``T_worker_admission`` wake gates live in the scheduler (the queue gets
+the window between sessions, §5.9.1 liveness).
 """
 
 from __future__ import annotations
@@ -82,6 +85,13 @@ from packages.memory.rules_engine import (
     reverify_after,
 )
 from packages.memory.service import MemoryService, _evidence_set_hash
+from packages.memory.writer_gate import (
+    GATE_PRIORITY_WORKER,
+    OWNER_WORKER,
+    acquire_writer_gate,
+    active_session_intent,
+    release_writer_gate,
+)
 
 #: the worker's actor (closed prepared_by enum value, §14.1)
 ACTOR = "system:reassessment"
@@ -96,6 +106,16 @@ DEFAULT_BATCH_SIZE = 8
 _BACKOFF_BASE_SECONDS = 30
 _BACKOFF_CAP_SECONDS = 3600
 _JITTER_SECONDS = 15.0
+
+#: the writer-gate lease: long enough for one full batch (8 jobs), short
+#: enough that a crashed worker does not block activation acquisition
+#: (T4.5) for more than ten minutes
+DEFAULT_GATE_LEASE_SECONDS = 600
+
+#: gate-conflict deferral (§5.9.1 rule 3: «при конфликте откладывает job
+#: с jitter»): now() + 5..15 s
+_DEFER_BASE_SECONDS = 5.0
+_DEFER_JITTER_SECONDS = 10.0
 
 
 class ReassessmentWorkerError(RuntimeError):
@@ -324,6 +344,12 @@ async def _process_one_job(
         # restored (no work was done in this transaction)
         await _unlease(db, (job,))
         return "unleased"
+    if await active_session_intent(db):
+        # §5.9.1 rule 4: a session commit intent appeared during
+        # validation — the worker does not commit the prepared batch;
+        # the job goes back to the queue with the attempt restored
+        await _unlease(db, (job,))
+        return "intent_conflict"
 
     snapshot = await db.get(ORMConfigSnapshot, effective)
     claim = await db.get(ORMClaim, _as_uuid(job.claim_id))
@@ -639,28 +665,86 @@ async def _retry_lost_job(
     return True
 
 
+async def _defer_runnable_with_jitter(
+    db: AsyncSession, *, effective: uuid.UUID, limit: int
+) -> None:
+    """§5.9.1 rule 3: a NOWAIT gate conflict defers the jobs with jitter
+    (now() + 5..15 s) instead of queueing them — the worker retries in
+    the gap and never fights the current gate holder. Only jobs that are
+    DUE now are touched (a job already inside its backoff window keeps
+    its schedule)."""
+    await db.execute(
+        text(
+            f"""
+            UPDATE reassessment_jobs
+            SET next_attempt_at = now()
+                + interval '{_DEFER_BASE_SECONDS:g} seconds'
+                + (random() * {_DEFER_JITTER_SECONDS:g}) * interval '1 second'
+            WHERE id IN (
+                SELECT id FROM reassessment_jobs
+                WHERE status IN ('queued','retry')
+                  AND target_config_snapshot_id = :eff
+                  AND (next_attempt_at IS NULL OR next_attempt_at <= now())
+                  AND attempts < max_attempts
+                ORDER BY priority DESC, enqueued_at ASC, id
+                LIMIT :n
+            )
+            """
+        ),
+        {"eff": effective, "n": limit},
+    )
+
+
 async def run_reassessment_batch(
     db: AsyncSession,
     *,
     batch_size: int = DEFAULT_BATCH_SIZE,
     lease_seconds: int = DEFAULT_LEASE_SECONDS,
+    gate_lease_seconds: int = DEFAULT_GATE_LEASE_SECONDS,
 ) -> WorkerOutcome:
     """One bounded batch of the reassessment worker (§5.9.1).
 
-    Transaction 1 (admission + lease): writer gate + canonical head
-    lock, the exact runnability predicate, lease a bounded batch.
+    Transaction 1 (admission + lease): the knowledge writer gate is
+    acquired NOWAIT (a live foreign holder defers the batch with jitter,
+    rule 3), a live session commit intent aborts the batch (rule 4),
+    then the canonical head lock + the exact runnability predicate lease
+    a bounded batch.
     Transactions 2..N+1 (one per job): the job row is re-fetched under
     FOR UPDATE INSIDE the job transaction (the lease lock survives
     until the job commits), the admission is re-checked under the same
-    head lock (an activation that appeared during validation sends the
-    job back to the queue — the session always wins), then evaluation
-    and write/retry/blocked. Each job commits on its own so a failure
-    never poisons the rest of the batch; a crash between the lease tx
-    and the job tx is recoverable via ``recover_expired_leases``."""
+    head lock (an activation or a session intent that appeared during
+    validation sends the job back to the queue — the session always
+    wins), then evaluation and write/retry/blocked. Each job commits on
+    its own so a failure never poisons the rest of the batch; a crash
+    between the lease tx and the job tx is recoverable via
+    ``recover_expired_leases`` (and the gate lease bounds the gate
+    crash window). The gate is released on the success paths; a crash
+    leaves the holder row for the lease TTL."""
     audit = AuditService(db)
 
     async with writer_gate(db):
         async with transaction(db):
+            # §5.9.1 rule 3: the worker takes the gate NOWAIT
+            acquired = await acquire_writer_gate(
+                db,
+                owner_kind=OWNER_WORKER,
+                owner_id=ACTOR,
+                priority=GATE_PRIORITY_WORKER,
+                lease_seconds=gate_lease_seconds,
+            )
+            if not acquired:
+                # a live foreign holder (activation, or another writer
+                # class) — defer the due jobs with jitter, no lease
+                head = await _head_row(db)
+                if head is None:
+                    raise ReassessmentWorkerError("runtime config head missing")
+                await _defer_runnable_with_jitter(db, effective=head[0], limit=batch_size)
+                return WorkerOutcome(0, 0, 0, 0, True)
+            if await active_session_intent(db):
+                # rule 4: a session declares the priority writer intent —
+                # no batch, no lease; the session wins
+                await release_writer_gate(db, owner_kind=OWNER_WORKER, owner_id=ACTOR)
+                return WorkerOutcome(0, 0, 0, 0, True)
             head = await _head_row(db)
             if head is None:
                 raise ReassessmentWorkerError("runtime config head missing")
@@ -668,6 +752,7 @@ async def run_reassessment_batch(
             if activating is not None:
                 # §5.9.1 step 7: activating candidate present — no
                 # validation/write batch, jobs stay in the queue
+                await release_writer_gate(db, owner_kind=OWNER_WORKER, owner_id=ACTOR)
                 return WorkerOutcome(0, 0, 0, 0, True)
             rows = (
                 await db.execute(
@@ -684,6 +769,7 @@ async def run_reassessment_batch(
                 )
             ).scalars().all()
             if not rows:
+                await release_writer_gate(db, owner_kind=OWNER_WORKER, owner_id=ACTOR)
                 return WorkerOutcome(0, 0, 0, 0, True)
             job_ids = [_as_uuid(r) for r in rows]
             await db.execute(
@@ -753,7 +839,14 @@ async def run_reassessment_batch(
                 retried += 1
             elif outcome == "blocked":
                 blocked += 1
-            # 'unleased' — admission lost mid-batch, not counted as work
+            # 'unleased' / 'intent_conflict' — admission lost mid-batch,
+            # not counted as work
+
+        # the batch is done: release the gate (a crash on the job paths
+        # leaves the holder row for the gate lease TTL, rule 3 crash
+        # window)
+        async with transaction(db):
+            await release_writer_gate(db, owner_kind=OWNER_WORKER, owner_id=ACTOR)
 
     return WorkerOutcome(processed, completed, retried, blocked, False)
 

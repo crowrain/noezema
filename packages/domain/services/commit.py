@@ -234,6 +234,7 @@ async def finalize(
         session.finished_at = datetime.now(UTC)
         session.lease_owner = None
         session.lease_expires_at = None
+        session.commit_intent_at = None  # T4.4 (§5.9.1 rule 5)
         await db.flush()
         await audit.record(
             AuditEventType.SESSION_FAILED,
@@ -301,12 +302,14 @@ async def finalize(
         )
     await db.flush()
 
-    # 6. terminal session state + audit (+ outbox twin)
+    # 6. terminal session state + audit (+ outbox twin). T4.4 (§5.9.1
+    # rule 5): the terminal transaction clears the writer intent.
     session.state = terminal.value
     session.termination_reason = termination_reason
     session.finished_at = datetime.now(UTC)
     session.lease_owner = None
     session.lease_expires_at = None
+    session.commit_intent_at = None
     await db.flush()
 
     event = (
