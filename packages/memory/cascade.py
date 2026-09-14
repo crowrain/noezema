@@ -180,7 +180,7 @@ def compute_reverse_closure(
 
 
 @asynccontextmanager
-async def _writer_gate(db: AsyncSession) -> AsyncIterator[None]:
+async def writer_gate(db: AsyncSession) -> AsyncIterator[None]:
     """Session-level advisory writer gate: acquired before the short
     transaction, released after it settles (commit or rollback)."""
     got = (
@@ -471,7 +471,7 @@ async def start_cascade(
     closure = await _load_closure(db, root)
     audit = AuditService(db)
 
-    async with _writer_gate(db), transaction(db):
+    async with writer_gate(db), transaction(db):
         # step 2 — canonical locks, verify the graph revision
         snapshot_id = await _effective_snapshot_id(db)
         await db.execute(
@@ -676,7 +676,7 @@ async def process_barrier(
     barrier_id = barrier_id if isinstance(barrier_id, uuid.UUID) else uuid.UUID(str(barrier_id))
     audit = AuditService(db)
 
-    async with _writer_gate(db), transaction(db):
+    async with writer_gate(db), transaction(db):
         barrier = (
             (
                 await db.execute(
