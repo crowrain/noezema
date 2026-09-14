@@ -1,5 +1,6 @@
-"""Cognition package: question selection (M1: FIFO), curiosity (M5)."""
+"""Cognition: question selection (M1: FIFO), curiosity (M5), context
+builder + retrieval (M3, §5.4)."""
 
-from packages.cognition import question_selector
+from packages.cognition import context, question_selector, retrieval, tokenizer
 
-__all__ = ["question_selector"]
+__all__ = ["context", "question_selector", "retrieval", "tokenizer"]

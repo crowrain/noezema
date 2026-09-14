@@ -10,7 +10,7 @@
 | M0 каркас | ✅ выполнена | — | чистое дерево, скелет, CI, fake LLM, ADR-0001/0002/0003 |
 | M1 контракты + LLM | ✅ выполнена | noezema-m1 | PR #4–#10; gate пройден: 112 тестов (86 unit ≥ 40), Sealed-сессия question→action→evidence→commit на fake LLM |
 | M2 изоляция + commit | ✅ выполнена | noezema-m2 | PR #11–#16: sandbox+runtime, policy engine, tool broker, artifact store+staging+freeze, commit boundary (prepared→fenced final tx) + reconciliation; gate пройден: 206 тестов, failpoints (kill до/после COMMIT, open final tx, stale finalizer, kill mid-action), security (сеть off, cap-drop, injection, ro rootfs) |
-| M3 память + web slice (MVP) | 🔄 в работе | — | PR #17: память — модель (0004), evidence identity (§14.3), rules engine v1 (единственный производитель grade/confidence), independence (PSL+overlap), lifecycle heads (§14.1), apply в fenced tx; 243 теста |
+| M3 память + web slice (MVP) | 🔄 в работе | — | PR #17: память — модель (0004), evidence identity (§14.3), rules engine v1 (единственный производитель grade/confidence), independence (PSL+overlap), lifecycle heads (§14.1), apply в fenced tx. PR #18: context pack §5.4 (абсолютные токен-бюджеты, hard-секции, ContextPacked) + retrieval (fulltext russian, pending/invalid — отдельный лимит и метка в той же строке §5.4.2); 261 тест |
 | M4 зависимости + переоценка | ⬜ не начата | — | |
 | M5 расширенный цикл | ⬜ не начата | — | |
 | M6 Research Proxy | ⬜ не начата | — | |
@@ -43,7 +43,7 @@
 | 12 | random backup point + root set | v1 | ⬜ | — |
 | 13 | partial success на safe boundary | MVP | ✅ | test_orchestrator.py::test_budget_exhausted_partial (succeeded_partial) |
 | 14 | каскадная инвалидация | v1 | ⬜ | — |
-| 15 | pending/invalid не current | MVP | 🔄 | test_memory_service.py (lifecycle CHECK: pending/invalid ⇒ assessment/status NULL) + MemoryService.pending_invalid_claims (§8.6); сам переход в pending/invalid — с offline activation (PR #19) |
+| 15 | pending/invalid не current | MVP | 🔄 | test_memory_service.py (lifecycle CHECK: pending/invalid ⇒ assessment/status NULL) + test_context_builder.py/test_retrieval.py (§5.4.2: отдельный лимит pending, метка в той же строке, исключение целиком если не хватает на метку); сам переход в pending/invalid — с offline activation (PR #19) |
 | 16 | worker: priority, retry, no starvation | v1 | ⬜ | — |
 | 17 | repeatability/reproducibility/replication | v1 | ⬜ | — |
 | 18 | counterevidence resolutions | v1 | ⬜ | — |
