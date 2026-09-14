@@ -8,7 +8,7 @@
 | Веха | Статус | Tag | Примечание |
 |---|---|---|---|
 | M0 каркас | ✅ выполнена | — | чистое дерево, скелет, CI, fake LLM, ADR-0001/0002/0003 |
-| M1 контракты + LLM | 🔄 в работе | — | PR #4–#10 |
+| M1 контракты + LLM | 🔄 в работе | — | PR #4–#9 готовы (CI-зелёные, 106 тестов); остался PR #10 (Query/Command API) |
 | M2 изоляция + commit | ⬜ не начата | — | |
 | M3 память + web slice (MVP) | ⬜ не начата | — | |
 | M4 зависимости + переоценка | ⬜ не начата | — | |
@@ -21,9 +21,9 @@
 | # | Критерий | Класс | Статус | Тест |
 |---|---|---|---|---|
 | 1 | пробуждение по расписанию, pause/backoff | MVP | ⬜ | — |
-| 2 | локальная LLM с fingerprint | MVP | ⬜ | — |
-| 3 | causal/idempotency ID в trusted host | MVP | ⬜ | — |
-| 4 | typed actions в sandbox | MVP | ⬜ | — |
+| 2 | локальная LLM с fingerprint | MVP | 🔄 | test_llm_gateway.py, test_compat_and_roles.py (gateway+fingerprint; local model profile — PR #10) |
+| 3 | causal/idempotency ID в trusted host | MVP | ✅ | test_orchestrator.py (turn_id/action_id/idempotency_key генерирует хост) |
+| 4 | typed actions в sandbox | MVP | 🔄 | test_stub_executor.py (typed actions + dev-исполнитель; sandboxed ToolBroker — M2) |
 | 5 | claim только с согласованным lifecycle | MVP | ⬜ | — |
 | 6 | один fenced commit attempt | MVP | ⬜ | — |
 | 7 | lost COMMIT → reconciliation | MVP | ⬜ | — |
@@ -32,17 +32,17 @@
 | 10 | раздельные messages/stop/abort/controls | MVP | ⬜ | — |
 | 11 | нет вслепую-ретраев | MVP | ⬜ | — |
 | 12 | random backup point + root set | v1 | ⬜ | — |
-| 13 | partial success на safe boundary | MVP | ⬜ | — |
+| 13 | partial success на safe boundary | MVP | ✅ | test_orchestrator.py::test_budget_exhausted_partial (succeeded_partial) |
 | 14 | каскадная инвалидация | v1 | ⬜ | — |
 | 15 | pending/invalid не current | MVP | ⬜ | — |
 | 16 | worker: priority, retry, no starvation | v1 | ⬜ | — |
 | 17 | repeatability/reproducibility/replication | v1 | ⬜ | — |
 | 18 | counterevidence resolutions | v1 | ⬜ | — |
 | 19 | unresolved attempt блокирует wake/GC | MVP | ⬜ | — |
-| 20 | FIFO полный минимальный путь | MVP | ⬜ | — |
+| 20 | FIFO полный минимальный путь | MVP | 🔄 | test_orchestrator.py::test_full_sealed_session + test_question_selector.py (question→action→evidence→commit; durable knowledge — M3) |
 | 21 | sync head update + offline flip | MVP | ⬜ | — |
 | 22 | barrier crash-resume | v1 | ⬜ | — |
-| 23 | session limits + host reserve | MVP | ⬜ | — |
+| 23 | session limits + host reserve | MVP | 🔄 | test_orchestrator.py (max_explorer_steps из config; single-session enforcement; host reserve — M2) |
 | 24 | online activation | v1 | ⬜ | — |
 | 25 | activating slot / terminal-cleanup | v1 | ⬜ | — |
 | 26 | quiesce через writer gate | v1 | ⬜ | — |

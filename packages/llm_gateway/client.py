@@ -17,13 +17,15 @@ import asyncio
 import json
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, TypeVar
 
 import httpx
 from pydantic import BaseModel, ValidationError
 
 from packages.domain.models.base import JsonDict
 from packages.llm_gateway.config import LLMGatewayConfig
+
+TModel = TypeVar("TModel", bound=BaseModel)
 
 
 class LLMError(RuntimeError):
@@ -87,9 +89,9 @@ class LLMMiddleware:
         *,
         system: str,
         user: str,
-        response_schema: type[BaseModel],
+        response_schema: type[TModel],
         fingerprint: JsonDict | None = None,
-    ) -> tuple[BaseModel, CallRecord]:
+    ) -> tuple[TModel, CallRecord]:
         """One structured chat call. Returns (validated model, record).
 
         Raises LLMSchemaError (bad schema, not retried further once the
