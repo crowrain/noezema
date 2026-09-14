@@ -256,6 +256,57 @@ class DependencyKind(StrEnum):
     RESEARCH = "research"
 
 
+class BarrierStatus(StrEnum):
+    """dependency_invalidation_barriers.status (T4.2, §8.6).
+
+    ``discovering`` — (re)building the closure manifest outside the
+    barrier transaction; ``active`` — applying batches from the durable
+    cursor; ``closing`` — manifest exhausted, final closure check before
+    ``resolved``; ``blocked`` — manifest hash mismatch / impossible
+    cursor / closure-invariant violation: ancestor protection is kept
+    and only an audited operator recovery may close it (it never
+    auto-resolves).
+    """
+
+    DISCOVERING = "discovering"
+    ACTIVE = "active"
+    CLOSING = "closing"
+    RESOLVED = "resolved"
+    BLOCKED = "blocked"
+
+    @property
+    def is_open(self) -> bool:
+        """Open barriers keep ancestor protection on their closure."""
+        return self in (
+            BarrierStatus.DISCOVERING,
+            BarrierStatus.ACTIVE,
+            BarrierStatus.CLOSING,
+            BarrierStatus.BLOCKED,
+        )
+
+
+class ReassessmentJobStatus(StrEnum):
+    """reassessment_jobs.status (T4.2 scaffold, T4.3 worker, §14.1).
+
+    At most one ``queued|leased|retry`` job per (claim, target snapshot)
+    (partial unique index); ``blocked|completed`` rows stay for history.
+    """
+
+    QUEUED = "queued"
+    LEASED = "leased"
+    RETRY = "retry"
+    BLOCKED = "blocked"
+    COMPLETED = "completed"
+
+    @property
+    def is_active(self) -> bool:
+        return self in (
+            ReassessmentJobStatus.QUEUED,
+            ReassessmentJobStatus.LEASED,
+            ReassessmentJobStatus.RETRY,
+        )
+
+
 # ─── Questions (§9) ────────────────────────────────────────────────────────
 
 
@@ -388,6 +439,11 @@ class AuditEventType(StrEnum):
     CLAIM_ASSESSED = "claim_assessed"
     CLAIM_INVALIDATED = "claim_invalidated"
     DEPENDENCY_EDGE_REJECTED = "dependency_edge_rejected"
+    CASCADE_STARTED = "cascade_started"
+    BARRIER_GENERATION_PUBLISHED = "barrier_generation_published"
+    BARRIER_BATCH_APPLIED = "barrier_batch_applied"
+    BARRIER_RESOLVED = "barrier_resolved"
+    BARRIER_BLOCKED = "barrier_blocked"
     COMMIT_ATTEMPT_PREPARED = "commit_attempt_prepared"
     COMMIT_ATTEMPT_COMMITTED = "commit_attempt_committed"
     COMMIT_ATTEMPT_ABORTED = "commit_attempt_aborted"

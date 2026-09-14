@@ -21,6 +21,12 @@ QUESTION_UUID5_NAMESPACE = "c0e3d3b6-dd7b-557d-a4d8-6e41049f8468"
 """UUIDv5 namespace for deterministic invalid-assessment question IDs (§8.7.1).
 Pinned by migration 0001; never part of a mutable config payload."""
 
+CLOSURE_MANIFEST_UUID5_NAMESPACE = "b3f2a9d1-7c4e-5a8f-9e2d-1c6b8a4f3e70"
+"""UUIDv5 namespace for content-addressed closure manifest IDs (T4.2, §8.6):
+id = uuid5(namespace, sha256) — the same closure under the same graph
+revision always resolves to the same manifest row (dedup by content).
+Code-pinned constant, never part of a mutable config payload."""
+
 BOOTSTRAP_SNAPSHOT_ID = uuid.uuid5(uuid.NAMESPACE_URL, "https://github.com/crowrain/noezema/bootstrap-config-snapshot")
 
 BOOTSTRAP_PAYLOAD: dict[str, Any] = {

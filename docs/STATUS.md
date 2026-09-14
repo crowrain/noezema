@@ -11,7 +11,7 @@
 | M1 контракты + LLM | ✅ выполнена | noezema-m1 | PR #4–#10; gate пройден: 112 тестов (86 unit ≥ 40), Sealed-сессия question→action→evidence→commit на fake LLM |
 | M2 изоляция + commit | ✅ выполнена | noezema-m2 | PR #11–#16: sandbox+runtime, policy engine, tool broker, artifact store+staging+freeze, commit boundary (prepared→fenced final tx) + reconciliation; gate пройден: 206 тестов, failpoints (kill до/после COMMIT, open final tx, stale finalizer, kill mid-action), security (сеть off, cap-drop, injection, ro rootfs) |
 | M3 память + web slice (MVP) | ✅ Gate M3 пройден (T3.29 закрыл пункт 1 §22.1); T3.30 — дефект lease из первой реальной сессии | noezema-m3 (на `ec6b4b0`, T3.29 — закрытие gate); noezema-mvp остаётся на `5d94b27` (создан до T3.29 — см. раздел Gate M3) | PR #17: память — модель (0004), evidence identity (§14.3), rules engine v1, independence (PSL+overlap), lifecycle heads (§14.1), apply в fenced tx. PR #18: context pack §5.4 + retrieval (fulltext russian, pending/invalid — отдельный лимит и метка в той же строке §5.4.2). PR #19: host recovery — noezemactl CLI, recovery policy schema v1 (jitter=0, JCS-хэш), fsync-safe transition journal + head + boot reconcile, offline rules (advisory lock, cohort+seal, atomic publish с UUIDv5 invalid-вопросами), fail-closed admission, resume-классификация (transient→retry_wait/0, permanent→resume_blocked/78, unclassified→degraded) + idempotent audit replay, policy change head + event stream, unit-state publisher, systemd units + CI-verify. PR #20: web slice — Query/Command + admin-token auth, fail-closed Command API на нездоровом hostе (423), SSE timeline (committed outbox + max_events), session detail, message TTL→expired, Host Status Adapter (recovery banner: none/retry_wait/degraded/blocked), минимальные HTML-страницы main/session. PR #21: failpoints/инварианты/resume/scenario-тесты. T3.29: wake scheduling + wake admission + backoff/pause (§5.2.1, пункт 1 §22.1): `wake_schedule` в snapshot (миграция 0005) + `wake_scheduler_state`, `noezemactl wake-tick` + `noezema-wake.timer`, admission (6 gates, skip с точной причиной в audit `wake_skipped`), экспоненциальный backoff, авто-pause после 3 неудач, wake_now — без расписания но с admission. T3.30: фоновый heartbeat lease во время долгих LLM-вызовов + `clock_timestamp()` в lease (дефект из первой реальной MVP-сессии — см. раздел ниже); 374 тест |
-| M4 зависимости + переоценка | 🔄 T4.1 закрыт (claim_dependencies: DAG cycle check при commit, graph revision, kind `research` по §8.6); T4.2–T4.9 — впереди | — | пороги M4 из замеров серии 2026-09-14 зафиксированы в PLAN (батч 32, SLO P95 200 с); 391 тест |
+| M4 зависимости + переоценка | 🔄 T4.1 закрыт (claim_dependencies: DAG cycle check при commit, graph revision, kind `research` по §8.6); T4.2 закрыт (cascade invalidation: closure manifest, barrier с durable курсором, idempotent батчи, blocked-путь, retrieval ancestor check); T4.3–T4.9 — впереди | — | пороги M4 из замеров серии 2026-09-14 зафиксированы в PLAN (батч 32, SLO P95 200 с); 399 тестов |
 | M5 расширенный цикл | ⬜ не начата | — | |
 | M6 Research Proxy | ⬜ не начата | — | |
 | M7 полный веб + эксплуатация | ⬜ не начата | — | |
@@ -42,7 +42,7 @@
 | 11 | нет вслепую-ретраев | MVP | ✅ | test_tool_broker.py (§5.7 retry-классы: pure=2, idempotent=1, non_idempotent/observation=0 без вслепую-ретраев; idempotency key + different hash=incident/alert) + test_llm_gateway.py |
 | 12 | random backup point + root set | v1 | ⬜ | — |
 | 13 | partial success на safe boundary | MVP | ✅ | test_orchestrator.py::test_budget_exhausted_partial (succeeded_partial) |
-| 14 | каскадная инвалидация | v1 | 🔄 T4.1 | основа (граф + цикл): test_claim_dependencies.py (unit: cycle check — чистая функция и через apply_claim_staging: циклическое evidential-ребро отклоняется с audit `dependency_edge_rejected`, claim всё же коммитится; research-ребро не в цикле и не двигает graph revision; evidential на non-current цель — отклонено §8.6; bad kind/self/missing/unparseable — отклонены) + test_orchestrator.py (scenario: полный цикл — curator-зависимость коммитится с bump `domain_revisions(dependency_graph)` 0→1 и audit-полями; цикл — ребро отклонено, graph revision не меняется) + test_staging_schema.py (ClaimDependencyProposal: closed kind, UUID, budget ≤10, дубликаты). Остаток: barrier/closure/manifest — T4.2 |
+| 14 | каскадная инвалидация | v1 | 🔄 T4.1+T4.2 | T4.1 (граф + цикл): test_claim_dependencies.py (unit: cycle check — чистая функция и через apply_claim_staging: циклическое evidential-ребро отклоняется с audit `dependency_edge_rejected`, claim всё же коммитится; research-ребро не в цикле и не двигает graph revision; evidential на non-current цель — отклонено §8.6; bad kind/self/missing/unparseable — отклонены) + test_orchestrator.py (scenario: полный цикл — curator-зависимость коммитится с bump `domain_revisions(dependency_graph)` 0→1 и audit-полями; цикл — ребро отклонено, graph revision не меняется) + test_staging_schema.py (ClaimDependencyProposal: closed kind, UUID, budget ≤10, дубликаты). T4.2 (barrier/closure/manifest): test_cascade.py (8: closure-ходы; inline cascade; idempotent replay; barrier lifecycle + crash-resume; graph-change → new generation; tamper → blocked; retrieval ancestor check; moved graph при старте). Остаток: T4.3 (worker reassessment_jobs) |
 | 15 | pending/invalid не current | MVP | ✅ | test_memory_service.py (lifecycle CHECK: pending/invalid ⇒ assessment/status NULL) + test_context_builder.py/test_retrieval.py (§5.4.2: отдельный лимит pending, метка в той же строке, исключение целиком если не хватает на метку) + test_invariants.py (pending/invalid не подаётся как current) + test_offline_rules.py (deferred→pending, removed-type→invalid) |
 | 16 | worker: priority, retry, no starvation | v1 | ⬜ | — |
 | 17 | repeatability/reproducibility/replication | v1 | ⬜ | — |
@@ -250,5 +250,62 @@ MVP-сессий»); старт M4 — решение пользователя.
 - Тесты: test_claim_dependencies.py (8: 5 unit cycle-check + 3 DB-сценария через
   apply_claim_staging), test_staging_schema.py (+7), test_orchestrator.py (+2
   scenario: bump 0→1 с audit; цикл — отклонено, revision не изменился). 391 тест.
+
+**Закрыто T4.2 (каскадная инвалидация, §8.6 шаги 1–6, §14.1)** — `packages/memory/cascade.py`
++ миграция `0007_cascade` (3 таблицы: `closure_manifests`,
+`dependency_invalidation_barriers`, `reassessment_jobs` + расширение CHECK
+`prepared_by` на `system:cascade`/`system:barrier`):
+- **Closure вне транзакции** (шаг 1): reverse-closure по evidential-рёбрам против
+  ТЕКУЩЕЙ `domain_revisions(dependency_graph)`, чистая функция
+  `compute_reverse_closure` (детерминированный порядок (rank, claim_id), BFS-глубины,
+  root исключён, self-edges безопасны) → **immutable content-addressed manifest**
+  (root, graph rev, ordered IDs, ranks, count, sha256; id = uuid5(пinned namespace,
+  sha); дедуп по PK — повторный closure при том же rev = та же строка).
+- **Короткая tx старта** (шаги 2–5): writer gate (session-level advisory lock
+  `pg_try_advisory_lock(hashtext('noezema:knowledge_writer'))`, снимается после
+  settle tx — при крахе сессия закрывается, Postgres отпускает) → канонические
+  locks `runtime_config_heads → knowledge → dependency_graph` (subsequence,
+  `validate_lock_order` в `_CASCADE_LOCK_PLAN`) → верификация graph revision
+  (сдвинулся — `CascadeError`, вызывающий пересчитывает closure) → root head
+  `pending` + `reassessment_job` + UUIDv5 question (`origin=invalid_assessment`,
+  uuid5(QUESTION_UUID5_NAMESPACE, "cascade-invalidation:{snapshot}:{claim}") —
+  паттерн offline rules) → closure ≤32 inline в топологическом порядке (шаг 4)
+  ИЛИ barrier gen-1 `active` + первый батч 32 + сдвиг курсора — одной tx (шаг 5).
+  Bump `knowledge revision` только если реально кто-то инвалидирован (fencing
+  честен: in-flight commit сессии с base до инвалидации не пройдёт).
+- **Barrier-processor** (шаг 6, `process_barrier`): idempotent — всегда с
+  durable курсора. Батч: invalidation + job + сдвиг `next_offset` = ОДНА tx;
+  повторный батч no-op (pending/invalid head пропускается, unique
+  `uq_reassessment_jobs_active` не даёт дублей). Graph revision сдвинулся →
+  новая generation (строка barrier = generation: +1, курсор 0, manifest из
+  свежего closure под graph-lock'ом; обработанные claims безопасно
+  безопасно пропущены idempotent-батчами). Перед `resolved` — final closure
+  scan: manifest выхажан И в live closure нет ни одного current-descendant,
+  иначе возврат в `discovering`. `blocked` (manifest hash mismatch /
+  impossible cursor / manifest missing) — неавтономно, ancestor protection
+  держится, recovery только операторский с audit.
+- **Retrieval ancestor check**: `retrieve()` исключает из current claims из
+  closure открытых barrier'ов (`protected_claim_ids`: union manifests по
+  barrier'ам discovering/active/closing/blocked) — даже если head-row ещё
+  `current` (батч к ним не дошёл).
+- Решения: (1) writer gate T4.2 — advisory lock (session-level), T4.4
+  формализует NOWAIT-адаптацию + уступление session intent; (2) inline limit
+  = batch = 32 (пороги M4 из замеров); (3) barrier row lock берётся до
+  канонических — deadlock-free (barrier lock держит только processor,
+  канонические — в одном порядке у всех); (4) barrier-батчи тоже bump'ят
+  knowledge revision (иначе fence не видел бы изменение знания); (5)
+  `resolved_at` пишется ORM-выражением `func.now()` (flush вместе со
+  `status='resolved'` — CHECK `(resolved_at IS NULL) = (status <> 'resolved')`
+  строка-ориентированная); (6) discovering barrier без manifest защищает
+  только root (root уже pending — инвалидирован tx старта).
+- Тесты: test_cascade.py (8: чистые closure-ходы; inline cascade — heads
+  pending, 3 jobs, UUIDv5 question, knowledge bump, audit, graph нетронут;
+  idempotent replay — 0 дублей, manifest дедуп; barrier lifecycle 34 —
+  active→resolved, fresh-session resume с курсора (crash-resume), audit
+  батчей/resolve; graph-change → gen 2 (fresh closure +1, обработанные
+  skipped, `barrier_generation_published`); tamper manifest → `blocked` +
+  protection держится + повтор — `BarrierBlockedError`; retrieval ancestor
+  check; moved graph при старте — `CascadeError`, ничего не записано).
+  399 тестов.
 
 Merge в `main` — отдельное решение (не выполняется автоматически).
