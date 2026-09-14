@@ -6,78 +6,16 @@ without a socket). The engine probe and the image build are session-scoped.
 
 from __future__ import annotations
 
-import os
 import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
 
-from packages.sandbox.runtime import (
-    ContainerSandboxRuntime,
-    SandboxError,
-    SandboxProfile,
-    sandbox_available,
-)
+from packages.sandbox.runtime import SandboxError, sandbox_available
+from tests.conftest import _runtime, _sealed
 
 pytestmark = [pytest.mark.scenario]
-
-IMAGE = "noezema-sandbox:test"
-REPO_ROOT = Path(__file__).resolve().parents[2]
-
-
-def _docker_available() -> bool:
-    return sandbox_available("docker")
-
-
-def _docker_env() -> dict[str, str]:
-    """Buildx needs a writable config dir; prefer the repo-local one."""
-    env = dict(os.environ)
-    cfg = os.environ.get("NOEZEMA_DOCKER_CONFIG")
-    if not cfg and (REPO_ROOT / ".docker-config").is_dir():
-        cfg = str(REPO_ROOT / ".docker-config")
-    if cfg:
-        env["DOCKER_CONFIG"] = cfg
-    return env
-
-
-@pytest.fixture(scope="session")
-def docker_engine() -> str:
-    if not _docker_available():
-        pytest.skip("docker engine not available")
-    env = _docker_env()
-    if env.get("DOCKER_CONFIG") and os.environ.get("DOCKER_CONFIG") != env["DOCKER_CONFIG"]:
-        # the runtime spawns the CLI via os.environ
-        os.environ["DOCKER_CONFIG"] = env["DOCKER_CONFIG"]
-    return "docker"
-
-
-@pytest.fixture(scope="session")
-def sandbox_image(docker_engine: str) -> str:
-    env = _docker_env()
-    rc = subprocess.run(
-        [docker_engine, "image", "inspect", IMAGE], capture_output=True, timeout=30, env=env
-    ).returncode
-    if rc != 0:
-        build_cmd = [
-            docker_engine,
-            "build",
-            "-f",
-            str(REPO_ROOT / "sandbox" / "Containerfile"),
-            "-t",
-            IMAGE,
-            str(REPO_ROOT / "sandbox"),
-        ]
-        subprocess.run(build_cmd, capture_output=True, timeout=600, check=True, env=env)
-    return IMAGE
-
-
-def _runtime(work_root: Path, image: str) -> ContainerSandboxRuntime:
-    return ContainerSandboxRuntime(image=image, engine="docker", work_root=work_root)
-
-
-def _sealed() -> SandboxProfile:
-    return SandboxProfile.from_yaml(REPO_ROOT / "sandbox" / "policy" / "sealed.yaml")
 
 
 @pytest.mark.asyncio

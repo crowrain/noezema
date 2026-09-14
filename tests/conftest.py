@@ -22,6 +22,8 @@ import httpx
 import pytest
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from packages.sandbox.runtime import ContainerSandboxRuntime, SandboxProfile, sandbox_available
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -164,9 +166,67 @@ def db_url_factory():
     return _db_session
 
 
+SANDBOX_IMAGE = "noezema-sandbox:test"
+
+
+def _docker_env() -> dict[str, str]:
+    """Buildx needs a writable config dir; prefer the repo-local one."""
+    env = dict(os.environ)
+    cfg = os.environ.get("NOEZEMA_DOCKER_CONFIG")
+    if not cfg and (REPO_ROOT / ".docker-config").is_dir():
+        cfg = str(REPO_ROOT / ".docker-config")
+    if cfg:
+        env["DOCKER_CONFIG"] = cfg
+    return env
+
+
+@pytest.fixture(scope="session")
+def docker_engine() -> str:
+    if not sandbox_available("docker"):
+        pytest.skip("docker engine not available")
+    env = _docker_env()
+    if env.get("DOCKER_CONFIG") and os.environ.get("DOCKER_CONFIG") != env["DOCKER_CONFIG"]:
+        # the runtime spawns the CLI via os.environ
+        os.environ["DOCKER_CONFIG"] = env["DOCKER_CONFIG"]
+    return "docker"
+
+
+@pytest.fixture(scope="session")
+def sandbox_image(docker_engine: str) -> str:
+    env = _docker_env()
+    rc = subprocess.run(
+        [docker_engine, "image", "inspect", SANDBOX_IMAGE], capture_output=True, timeout=30, env=env
+    ).returncode
+    if rc != 0:
+        build_cmd = [
+            docker_engine,
+            "build",
+            "-f",
+            str(REPO_ROOT / "sandbox" / "Containerfile"),
+            "-t",
+            SANDBOX_IMAGE,
+            str(REPO_ROOT / "sandbox"),
+        ]
+        subprocess.run(build_cmd, capture_output=True, timeout=600, check=True, env=env)
+    return SANDBOX_IMAGE
+
+
+def _runtime(work_root: Path, image: str) -> ContainerSandboxRuntime:
+    return ContainerSandboxRuntime(image=image, engine="docker", work_root=work_root)
+
+
+def _sealed() -> SandboxProfile:
+    return SandboxProfile.from_yaml(REPO_ROOT / "sandbox" / "policy" / "sealed.yaml")
+
+
 __all__ = [
     "FakeLLM",
+    "_runtime",
+    "_sealed",
     "db_url_factory",
+    "docker_engine",
     "fake_llm",
+    "sandbox_image",
     "test_db_url",
+
 ]

@@ -22,12 +22,14 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from apps.orchestrator.evidence import observation_to_evidence
-from apps.orchestrator.executor import StubToolExecutor, arguments_hash
+from apps.orchestrator.executor import arguments_hash
 from apps.orchestrator.state_machine import transition
+from packages.broker import ToolExecutor, check_idempotency
 from packages.cognition.question_selector import FIFOQuestionSelector
 from packages.domain.canonical import canonical_json_bytes
 from packages.domain.db.uow import transaction
@@ -93,7 +95,7 @@ class Orchestrator:
         session_factory: async_sessionmaker[AsyncSession],
         gateway: LLMMiddleware,
         profile: ModelProfile,
-        executor: StubToolExecutor,
+        executor: ToolExecutor,
         selector: FIFOQuestionSelector | None = None,
     ) -> None:
         self.session_factory = session_factory
@@ -324,6 +326,7 @@ class Orchestrator:
             args: JsonDict = decision.arguments
             args_hash = arguments_hash(args)
             spec = get_tool(tool_name)
+            action_key = f"{turn_id}:{tool_name}:{args_hash[:32]}"
             evaluation = policy_engine.evaluate(tool_name, args, external_texts=ctx.messages)
             await audit.record(
                 AuditEventType.POLICY_EVALUATED,
@@ -340,10 +343,43 @@ class Orchestrator:
                 public_summary=f"policy {evaluation.decision.value}: {tool_name}",
             )
 
+            # T2.8: the host key is bound to tool + arguments hash forever
+            existing = await ActionRepository.get_by_idempotency_key(db, session.id, action_key)
+            verdict = check_idempotency(
+                {"arguments_hash": existing.arguments_hash, "state": existing.state}
+                if existing is not None
+                else None,
+                args_hash,
+            )
+            if verdict.status == "conflict" and existing is not None:
+                # SECURITY INCIDENT: the key was reused with other arguments
+                await audit.record(
+                    AuditEventType.ALERT_RAISED,
+                    session_id=session.id,
+                    actor="tool-broker",
+                    payload={
+                        "kind": "idempotency_key_conflict",
+                        "action_id": str(existing.id),
+                        "tool": tool_name,
+                        "key": action_key,
+                        "stored_hash": existing.arguments_hash,
+                        "presented_hash": args_hash,
+                    },
+                    public_summary="SECURITY: idempotency key reused with different arguments",
+                )
+                ctx.observations.append(
+                    f"[{step}] {tool_name}: инцидент — повтор idempotency key с другими аргументами (отклонено)"
+                )
+                continue
+            if verdict.status == "replay" and existing is not None:
+                # same key + same hash: no blind re-execution
+                ctx.observations.append(f"[{step}] {tool_name}: повтор (replay), действие уже зафиксировано")
+                continue
+
             action = ORMAction(
                 session_id=session.id,
                 model_run_id=run.id,
-                idempotency_key=f"{turn_id}:{tool_name}:{args_hash[:32]}",
+                idempotency_key=action_key,
                 idempotency_class=(
                     spec.idempotency_class.value if spec is not None else IdempotencyClass.NON_IDEMPOTENT.value
                 ),
@@ -375,8 +411,10 @@ class Orchestrator:
                 continue
 
             # allow: proposed → accepted → started
+            now = datetime.now(UTC)
             action.state = ActionState.ACCEPTED.value
             action.state = ActionState.STARTED.value
+            action.started_at = now
             await audit.record(
                 AuditEventType.ACTION_STARTED,
                 session_id=session.id,
@@ -388,9 +426,10 @@ class Orchestrator:
                 public_summary=f"action: {tool_name}",
             )
 
-            obs = await self.executor.execute(tool_name, args)
+            obs = await self.executor.execute(tool_name, args, db=db)
             action.state = ActionState.COMPLETED.value if obs.ok else ActionState.FAILED.value
             action.error_code = obs.error
+            action.finished_at = datetime.now(UTC)
             await audit.record(
                 AuditEventType.ACTION_COMPLETED if obs.ok else AuditEventType.ACTION_FAILED,
                 session_id=session.id,

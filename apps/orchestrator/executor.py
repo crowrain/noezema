@@ -11,37 +11,17 @@ from __future__ import annotations
 
 import asyncio
 import sys
-from dataclasses import dataclass, field
 from pathlib import Path
 
 from packages.domain.canonical import canonical_sha256
 from packages.domain.models.base import JsonDict
-from packages.domain.models.enums import IdempotencyClass
+from packages.domain.schemas.observation import Observation
+
+# re-exported for backward compatibility (M1 tests import from here)
+__all__ = ["Observation", "StubToolExecutor", "UnknownToolError", "arguments_hash"]
 
 MAX_OUTPUT_BYTES = 10_000
 TOOL_TIMEOUT_SECONDS = 15.0
-
-_IDEMPOTENCY: dict[str, IdempotencyClass] = {
-    "workspace.read": IdempotencyClass.PURE,
-    "workspace.list": IdempotencyClass.PURE,
-    "workspace.write": IdempotencyClass.NON_IDEMPOTENT,
-    "python.execute": IdempotencyClass.NON_IDEMPOTENT,
-    "memory.search": IdempotencyClass.OBSERVATION,
-    "question.create": IdempotencyClass.IDEMPOTENT,
-    "message.reply": IdempotencyClass.NON_IDEMPOTENT,
-}
-
-
-@dataclass(slots=True)
-class Observation:
-    tool: str
-    ok: bool
-    data: JsonDict = field(default_factory=dict)
-    error: str | None = None
-
-    @property
-    def idempotency_class(self) -> IdempotencyClass:
-        return _IDEMPOTENCY[self.tool]
 
 
 class UnknownToolError(ValueError):
@@ -60,13 +40,13 @@ class StubToolExecutor:
             raise ValueError(f"path escapes workspace: {path!r}")
         return candidate
 
-    async def execute(self, tool: str, arguments: JsonDict) -> Observation:
-        try:
-            if tool not in _IDEMPOTENCY:
-                raise UnknownToolError(tool)
-        except UnknownToolError as exc:
-            return Observation(tool=tool, ok=False, error=f"unknown tool: {exc}")
+    async def execute(
+        self, tool: str, arguments: JsonDict, *, db: object | None = None
+    ) -> Observation:
+        from packages.policy.tools import get_tool
 
+        if get_tool(tool) is None:
+            return Observation(tool=tool, ok=False, error=f"unknown tool: {tool}")
         try:
             if tool == "workspace.read":
                 return await self._workspace_read(arguments)
