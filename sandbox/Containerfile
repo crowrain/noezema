@@ -1,10 +1,29 @@
+# NOEZEMA session sandbox image (M2, T2.1).
+#
+# One image for dev (Docker) and prod (Podman); the difference between them
+# is runtime security options (sandbox/policy/*.yaml), not the image.
+#
+# Invariants:
+#   - non-root user (uid 10001, nologin);
+#   - no network tools, no package managers, no credentials, no secrets;
+#   - read-only rootfs + no-new-privileges + cap-drop ALL are enforced by
+#     the runtime (packages/sandbox/runtime.py), not by the image;
+#   - /base is mounted read-only by the runtime; /workspace is a per-session
+#     tmpfs initialized from /base (COW, disposable).
 FROM python:3.11-slim
 
-RUN useradd -r -s /bin/bash noezema
+RUN useradd -r -u 10001 -m -s /usr/sbin/nologin noezema
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        bash coreutils findutils \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+RUN mkdir -p /workspace /base && chown noezema:noezema /workspace /base
+
 WORKDIR /workspace
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    bash coreutils curl && \
-    rm -rf /var/lib/apt/lists/*
-
 USER noezema
+
+# No ENTRYPOINT: the runtime always supplies the full command
+# (init: copy base -> workspace, then idle; exec: one tool call).

@@ -1,19 +1,30 @@
-# Sealed profile — no network, read-only rootfs
-security:
-  network: none
-  read_only_rootfs: true
-  capabilities: []
-  no_new_privileges: true
-  seccomp: default
+# Sealed profile — M2 default (§11).
+# No network, read-only rootfs, writes only to the session overlay.
+# The runtime enforces these options; the Policy Engine (M2) consumes the
+# tool/path rules from here.
+name: sealed
+network: none
+read_only_rootfs: true
+capabilities: []
+no_new_privileges: true
+seccomp: default
 resource_limits:
-  cpu_seconds: 300
+  cpu: "1.0"
   memory_mb: 512
-  max_processes: 10
-  max_file_size_mb: 50
+  max_processes: 32
   timeout_seconds: 60
-allowed_tools:
-  - workspace.read
-  - workspace.list
-  - workspace.write
-  - shell.execute
-  - python.execute
+  max_file_size_mb: 50
+tools:
+  workspace.read: true
+  workspace.list: true
+  workspace.write: true
+  python.execute: true
+  shell.execute: true
+  memory.search: false      # M3
+  question.create: true     # staging, host-side
+  message.reply: true       # staging, host-side
+paths:
+  writable: ["/workspace"]
+  readable: ["/base", "/workspace"]
+secrets: deny
+metadata_endpoints: deny
