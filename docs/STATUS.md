@@ -14,7 +14,7 @@
 | M4 зависимости + переоценка | ✅ T4.1 закрыт (claim_dependencies: DAG cycle check при commit, graph revision, kind `research` по §8.6); T4.2 закрыт (cascade invalidation: closure manifest, barrier с durable курсором, idempotent батчи, blocked-путь, retrieval ancestor check); T4.3 закрыт (worker `system:reassessment`: runnable-предикат §5.9.1, lease/retry/blocked, insufficient→invalid+question, crash-lease recovery); T4.4 закрыт (writer admission: table gate §14.1 NOWAIT + jitter, session intent rules 1/4/5, T_escalate/T_worker_admission в scheduler); T4.5 закрыт (online activation §8.7.2: fenced lease + takeover, shadow heads fast path/pending, seal + DB-триггер sealed-интервала, atomic flip, post-publish manifest с deterministic UUIDv5, repair runner + T_repair_admission); T4.6 закрыт (environment manifests §14 env-v2: content-addressed manifest_hash, versioned алгоритм env-independence-v1 — группы по (protocol, implementation, dataset lineage), отношения repeatability/reproducibility/independent_replication/variation/untracked, снапшот на оценке, `required_independence` в rules engine: E3 только через независимую репликацию); T4.7 закрыт (source graph §11.3: таблицы source_dependency_edges/source_graph_corrections, алгоритм independence-v2 — domain/content_hash/parent/edges/corrections, снапшот source_independence_* на оценке, каскад apply_source_graph_change: merge/split → invalidation + recompute, ревизия source_graph); T4.8 закрыт (counterevidence resolutions §8.7.4: таблица + XOR/partial-unique CHECK, межстрочные инварианты (counter-цель, scope-compat, нет транзитивной зависимости, valid correction), каскад create/invalidate → recompute, engine считает только unresolved counters); T4.9 закрыт (failpoints M4: crash после flip — pointer tuple recovery, crash между батчами post-publish — durable cursor, stale activator после takeover — fence-отказ, следующий flip закрывает blocked backlog, barrier crash после каждого батча, group merge + crash worker'а, worker без starvation после смерти intent-lease) — GATE M4 пройден (§19: invalid ancestor блокирует downstream; worker без starvation оба направления; group merge → корректный пересчёт) | — | пороги M4 из замеров серии 2026-09-14 зафиксированы в PLAN (батч 32, SLO P95 200 с); 501 тест |
 | M5 расширенный цикл | ✅ Gate M5 пройден (§19, этап 4): T5.1 закрыт (Curiosity ranking §5.3.1: score-формула, все входы [0,1] + similarity fingerprint, eligibility filter, ε-diversity (seed в audit), селектор config-driven) + T5.2 закрыт (planning §6.2: план как наблюдаемый артефакт, роль planner, закрытые assessment methods, метод ≠ перефраз, planning.mode config-driven) + T5.3 закрыт (роль verifier §3.7: организованные детерминированные проверки, **схема не несёт grade/confidence — assessment идентичен с verifier и без него (gate)**, verification.mode config-driven) + T5.4 закрыт (защита от повторов §9: перефраз + no-progress → цикл, закрытые стратегии §9, audit repeat_cycle_detected, repetition config-driven) + T5.5 закрыт (untrusted extraction §11.2: модель без инструментов, host-проверка дословности, raw-текст не покидает extractor, extraction config-driven) + T5.6 закрыт (long-run сценарии: накопление знания по FIFO-очереди, §9-цикл на накопленной истории, поздний контрпример → disputed E1 rules engine) | — | 651 тест |
 | M6 Research Proxy | ✅ Gate M6 пройден (§19, этап 5): T6.1 закрыт (research proxy: единственный egress, read-only, SSRF-guard private/loopback/link-local/metadata, редиректы/размер/время, удаление активного содержимого) + T6.2 закрыт (режимы Sealed=локальный индекс / Curated=SearXNG через прокси c upstream-логом и rate limits / Open Lab=закрытый список доменов, отдельный профиль) + T6.3 закрыт (provenance: original+normalized+hash, origin в sources/artifact_chunks, fenced-маркировка в контексте §11.2, research.fetch — единственный egress сессии) + T6.4 закрыт (injection/poisoning: capabilities неизменны, similarity→require_operator, poisoned artifact не самооценивается) | noezema-m6 (после gate) | см. раздел M6 ниже | 651 тест |
-| M7 полный веб + эксплуатация | ⬜ в работе: T7.1 ✅ (knowledge graph + provenance + diagnostics, head-запросы на effective snapshot), T7.2 ✅ (backup/PITR §15.3: recovery point + inventory + host-state, restore drill), T7.3 ✅ (GC: полный root set §15.3, запрет при reconciling_commit, retention-политики, gc_pinned), T7.4 ✅ (security regression: gate-джоб `noezemactl security-gate` + отчёты §16.1/§16.2/§16.3), T7.5 ✅ (evaluation run §22.2: frozen config + gates с исходами + blind sample) | — | см. раздел M7 ниже | |
+| M7 полный веб + эксплуатация | ⬜ в работе: T7.1 ✅ (knowledge graph + provenance + diagnostics, head-запросы на effective snapshot), T7.2 ✅ (backup/PITR §15.3: recovery point + inventory + host-state, restore drill), T7.3 ✅ (GC: полный root set §15.3, запрет при reconciling_commit, retention-политики, gc_pinned), T7.4 ✅ (security regression: gate-джоб `noezemactl security-gate` + отчёты §16.1/§16.2/§16.3), T7.5 ✅ (evaluation run §22.2: frozen config + gates с исходами + blind sample), T7.6 ✅ (ADR-0004 по результатам evaluation) | — | см. раздел M7 ниже | |
 
 ## Gate M2 (§19, этап 2) — пройден (noezema-m2)
 
@@ -1591,3 +1591,31 @@ color-coded outcome, auto-refresh 5s).
 SLO и пороги меняются только до нового evaluation run с новой config
 version (§22.2) — это зафиксировано в `thresholds` jsonb +
 `config_snapshot_id` + `rules_hash` каждого run.
+
+**T7.6 закрыт: ADR-0004 по результатам evaluation.**
+
+ADR-0004 (`docs/adr/0004-evaluation-run-mechanism.md`) фиксирует
+механизм evaluation run (§22.2):
+
+- **frozen config** (config_snapshot_id + model_fingerprint +
+  rules_version + rules_hash) — изменение любого из полей = новый run
+  (§22.2: «SLO и пороги меняются только до нового evaluation run с
+  новой config version»);
+- **11 gates §22.2** с порогами (E2+ ≥80%, E3 100%, eligible ≥60%,
+  near-dup ≤15%, reuse ≥25%, due/stale <20%, SLO зафиксировано,
+  pending/invalid ancestor 0, high-severity incidents 0, blind
+  provenance ≥90%, blind scope ≥80%);
+- **three outcomes** (passed / failed / insufficient_sample) —
+  `insufficient_sample` (denominator < 20) ≠ `failed`: measurement gap
+  ≠ quality failure (§22.2: «при N<20 gate получает
+  insufficient_sample»);
+- **blind sample** (seed + size, стратификация по type/status, 95%
+  CI) — seed фиксируется до серии (воспроизводимость);
+- **overall outcome** (running | passed | failed |
+  insufficient_sample): `failed` если ≥1 gate failed; иначе
+  `insufficient_sample` если ≥1 gate insufficient_sample (и нет
+  failed); иначе `passed`. Gate M7 читает overall outcome.
+
+Обоснование + альтернативы (изменение порога в том же run, two
+outcomes, non-frozen config, blind sample без seed — все отклонены) —
+в ADR-0004.
