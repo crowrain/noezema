@@ -924,8 +924,50 @@ def eval_run(
             try:
                 outcome = await orchestrator.run_session()
             except Exception as exc:  # infra failure around the session
+                # T7.7 (EVAL-2): a LeaseLost can be reported after the
+                # session already committed — the guard's last refused
+                # renewal (phase deadline) is detected at guard exit,
+                # while the fenced commit's own is_live() check passed.
+                # The durable row wins: re-read the session state before
+                # counting a failure (the EVAL-2 smoke session
+                # f8c548cc was succeeded in the DB but reported failed).
                 final_state = "failed"
-                click.echo(f"session {i + 1}: error ({type(exc).__name__}: {exc})", err=True)
+                outcome_steps = 0
+                if "LeaseLost" in type(exc).__name__ or "lease lost" in str(exc).lower():
+                    # the session id is in the LeaseLost message
+                    sid = None
+                    for part in str(exc).split():
+                        if len(part) == 36 and part.count("-") == 4:
+                            sid = part
+                            break
+                    if sid is not None:
+                        async with factory() as probe:
+                            row = (
+                                await probe.execute(
+                                    text(
+                                        "SELECT state, termination_reason "
+                                        "FROM sessions WHERE id = :id"
+                                    ),
+                                    {"id": uuid.UUID(sid)},
+                                )
+                            ).first()
+                    else:
+                        row = None
+                    if row is not None and row[0] in (
+                        "succeeded", "succeeded_partial"
+                    ):
+                        final_state = row[0]
+                        click.echo(
+                            f"session {i + 1}: lease-lost reported after "
+                            f"durable {row[0]} commit (reason={row[1]!r}) — "
+                            f"counted as {final_state}"
+                        )
+                    else:
+                        click.echo(
+                            f"session {i + 1}: error (LeaseLost: {exc})", err=True
+                        )
+                else:
+                    click.echo(f"session {i + 1}: error ({type(exc).__name__}: {exc})", err=True)
             else:
                 final_state = outcome.final_state.value
                 outcome_steps = outcome.steps
