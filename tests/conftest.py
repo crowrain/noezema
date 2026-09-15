@@ -50,6 +50,14 @@ class FakeLLM:
         r.raise_for_status()
         return r.json()
 
+    def requests(self) -> list[dict]:
+        """The per-request log (model, response_format, last user
+        message) — scenario tests assert what actually reached the
+        model (e.g. the extraction profile, T5.5)."""
+        r = self._client.get(f"{self.root}/_noezema/requests")
+        r.raise_for_status()
+        return r.json()["requests"]
+
     def close(self) -> None:
         self._client.close()
 

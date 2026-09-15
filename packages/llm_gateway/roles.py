@@ -20,6 +20,17 @@ PROMPTS_DIR = Path(__file__).resolve().parents[2] / "prompts"
 class Role(StrEnum):
     EXPLORER = "explorer"
     CURATOR = "curator"
+    # T5.2 (stage 4): multi-step planning — the explorer role with a
+    # dedicated planning prompt snapshot (§5.5: one model, different
+    # prompts; role switch = context rebuild + new prefill)
+    PLANNER = "planner"
+    # T5.3 (stage 4): the verifier — organizes deterministic checks
+    # and interprets their results; never assigns grade/confidence
+    # (§3.7, §5.5)
+    VERIFIER = "verifier"
+    # T5.5 (stage 4): the extractor — a model without tools that
+    # extracts verbatim chunks from untrusted documents (§11.2)
+    EXTRACTOR = "extractor"
 
 
 @dataclass(frozen=True, slots=True)

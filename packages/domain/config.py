@@ -49,6 +49,14 @@ BOOTSTRAP_PAYLOAD: dict[str, Any] = {
     "prompts": {
         "explorer": {"version": "explorer-v2", "path": "prompts/explorer.md"},
         "curator": {"version": "curator-v2", "path": "prompts/curator.md"},
+        # T5.2 (stage 4): the planner role (multi-step planning)
+        "planner": {"version": "planner-v1", "path": "prompts/planner.md"},
+        # T5.3 (stage 4): the verifier role (deterministic checks;
+        # never assigns grade/confidence — §3.7)
+        "verifier": {"version": "verifier-v1", "path": "prompts/verifier.md"},
+        # T5.5 (stage 4): the extraction profile (untrusted documents,
+        # §11.2) — a model without tools extracts verbatim chunks
+        "extractor": {"version": "extractor-v1", "path": "prompts/extractor.md"},
     },
     "policy": {
         "access_profile": "sealed",
@@ -74,7 +82,70 @@ BOOTSTRAP_PAYLOAD: dict[str, Any] = {
             "workspace_quota_mb": 512,
         },
     },
-    "curiosity": {"selector": "fifo", "epsilon": 0.0, "top_m": 1, "delta": 0.0},
+    # T5.2 (stage 4): multi-step planning. mode "template" = MVP fixed
+    # template plan (the default, unchanged behavior); "llm" = the
+    # planner role proposes a structured plan (schema-validated by the
+    # host; an invalid proposal falls back to the template, never a
+    # session failure). max_steps caps the plan against the session
+    # step budget.
+    "planning": {"mode": "template", "max_steps": 10},
+    # T5.3 (stage 4): the verifier role in the verifying phase.
+    # mode "off" = MVP no-op (the default, unchanged behavior);
+    # "llm" = the verifier proposes a structured report of organized
+    # deterministic checks (host-validated; an invalid/over-budget
+    # report falls back to the no-op phase, never a session failure).
+    # The report never carries a grade/confidence (§3.7).
+    "verification": {"mode": "off", "max_checks": 8},
+    # T5.4 (stage 4): protection against semantic repetition (§9).
+    # enabled=false keeps the MVP selection unchanged; rephrase =
+    # Jaccard over the host word set (deterministic, no LLM); a cycle
+    # = rephrase of an already-investigated question + no_progress
+    # consecutive sessions without a new claim → a strategy from the
+    # closed §9 list (deterministic rotation, audited).
+    "repetition": {
+        "enabled": False,
+        "rephrase_threshold": 0.6,
+        "plan_cycle_threshold": 0.5,
+        "no_progress_limit": 2,
+    },
+    # T5.5 (stage 4): untrusted extraction profile (§11.2, §10.1).
+    # mode "off" = MVP raw read (the default); "llm" = a document
+    # read of >= min_document_bytes is first passed to the extractor
+    # (a model without tools), which must return verbatim quotes;
+    # the explorer then receives only the extracted chunks with
+    # host-computed provenance. A non-verbatim or over-budget report
+    # falls back to the raw read (audited, never a session failure).
+    # Extraction shrinks the injection surface but does not make the
+    # text trusted.
+    "extraction": {"mode": "off", "min_document_bytes": 500, "max_chunks": 8},
+    # T5.1 (§5.3.1): the selector is config-driven — the MVP default stays
+    # FIFO; a config change to "curiosity" enables the score-based ranking
+    # (weights, thresholds, ε/M/δ and the similarity fingerprint below are
+    # part of the session config snapshot).
+    "curiosity": {
+        "selector": "fifo",
+        "epsilon": 0.0,
+        "top_m": 1,
+        "delta": 0.0,
+        "recency_sessions": 5,
+        "weights": {
+            "novelty": 0.3,
+            "coverage_gap": 0.2,
+            "evidenceability": 0.2,
+            "feasibility": 0.1,
+            "cost": 0.1,
+            "risk": 0.0,
+            "topic_recency": 0.1,
+        },
+        "normalization": {
+            "gap_debt_threshold": 4.0,
+            "feasibility_word_limit": 200.0,
+            "cost_word_threshold": 400.0,
+            "topic_overlap_threshold": 0.34,
+            "min_word_len": 3.0,
+        },
+        "similarity": {"fingerprint": "token-jaccard-v1"},
+    },
     "token_budgets": {
         "protocol": 4096,
         "identity": 2048,

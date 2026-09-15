@@ -473,6 +473,19 @@ class AuditEventType(StrEnum):
     SOURCE_GRAPH_CHANGED = "source_graph_changed"
     # T4.8 (§8.7.4): counterevidence resolutions
     COUNTER_RESOLUTION_CREATED = "counter_resolution_created"
+    # T5.2 (stage 4): the plan as an observable artifact
+    PLAN_PROPOSED = "plan_proposed"
+    PLAN_FALLBACK = "plan_fallback"
+    # T5.3 (stage 4): the verifier role (organizes deterministic
+    # checks; never assigns grade/confidence — §3.7)
+    VERIFICATION_COMPLETED = "verification_completed"
+    VERIFICATION_FALLBACK = "verification_fallback"
+    # T5.4 (stage 4): protection against semantic repetition (§9)
+    REPEAT_CYCLE_DETECTED = "repeat_cycle_detected"
+    QUESTION_DEFERRED = "question_deferred"
+    # T5.5 (stage 4): the untrusted extraction profile (§11.2)
+    EXTRACTION_COMPLETED = "extraction_completed"
+    EXTRACTION_FALLBACK = "extraction_fallback"
     COUNTER_RESOLUTION_INVALIDATED = "counter_resolution_invalidated"
     ALERT_RAISED = "alert_raised"
 

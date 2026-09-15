@@ -26,14 +26,20 @@ class QuestionRepository:
     async def list_candidates(
         db: AsyncSession,
         limit: int = 10,
+        exclude_ids: frozenset[uuid.UUID] | None = None,
     ) -> list[ORMQuestion]:
-        """FIFO by (priority DESC, created_at ASC) among candidates (§5.3.2)."""
+        """FIFO by (priority DESC, created_at ASC) among candidates (§5.3.2).
+
+        ``exclude_ids`` lets the repetition guard (§9) skip a question
+        whose investigation would cycle on the same content."""
         stmt = (
             select(ORMQuestion)
             .where(ORMQuestion.state == QuestionState.CANDIDATE.value)
             .order_by(ORMQuestion.priority.desc(), ORMQuestion.created_at.asc(), ORMQuestion.id)
-            .limit(limit)
         )
+        if exclude_ids:
+            stmt = stmt.where(ORMQuestion.id.not_in(tuple(exclude_ids)))
+        stmt = stmt.limit(limit)
         result = await db.execute(stmt)
         return list(result.scalars().all())
 

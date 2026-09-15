@@ -41,6 +41,21 @@ class ORMSession(Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     termination_reason: Mapped[str | None] = mapped_column(Text)
+    # T5.2 (stage 4): the structured multi-step plan proposed in the
+    # planning phase (observable artifact; NULL = MVP fixed template).
+    # Written once per session, never mutated.
+    plan: Mapped[JsonDict | None] = mapped_column(JSONB, nullable=True)
+    plan_sha256: Mapped[str | None] = mapped_column(Text)
+    # T5.3 (stage 4): the verifier's structured report (observable
+    # artifact; NULL = MVP no-op verifying phase or fallback). Written
+    # once per session, never mutated. No grade/confidence by design.
+    verification: Mapped[JsonDict | None] = mapped_column(JSONB, nullable=True)
+    verification_sha256: Mapped[str | None] = mapped_column(Text)
+    # T5.5 (stage 4): the extraction records (documents processed by
+    # the untrusted extraction profile; each record carries host
+    # provenance, never the raw content). NULL = nothing extracted.
+    extraction: Mapped[JsonDict | None] = mapped_column(JSONB, nullable=True)
+    extraction_sha256: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = created_at_column()
 
     def __repr__(self) -> str:

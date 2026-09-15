@@ -40,6 +40,17 @@ class ORMConfigSnapshot(Base):
     prompts: Mapped[JsonDict] = mapped_column(JSONB, nullable=False)
     policy: Mapped[JsonDict] = mapped_column(JSONB, nullable=False)
     curiosity: Mapped[JsonDict] = mapped_column(JSONB, nullable=False)
+    # T5.2 (stage 4): multi-step planning (mode "template" | "llm",
+    # max_steps) — pinned in the snapshot
+    planning: Mapped[JsonDict | None] = mapped_column(JSONB, nullable=True)
+    # T5.3 (stage 4): verification section (mode "off" | "llm",
+    # max_checks) — pinned in the snapshot
+    verification: Mapped[JsonDict | None] = mapped_column(JSONB, nullable=True)
+    # T5.4 (stage 4): repetition section (§9) — pinned in the snapshot
+    repetition: Mapped[JsonDict | None] = mapped_column(JSONB, nullable=True)
+    # T5.5 (stage 4): extraction section (§11.2) — pinned in the
+    # snapshot
+    extraction: Mapped[JsonDict | None] = mapped_column(JSONB, nullable=True)
     token_budgets: Mapped[JsonDict] = mapped_column(JSONB, nullable=False)
     session_limits: Mapped[JsonDict] = mapped_column(JSONB, nullable=False)
     activation_limits: Mapped[JsonDict] = mapped_column(JSONB, nullable=False)
