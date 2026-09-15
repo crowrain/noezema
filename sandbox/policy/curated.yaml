@@ -2,7 +2,7 @@
 # Network через Research Proxy только, read-only rootfs сохраняется.
 version: v1
 name: curated
-network: none               # M6: research-proxy (только через прокси)
+network: research_proxy     # M6: egress only through the research proxy
 read_only_rootfs: true
 capabilities: []
 no_new_privileges: true
@@ -23,7 +23,7 @@ tools:
   question.create: true
   message.reply: true
   artifact.create: true
-  research.fetch: false     # M6, через Research Proxy
+  research.fetch: true      # M6: только через Research Proxy
 paths:
   writable: ["/workspace"]
   readable: ["/base", "/workspace"]

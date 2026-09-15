@@ -258,6 +258,7 @@ class ResearchProxyService:
 
         return {
             "source_id": str(source_id),
+            "mode": mode,
             "requested_url": result.url,
             "final_url": result.final_url,
             "original_sha256": original_sha,

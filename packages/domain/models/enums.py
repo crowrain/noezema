@@ -490,6 +490,7 @@ class AuditEventType(StrEnum):
     RESEARCH_FETCH_COMPLETED = "research_fetch_completed"
     RESEARCH_FETCH_REJECTED = "research_fetch_rejected"
     RESEARCH_UPSTREAM_REQUEST = "research_upstream_request"
+    RESEARCH_CONTENT_READ = "research_content_read"
     COUNTER_RESOLUTION_INVALIDATED = "counter_resolution_invalidated"
     ALERT_RAISED = "alert_raised"
 
