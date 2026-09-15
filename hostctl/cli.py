@@ -709,5 +709,283 @@ def security_gate(python_bin: str | None, metrics_url: str | None) -> None:
     sys.exit(proc.returncode)
 
 
+@main.command("eval-run")
+@click.option("--label", required=True, help="Run label (e.g. EVAL-1).")
+@click.option(
+    "--questions",
+    "questions_file",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False),
+    help="JSONL question corpus (one {'text': ...} per line); seeded as origin='seeded'.",
+)
+@click.option("--count", default=50, show_default=True, help="Number of sessions to run.")
+@click.option(
+    "--slo-seconds",
+    default=3600.0,
+    show_default=True,
+    help="Fixed reassessment wall-clock SLO (§22.2: fixed before the series).",
+)
+@click.option("--seed", default=20260915, show_default=True, help="Blind sample seed.")
+@click.option("--blind-size", default=50, show_default=True, help="Blind sample size.")
+@click.option(
+    "--skip-sessions",
+    is_flag=True,
+    help="Do not run the series (freeze + finish only); for gate re-computation.",
+)
+def eval_run(
+    label: str,
+    questions_file: str,
+    count: int,
+    slo_seconds: float,
+    seed: int,
+    blind_size: int,
+    skip_sessions: bool,
+) -> None:
+    """T7.7 (stage 7): the actual §22.2 evaluation run.
+
+    Freezes the run configuration (model fingerprint, effective config
+    snapshot, rules version/hash, thresholds incl. the fixed SLO, blind
+    seed/size) BEFORE the series, seeds the question corpus (origin
+    'seeded'), runs ``count`` real sessions through the standard wake
+    admission + orchestrator pipeline, then computes all 11 §22.2
+    gates from the domain data and finishes the run.
+    """
+    import asyncio
+    import hashlib
+    import json
+    import os
+
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    url = os.environ.get("NOEZEMA_DATABASE_URL", "")
+    if not url:
+        click.echo("NOEZEMA_DATABASE_URL is not set", err=True)
+        sys.exit(EXIT_USAGE_ERROR)
+    from apps.orchestrator.main import build_orchestrator
+    from apps.orchestrator.scheduler import (
+        ReassessmentAdmissionError,
+        RepairAdmissionError,
+        WakeScheduleError,
+        WakeScheduler,
+        data_root_from_env,
+        node_owner_from_env,
+    )
+    from packages.domain.services.config import ConfigError, ConfigService
+    from packages.evaluation.gates import compute_gates
+    from packages.evaluation.service import (
+        create_evaluation_run,
+        finish_evaluation_run,
+        get_evaluation_run,
+    )
+    from packages.llm_gateway.config import LLMGatewayConfig
+    from packages.memory.evidence import RULES_ENGINE_VERSION, rules_hash
+
+    owner = node_owner_from_env()
+    root = data_root_from_env()
+    llm = LLMGatewayConfig()
+
+    raw = Path(questions_file).read_text(encoding="utf-8")
+    questions = [
+        json.loads(line)
+        for line in raw.splitlines()
+        if line.strip() and not line.startswith("#")
+    ]
+    corpus_sha = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    click.echo(f"corpus: {len(questions)} questions, sha256={corpus_sha[:16]}…")
+
+    engine = create_async_engine(url)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    async def _freeze() -> uuid.UUID:
+        async with factory() as db, db.begin():
+            effective = await ConfigService.get_effective(db)
+            mf = {
+                "model": llm.model,
+                "base_url": llm.base_url,
+                "max_output_tokens": llm.max_output_tokens,
+                "corpus_sha256": corpus_sha,
+                "corpus_size": len(questions),
+            }
+            run = await create_evaluation_run(
+                db,
+                label=label,
+                config_snapshot_id=effective.id,
+                model_fingerprint=mf,
+                rules_version=RULES_ENGINE_VERSION,
+                rules_hash=rules_hash(dict(effective.claim_type_rules)),
+                thresholds={"reassessment_slo_seconds": slo_seconds},
+                blind_sample_seed=seed,
+                blind_sample_size=blind_size,
+            )
+            click.echo(
+                f"run frozen: id={run.id} snapshot={effective.id} "
+                f"model={llm.model} slo={slo_seconds}s seed={seed} size={blind_size}"
+            )
+            return run.id
+
+    async def _seed_questions() -> None:
+        async with factory() as db, db.begin():
+            n = 0
+            for q in questions:
+                t = str(q["text"])
+                exists = (
+                    await db.execute(
+                        text("SELECT 1 FROM questions WHERE text = :t"), {"t": t}
+                    )
+                ).first()
+                if exists is not None:
+                    continue
+                await db.execute(
+                    text(
+                        "INSERT INTO questions (id, text, origin, state) "
+                        "VALUES (:id, :t, 'seeded', 'candidate')"
+                    ),
+                    {"id": uuid.uuid4(), "t": t},
+                )
+                n += 1
+            click.echo(f"seeded {n} new questions (corpus frozen)")
+
+    async def _node_state_set(state: str) -> None:
+        async with factory() as db, db.begin():
+            await db.execute(
+                text(
+                    "INSERT INTO system_constants (key, value) VALUES ('node_state', :v) "
+                    "ON CONFLICT (key) DO UPDATE SET value = :v"
+                ),
+                {"v": state},
+            )
+
+    async def _load_node_state() -> str | None:
+        async with factory() as db:
+            return (
+                await db.execute(
+                    text(
+                        "SELECT value FROM system_constants WHERE key = 'node_state'"
+                    )
+                )
+            ).scalar_one_or_none()
+
+    async def _operator_resume() -> None:
+        """Operator resume semantics (web command API): clear the sticky
+        pause + failure bookkeeping so the series can continue."""
+        async with factory() as db, db.begin():
+            await db.execute(
+                text("UPDATE system_constants SET value = 'idle' WHERE key = 'node_state'")
+            )
+            await db.execute(
+                text(
+                    "UPDATE wake_scheduler_state SET consecutive_failures = 0, "
+                    "backoff_until = NULL, last_failure_at = NULL, "
+                    "paused_reason = NULL, updated_at = now() WHERE node_id = :n"
+                ),
+                {"n": owner},
+            )
+
+    async def _run_sessions() -> tuple[int, int]:
+        import time as _time
+        from datetime import UTC, datetime
+
+        completed = 0
+        succeeded = 0
+        for i in range(count):
+            deadline = _time.monotonic() + 600
+            decision = None
+            while _time.monotonic() < deadline:
+                async with factory() as db:
+                    decision = await WakeScheduler(
+                        db, node_owner=owner, data_root=root
+                    ).decide(source="wake_now", now=datetime.now(UTC))
+                if decision.action == "wake":
+                    break
+                if decision.action == "skip" and await _load_node_state() == "paused":
+                    # an auto-pause (consecutive failures) is sticky until the
+                    # operator resume; apply that semantics once, then retry
+                    click.echo(
+                        f"session {i + 1}: node paused ({decision.reason}); "
+                        "operator resume"
+                    )
+                    await _operator_resume()
+                    continue
+                click.echo(
+                    f"session {i + 1}: {decision.action} ({decision.reason}); retry"
+                )
+                await asyncio.sleep(10)
+            if decision is None or decision.action != "wake":
+                click.echo(
+                    f"session {i + 1}: admission never granted; aborting series", err=True
+                )
+                break
+
+            await _node_state_set("session_running")
+            orchestrator, gateway = build_orchestrator(factory, root / "workspace")
+            t0 = _time.monotonic()
+            outcome_steps = 0
+            try:
+                outcome = await orchestrator.run_session()
+            except Exception as exc:  # infra failure around the session
+                final_state = "failed"
+                click.echo(f"session {i + 1}: error ({type(exc).__name__}: {exc})", err=True)
+            else:
+                final_state = outcome.final_state.value
+                outcome_steps = outcome.steps
+            finally:
+                await gateway.close()
+            elapsed = _time.monotonic() - t0
+            async with factory() as db:
+                node_state = await WakeScheduler(
+                    db, node_owner=owner, data_root=root
+                ).record_session_result(final_state=final_state, now=datetime.now(UTC))
+            completed += 1
+            if final_state in ("succeeded", "succeeded_partial"):
+                succeeded += 1
+            click.echo(
+                f"session {i + 1}/{count}: {final_state} (steps={outcome_steps}, "
+                f"{elapsed:.0f}s, node_state={node_state})"
+            )
+        return completed, succeeded
+
+    async def _finish(run_id: uuid.UUID, completed: int, succeeded: int) -> None:
+        from datetime import UTC, datetime
+
+        async with factory() as db, db.begin():
+            run = await get_evaluation_run(db, run_id)
+            assert run is not None
+            gates = await compute_gates(db, run=run)
+            finished = await finish_evaluation_run(
+                db,
+                run_id,
+                gates=gates,
+                eligible_sessions=completed,
+                completed_sessions=succeeded,
+                now=datetime.now(UTC),
+            )
+            click.echo(f"run finished: outcome={finished.outcome}")
+            for name, g in gates.items():
+                click.echo(f"  {name}: {g.get('outcome')} {g}")
+
+    async def _main() -> int:
+        run_id = await _freeze()
+        if skip_sessions:
+            click.echo("--skip-sessions: freezing only, finishing now")
+            await _finish(run_id, 0, 0)
+        else:
+            await _seed_questions()
+            completed, succeeded = await _run_sessions()
+            await _finish(run_id, completed, succeeded)
+        return 0
+
+    try:
+        sys.exit(asyncio.run(_main()))
+    except (
+        ConfigError,
+        WakeScheduleError,
+        ReassessmentAdmissionError,
+        RepairAdmissionError,
+    ) as exc:
+        click.echo(f"eval-run: fail-closed ({type(exc).__name__}: {exc})", err=True)
+        sys.exit(78)
+
+
 if __name__ == "__main__":
     main()

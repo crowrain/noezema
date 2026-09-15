@@ -77,17 +77,17 @@ test_evaluation.py` (4) + `tests/scenario/test_web_evaluation.py` (2).
 
 | Gate | Порог | Итог (passed/failed/insufficient_sample) |
 |---|---|---|
-| E2+ у новых supported/refuted | ≥80% | mechanism: ADR-0004 + test_evaluation.py (gates jsonb); actual run — T7.5 (50–100 sessions, frozen config) |
-| external/temporal facts E3 | 100% в выборке ≥20 | mechanism: ADR-0004 + test_evaluation.py (insufficient_sample при N<20); actual run — T7.5 |
-| eligible sessions с результатом | ≥60% | mechanism: ADR-0004 + test_evaluation.py (eligible/completed sessions); actual run — T7.5 |
-| near-duplicate вопросы | ≤15% | mechanism: ADR-0004 + test_evaluation.py (thresholds jsonb); actual run — T7.5 |
-| переиспользование значимых claims | ≥25% / 20 сессий | mechanism: ADR-0004 + test_evaluation.py (thresholds jsonb); actual run — T7.5 |
-| due/stale time-sensitive | <20% | mechanism: ADR-0004 + test_evaluation.py (thresholds jsonb); actual run — T7.5 |
-| reassessment SLO | зафиксировано до run | mechanism: ADR-0004 + test_evaluation.py (reassessment_slo_seconds в thresholds, фиксация до run); actual run — T7.5 |
-| current assessments с pending/invalid ancestor | 0 | mechanism: ADR-0004 + test_evaluation.py (thresholds jsonb); actual run — T7.5 |
-| high-severity incidents | 0 | mechanism: ADR-0004 + test_evaluation.py (thresholds jsonb); actual run — T7.5 |
-| blind-выборка: provenance path | ≥90% | mechanism: ADR-0004 + test_evaluation.py (blind_sample_seed + size, стратификация); actual run — T7.5 |
-| blind-выборка: не выходит за scope | ≥80% | mechanism: ADR-0004 + test_evaluation.py (blind_sample_seed + size, стратификация); actual run — T7.5 |
+| E2+ у новых supported/refuted | ≥80% | mechanism: ADR-0004 + test_evaluation.py (gates jsonb); расчёт: gates.py + test_evaluation_gates.py; actual run — T7.7 (50 сессий, frozen config) |
+| external/temporal facts E3 | 100% в выборке ≥20 | mechanism: ADR-0004 + test_evaluation.py (insufficient_sample при N<20); расчёт: gates.py + test_evaluation_gates.py; actual run — T7.7 |
+| eligible sessions с результатом | ≥60% | mechanism: ADR-0004 + test_evaluation.py (eligible/completed sessions); расчёт: gates.py + test_evaluation_gates.py; actual run — T7.7 |
+| near-duplicate вопросы | ≤15% | mechanism: ADR-0004 + test_evaluation.py (thresholds jsonb); расчёт: gates.py + test_evaluation_gates.py; actual run — T7.7 |
+| переиспользование значимых claims | ≥25% / 20 сессий | mechanism: ADR-0004 + test_evaluation.py (thresholds jsonb); расчёт: gates.py + test_evaluation_gates.py; actual run — T7.7 |
+| due/stale time-sensitive | <20% | mechanism: ADR-0004 + test_evaluation.py (thresholds jsonb); расчёт: gates.py + test_evaluation_gates.py; actual run — T7.7 |
+| reassessment SLO | зафиксировано до run | mechanism: ADR-0004 + test_evaluation.py (reassessment_slo_seconds в thresholds, фиксация до run); расчёт: gates.py + test_evaluation_gates.py; actual run — T7.7 (SLO 3600 с, зафиксировано) |
+| current assessments с pending/invalid ancestor | 0 | mechanism: ADR-0004 + test_evaluation.py (thresholds jsonb); расчёт: gates.py + test_evaluation_gates.py; actual run — T7.7 |
+| high-severity incidents | 0 | mechanism: ADR-0004 + test_evaluation.py (thresholds jsonb); расчёт: gates.py + test_evaluation_gates.py; actual run — T7.7 |
+| blind-выборка: provenance path | ≥90% | mechanism: ADR-0004 + test_evaluation.py (blind_sample_seed + size, стратификация); расчёт: gates.py + test_evaluation_gates.py (seeded, детерминизм); actual run — T7.7 |
+| blind-выборка: не выходит за scope | ≥80% | mechanism: ADR-0004 + test_evaluation.py (blind_sample_seed + size, стратификация); расчёт: gates.py + test_evaluation_gates.py (seeded, детерминизм); actual run — T7.7 |
 
 ## Gate M3 (этап 3a + MVP-критерии §22.1)
 
@@ -1664,3 +1664,44 @@ test_evaluation.py + test_web_evaluation.py); пороги зафиксиров�
 
 **Gate M7 пройден**: §22.1 полный + §22.2 mechanism (frozen config +
 gates + blind sample + overall outcome). Tag: `noezema-m7`.
+
+**T7.7 (в работе): фактический evaluation run §22.2.**
+
+1. **Расчёт gates по доменным данным** — `packages/evaluation/gates.py`
+   (`compute_gates`): все 11 gates §22.2 вычисляются из доменных
+   таблиц (sessions window `started_at >= run.started_at`,
+   claims/heads, evidence, assessments, reassessment_jobs,
+   audit_events); three outcomes + MIN_SAMPLE=20
+   (insufficient_sample при denominator < 20); blind sample — seeded
+   (Python `random.Random(seed)`, стратификация по (claim_type,
+   epistemic_status), пропорциональная аллокация + top-up), size =
+   min(blind_sample_size, current-head claims). Сценарий:
+   `tests/scenario/test_evaluation_gates.py` (3: rich dataset —
+   каждый gate проверяет ожидаемый исход с точными числителями/
+   знаменателями; пустая БД — все sample gates insufficient_sample;
+   детерминизм blind sample).
+2. **Драйвер серии** — `noezemactl eval-run` (hostctl/cli.py):
+   заморозка run ДО серии (config snapshot, model fingerprint, rules
+   version/hash, thresholds со SLO, blind seed/size) → seed question
+   corpus (origin='seeded', dedup by text) → N сессий через
+   стандартный wake admission + orchestrator pipeline (operator
+   resume при sticky pause) → `compute_gates` +
+   `finish_evaluation_run` + печатная таблица исходов.
+3. **Заморозка конфигурации серии (решение зафиксировано ДО запуска):**
+
+   | Параметр | Значение |
+   | --- | --- |
+   | модель | `qwen36-35b-a3b-q6-mtp` @ `http://192.168.1.48:8080/v1` (llama-swap) |
+   | LLM env | `NOEZEMA_LLM_MAX_OUTPUT_TOKENS=8192`, `NOEZEMA_LLM_TIMEOUT_SECONDS=600` |
+   | config snapshot | bootstrap (activation_mode='bootstrap', active head) |
+   | rules | `rules-v1` + rules_hash(snapshot.claim_type_rules) — фиксируются в run |
+   | SLO reassessment | **3600 с** (зафиксировано до серии; изменение = новый run) |
+   | blind seed | **20260915** |
+   | blind size | **50** |
+   | сессий | **50** |
+   | corpus | `docs/eval/question-set-v1.jsonl` (50 вопросов; sha256 = `9d09e17ca5f388bb…` — полный в model_fingerprint run) |
+   | БД | `noezema-eval` @ 127.0.0.1:54329 (alembic head, чистая) |
+   | node owner / data root | `eval-node` / `/home/denis/dsh1/noezema-eval-data` |
+
+   Smoke-прогон (1 сессия, отдельный run) подтвердил pipeline:
+   freeze → seed → succeeded (9 steps, ~8.7 мин) → gates → finish.
