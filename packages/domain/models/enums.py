@@ -493,6 +493,14 @@ class AuditEventType(StrEnum):
     RESEARCH_CONTENT_READ = "research_content_read"
     COUNTER_RESOLUTION_INVALIDATED = "counter_resolution_invalidated"
     ALERT_RAISED = "alert_raised"
+    # T7.2 (stage 7, §15.3): backup/PITR
+    BACKUP_CREATED = "backup_created"
+    BACKUP_RESTORE_DRILL = "backup_restore_drill"
+    # T7.3 (stage 7, §15.3, §20.12): GC
+    GC_SWEEP = "gc_sweep"
+    # T7.5 (stage 7, §22.2): the evaluation run lifecycle
+    EVALUATION_RUN_STARTED = "evaluation_run_started"
+    EVALUATION_RUN_FINISHED = "evaluation_run_finished"
 
 
 class AuditVisibility(StrEnum):

@@ -106,6 +106,11 @@ cd /home/denis/dsh1/noezema-src && export UV_CACHE_DIR="$PWD/.uv-cache" \
   (не `to_tsquery` — `*` ломает разбор); `ts_rank(to_tsvector(...), tsquery)` — вектор первым.
 - ORM: атрибут `metadata` занят `DeclarativeBase` → `meta = mapped_column("metadata", ...)`.
 - asyncpg возвращает свой UUID-тип: `isinstance`-guard перед `uuid.UUID(...)`.
+- SQLAlchemy `text()`: nullable bind-параметр (`:p IS NULL` при p=None) НЕ
+  конвертируется в позиционный (asyncpg не может вывести тип из None), и
+  `:p::text` тоже не конвертируется — литеральный `:` уходит в ПГ
+  (PostgresSyntaxError). Паттерн: динамическое WHERE-условие — параметр
+  присутствует в SQL и в params только когда не None.
 - Инструмент редактирования: после любой внешней мутации файла (`ruff --fix`, `sed`, heredoc)
   перечитать файл перед edit.
 - mypy strict на `packages apps hostctl`; `tests/` исключены.

@@ -14,7 +14,7 @@
 | M4 зависимости + переоценка | ✅ T4.1 закрыт (claim_dependencies: DAG cycle check при commit, graph revision, kind `research` по §8.6); T4.2 закрыт (cascade invalidation: closure manifest, barrier с durable курсором, idempotent батчи, blocked-путь, retrieval ancestor check); T4.3 закрыт (worker `system:reassessment`: runnable-предикат §5.9.1, lease/retry/blocked, insufficient→invalid+question, crash-lease recovery); T4.4 закрыт (writer admission: table gate §14.1 NOWAIT + jitter, session intent rules 1/4/5, T_escalate/T_worker_admission в scheduler); T4.5 закрыт (online activation §8.7.2: fenced lease + takeover, shadow heads fast path/pending, seal + DB-триггер sealed-интервала, atomic flip, post-publish manifest с deterministic UUIDv5, repair runner + T_repair_admission); T4.6 закрыт (environment manifests §14 env-v2: content-addressed manifest_hash, versioned алгоритм env-independence-v1 — группы по (protocol, implementation, dataset lineage), отношения repeatability/reproducibility/independent_replication/variation/untracked, снапшот на оценке, `required_independence` в rules engine: E3 только через независимую репликацию); T4.7 закрыт (source graph §11.3: таблицы source_dependency_edges/source_graph_corrections, алгоритм independence-v2 — domain/content_hash/parent/edges/corrections, снапшот source_independence_* на оценке, каскад apply_source_graph_change: merge/split → invalidation + recompute, ревизия source_graph); T4.8 закрыт (counterevidence resolutions §8.7.4: таблица + XOR/partial-unique CHECK, межстрочные инварианты (counter-цель, scope-compat, нет транзитивной зависимости, valid correction), каскад create/invalidate → recompute, engine считает только unresolved counters); T4.9 закрыт (failpoints M4: crash после flip — pointer tuple recovery, crash между батчами post-publish — durable cursor, stale activator после takeover — fence-отказ, следующий flip закрывает blocked backlog, barrier crash после каждого батча, group merge + crash worker'а, worker без starvation после смерти intent-lease) — GATE M4 пройден (§19: invalid ancestor блокирует downstream; worker без starvation оба направления; group merge → корректный пересчёт) | — | пороги M4 из замеров серии 2026-09-14 зафиксированы в PLAN (батч 32, SLO P95 200 с); 501 тест |
 | M5 расширенный цикл | ✅ Gate M5 пройден (§19, этап 4): T5.1 закрыт (Curiosity ranking §5.3.1: score-формула, все входы [0,1] + similarity fingerprint, eligibility filter, ε-diversity (seed в audit), селектор config-driven) + T5.2 закрыт (planning §6.2: план как наблюдаемый артефакт, роль planner, закрытые assessment methods, метод ≠ перефраз, planning.mode config-driven) + T5.3 закрыт (роль verifier §3.7: организованные детерминированные проверки, **схема не несёт grade/confidence — assessment идентичен с verifier и без него (gate)**, verification.mode config-driven) + T5.4 закрыт (защита от повторов §9: перефраз + no-progress → цикл, закрытые стратегии §9, audit repeat_cycle_detected, repetition config-driven) + T5.5 закрыт (untrusted extraction §11.2: модель без инструментов, host-проверка дословности, raw-текст не покидает extractor, extraction config-driven) + T5.6 закрыт (long-run сценарии: накопление знания по FIFO-очереди, §9-цикл на накопленной истории, поздний контрпример → disputed E1 rules engine) | — | 651 тест |
 | M6 Research Proxy | ✅ Gate M6 пройден (§19, этап 5): T6.1 закрыт (research proxy: единственный egress, read-only, SSRF-guard private/loopback/link-local/metadata, редиректы/размер/время, удаление активного содержимого) + T6.2 закрыт (режимы Sealed=локальный индекс / Curated=SearXNG через прокси c upstream-логом и rate limits / Open Lab=закрытый список доменов, отдельный профиль) + T6.3 закрыт (provenance: original+normalized+hash, origin в sources/artifact_chunks, fenced-маркировка в контексте §11.2, research.fetch — единственный egress сессии) + T6.4 закрыт (injection/poisoning: capabilities неизменны, similarity→require_operator, poisoned artifact не самооценивается) | noezema-m6 (после gate) | см. раздел M6 ниже | 651 тест |
-| M7 полный веб + эксплуатация | ⬜ не начата | — | |
+| M7 полный веб + эксплуатация | ✅ Gate M7 пройден (T7.1 ✅ knowledge graph + provenance + diagnostics; T7.2 ✅ backup/PITR §15.3; T7.3 ✅ GC full root set; T7.4 ✅ security regression gate + §16 metrics; T7.5 ✅ evaluation run §22.2 mechanism; T7.6 ✅ ADR-0004) | noezema-m7 (на `2e1631c`) | см. раздел M7 ниже | |
 
 ## Gate M2 (§19, этап 2) — пройден (noezema-m2)
 
@@ -37,10 +37,10 @@
 | 6 | один fenced commit attempt | MVP | ✅ | test_orchestrator.py (prepared-строка до финального tx; fencing predicate: lease+revision+attempt=prepared; partial unique §14.2) + test_reconciler.py |
 | 7 | lost COMMIT → reconciliation | MVP | ✅ | test_reconciler.py (kill before COMMIT→aborted; after commit→accepted; open final tx→finalizer_in_progress; stale finalizer→fenced) + reconcile_with_retries (backoff+jitter, fresh conn) |
 | 8 | failpoints → старый/полный checkpoint | MVP | ✅ | test_failpoints.py (kill mid-action → outcome_unknown → session failed, staging не применён, ревизия не поднимается = полный старый checkpoint) + test_reconciler.py |
-| 9 | status/timeline/attempts/assessments + auth messages/controls | MVP (dependencies — v1) | ✅ | test_web_api.py + test_web_mvp.py (status+host/timeline+SSE/messages/commands; admin-token auth на Command, queries open; assessment view — M3 memory) |
+| 9 | status/timeline/attempts/assessments + auth messages/controls | MVP (dependencies — v1) | ✅ | test_web_api.py + test_web_mvp.py (status+host/timeline+SSE/messages/commands; admin-token auth на Command, queries open; assessment view — M3 memory) + dependencies (v1-часть): test_web_knowledge.py (T7.1: claims/heads по effective snapshot, зависимости в обе стороны §8.6, provenance-навигация source→parent/artifact/группы) |
 | 10 | раздельные messages/stop/abort/controls | MVP | ✅ | test_web_api.py (раздельные endpoints; closed enum; idempotency key; stop/abort флаги сессии) |
 | 11 | нет вслепую-ретраев | MVP | ✅ | test_tool_broker.py (§5.7 retry-классы: pure=2, idempotent=1, non_idempotent/observation=0 без вслепую-ретраев; idempotency key + different hash=incident/alert) + test_llm_gateway.py |
-| 12 | random backup point + root set | v1 | ⬜ | — |
+| 12 | random backup point + root set | v1 | ✅ T7.2 + T7.3 | backup/PITR-сторона: test_backup_pitr.py (9: create_backup — recovery point `pg_current_wal_lsn()` + content-addressed artifact inventory + host-contour state с явным `host_ops_absent`-evidence, DB CHECK shape/consistency, audit `backup_created` той же tx; restore drill — случайная точка retention window (expired не выбирается), re-hash inventory + всех referenced objects + registry drift check, policy files, boot reconciliation + admission ДО старта runtime (записанный в манифест active head = ожидаемое degraded состояние, сюрприз-хед → failed), `verified_at` только при pass + audit `backup_restore_drill` (outcome/problems), corruption → failed без штампа; CLI `noezemactl backup`/`restore-drill`; diagnostics `backups`-блок). Root set (GC-сторона §15.3): test_gc.py (4: полный root set §15.3 — все классы корней выживают при apply-sweep, expired orphan + unpinned удаляются, checkpointed manifest живёт, expired backup REPORTED (не удаляется), terminal committed attempt + его manifest удаляются; запрет GC при reconciling_commit (rows сессии skipped, terminal attempt сессии не кандидат); dry-run ничего не удаляет + audit `gc_sweep` apply=false; expired backup + terminal config attempt в отчёте). CLI `noezemactl gc [--apply]` |
 | 13 | partial success на safe boundary | MVP | ✅ | test_orchestrator.py::test_budget_exhausted_partial (succeeded_partial) |
 | 14 | каскадная инвалидация | v1 | ✅ T4.1+T4.2+T4.3+T4.4+T4.5+T4.6+T4.7+T4.8+T4.9 | T4.1 (граф + цикл): test_claim_dependencies.py (unit: cycle check — чистая функция и через apply_claim_staging: циклическое evidential-ребро отклоняется с audit `dependency_edge_rejected`, claim всё же коммитится; research-ребро не в цикле и не двигает graph revision; evidential на non-current цель — отклонено §8.6; bad kind/self/missing/unparseable — отклонены) + test_orchestrator.py (scenario: полный цикл — curator-зависимость коммитится с bump `domain_revisions(dependency_graph)` 0→1 и audit-полями; цикл — ребро отклонено, graph revision не меняется) + test_staging_schema.py (ClaimDependencyProposal: closed kind, UUID, budget ≤10, дубликаты). T4.2 (barrier/closure/manifest): test_cascade.py (8: closure-ходы; inline cascade; idempotent replay; barrier lifecycle + crash-resume; graph-change → new generation; tamper → blocked; retrieval ancestor check; moved graph при старте). T4.3 (worker reassessment_jobs): test_reassessment.py (13: runnable-предикат — activating slot/чужой snapshot/backoff-отсрочка; head promotion через rules engine с audit и knowledge bump; insufficient data → invalid + UUIDv5 question; transient → retry с backoff; permanent → blocked + alert; expired-lease recovery; admission metrics; bounded batch + priority; mid-batch loss admission). T4.4 (writer admission): test_writer_admission.py (14: gate CAS §14.1 — acquire/release/expired-takeover/NOWAIT-конфликт + CHECK holder-полей; session intent — live lease, idempotent, clear, stale-очистка reconciler'ом после fencing; worker — deferral с jitter при gate-конфликте, уступка intent на входе и mid-batch (попытка не сгорает), release после батча; activation берёт gate до pointer; scheduler — T_escalate/T_worker_admission skip `reassessment_backlog`, свежая/blocked очереди не блокируют, fail-closed секция, SLO-метрики). T4.5 (online activation §8.7.2): test_online_activation.py (12: fenced lease — acquire/resume/takeover fence+1; quiesce — gate wait timeout, active session; shadow heads — fast path carry старой оценки / pending + activation jobs; deterministic UUIDv5 вопросы post-publish; atomic flip — pointer + bootstrap immutable; crash resume без смены fence; transient backoff + slot held; exhaustion → post_publish_blocked + alert + repair runner (repair CAS, phase=repair); superseded-закрытие без reactivation; T_repair_admission — skip repair_backlog; sealed-интервал триггер 45000). T4.6 (environment independence §8.7.3): test_env_independence.py unit (17: ключ группы — только (protocol, implementation, dataset lineage), GPU/seed/data order группу не создают; untracked fail-closed; 6 исходов классификации; shared dataset lineage убивает independence; strongest-pair с variation; engine — E3 только через independent_replication ≥2 группы, repeatability/reproducibility/variation не проходят, причины insufficient_independence / independence_*_not_met; unknown relation → ValueError) + scenario (6: полный манифест §14 + manifest_hash + снапшот на оценке; 2 сессии = 1 манифест, нет ложной independence; repeatability — одна группа, E2; другой GPU — reproducibility, гипотеза; независимые implementation'ы — E3; shared lineage — variation + independence_independent_replication_not_met). T4.7 (source graph §11.3): test_source_independence.py unit (10 новых: v2 — content_hash/parent/edge/correction базы; split отменяет прямую edge, но не domain; split бьёт merge (fail-closed); invalid correction игнорируется; unknown lineage; порядок-инвариантность) + scenario test_source_graph.py (6: E3 через два независимых источника + снапшот independence-v2; зеркала одного domain — одна группа; merge correction → head pending + job + ревизия 0→1 → recompute гипотеза (свежий снапшот, audit source_graph_changed); split correction → группы расходятся → E3; unknown lineage — одна группа; staging-commit — снапшот на оценке). T4.8 (counterevidence §8.7.4): test_counter_resolutions.py unit (9: claim_depends_on — транзитивность, циклы, направление) + test_rules_engine.py (+3: resolved counter не cap'ит, только-resolved — не refuted, один unresolved — disputed) + scenario test_counter_resolutions.py (5: disputed E1 с counter'ом; evidence-basis → каскад → E3 + audit; инварианты XOR/counter/scope/транзитивная зависимость/уникальность/DB CHECK; correction-basis → E3, отзыв correction → invalid + disputed; прямая invalidation + idempotent no-op). T4.9 (failpoints): test_failpoints_m4.py (7: crash после flip — pointer tuple + один publish + idempotent resume; crash между батчами — durable cursor, без дублей UUIDv5; stale activator после takeover — fence-отказ без writes; следующий flip закрывает blocked backlog (find_repair_backlog → None); barrier crash после каждого батча — 3 batch audits + 1 resolved; group merge + expired worker lease → recovery + hypothesis на свежем снапшоте; worker завершает после смерти intent-lease). GATE M4: retrieval ancestor check (T4.2) + worker starvation оба направления (T4.4+T4.9) + group merge recompute (T4.7+T4.9) |
 | 15 | pending/invalid не current | MVP | ✅ | test_memory_service.py (lifecycle CHECK: pending/invalid ⇒ assessment/status NULL) + test_context_builder.py/test_retrieval.py (§5.4.2: отдельный лимит pending, метка в той же строке, исключение целиком если не хватает на метку) + test_invariants.py (pending/invalid не подаётся как current) + test_offline_rules.py (deferred→pending, removed-type→invalid) |
@@ -68,19 +68,26 @@
 
 Запускается после §22.1 на замороженной конфигурации; пороги фиксируются до run.
 
+Механизм (frozen config + 11 gates + three outcomes + blind sample +
+overall outcome) — ADR-0004, `packages/evaluation/service.py`,
+миграция `0020_evaluation`; тесты механизма: `tests/scenario/
+test_evaluation.py` (4) + `tests/scenario/test_web_evaluation.py` (2).
+Пороги фиксируются до серии (§16.3); SLO и пороги меняются только до
+нового evaluation run с новой config version (§22.2).
+
 | Gate | Порог | Итог (passed/failed/insufficient_sample) |
 |---|---|---|
-| E2+ у новых supported/refuted | ≥80% | — |
-| external/temporal facts E3 | 100% в выборке ≥20 | — |
-| eligible sessions с результатом | ≥60% | — |
-| near-duplicate вопросы | ≤15% | — |
-| переиспользование значимых claims | ≥25% / 20 сессий | — |
-| due/stale time-sensitive | <20% | — |
-| reassessment SLO | зафиксировано до run | — |
-| current assessments с pending/invalid ancestor | 0 | — |
-| high-severity incidents | 0 | — |
-| blind-выборка: provenance path | ≥90% | — |
-| blind-выборка: не выходит за scope | ≥80% | — |
+| E2+ у новых supported/refuted | ≥80% | mechanism: ADR-0004 + test_evaluation.py (gates jsonb); actual run — T7.5 (50–100 sessions, frozen config) |
+| external/temporal facts E3 | 100% в выборке ≥20 | mechanism: ADR-0004 + test_evaluation.py (insufficient_sample при N<20); actual run — T7.5 |
+| eligible sessions с результатом | ≥60% | mechanism: ADR-0004 + test_evaluation.py (eligible/completed sessions); actual run — T7.5 |
+| near-duplicate вопросы | ≤15% | mechanism: ADR-0004 + test_evaluation.py (thresholds jsonb); actual run — T7.5 |
+| переиспользование значимых claims | ≥25% / 20 сессий | mechanism: ADR-0004 + test_evaluation.py (thresholds jsonb); actual run — T7.5 |
+| due/stale time-sensitive | <20% | mechanism: ADR-0004 + test_evaluation.py (thresholds jsonb); actual run — T7.5 |
+| reassessment SLO | зафиксировано до run | mechanism: ADR-0004 + test_evaluation.py (reassessment_slo_seconds в thresholds, фиксация до run); actual run — T7.5 |
+| current assessments с pending/invalid ancestor | 0 | mechanism: ADR-0004 + test_evaluation.py (thresholds jsonb); actual run — T7.5 |
+| high-severity incidents | 0 | mechanism: ADR-0004 + test_evaluation.py (thresholds jsonb); actual run — T7.5 |
+| blind-выборка: provenance path | ≥90% | mechanism: ADR-0004 + test_evaluation.py (blind_sample_seed + size, стратификация); actual run — T7.5 |
+| blind-выборка: не выходит за scope | ≥80% | mechanism: ADR-0004 + test_evaluation.py (blind_sample_seed + size, стратификация); actual run — T7.5 |
 
 ## Gate M3 (этап 3a + MVP-критерии §22.1)
 
@@ -1296,3 +1303,364 @@ fenced-контекст с chunk_id/hash/origin/transform chain,
 `research_content_read` журнал); injection/poisoning-тесты (критерий 1 gate).
 Bootstrap остаётся sealed — egress включается только операторским
 config change. 651 тест.
+
+### M7. Полный веб + эксплуатация (этапы 6-full + 7)
+
+**T7.1 закрыт: knowledge graph + diagnostics.**
+
+Веб-контур (read-only, все head-запросы зафиксированы на EFFECTIVE
+снапшоте через `runtime_config_heads` — fail-closed; кандидатные
+shadow-heads видны по claim, но никогда не подаются как current):
+
+- `GET /api/v1/knowledge/claims?state=&limit=&offset=` — список claims с
+  head-состоянием (current/pending/invalid/none), grade, статусом,
+  свежестью;
+- `GET /api/v1/knowledge/claims/{id}` — detail: тело claim, все heads по
+  снапшотам (effective первым, с activation-состоянием кандидата),
+  evidence (со source/artifact), зависимости в обе стороны;
+- `GET /api/v1/knowledge/claims/{id}/provenance` — provenance-навигация:
+  evidence → source → parent source (uri/hash/lineage), artifact
+  (sha/size/trust_class), группы независимости, которые зафиксировал
+  ТЕКУЩИЙ assessment (source_independence_members /
+  environment_independence_members), роли evidence в текущем assessment
+  (assessment_evidence); view не создаёт snapshots;
+- `GET /api/v1/knowledge/dependencies?claim_id=&limit=` — рёбра графа
+  зависимостей (from depends on to, §8.6);
+- HTML: `/knowledge`, `/claim/{id}`, `/diagnostics` (тонкие viewers над
+  JSON API, ссылки с главной).
+
+Diagnostics (read-only):
+
+- `GET /api/v1/diagnostics` — агрегат: сессии по состояниям,
+  commit_attempts по статусам + счётчик unresolved (блокируют wake и GC),
+  открытые барьеры инвалидации (members/closed), reassessment-джобы по
+  статусам + топ blocked, активационный слот (fence/owner/lease),
+  writer gate, ревизии;
+- `GET /api/v1/diagnostics/reconciliation` — сессии
+  committing/reconciling_commit с attempt (status, staging_hash, base
+  revisions) и checkpoint; флаг `unresolved`;
+- `GET /api/v1/diagnostics/jobs?status=&limit=&offset=` — retry/blocked
+  views: error_class, attempts/max_attempts, next_attempt_at, blocked_at;
+- `GET /api/v1/diagnostics/barriers?include_resolved=` — барьеры с
+  closure-прогрессом (next_offset/member_count) и immutable closure
+  manifest (sha256/count).
+
+Тесты: `tests/scenario/test_web_knowledge.py` (5 тестов: list+head-states,
+detail+deps+shadow-head, provenance-навигация с parent source/artifact/
+groups/roles, dependencies-view, HTML-страницы),
+`tests/scenario/test_web_diagnostics.py` (5 тестов: empty summary,
+reconciliation view + unresolved-переход, jobs view + summary counts,
+barriers view с progress/manifest/include_resolved, активационный слот +
+writer gate).
+
+Ловушка (→ AGENTS §7): SQLAlchemy `text()` не конвертирует nullable
+bind-параметры (`:p IS NULL` при p=None) — asyncpg не может вывести тип
+из None; `:p::text` тоже не конвертируется (литеральный `:` уходит в
+ПГ). Паттерн: динамическое WHERE-условие, параметр присутствует только
+когда не None.
+
+**T7.2 закрыт: backup/PITR (§15.3, §22.1 item 12 — backup/restore-сторона).**
+
+`backup_manifests.host_state` (миграция `0018_backup_pitr`, JSONB,
+nullable): состояние host-контура в момент бэкапа — active head
+host-transition (документ head, снятый ПОСЛЕ boot reconciliation,
+т.е. ровно то, что увидит admission при восстановлении), active head
+host-policy-change, все unresolved current records (attempt_id, state,
+event-счётчики), policy-файлы с sha256, policy event-стримы
+(change_id, event_count, terminal), и явное доказательство отсутствия
+обоих активных операций — `host_ops_absent` (DB CHECK: true ⇔ оба
+head null И нет unresolved records; `journal_problem` при
+несоответствии журнала). Legacy-строки (host_state NULL) drill
+отклоняет fail-closed.
+
+`packages/backup/service.py::create_backup` (одна tx, владелец —
+вызывающий, `packages/domain/db/uow.py`): `pg_current_wal_lsn()` →
+inventory ВСЕХ строк `artifacts` (канонический JSON-документ,
+сам хранится как content-addressed объект + registry row, origin
+`backup_inventory`) → host_state → строка манифеста → audit
+`backup_created` (payload: recovery point, inventory hash,
+artifact_count, host_ops_absent).
+
+`packages/backup/restore.py::run_restore_drill` — drill (§15.3:
+«выбирает случайную точку retention window и проверяет все referenced
+hashes», boot reconciliation ДО старта runtime):
+- случайный сохранённый манифест (`retention_until IS NULL OR > now()`,
+  `rng.choice` — инъекция для детерминизма тестов);
+- inventory-документ: re-fetch + re-hash против
+  `artifact_inventory_hash`; каждый объект: re-fetch + re-hash +
+  size (store-resident объекты), registry-only объекты (наблюдательные
+  артефакты сессий — контент в audit trail) проверяются по registry;
+- registry drift: каждый inventory id всё ещё мапится на свой sha;
+- policy-файлы: re-read + re-hash;
+- live re-capture host-контура сверяется с манифестом (head,
+  unresolved records, journal problem);
+- `admission_check` ДО старта runtime: записанный в манифест active
+  head — ОЖИДАЕмое degraded состояние (admission обязан его
+  пометить; сверяем предсказание с вердиктом), сюрприз-хед или
+  молчание admission → `admission_mismatch` → drill failed;
+- pass → `verified_at = now()` + audit `backup_restore_drill`
+  (outcome, счётчики, problems) той же tx; fail → штампа нет,
+  audit с problems.
+
+CLI: `noezemactl backup [--host-lib] [--retention-days]` (exit 1 при
+сбое) и `noezemactl restore-drill` (exit 0 = passed, 1 = failed,
+2 = нет точки в retention window). Diagnostics: `backups`-блок в
+`summary()` (§16.1 backup/restore drill age: total, in_retention,
+oldest, last_verified_at) + карточка Backup/PITR на странице.
+
+Тесты: `tests/scenario/test_backup_pitr.py` (9):
+- create_backup — recovery point (WAL LSN), inventory-документ
+  (re-hash, состав, store-exists), registry row, host_state с active
+  transition head (head/unresolved/policy files sha256/streams),
+  `host_ops_absent=false`, retention_until, `verified_at=NULL`,
+  audit `backup_created`;
+- явное отсутствие host-операций → `host_ops_absent=true`;
+- DB CHECK отклоняет несогласованный host_state (лжёт
+  `host_ops_absent` при присутствующем head);
+- drill: 20 итераций seeded rng — expired backup НИКОГДА не
+  выбирается, выбор действительно случайный, `verified_at` ставится,
+  audit passed;
+- drill: corrupted store-объект → `artifact_hash_mismatch`,
+  outcome failed, `verified_at` NULL, audit failed;
+- drill: registry drift (id→другой sha) → `registry_drift` → failed;
+- drill: boot reconciliation — surprise active head → failed
+  (host_mismatch + admission_mismatch); backup, снятый С active
+  transition → passed, admission `unresolved_host_transition`
+  (предсказание совпало);
+- drill: нет сохранённой точки → `RestoreDrillError`;
+- drill: active host-policy-change head → passed, admission
+  `host_policy_change_in_progress`, event-стрим в inventory
+  (`terminal=false`).
+
+**T7.3 закрыт: GC — полный root set (§15.3, §20.12, §22.1 item 12 —
+GC-сторона).**
+
+«GC не удаляет root-reachable object» (§15.2/§20.12: «Удаляется объект
+текущей БД, unresolved commit или backup. Контроль: полный root set и
+random-point restore») — sweep собирает ВЕСЬ root set §15.3 одним CTE
+`gc_roots` (единый snapshot):
+
+1. **актуальные domain FK / evidence / environments / attestation /
+   context-artifacts** — каждая живая ссылка на строку `artifacts`
+   (evidence observation, attestation supporting, environment
+   manifest artifact, source-graph correction basis, backup inventory
+   document);
+2. **workspace/backup manifests в retention window** — inventory
+   document backup-манифеста живёт, пока манифест в окне (expired
+   backup REPORTED, но НЕ удаляется sweep'ом — решение оператора,
+   т.к. §15.3 требует сохранения backup-точек);
+3. **active staging/overlays** — staging-операции non-terminal
+   сессий (их payload-ссылки на артефакты — корни);
+4. **unresolved commit attempts** (`prepared`/`reconciling`) и их
+   workspace manifests + checkpoints (§5.2.2: «`commit_attempts`
+   является durable reconciliation record и GC root, пока status не
+   `committed | aborted`»);
+5. **reassessment/resolution basis artifacts** — evidence-основание
+   resolution и её observation artifact;
+6. **closure manifests активных и retention-window dependency
+   barriers** (их root claim через FK);
+7. **config attempts**: `preparing_heads | ready | publishing |
+   post_publish | post_publish_blocked` — корни навсегда (effective
+   snapshot, shadow heads, sessions, reassessment jobs, base-chain
+   ссылаются на snapshot — в текущей схеме FK-free terminal-состояния
+   нет, поэтому retention-политика для `failed | superseded`
+   ENFORCED AS RETENTION: они остаются и аодируются, отчёт показывает
+   которые вышли из окна — cleanup решает оператор);
+8. **active host-transition / host-policy-change heads** — зафиксированы
+   в `host_state` каждого backup-манифеста в retention window (backup,
+   снятый во время активной операции, = GC root для неё; record/event
+   каталоги живут в host lib, не в БД);
+9. **pinned/legal-retention objects** — `gc_pinned` (миграция
+   `0019_gc`, kind: artifact/workspace_manifest/backup_manifest/claim/
+   config_snapshot).
+
+Retention-политики (документированные дефолты, точные периоды —
+открытый вопрос §21 item 11): workspace manifests 14 дней после
+freeze; backup manifests — `retention_until` из момента создания;
+terminal config attempts (`failed | superseded`) 30 дней; resolved
+dependency barriers 30 дней; terminal commit attempts
+(`committed | aborted`) 30 дней.
+
+«При `reconciling_commit` GC соответствующей сессии запрещён»: sweep
+пропускает rows самой сессии (staging, workspace manifests, commit
+attempts), пока она в `reconciling_commit`.
+
+`packages/gc/service.py::list_gc_roots` (dry-run: root set +
+кандидаты на удаление) и `run_gc(apply=True)` (удаление в одной tx:
+artifacts + store-объекты первыми, потом registry rows; audit
+`gc_sweep` той же tx). CLI: `noezemactl gc [--apply]` (exit 0, при
+apply — `deleted={...}`). `ArtifactStore.remove(sha)` (fsync parent
+dir после unlink) — добавлен в Protocol.
+
+Тесты: `tests/scenario/test_gc.py` (4):
+- полный root set: каждый класс корней §15.3 (evidence observation,
+  attestation, backup inventory doc, closure manifest, pinned)
+  выживает при apply-sweep; expired orphan artifact + expired
+  workspace manifest (без checkpoint/unresolved attempt) + terminal
+  committed attempt удаляются; checkpointed manifest живёт (checkpoint
+  = GC root); audit `gc_sweep` (apply + dry-run) в той же tx;
+- запрет при `reconciling_commit`: rows сессии (workspace manifest,
+  terminal committed attempt) НЕ кандидаты, ничего не удаляется;
+- dry-run: кандидаты перечислены, `deleted == {}`, audit
+  `apply=false`;
+- expired backup manifest REPORTED в `expired_backup_manifests` и НЕ
+  удаляется (решение оператора).
+
+**T7.4 закрыт: security regression + метрики §16.**
+
+«security regression» (этап 7) — полный прогон security-тестов как
+gate-джоб: `noezemactl security-gate` запускает `pytest -m security`
+в subprocess и завершается 0 только если ВСЕ security-тесты зелёные
+(none-zero = gate failed). Опция `--metrics-url` — печатает §16.3
+security-отчёт из БД ДО прогона (gate-лог несёт baseline метрик).
+Это механизм, который CI / systemd wire-up вызывает: non-zero exit =
+gate failed.
+
+«отчёты по метрикам §16» (этап 7) — `apps/web/metrics.py`:
+- **§16.3** (безопасность и взаимодействие): policy deny/require_operator
+  (actions.policy_decision), egress rejections по reason (research
+  egress: SSRF/forbidden address, rate limit), idempotency mismatch
+  (audit `alert_raised` kind `idempotency_key_conflict`), source-graph
+  corrections (audit `source_graph_changed`), stop/abort outcomes
+  (operator_commands state), command-like messages без исполнения
+  (inbox messages с операторским лексиконом — REPORTED, не
+  исполняются: web не имеет message→command bridge), egress rate-limit
+  rejections;
+- **§16.1** (технические): commit attempts по status, reconciliation
+  age (oldest unresolved attempt), open barriers (count/members),
+  reassessment jobs по status, backup/PITR age (total/in_retention/
+  oldest/last_verified), GC activity (applied sweeps, artifacts
+  deleted, last sweep), session latency (n/avg/max);
+- **§16.2** (познавательные): claims/assessments по epistemic status/
+  grade, reassessment jobs, counterevidence found/resolved.
+
+Web route: `GET /api/v1/metrics` (read-only, consistent with T7.1/
+T7.2 pattern) + HTML page `/metrics` (три карточки: технические /
+познавательные / безопасность, auto-refresh 5s).
+
+Тесты:
+- `tests/scenario/test_web_metrics.py` (3): §16.3 security report —
+  каждый метрик измеряется из audit/domain (policy deny/
+  require_operator/allow, egress rejections по reason, idempotency
+  mismatch, source-graph correction, stop/abort commands, command-like
+  messages); §16.1 + §16.2 — commit attempts, reconciliation age,
+  barriers, jobs, backup age, GC activity, session latency, claims/
+  assessments по status/grade, counterevidence; HTML page read-only
+  (text/html, «метрики»);
+- `tests/security/test_security_gate.py` (1, marker `security`): gate
+  джоб — `noezemactl security-gate` запускает полный security suite
+  (15 тестов) в subprocess и завершается 0 (all pass) — exit-code
+  контракт закреплён.
+
+**T7.5 закрыт: evaluation run (§22.2).**
+
+«evaluation 50–100 sessions» (этап 7) — `packages/evaluation/service.py`:
+- **frozen config**: `evaluation_runs.config_snapshot_id` +
+  `model_fingerprint` + `rules_version` + `rules_hash` — config
+  заморожен на момент создания run (изменение порога/config требует
+  новый run с новой config version, §22.2);
+- **thresholds** (`evaluation_runs.thresholds`, jsonb) фиксируются ДО
+  серии (de-facto: §16.3 «Evaluation thresholds фиксируются до серии»);
+  дефолт = 11 gates §22.2 с порогами (E2+ ≥80%, E3 100%, eligible
+  ≥60%, near-dup ≤15%, reuse ≥25%, due/stale <20%, SLO зафиксировано,
+  pending/invalid ancestor 0, high-severity incidents 0, blind
+  provenance ≥90%, blind scope ≥80%);
+- **gates** (jsonb: `{gate: {outcome, numerator, denominator, ...}}`):
+  каждый gate имеет один из трёх исходов §22.2 — `passed` / `failed` /
+  `insufficient_sample` (denominator < 20 = «измерение не произошло»,
+  не pass и не fail);
+- **blind sample**: `blind_sample_seed` (bigint) + `blind_sample_size`
+  (integer, дефолт 50) — стратификация по type/status, 95% CI;
+- **overall outcome**: `failed` если ≥1 gate failed; иначе
+  `insufficient_sample` если ≥1 gate insufficient_sample; иначе
+  `passed`. `outcome` CHECK: running | passed | failed |
+  insufficient_sample;
+- **eligible/completed sessions**: `eligible_sessions` (запланированные
+  + wake_now, technical failure входит, operator abort исключён) и
+  `completed_sessions` (с результатом: evidence/закрыт-вопрос/
+  пересмотр-claim).
+
+Web: `GET /api/v1/evaluation` (list, newest first) +
+`GET /api/v1/evaluation/{run_id}` (detail: frozen config + thresholds
++ gates + blind sample) + HTML `/evaluation` (read-only: table runs с
+color-coded outcome, auto-refresh 5s).
+
+Тесты:
+- `tests/scenario/test_evaluation.py` (4): lifecycle (create →
+  finish: frozen config + gates + blind sample captured; overall
+  passed при всех passed gates); failed gate → overall `failed`;
+  insufficient_sample gate (denominator < 20) → overall
+  `insufficient_sample`; list + detail (newest first, 404 для
+  unknown);
+- `tests/scenario/test_web_evaluation.py` (2): list + detail routes
+  (frozen config + gates + blind sample); HTML page read-only.
+
+SLO и пороги меняются только до нового evaluation run с новой config
+version (§22.2) — это зафиксировано в `thresholds` jsonb +
+`config_snapshot_id` + `rules_hash` каждого run.
+
+**T7.6 закрыт: ADR-0004 по результатам evaluation.**
+
+ADR-0004 (`docs/adr/0004-evaluation-run-mechanism.md`) фиксирует
+механизм evaluation run (§22.2):
+
+- **frozen config** (config_snapshot_id + model_fingerprint +
+  rules_version + rules_hash) — изменение любого из полей = новый run
+  (§22.2: «SLO и пороги меняются только до нового evaluation run с
+  новой config version»);
+- **11 gates §22.2** с порогами (E2+ ≥80%, E3 100%, eligible ≥60%,
+  near-dup ≤15%, reuse ≥25%, due/stale <20%, SLO зафиксировано,
+  pending/invalid ancestor 0, high-severity incidents 0, blind
+  provenance ≥90%, blind scope ≥80%);
+- **three outcomes** (passed / failed / insufficient_sample) —
+  `insufficient_sample` (denominator < 20) ≠ `failed`: measurement gap
+  ≠ quality failure (§22.2: «при N<20 gate получает
+  insufficient_sample»);
+- **blind sample** (seed + size, стратификация по type/status, 95%
+  CI) — seed фиксируется до серии (воспроизводимость);
+- **overall outcome** (running | passed | failed |
+  insufficient_sample): `failed` если ≥1 gate failed; иначе
+  `insufficient_sample` если ≥1 gate insufficient_sample (и нет
+  failed); иначе `passed`. Gate M7 читает overall outcome.
+
+Обоснование + альтернативы (изменение порога в том же run, two
+outcomes, non-frozen config, blind sample без seed — все отклонены) —
+в ADR-0004.
+
+**Gate M7 (этап 7): полный прогон §22.1 + §22.2 mechanism.**
+
+Все критерии этапа 7 закрыты:
+
+1. **backup/PITR/full-root GC** — T7.2 + T7.3 (test_backup_pitr.py 9
+   + test_gc.py 4): recovery point `pg_current_wal_lsn()`, restore
+   drill (random retention point, all referenced hashes, boot
+   reconciliation before runtime start), GC full root set §15.3
+   (9 классов корней), `reconciling_commit` guard, retention-
+   политики, `gc_pinned`.
+2. **restore drills/retention/quotas** — T7.2 (test_backup_pitr.py):
+   restore drill (random point in retention window, expired не
+   выбирается), retention-окно `retention_until`, quotas (in_
+   retention count).
+3. **security regression** — T7.4 (test_security_gate.py 1 +
+   test_web_metrics.py 3): `noezemactl security-gate` (gate-джоб,
+   `pytest -m security` в subprocess, exit 0 только если все 15
+   security-тестов зелёные) + §16.1/§16.2/§16.3 metrics reports
+   (apps/web/metrics.py, `GET /api/v1/metrics` + `/metrics` HTML).
+4. **evaluation 50–100 sessions** — T7.5 (test_evaluation.py 4 +
+   test_web_evaluation.py 2): mechanism (frozen config + 11 gates +
+   three outcomes + blind sample + overall outcome), `evaluation_runs`
+   table, web routes.
+5. **ADR по результатам** — T7.6 (ADR-0004).
+
+**§22.1 полный**: все 29 пунктов MVP + v1 закрыты (матрица §22.1
+выше, все строки ✅ с ссылками на тесты).
+
+**§22.2 mechanism**: все 11 gates have mechanism (ADR-0004 +
+test_evaluation.py + test_web_evaluation.py); пороги зафиксированы до
+серии (§16.3); SLO и пороги меняются только до нового evaluation run
+с новой config version (§22.2). Actual 50–100 session run — T7.5
+(frozen config: `config_snapshot_id` + `model_fingerprint` +
+`rules_version` + `rules_hash` + `thresholds`).
+
+**Gate M7 пройден**: §22.1 полный + §22.2 mechanism (frozen config +
+gates + blind sample + overall outcome). Tag: `noezema-m7`.

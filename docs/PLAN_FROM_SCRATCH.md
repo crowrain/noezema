@@ -478,12 +478,12 @@ reassessment.
 
 | # | Задача |
 |---|---|
-| T7.1 | Веб: knowledge graph (claims/assessments/dependencies, provenance navigation), diagnostics (reconciliation, invalidation, blocked jobs/barriers, retry views) |
-| T7.2 | Backup/PITR: `backup_manifests` (DB recovery point + artifact inventory), restore drill (случайная точка retention, проверка всех referenced hashes, boot reconciliation) |
-| T7.3 | GC: полный root set §15.3; запрет GC при `reconciling_commit`; retention-политики |
-| T7.4 | Security regression: полный прогон security-тестов как gate-джоб; отчёты по метрикам §16 |
-| T7.5 | Evaluation run §22.2: 50–100 eligible sessions, замороженные model/config/rules, gates с исходами passed/failed/insufficient_sample, слепая выборка |
-| T7.6 | ADR по результатам evaluation |
+| T7.1 | Веб: knowledge graph (claims/assessments/dependencies, provenance navigation), diagnostics (reconciliation, invalidation, blocked jobs/barriers, retry views) | ✅ |
+| T7.2 | Backup/PITR: `backup_manifests` (DB recovery point + artifact inventory + host-contour state), restore drill (случайная точка retention, проверка всех referenced hashes, boot reconciliation) | ✅ |
+| T7.3 | GC: полный root set §15.3; запрет GC при `reconciling_commit`; retention-политики | ✅ |
+| T7.4 | Security regression: полный прогон security-тестов как gate-джоб; отчёты по метрикам §16 | ✅ |
+| T7.5 | Evaluation run §22.2: 50–100 eligible sessions, замороженные model/config/rules, gates с исходами passed/failed/insufficient_sample, слепая выборка | ✅ |
+| T7.6 | ADR по результатам evaluation | ✅ (ADR-0004) |
 
 **Gate M7** (§19, этап 7): §22.1 полный + §22.2 пройден (ни один gate не `failed` и не
 `insufficient_sample`).

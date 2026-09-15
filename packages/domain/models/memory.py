@@ -472,4 +472,8 @@ class ORMBackupManifest(Base):
     )
     retention_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # T7.2 (§15.3): the host-contour state captured at backup time
+    # (schema v1; NULL only on legacy rows — the restore drill
+    # refuses to verify them, fail-closed)
+    host_state: Mapped[JsonDict | None] = mapped_column(JSONB)
     created_at: Mapped[datetime] = created_at_column()
