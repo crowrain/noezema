@@ -484,7 +484,7 @@ reassessment.
 | T7.4 | Security regression: полный прогон security-тестов как gate-джоб; отчёты по метрикам §16 | ✅ |
 | T7.5 | Evaluation run §22.2: 50–100 eligible sessions, замороженные model/config/rules, gates с исходами passed/failed/insufficient_sample, слепая выборка | ✅ |
 | T7.6 | ADR по результатам evaluation | ✅ (ADR-0004) |
-| T7.7 | Фактический evaluation run §22.2: расчёт 11 gates по доменным данным (`packages/evaluation/gates.py`), заморозка конфигурации серии, запуск 50 реальных сессий на локальной модели, исходы gates в run, ADR-0005 с фактическими результатами | 🔄 |
+| T7.7 | Фактический evaluation run §22.2: расчёт 11 gates по доменным данным (`packages/evaluation/gates.py`), заморозка конфигурации серии, запуск 50 реальных сессий на локальной модели, исходы gates в run, ADR-0005 с фактическими результатами | ✅ (run EVAL-1: overall failed — reuse 3.4% < 25%; 3 gates insufficient_sample; ADR-0005) |
 
 **Gate M7** (§19, этап 7): §22.1 полный + §22.2 пройден (ни один gate не `failed` и не
 `insufficient_sample`).

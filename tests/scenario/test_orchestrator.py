@@ -147,6 +147,23 @@ async def test_full_sealed_session(migrated_db, fake_llm: FakeLLM, tmp_path: Pat
 
     assert await _session_state(scratch_url, outcome.session_id) == "succeeded"
 
+    # T7.7: started_at is set at creation (evaluation window anchor §22.2)
+    engine = create_async_engine(scratch_url)
+    try:
+        async with engine.connect() as conn:
+            started = (
+                await conn.execute(
+                    text(
+                        "SELECT started_at FROM sessions WHERE id=:id"
+                    ),
+                    {"id": str(outcome.session_id)},
+                )
+            ).scalar_one()
+    finally:
+        await engine.dispose()
+    assert started is not None, "sessions.started_at must be set at creation"
+    assert started.tzinfo is not None
+
 
 @pytest.mark.asyncio
 async def test_slow_llm_does_not_lose_commit_lease(migrated_db, fake_llm: FakeLLM, tmp_path: Path) -> None:

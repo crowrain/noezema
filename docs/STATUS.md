@@ -1705,3 +1705,29 @@ gates + blind sample + overall outcome). Tag: `noezema-m7`.
 
    Smoke-прогон (1 сессия, отдельный run) подтвердил pipeline:
    freeze → seed → succeeded (9 steps, ~8.7 мин) → gates → finish.
+4. **Серия EVAL-1 проведена, run завершён (overall: failed).**
+   Run `29667a42…`, окно 2026-09-15 16:03:13 → 19:42:09 UTC
+   (~3 ч 39 мин, 239 model runs). 50 попыток → 48 terminal сессий
+   (26 succeeded + 22 succeeded_partial, 0 failed); 2 технических
+   срыва на уровне lease (LeaseLost >600 с, строк сессий нет).
+   34 claims (29 current supported E2+), 26 вопросов verified.
+
+   | # | gate | исход |
+   | --- | --- | --- |
+   | 1 | new_supported_refuted_e2 | **passed** 29/29 |
+   | 2 | external_temporal_e3 | insufficient_sample 0/0 |
+   | 3 | eligible_sessions_with_outcome | **passed** 48/48 |
+   | 4 | near_duplicate_questions | **passed** 0/48 |
+   | 5 | significant_claim_reuse | **failed** 1/29 (3.4% < 25%) |
+   | 6 | due_stale_time_sensitive | insufficient_sample 0/0 |
+   | 7 | reassessment_slo (3600 с) | insufficient_sample 0/0 |
+   | 8 | current_pending_invalid_ancestor | **passed** 0 |
+   | 9 | high_severity_incidents | **passed** 0 |
+   | 10 | blind_provenance_path | **passed** 29/29 |
+   | 11 | blind_scope | **passed** 29/29 |
+
+   Итог по §22.2: «платформа работает, гипотеза не подтверждена» —
+   full v1 acceptance не объявляется. Детали + поправка данных
+   (баг `sessions.started_at`: оркестратор теперь записывает якорь
+   window; 48 строк run-а backfill'нуты из audit trail, config не
+   менялась) — **ADR-0005**.
