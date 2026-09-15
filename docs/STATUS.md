@@ -1756,3 +1756,24 @@ gates + blind sample + overall outcome). Tag: `noezema-m7`.
      выполняется, dependency-edge коммитится (источник числителя
      гейта); `test_memory_search_without_db`
      (tests/unit/test_stub_executor.py).
+
+6. **Заморозка конфигурации серии EVAL-2 (зафиксировано ДО
+   запуска).** Цель: A/B-сравнение с EVAL-1 — те же вопросы, та же
+   модель, те же пороги; изменился только путь reuse (реальный
+   `memory.search` + протокол). БД EVAL-1 (`noezema-eval`) не
+   тронута — она доказательная база ADR-0005; серия идёт в чистой
+   `noezema-eval2`.
+
+   | Параметр | Значение |
+   | --- | --- |
+   | модель | `qwen36-35b-a3b-q6-mtp` @ `http://192.168.1.48:8080/v1` (llama-swap) |
+   | LLM env | `NOEZEMA_LLM_MAX_OUTPUT_TOKENS=8192`, `NOEZEMA_LLM_TIMEOUT_SECONDS=600` |
+   | config snapshot | bootstrap (activation_mode='bootstrap', active head) |
+   | rules | `rules-v1` + rules_hash(snapshot.claim_type_rules) — фиксируются в run |
+   | пороги гейтов | без изменений (reuse ≥ 25%, MIN_SAMPLE 20, …) |
+   | SLO reassessment | **3600 с** (зафиксировано до серии) |
+   | blind seed / size | **20260915** / **50** (как в EVAL-1, для сопоставимости) |
+   | сессий | **50** |
+   | corpus | `docs/eval/question-set-v1.jsonl` (те же 50 вопросов, тот же sha256) |
+   | БД | `noezema-eval2` @ 127.0.0.1:54329 (alembic head `0020_evaluation`, чистая) |
+   | node owner / data root | `eval-node` / `/home/denis/dsh1/noezema-eval-data` |
