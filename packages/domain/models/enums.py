@@ -498,6 +498,9 @@ class AuditEventType(StrEnum):
     BACKUP_RESTORE_DRILL = "backup_restore_drill"
     # T7.3 (stage 7, §15.3, §20.12): GC
     GC_SWEEP = "gc_sweep"
+    # T7.5 (stage 7, §22.2): the evaluation run lifecycle
+    EVALUATION_RUN_STARTED = "evaluation_run_started"
+    EVALUATION_RUN_FINISHED = "evaluation_run_finished"
 
 
 class AuditVisibility(StrEnum):

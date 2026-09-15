@@ -81,7 +81,8 @@ _MAIN_HTML = """<!doctype html>
  ul{margin:.3rem 0 .3rem 1.2rem}
 </style></head><body>
 <h1>NOEZEMA — узел</h1>
-<p><a href="/knowledge">Знание (граф)</a> · <a href="/diagnostics">Диагностика</a> · <a href="/metrics">Метрики</a></p>
+<p><a href="/knowledge">Знание (граф)</a> · <a href="/diagnostics">Диагностика</a></p>
+<p><a href="/metrics">Метрики (§16)</a> · <a href="/evaluation">Evaluation (§22.2)</a></p>
 <div id="banner" class="none">загрузка…</div>
 <div class="card"><b>Узел:</b> <span id="node">—</span> · <b>Фазa:</b> <span id="phase">—</span></div>
 <div class="card"><b>Конфиг:</b> <code id="cfg">—</code></div>
@@ -417,6 +418,52 @@ async function tick(){
        + esc(s.command_like_messages) + '</p>';
     h += '<p>egress_rate_limited: ' + esc(s.egress_rate_limited) + '</p>';
     h += '</div>';
+    document.getElementById('box').innerHTML = h;
+  }catch(e){ document.getElementById('box').textContent='ошибка чтения'; }
+}
+tick(); setInterval(tick, 5000);
+</script></body></html>
+"""
+
+_EVALUATION_HTML = """<!doctype html>
+<html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NOEZEMA — evaluation (§22.2)</title>
+<style>
+ body{font-family:system-ui,sans-serif;margin:2rem;background:#0e1116;color:#e6e6e6}
+ .card{background:#171c26;border:1px solid #2a3142;border-radius:8px;padding:1rem;margin:.7rem 0}
+ code{background:#0b0e13;padding:.1rem .3rem;border-radius:4px}
+ table{border-collapse:collapse;width:100%}
+ th,td{border:1px solid #2a3142;padding:.4rem .6rem;text-align:left}
+ th{background:#171c26}
+ a{color:#61afef;text-decoration:none}
+ .ok{color:#7bd88f}.warn{color:#e5c07b}.bad{color:#e06c75}
+</style></head><body>
+<h1>NOEZEMA — evaluation (§22.2)</h1>
+<p><a href="/">← узел</a> · <a href="/metrics">Метрики</a></p>
+<div id="box">загрузка…</div>
+<script>
+const esc = s => (s==null?'—':String(s)).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+function outcomeCls(o){
+  return o==='passed'?'ok':(o==='failed'?'bad':'warn');
+}
+async function tick(){
+  try{
+    const m = await fetch('/api/v1/evaluation').then(r => r.json());
+    const runs = m.runs || [];
+    let h = '<table><tr><th>label</th><th>outcome</th><th>started</th>'
+      + '<th>eligible</th><th>completed</th><th>blind size</th></tr>';
+    for (const r of runs){
+      const cls = outcomeCls(r.outcome);
+      h += '<tr><td><a href="/evaluation/' + esc(r.id) + '">' + esc(r.label) + '</a></td>'
+        + '<td class="' + cls + '">' + esc(r.outcome) + '</td>'
+        + '<td>' + esc((r.started_at||'').slice(0,19)) + '</td>'
+        + '<td>' + esc(r.eligible_sessions) + '</td>'
+        + '<td>' + esc(r.completed_sessions) + '</td>'
+        + '<td>' + esc(r.blind_sample_size) + '</td></tr>';
+    }
+    h += '</table>';
+    if (runs.length===0) h += '<p class="warn">нет evaluation runs</p>';
     document.getElementById('box').innerHTML = h;
   }catch(e){ document.getElementById('box').textContent='ошибка чтения'; }
 }
@@ -1026,6 +1073,63 @@ def create_app(
         async with factory() as db:
             return await metrics_queries.all_metrics(db)
 
+    # ── T7.5: evaluation run (§22.2) ────────────────────────────────────
+
+    @app.get("/api/v1/evaluation")
+    async def evaluation_runs(limit: int = 20) -> JsonDict:
+        """T7.5 (§22.2): the evaluation runs (newest first)."""
+        from packages.evaluation.service import list_evaluation_runs
+
+        async with factory() as db:
+            runs = await list_evaluation_runs(db, limit=limit)
+            return {
+                "runs": [
+                    {
+                        "id": str(r.id),
+                        "label": r.label,
+                        "outcome": r.outcome,
+                        "started_at": r.started_at.isoformat(),
+                        "finished_at": (
+                            r.finished_at.isoformat() if r.finished_at else None
+                        ),
+                        "eligible_sessions": r.eligible_sessions,
+                        "completed_sessions": r.completed_sessions,
+                        "gates": r.gates,
+                        "blind_sample_size": r.blind_sample_size,
+                    }
+                    for r in runs
+                ]
+            }
+
+    @app.get("/api/v1/evaluation/{run_id}")
+    async def evaluation_run_detail(run_id: uuid.UUID) -> JsonDict:
+        """T7.5 (§22.2): one evaluation run (frozen config + gates)."""
+        from packages.evaluation.service import get_evaluation_run
+
+        async with factory() as db:
+            run = await get_evaluation_run(db, run_id)
+            if run is None:
+                raise HTTPException(status_code=404, detail="not found")
+            return {
+                "id": str(run.id),
+                "label": run.label,
+                "config_snapshot_id": str(run.config_snapshot_id),
+                "model_fingerprint": run.model_fingerprint,
+                "rules_version": run.rules_version,
+                "rules_hash": run.rules_hash,
+                "thresholds": run.thresholds,
+                "started_at": run.started_at.isoformat(),
+                "finished_at": (
+                    run.finished_at.isoformat() if run.finished_at else None
+                ),
+                "eligible_sessions": run.eligible_sessions,
+                "completed_sessions": run.completed_sessions,
+                "gates": run.gates,
+                "blind_sample_seed": run.blind_sample_seed,
+                "blind_sample_size": run.blind_sample_size,
+                "outcome": run.outcome,
+            }
+
     # ── T3.20/T3.21/T7.1: HTML pages ─────────────────────────────────────
 
     @app.get("/", response_class=HTMLResponse)
@@ -1051,6 +1155,10 @@ def create_app(
     @app.get("/metrics", response_class=HTMLResponse)
     async def metrics_page() -> str:
         return _METRICS_HTML
+
+    @app.get("/evaluation", response_class=HTMLResponse)
+    async def evaluation_page() -> str:
+        return _EVALUATION_HTML
 
     return app
 
