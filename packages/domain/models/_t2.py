@@ -1,0 +1,1 @@
+A = mapped_column
