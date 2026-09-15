@@ -5,6 +5,7 @@ Runs a real Sealed session against PostgreSQL + the deterministic fake LLM.
 
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import timedelta
 from pathlib import Path
@@ -246,6 +247,19 @@ async def test_memory_search_and_claim_reuse(migrated_db, fake_llm: FakeLLM, tmp
         await gateway2.close()
         await engine2.dispose()
     assert outcome2.final_state is SessionState.SUCCEEDED
+
+    # memory.search actually returned the existing claim into the
+    # model's context (session 2's 3rd explorer call is the one made
+    # after the search step; the observation must be "-> N claims"
+    # with the [c:<id>] line, not "-> пусто")
+    reqs = fake_llm.requests()
+    search_prompt = str(reqs[6].get("last_user", ""))
+    assert re.search(
+        r"memory\.search\([^)]*\) -> \d+ claims", search_prompt
+    ), "memory.search returned no claims to the model (observation is пусто)"
+    assert f"[c:{claim1_id}]" in search_prompt, (
+        "the existing claim's [c:<id>] line never reached the model"
+    )
 
     # the reuse edge exists at the commit boundary
     dep = await _scalar(

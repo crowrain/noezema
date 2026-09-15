@@ -1746,15 +1746,21 @@ gates + blind sample + overall outcome). Tag: `noezema-m7`.
      ToolBroker): тот же retrieval, что и context pack
      (`packages/cognition/retrieval`, pointer equality §14.1,
      FTS `russian`); результаты — строки `[c:<id>] …`; retrieval
-     прикован к snapshot сессии (оркестратор передаёт
-     `snapshot_id`). Результаты поиска — наблюдения, НЕ evidence.
+     прикован к snapshot сессии — `executor.snapshot_id`
+     задаётся ДО explorer-цикла (дефект, найденный до запуска:
+     шепот был только в phase 3, поиск в ходе exploration всегда
+     получал `None` и возвращал «пусто»). Результаты поиска —
+     наблюдения, НЕ evidence.
    - Протокол (`_protocol_text`): правило переиспользования —
      связанные существующие claims указывать в `dependencies`
      предложенного claim.
    - Тесты: `test_memory_search_and_claim_reuse`
      (tests/scenario/test_orchestrator.py) — memory.search
-     выполняется, dependency-edge коммитится (источник числителя
-     гейта); `test_memory_search_without_db`
+     возвращает claim в контекст модели (наблюдение
+     `-> N claims` со строкой `[c:<id>]`, не «пусто») и
+     dependency-edge коммитится (источник числителя гейта);
+     регрессия без phase-1 шепота падает.
+     `test_memory_search_without_db`
      (tests/unit/test_stub_executor.py).
 
 6. **Заморозка конфигурации серии EVAL-2 (зафиксировано ДО
@@ -1777,3 +1783,12 @@ gates + blind sample + overall outcome). Tag: `noezema-m7`.
    | corpus | `docs/eval/question-set-v1.jsonl` (те же 50 вопросов, тот же sha256) |
    | БД | `noezema-eval2` @ 127.0.0.1:54329 (alembic head `0020_evaluation`, чистая) |
    | node owner / data root | `eval-node` / `/home/denis/dsh1/noezema-eval-data` |
+
+   Smoke-прогон (run `EVAL-2-SMOKE` `cf09b404…`, 1 сессия): pipeline
+   подтверждён (freeze → seed 50 → finish + gates). Сессия сорвалась
+   `LeaseLost` на 642-й секунде — load модели llama-swap'ом дольше
+   phase_deadline 600 с (известный риск §22.2, как сессии 32/38 в
+   EVAL-1; технические срывы так же учитывают, конфигурацию не
+   меняем — A/B-сравнимо с EVAL-1). Строк сессии/claims в БД нет
+   (phase-1 транзакция откатилась), БД чиста для серии: 50 seeded
+   вопросов, 0 sessions.

@@ -498,6 +498,12 @@ class Orchestrator:
 
         # exploring
         await self._transition(db, audit, session, SessionState.EXPLORING)
+        # T7.7 (EVAL-2): pin memory.search retrieval to this session's
+        # effective snapshot (pointer equality §14.1) BEFORE the explorer
+        # loop — the tool runs during exploration, so the pin must exist
+        # before the first step (phase 3 re-pins for the commit path)
+        if hasattr(self.executor, "snapshot_id"):
+            self.executor.snapshot_id = snapshot.id
         max_steps = int(limits.get("max_explorer_steps", 10))
         steps, stopped, aborted = await self._explorer_loop(
             db, audit, session, ctx, max_steps, cap_profile, policy_engine, staging, lease, pack, snapshot
