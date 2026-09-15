@@ -14,7 +14,7 @@
 | M4 зависимости + переоценка | ✅ T4.1 закрыт (claim_dependencies: DAG cycle check при commit, graph revision, kind `research` по §8.6); T4.2 закрыт (cascade invalidation: closure manifest, barrier с durable курсором, idempotent батчи, blocked-путь, retrieval ancestor check); T4.3 закрыт (worker `system:reassessment`: runnable-предикат §5.9.1, lease/retry/blocked, insufficient→invalid+question, crash-lease recovery); T4.4 закрыт (writer admission: table gate §14.1 NOWAIT + jitter, session intent rules 1/4/5, T_escalate/T_worker_admission в scheduler); T4.5 закрыт (online activation §8.7.2: fenced lease + takeover, shadow heads fast path/pending, seal + DB-триггер sealed-интервала, atomic flip, post-publish manifest с deterministic UUIDv5, repair runner + T_repair_admission); T4.6 закрыт (environment manifests §14 env-v2: content-addressed manifest_hash, versioned алгоритм env-independence-v1 — группы по (protocol, implementation, dataset lineage), отношения repeatability/reproducibility/independent_replication/variation/untracked, снапшот на оценке, `required_independence` в rules engine: E3 только через независимую репликацию); T4.7 закрыт (source graph §11.3: таблицы source_dependency_edges/source_graph_corrections, алгоритм independence-v2 — domain/content_hash/parent/edges/corrections, снапшот source_independence_* на оценке, каскад apply_source_graph_change: merge/split → invalidation + recompute, ревизия source_graph); T4.8 закрыт (counterevidence resolutions §8.7.4: таблица + XOR/partial-unique CHECK, межстрочные инварианты (counter-цель, scope-compat, нет транзитивной зависимости, valid correction), каскад create/invalidate → recompute, engine считает только unresolved counters); T4.9 закрыт (failpoints M4: crash после flip — pointer tuple recovery, crash между батчами post-publish — durable cursor, stale activator после takeover — fence-отказ, следующий flip закрывает blocked backlog, barrier crash после каждого батча, group merge + crash worker'а, worker без starvation после смерти intent-lease) — GATE M4 пройден (§19: invalid ancestor блокирует downstream; worker без starvation оба направления; group merge → корректный пересчёт) | — | пороги M4 из замеров серии 2026-09-14 зафиксированы в PLAN (батч 32, SLO P95 200 с); 501 тест |
 | M5 расширенный цикл | ✅ Gate M5 пройден (§19, этап 4): T5.1 закрыт (Curiosity ranking §5.3.1: score-формула, все входы [0,1] + similarity fingerprint, eligibility filter, ε-diversity (seed в audit), селектор config-driven) + T5.2 закрыт (planning §6.2: план как наблюдаемый артефакт, роль planner, закрытые assessment methods, метод ≠ перефраз, planning.mode config-driven) + T5.3 закрыт (роль verifier §3.7: организованные детерминированные проверки, **схема не несёт grade/confidence — assessment идентичен с verifier и без него (gate)**, verification.mode config-driven) + T5.4 закрыт (защита от повторов §9: перефраз + no-progress → цикл, закрытые стратегии §9, audit repeat_cycle_detected, repetition config-driven) + T5.5 закрыт (untrusted extraction §11.2: модель без инструментов, host-проверка дословности, raw-текст не покидает extractor, extraction config-driven) + T5.6 закрыт (long-run сценарии: накопление знания по FIFO-очереди, §9-цикл на накопленной истории, поздний контрпример → disputed E1 rules engine) | — | 651 тест |
 | M6 Research Proxy | ✅ Gate M6 пройден (§19, этап 5): T6.1 закрыт (research proxy: единственный egress, read-only, SSRF-guard private/loopback/link-local/metadata, редиректы/размер/время, удаление активного содержимого) + T6.2 закрыт (режимы Sealed=локальный индекс / Curated=SearXNG через прокси c upstream-логом и rate limits / Open Lab=закрытый список доменов, отдельный профиль) + T6.3 закрыт (provenance: original+normalized+hash, origin в sources/artifact_chunks, fenced-маркировка в контексте §11.2, research.fetch — единственный egress сессии) + T6.4 закрыт (injection/poisoning: capabilities неизменны, similarity→require_operator, poisoned artifact не самооценивается) | noezema-m6 (после gate) | см. раздел M6 ниже | 651 тест |
-| M7 полный веб + эксплуатация | ⬜ в работе: T7.1 ✅ (knowledge graph + provenance + diagnostics, head-запросы на effective snapshot) | — | см. раздел M7 ниже | |
+| M7 полный веб + эксплуатация | ⬜ в работе: T7.1 ✅ (knowledge graph + provenance + diagnostics, head-запросы на effective snapshot), T7.2 ✅ (backup/PITR §15.3: recovery point + inventory + host-state, restore drill) | — | см. раздел M7 ниже | |
 
 ## Gate M2 (§19, этап 2) — пройден (noezema-m2)
 
@@ -40,7 +40,7 @@
 | 9 | status/timeline/attempts/assessments + auth messages/controls | MVP (dependencies — v1) | ✅ | test_web_api.py + test_web_mvp.py (status+host/timeline+SSE/messages/commands; admin-token auth на Command, queries open; assessment view — M3 memory) + dependencies (v1-часть): test_web_knowledge.py (T7.1: claims/heads по effective snapshot, зависимости в обе стороны §8.6, provenance-навигация source→parent/artifact/группы) |
 | 10 | раздельные messages/stop/abort/controls | MVP | ✅ | test_web_api.py (раздельные endpoints; closed enum; idempotency key; stop/abort флаги сессии) |
 | 11 | нет вслепую-ретраев | MVP | ✅ | test_tool_broker.py (§5.7 retry-классы: pure=2, idempotent=1, non_idempotent/observation=0 без вслепую-ретраев; idempotency key + different hash=incident/alert) + test_llm_gateway.py |
-| 12 | random backup point + root set | v1 | ⬜ | — |
+| 12 | random backup point + root set | v1 | 🔄 T7.2 (root set → T7.3) | backup/PITR-сторона: test_backup_pitr.py (9: create_backup — recovery point `pg_current_wal_lsn()` + content-addressed artifact inventory + host-contour state с явным `host_ops_absent`-evidence, DB CHECK shape/consistency, audit `backup_created` той же tx; restore drill — случайная точка retention window (expired не выбирается), re-hash inventory + всех referenced objects + registry drift check, policy files, boot reconciliation + admission ДО старта runtime (записанный в манифест active head = ожидаемое degraded состояние, сюрприз-хед → failed), `verified_at` только при pass + audit `backup_restore_drill` (outcome/problems), corruption → failed без штампа; CLI `noezemactl backup`/`restore-drill`; diagnostics `backups`-блок). Root set (GC-сторона §15.3) — T7.3 |
 | 13 | partial success на safe boundary | MVP | ✅ | test_orchestrator.py::test_budget_exhausted_partial (succeeded_partial) |
 | 14 | каскадная инвалидация | v1 | ✅ T4.1+T4.2+T4.3+T4.4+T4.5+T4.6+T4.7+T4.8+T4.9 | T4.1 (граф + цикл): test_claim_dependencies.py (unit: cycle check — чистая функция и через apply_claim_staging: циклическое evidential-ребро отклоняется с audit `dependency_edge_rejected`, claim всё же коммитится; research-ребро не в цикле и не двигает graph revision; evidential на non-current цель — отклонено §8.6; bad kind/self/missing/unparseable — отклонены) + test_orchestrator.py (scenario: полный цикл — curator-зависимость коммитится с bump `domain_revisions(dependency_graph)` 0→1 и audit-полями; цикл — ребро отклонено, graph revision не меняется) + test_staging_schema.py (ClaimDependencyProposal: closed kind, UUID, budget ≤10, дубликаты). T4.2 (barrier/closure/manifest): test_cascade.py (8: closure-ходы; inline cascade; idempotent replay; barrier lifecycle + crash-resume; graph-change → new generation; tamper → blocked; retrieval ancestor check; moved graph при старте). T4.3 (worker reassessment_jobs): test_reassessment.py (13: runnable-предикат — activating slot/чужой snapshot/backoff-отсрочка; head promotion через rules engine с audit и knowledge bump; insufficient data → invalid + UUIDv5 question; transient → retry с backoff; permanent → blocked + alert; expired-lease recovery; admission metrics; bounded batch + priority; mid-batch loss admission). T4.4 (writer admission): test_writer_admission.py (14: gate CAS §14.1 — acquire/release/expired-takeover/NOWAIT-конфликт + CHECK holder-полей; session intent — live lease, idempotent, clear, stale-очистка reconciler'ом после fencing; worker — deferral с jitter при gate-конфликте, уступка intent на входе и mid-batch (попытка не сгорает), release после батча; activation берёт gate до pointer; scheduler — T_escalate/T_worker_admission skip `reassessment_backlog`, свежая/blocked очереди не блокируют, fail-closed секция, SLO-метрики). T4.5 (online activation §8.7.2): test_online_activation.py (12: fenced lease — acquire/resume/takeover fence+1; quiesce — gate wait timeout, active session; shadow heads — fast path carry старой оценки / pending + activation jobs; deterministic UUIDv5 вопросы post-publish; atomic flip — pointer + bootstrap immutable; crash resume без смены fence; transient backoff + slot held; exhaustion → post_publish_blocked + alert + repair runner (repair CAS, phase=repair); superseded-закрытие без reactivation; T_repair_admission — skip repair_backlog; sealed-интервал триггер 45000). T4.6 (environment independence §8.7.3): test_env_independence.py unit (17: ключ группы — только (protocol, implementation, dataset lineage), GPU/seed/data order группу не создают; untracked fail-closed; 6 исходов классификации; shared dataset lineage убивает independence; strongest-pair с variation; engine — E3 только через independent_replication ≥2 группы, repeatability/reproducibility/variation не проходят, причины insufficient_independence / independence_*_not_met; unknown relation → ValueError) + scenario (6: полный манифест §14 + manifest_hash + снапшот на оценке; 2 сессии = 1 манифест, нет ложной independence; repeatability — одна группа, E2; другой GPU — reproducibility, гипотеза; независимые implementation'ы — E3; shared lineage — variation + independence_independent_replication_not_met). T4.7 (source graph §11.3): test_source_independence.py unit (10 новых: v2 — content_hash/parent/edge/correction базы; split отменяет прямую edge, но не domain; split бьёт merge (fail-closed); invalid correction игнорируется; unknown lineage; порядок-инвариантность) + scenario test_source_graph.py (6: E3 через два независимых источника + снапшот independence-v2; зеркала одного domain — одна группа; merge correction → head pending + job + ревизия 0→1 → recompute гипотеза (свежий снапшот, audit source_graph_changed); split correction → группы расходятся → E3; unknown lineage — одна группа; staging-commit — снапшот на оценке). T4.8 (counterevidence §8.7.4): test_counter_resolutions.py unit (9: claim_depends_on — транзитивность, циклы, направление) + test_rules_engine.py (+3: resolved counter не cap'ит, только-resolved — не refuted, один unresolved — disputed) + scenario test_counter_resolutions.py (5: disputed E1 с counter'ом; evidence-basis → каскад → E3 + audit; инварианты XOR/counter/scope/транзитивная зависимость/уникальность/DB CHECK; correction-basis → E3, отзыв correction → invalid + disputed; прямая invalidation + idempotent no-op). T4.9 (failpoints): test_failpoints_m4.py (7: crash после flip — pointer tuple + один publish + idempotent resume; crash между батчами — durable cursor, без дублей UUIDv5; stale activator после takeover — fence-отказ без writes; следующий flip закрывает blocked backlog (find_repair_backlog → None); barrier crash после каждого батча — 3 batch audits + 1 resolved; group merge + expired worker lease → recovery + hypothesis на свежем снапшоте; worker завершает после смерти intent-lease). GATE M4: retrieval ancestor check (T4.2) + worker starvation оба направления (T4.4+T4.9) + group merge recompute (T4.7+T4.9) |
 | 15 | pending/invalid не current | MVP | ✅ | test_memory_service.py (lifecycle CHECK: pending/invalid ⇒ assessment/status NULL) + test_context_builder.py/test_retrieval.py (§5.4.2: отдельный лимит pending, метка в той же строке, исключение целиком если не хватает на метку) + test_invariants.py (pending/invalid не подаётся как current) + test_offline_rules.py (deferred→pending, removed-type→invalid) |
@@ -1351,3 +1351,76 @@ bind-параметры (`:p IS NULL` при p=None) — asyncpg не может
 из None; `:p::text` тоже не конвертируется (литеральный `:` уходит в
 ПГ). Паттерн: динамическое WHERE-условие, параметр присутствует только
 когда не None.
+
+**T7.2 закрыт: backup/PITR (§15.3, §22.1 item 12 — backup/restore-сторона).**
+
+`backup_manifests.host_state` (миграция `0018_backup_pitr`, JSONB,
+nullable): состояние host-контура в момент бэкапа — active head
+host-transition (документ head, снятый ПОСЛЕ boot reconciliation,
+т.е. ровно то, что увидит admission при восстановлении), active head
+host-policy-change, все unresolved current records (attempt_id, state,
+event-счётчики), policy-файлы с sha256, policy event-стримы
+(change_id, event_count, terminal), и явное доказательство отсутствия
+обоих активных операций — `host_ops_absent` (DB CHECK: true ⇔ оба
+head null И нет unresolved records; `journal_problem` при
+несоответствии журнала). Legacy-строки (host_state NULL) drill
+отклоняет fail-closed.
+
+`packages/backup/service.py::create_backup` (одна tx, владелец —
+вызывающий, `packages/domain/db/uow.py`): `pg_current_wal_lsn()` →
+inventory ВСЕХ строк `artifacts` (канонический JSON-документ,
+сам хранится как content-addressed объект + registry row, origin
+`backup_inventory`) → host_state → строка манифеста → audit
+`backup_created` (payload: recovery point, inventory hash,
+artifact_count, host_ops_absent).
+
+`packages/backup/restore.py::run_restore_drill` — drill (§15.3:
+«выбирает случайную точку retention window и проверяет все referenced
+hashes», boot reconciliation ДО старта runtime):
+- случайный сохранённый манифест (`retention_until IS NULL OR > now()`,
+  `rng.choice` — инъекция для детерминизма тестов);
+- inventory-документ: re-fetch + re-hash против
+  `artifact_inventory_hash`; каждый объект: re-fetch + re-hash +
+  size (store-resident объекты), registry-only объекты (наблюдательные
+  артефакты сессий — контент в audit trail) проверяются по registry;
+- registry drift: каждый inventory id всё ещё мапится на свой sha;
+- policy-файлы: re-read + re-hash;
+- live re-capture host-контура сверяется с манифестом (head,
+  unresolved records, journal problem);
+- `admission_check` ДО старта runtime: записанный в манифест active
+  head — ОЖИДАЕмое degraded состояние (admission обязан его
+  пометить; сверяем предсказание с вердиктом), сюрприз-хед или
+  молчание admission → `admission_mismatch` → drill failed;
+- pass → `verified_at = now()` + audit `backup_restore_drill`
+  (outcome, счётчики, problems) той же tx; fail → штампа нет,
+  audit с problems.
+
+CLI: `noezemactl backup [--host-lib] [--retention-days]` (exit 1 при
+сбое) и `noezemactl restore-drill` (exit 0 = passed, 1 = failed,
+2 = нет точки в retention window). Diagnostics: `backups`-блок в
+`summary()` (§16.1 backup/restore drill age: total, in_retention,
+oldest, last_verified_at) + карточка Backup/PITR на странице.
+
+Тесты: `tests/scenario/test_backup_pitr.py` (9):
+- create_backup — recovery point (WAL LSN), inventory-документ
+  (re-hash, состав, store-exists), registry row, host_state с active
+  transition head (head/unresolved/policy files sha256/streams),
+  `host_ops_absent=false`, retention_until, `verified_at=NULL`,
+  audit `backup_created`;
+- явное отсутствие host-операций → `host_ops_absent=true`;
+- DB CHECK отклоняет несогласованный host_state (лжёт
+  `host_ops_absent` при присутствующем head);
+- drill: 20 итераций seeded rng — expired backup НИКОГДА не
+  выбирается, выбор действительно случайный, `verified_at` ставится,
+  audit passed;
+- drill: corrupted store-объект → `artifact_hash_mismatch`,
+  outcome failed, `verified_at` NULL, audit failed;
+- drill: registry drift (id→другой sha) → `registry_drift` → failed;
+- drill: boot reconciliation — surprise active head → failed
+  (host_mismatch + admission_mismatch); backup, снятый С active
+  transition → passed, admission `unresolved_host_transition`
+  (предсказание совпало);
+- drill: нет сохранённой точки → `RestoreDrillError`;
+- drill: active host-policy-change head → passed, admission
+  `host_policy_change_in_progress`, event-стрим в inventory
+  (`terminal=false`).

@@ -493,6 +493,9 @@ class AuditEventType(StrEnum):
     RESEARCH_CONTENT_READ = "research_content_read"
     COUNTER_RESOLUTION_INVALIDATED = "counter_resolution_invalidated"
     ALERT_RAISED = "alert_raised"
+    # T7.2 (stage 7, §15.3): backup/PITR
+    BACKUP_CREATED = "backup_created"
+    BACKUP_RESTORE_DRILL = "backup_restore_drill"
 
 
 class AuditVisibility(StrEnum):

@@ -483,5 +483,113 @@ def show_policy(host_lib: str) -> None:
     )
 
 
+@main.command("backup")
+@click.option("--host-lib", type=click.Path(), default=str(DEFAULT_HOST_LIB))
+@click.option("--retention-days", type=int, default=30, show_default=True)
+def backup(host_lib: str, retention_days: int) -> None:
+    """Create one backup manifest: DB recovery point + artifact inventory
+    + host-contour state (§15.3). Root-only; audited."""
+    import asyncio
+    import os
+
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from packages.artifacts.store import FilesystemArtifactStore
+    from packages.backup.service import BackupError, create_backup
+    from packages.domain.db.uow import transaction
+
+    url = os.environ.get("NOEZEMA_DATABASE_URL", "")
+    if not url:
+        click.echo("NOEZEMA_DATABASE_URL is not set", err=True)
+        sys.exit(EXIT_USAGE_ERROR)
+    engine = create_async_engine(url)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    store_root = Path(os.environ.get("NOEZEMA_ARTIFACTS_ROOT", "/var/lib/noezema/artifacts"))
+
+    async def _run() -> int:
+        async with factory() as db, transaction(db):
+            try:
+                result = await create_backup(
+                    db,
+                    FilesystemArtifactStore(store_root),
+                    Path(host_lib),
+                    retention_days=retention_days,
+                    policy_baseline=DEFAULT_BASELINE if DEFAULT_BASELINE.exists() else None,
+                    policy_override=DEFAULT_OVERRIDE if DEFAULT_OVERRIDE.exists() else None,
+                )
+            except BackupError as exc:
+                click.echo(f"backup failed: {exc}", err=True)
+                return 1
+        click.echo(
+            f"backup: id={result['backup_id']} recovery_point="
+            f"{result['database_recovery_point']} inventory="
+            f"{result['artifact_inventory_hash'][:12]} "
+            f"host_ops_absent={result['host_state']['host_ops_absent']}"
+        )
+        return 0
+
+    try:
+        code = asyncio.run(_run())
+    finally:
+        asyncio.run(engine.dispose())
+    sys.exit(code)
+
+
+@main.command("restore-drill")
+@click.option("--host-lib", type=click.Path(), default=str(DEFAULT_HOST_LIB))
+def restore_drill(host_lib: str) -> None:
+    """Run one restore drill on a random retained backup point (§15.3):
+    verify every referenced hash + boot reconciliation/admission before
+    the runtime would start. Exit 0 = passed, 1 = failed, 2 = no usable
+    backup point."""
+    import asyncio
+    import os
+    import random
+
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from packages.artifacts.store import FilesystemArtifactStore
+    from packages.backup.restore import RestoreDrillError, run_restore_drill
+    from packages.domain.db.uow import transaction
+
+    url = os.environ.get("NOEZEMA_DATABASE_URL", "")
+    if not url:
+        click.echo("NOEZEMA_DATABASE_URL is not set", err=True)
+        sys.exit(EXIT_USAGE_ERROR)
+    engine = create_async_engine(url)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    store_root = Path(os.environ.get("NOEZEMA_ARTIFACTS_ROOT", "/var/lib/noezema/artifacts"))
+
+    async def _run() -> int:
+        async with factory() as db, transaction(db):
+            try:
+                drill = await run_restore_drill(
+                    db,
+                    FilesystemArtifactStore(store_root),
+                    Path(host_lib),
+                    policy_baseline=DEFAULT_BASELINE if DEFAULT_BASELINE.exists() else None,
+                    policy_override=DEFAULT_OVERRIDE if DEFAULT_OVERRIDE.exists() else None,
+                    rng=random.Random(),
+                )
+            except RestoreDrillError as exc:
+                click.echo(str(exc), err=True)
+                return 2
+        click.echo(f"restore-drill: outcome={drill.outcome} backup={drill.backup_id}")
+        for problem in drill.problems:
+            click.echo(f"  problem: {problem}", err=True)
+        click.echo(
+            f"  inventory={drill.inventory_ok}/{drill.inventory_checked} "
+            f"policy_files={drill.policy_files_ok}/{drill.policy_files_checked} "
+            f"admission_ok={drill.admission['ok']}"
+        )
+        return 0 if drill.outcome == "passed" else 1
+
+    try:
+        code = asyncio.run(_run())
+    finally:
+        asyncio.run(engine.dispose())
+    sys.exit(code)
+
+
 if __name__ == "__main__":
     main()

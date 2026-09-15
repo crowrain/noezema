@@ -296,6 +296,12 @@ async function tick(){
         : '') +
       ` · gate: ${s.writer_gate && s.writer_gate.owner_id ? esc(s.writer_gate.owner_id) : 'свободен'}` +
       ` · ревизии: ${Object.entries(s.revisions||{}).map(([k,v]) => k+'='+v).join(' · ')}</div>`;
+    const bk = s.backups || {total: 0};
+    const lastDrill = bk.last_verified_at
+      ? ` · последний restore drill: ${bk.last_verified_at.slice(0,19)}`
+      : ' · restore drill ещё не был';
+    h += `<div class="card"><b>Backup/PITR:</b> `+
+      `всего ${bk.total}, в retention ${bk.in_retention ?? 0}` + lastDrill + `</div>`;
     const un = rec.unresolved;
     h += `<div class="card"><b class="${un?'bad':'ok'}">Рекомендация/коммит:</b> `+
       (un ? 'есть нерешённые commit_attempts — блокируют wake и GC' : 'нерешённых попыток нет');

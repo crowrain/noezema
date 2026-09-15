@@ -74,6 +74,17 @@ async def summary(db: AsyncSession) -> JsonDict:
         "FROM runtime_config_heads WHERE scope = 'global'",
         {},
     )
+    # backup/PITR age (§16.1: backup и restore drill age)
+    backups = await _rows(
+        db,
+        "SELECT count(*)::int AS total, "
+        "count(*) FILTER (WHERE retention_until IS NULL OR retention_until > now())::int "
+        "AS in_retention, "
+        "min(created_at) AS oldest_backup_at, "
+        "max(verified_at) AS last_verified_at "
+        "FROM backup_manifests",
+        {},
+    )
     gate = await _rows(
         db,
         "SELECT owner_kind, owner_id, priority, acquired_at, lease_expires_at "
@@ -122,6 +133,16 @@ async def summary(db: AsyncSession) -> JsonDict:
                 "lease_expires_at": _iso(gate_row["lease_expires_at"]),
             }
             if gate_row is not None
+            else None
+        ),
+        "backups": (
+            {
+                "total": backups[0]["total"],
+                "in_retention": backups[0]["in_retention"],
+                "oldest_backup_at": _iso(backups[0]["oldest_backup_at"]),
+                "last_verified_at": _iso(backups[0]["last_verified_at"]),
+            }
+            if backups
             else None
         ),
         "revisions": {r["scope"]: r["revision"] for r in revisions},
