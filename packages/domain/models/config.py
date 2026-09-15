@@ -46,6 +46,8 @@ class ORMConfigSnapshot(Base):
     # T5.3 (stage 4): verification section (mode "off" | "llm",
     # max_checks) — pinned in the snapshot
     verification: Mapped[JsonDict | None] = mapped_column(JSONB, nullable=True)
+    # T5.4 (stage 4): repetition section (§9) — pinned in the snapshot
+    repetition: Mapped[JsonDict | None] = mapped_column(JSONB, nullable=True)
     token_budgets: Mapped[JsonDict] = mapped_column(JSONB, nullable=False)
     session_limits: Mapped[JsonDict] = mapped_column(JSONB, nullable=False)
     activation_limits: Mapped[JsonDict] = mapped_column(JSONB, nullable=False)

@@ -8,6 +8,8 @@ config-driven so the switch is a config change, not a rewrite.
 
 from __future__ import annotations
 
+import uuid
+
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.domain.models.enums import QuestionOrigin, QuestionState
@@ -18,8 +20,12 @@ from packages.domain.repositories.questions import QuestionRepository
 class FIFOQuestionSelector:
     """Select the next question: highest priority, oldest first."""
 
-    async def select(self, db: AsyncSession) -> ORMQuestion | None:
-        candidates = await QuestionRepository.list_candidates(db, limit=1)
+    async def select(
+        self,
+        db: AsyncSession,
+        exclude_ids: frozenset[uuid.UUID] | None = None,
+    ) -> ORMQuestion | None:
+        candidates = await QuestionRepository.list_candidates(db, limit=1, exclude_ids=exclude_ids)
         if not candidates:
             return None
         question = candidates[0]

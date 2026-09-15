@@ -480,6 +480,9 @@ class AuditEventType(StrEnum):
     # checks; never assigns grade/confidence — §3.7)
     VERIFICATION_COMPLETED = "verification_completed"
     VERIFICATION_FALLBACK = "verification_fallback"
+    # T5.4 (stage 4): protection against semantic repetition (§9)
+    REPEAT_CYCLE_DETECTED = "repeat_cycle_detected"
+    QUESTION_DEFERRED = "question_deferred"
     COUNTER_RESOLUTION_INVALIDATED = "counter_resolution_invalidated"
     ALERT_RAISED = "alert_raised"
 

@@ -12,7 +12,7 @@
 | M2 изоляция + commit | ✅ выполнена | noezema-m2 | PR #11–#16: sandbox+runtime, policy engine, tool broker, artifact store+staging+freeze, commit boundary (prepared→fenced final tx) + reconciliation; gate пройден: 206 тестов, failpoints (kill до/после COMMIT, open final tx, stale finalizer, kill mid-action), security (сеть off, cap-drop, injection, ro rootfs) |
 | M3 память + web slice (MVP) | ✅ Gate M3 пройден (T3.29 закрыл пункт 1 §22.1); T3.30 — дефект lease из первой реальной сессии | noezema-m3 (на `ec6b4b0`, T3.29 — закрытие gate); noezema-mvp остаётся на `5d94b27` (создан до T3.29 — см. раздел Gate M3) | PR #17: память — модель (0004), evidence identity (§14.3), rules engine v1, independence (PSL+overlap), lifecycle heads (§14.1), apply в fenced tx. PR #18: context pack §5.4 + retrieval (fulltext russian, pending/invalid — отдельный лимит и метка в той же строке §5.4.2). PR #19: host recovery — noezemactl CLI, recovery policy schema v1 (jitter=0, JCS-хэш), fsync-safe transition journal + head + boot reconcile, offline rules (advisory lock, cohort+seal, atomic publish с UUIDv5 invalid-вопросами), fail-closed admission, resume-классификация (transient→retry_wait/0, permanent→resume_blocked/78, unclassified→degraded) + idempotent audit replay, policy change head + event stream, unit-state publisher, systemd units + CI-verify. PR #20: web slice — Query/Command + admin-token auth, fail-closed Command API на нездоровом hostе (423), SSE timeline (committed outbox + max_events), session detail, message TTL→expired, Host Status Adapter (recovery banner: none/retry_wait/degraded/blocked), минимальные HTML-страницы main/session. PR #21: failpoints/инварианты/resume/scenario-тесты. T3.29: wake scheduling + wake admission + backoff/pause (§5.2.1, пункт 1 §22.1): `wake_schedule` в snapshot (миграция 0005) + `wake_scheduler_state`, `noezemactl wake-tick` + `noezema-wake.timer`, admission (6 gates, skip с точной причиной в audit `wake_skipped`), экспоненциальный backoff, авто-pause после 3 неудач, wake_now — без расписания но с admission. T3.30: фоновый heartbeat lease во время долгих LLM-вызовов + `clock_timestamp()` в lease (дефект из первой реальной MVP-сессии — см. раздел ниже); 374 тест |
 | M4 зависимости + переоценка | ✅ T4.1 закрыт (claim_dependencies: DAG cycle check при commit, graph revision, kind `research` по §8.6); T4.2 закрыт (cascade invalidation: closure manifest, barrier с durable курсором, idempotent батчи, blocked-путь, retrieval ancestor check); T4.3 закрыт (worker `system:reassessment`: runnable-предикат §5.9.1, lease/retry/blocked, insufficient→invalid+question, crash-lease recovery); T4.4 закрыт (writer admission: table gate §14.1 NOWAIT + jitter, session intent rules 1/4/5, T_escalate/T_worker_admission в scheduler); T4.5 закрыт (online activation §8.7.2: fenced lease + takeover, shadow heads fast path/pending, seal + DB-триггер sealed-интервала, atomic flip, post-publish manifest с deterministic UUIDv5, repair runner + T_repair_admission); T4.6 закрыт (environment manifests §14 env-v2: content-addressed manifest_hash, versioned алгоритм env-independence-v1 — группы по (protocol, implementation, dataset lineage), отношения repeatability/reproducibility/independent_replication/variation/untracked, снапшот на оценке, `required_independence` в rules engine: E3 только через независимую репликацию); T4.7 закрыт (source graph §11.3: таблицы source_dependency_edges/source_graph_corrections, алгоритм independence-v2 — domain/content_hash/parent/edges/corrections, снапшот source_independence_* на оценке, каскад apply_source_graph_change: merge/split → invalidation + recompute, ревизия source_graph); T4.8 закрыт (counterevidence resolutions §8.7.4: таблица + XOR/partial-unique CHECK, межстрочные инварианты (counter-цель, scope-compat, нет транзитивной зависимости, valid correction), каскад create/invalidate → recompute, engine считает только unresolved counters); T4.9 закрыт (failpoints M4: crash после flip — pointer tuple recovery, crash между батчами post-publish — durable cursor, stale activator после takeover — fence-отказ, следующий flip закрывает blocked backlog, barrier crash после каждого батча, group merge + crash worker'а, worker без starvation после смерти intent-lease) — GATE M4 пройден (§19: invalid ancestor блокирует downstream; worker без starvation оба направления; group merge → корректный пересчёт) | — | пороги M4 из замеров серии 2026-09-14 зафиксированы в PLAN (батч 32, SLO P95 200 с); 501 тест |
-| M5 расширенный цикл | 🔄 T5.1 закрыт (Curiosity ranking §5.3.1: score-формула, все входы [0,1] + similarity fingerprint, eligibility filter, ε-diversity (seed в audit), селектор config-driven) + T5.2 закрыт (planning §6.2: план как наблюдаемый артефакт, роль planner, закрытые assessment methods, метод ≠ перефраз, planning.mode config-driven) + T5.3 закрыт (роль verifier §3.7: организованные детерминированные проверки, **схема не несёт grade/confidence — assessment идентичен с verifier и без него (gate)**, fallback на no-op, verification.mode config-driven) | — | v1-решения T5.3: отчёт верификатора — предложение для куратора, не оценка; без инструментов; 547 тест |
+| M5 расширенный цикл | 🔄 T5.1 закрыт (Curiosity ranking §5.3.1: score-формула, все входы [0,1] + similarity fingerprint, eligibility filter, ε-diversity (seed в audit), селектор config-driven) + T5.2 закрыт (planning §6.2: план как наблюдаемый артефакт, роль planner, закрытые assessment methods, метод ≠ перефраз, planning.mode config-driven) + T5.3 закрыт (роль verifier §3.7: организованные детерминированные проверки, **схема не несёт grade/confidence — assessment идентичен с verifier и без него (gate)**, verification.mode config-driven) + T5.4 закрыт (защита от повторов §9: перефраз + no-progress → цикл, закрытый список стратегий §9, детерминированная ротация, audit repeat_cycle_detected, repetition config-driven) | — | v1-решения T5.4: детекция Jaccard (без LLM), план-циклы — follow-up; 559 тест |
 | M6 Research Proxy | ⬜ не начата | — | |
 | M7 полный веб + эксплуатация | ⬜ не начата | — | |
 
@@ -977,6 +977,54 @@ model_runs phase=verifying, в документе нет grade/confidence;
 идентичен с «восторженным» verifier и без него**; висящий
 evidence-индекс → fallback + audit, сессия SUCCEEDED; сверхбюджетный
 → fallback max_checks; off-mode — ни одного verifier-вызова). 547
+тест.
+
+**Закрыто T5.4 (защита от семантических повторов, §9, этап 4)** —
+`packages/cognition/repetition.py` + guard в выборе вопроса
+оркестратора:
+- детектор цикла (детерминированный, без LLM): кандидат =
+  **перефраз уже исследованного вопроса** (Jaccard по word set —
+  тот же fingerprint-семей, что curiosity, §5.3.1:
+  `repeat-jaccard-v1`, порог из конфига) **И** число
+  последовательных сессий на похожем вопросе без нового проверяемого
+  результата (без нового claim; сессия с claim сбрасывает счётчик)
+  достигло `no_progress_limit` → цикл;
+- при цикле хост выбирает **стратегию из закрытого списка §9**
+  (детерминированная ротация по числу no-progress-сессий — «не
+  случайный текстовый толчок»): compare_previous_session /
+  opposite_hypothesis / change_source_type / experiment (→
+  host-сгенерированная секция в explorer-контекст) /
+  defer_question / choose_different_area (→ вопрос откладывается в
+  deferred + выбор следующего кандидата, selector получает
+  exclude_ids);
+- наблюдаемость: audit `repeat_cycle_detected` (question, similar
+  question, similarity, no_progress_sessions, cycle_count, strategy,
+  fingerprint) + audit `question_deferred`;
+- guard применяется только к автономному выбору (явный
+  question_id оператора не пропускается); лимит 10 повторных
+  отборов;
+- config: секция `repetition` в snapshot (`enabled`,
+  `rephrase_threshold`, `plan_cycle_threshold`,
+  `no_progress_limit`); bootstrap = disabled (MVP FIFO не меняется),
+  NULL-секция = disabled (fail-closed, как curiosity); включение —
+  online config change; миграция 0015.
+
+v1-решение (STATUS): «циклы между одинаковыми планами» §9 не
+детектируются на план-уровне в v1 (план формируется после выбора
+вопроса; сравнение планов потребует guard в plan-фазе) — покрывается
+пара «перефраз + no-progress» (план — наблюдаемый артефакт T5.2;
+сравнение по нему — кандидат на follow-up); `plan_cycle_threshold`
+зафиксирован в конфиге как зарезервированный вход.
+
+Тесты: `tests/unit/test_repetition.py` (7: fail-closed конфиг,
+closed-список стратегий в порядке §9, детерминированная ротация
+(включая обход списка), skip-стратегии, host-заметки) +
+`tests/scenario/test_repetition_guard.py` (5: disabled-by-default —
+MVP-выбор не меняется; cycle → audit + note-стратегия
+(compare_previous_session при no_progress=limit); defer-стратегия
+(no_progress=limit+4) — вопрос deferred + выбран следующий
+кандидат + audit question_deferred; сессия с claim сбрасывает
+счётчик (цикла нет); все кандидаты пропущены → no_question). 559
 тест.
 
 Merge в `main` — отдельное решение пользователя (не выполняется

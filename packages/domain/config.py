@@ -93,6 +93,18 @@ BOOTSTRAP_PAYLOAD: dict[str, Any] = {
     # report falls back to the no-op phase, never a session failure).
     # The report never carries a grade/confidence (§3.7).
     "verification": {"mode": "off", "max_checks": 8},
+    # T5.4 (stage 4): protection against semantic repetition (§9).
+    # enabled=false keeps the MVP selection unchanged; rephrase =
+    # Jaccard over the host word set (deterministic, no LLM); a cycle
+    # = rephrase of an already-investigated question + no_progress
+    # consecutive sessions without a new claim → a strategy from the
+    # closed §9 list (deterministic rotation, audited).
+    "repetition": {
+        "enabled": False,
+        "rephrase_threshold": 0.6,
+        "plan_cycle_threshold": 0.5,
+        "no_progress_limit": 2,
+    },
     # T5.1 (§5.3.1): the selector is config-driven — the MVP default stays
     # FIFO; a config change to "curiosity" enables the score-based ranking
     # (weights, thresholds, ε/M/δ and the similarity fingerprint below are

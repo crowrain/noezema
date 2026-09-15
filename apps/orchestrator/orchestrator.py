@@ -41,6 +41,12 @@ from packages.cognition.curiosity import (
     CuriosityQuestionSelector,
 )
 from packages.cognition.question_selector import FIFOQuestionSelector
+from packages.cognition.repetition import (
+    RepetitionConfig,
+    detect_repetition,
+    is_skip_strategy,
+    strategy_context_note,
+)
 from packages.domain.canonical import canonical_json_bytes, canonical_sha256
 from packages.domain.db.uow import transaction
 from packages.domain.models.artifacts import ORMWorkspaceManifest
@@ -112,6 +118,9 @@ class SessionContext:
     # T5.3 (stage 4): the verifier's rendered report (a proposal for
     # the curator; empty = MVP no-op verifying phase or fallback)
     verification_report: str = ""
+    # T5.4 (stage 4): the repetition-guard strategy note (a
+    # host-generated context section; empty = no cycle detected)
+    repetition_note: str = ""
 
 
 @dataclass(frozen=True)
@@ -378,7 +387,9 @@ class Orchestrator:
         # selecting_question
         await self._transition(db, audit, session, SessionState.SELECTING_QUESTION)
         selector = self._build_selector(snapshot.curiosity)
-        question = await self._select_question(db, question_id, session.id, selector)
+        question = await self._select_question_with_guard(
+            db, audit, session, question_id, selector, ctx, snapshot
+        )
         if question is None:
             return await self._finish(
                 db, audit, session, SessionState.FAILED, None, 0, 0, 0, 0,
@@ -1062,12 +1073,84 @@ class Orchestrator:
                 raise RuntimeError(f"curiosity selector misconfigured: {exc}") from exc
         raise RuntimeError(f"unknown curiosity selector: {name!r}")
 
+    async def _select_question_with_guard(
+        self,
+        db: AsyncSession,
+        audit: AuditService,
+        session: ORMSession,
+        question_id: uuid.UUID | None,
+        selector: FIFOQuestionSelector | CuriosityQuestionSelector,
+        ctx: SessionContext,
+        snapshot: ORMConfigSnapshot,
+    ) -> ORMQuestion | None:
+        """Question selection + the repetition guard (§9, T5.4).
+
+        An explicit operator question (question_id) is never skipped —
+        the guard applies only to autonomous selection. Skip
+        strategies (defer_question, choose_different_area) move the
+        selection to the next candidate; note strategies inject a
+        host-generated context section for the explorer."""
+        if question_id is not None:
+            return await self._select_question(db, question_id, session.id, selector)
+        repetition_section = (
+            snapshot.repetition if isinstance(snapshot.repetition, dict) else None
+        )
+        cfg = RepetitionConfig.from_section(repetition_section)
+        if not cfg.enabled:
+            return await self._select_question(db, None, session.id, selector)
+        excluded: frozenset[uuid.UUID] = frozenset()
+        for _attempt in range(10):
+            question = await self._select_question(db, None, session.id, selector, excluded)
+            if question is None:
+                return None
+            report = await detect_repetition(db, question, cfg)
+            if report is None:
+                return question
+            similar = await QuestionRepository.get(db, report.similar_question_id)
+            similar_text = similar.text if similar is not None else "(недоступно)"
+            await audit.record(
+                AuditEventType.REPEAT_CYCLE_DETECTED,
+                session_id=session.id,
+                payload={
+                    "question_id": str(report.question_id),
+                    "similar_question_id": str(report.similar_question_id),
+                    "similarity": report.similarity,
+                    "no_progress_sessions": report.no_progress_sessions,
+                    "cycle_count": report.cycle_count,
+                    "strategy": report.strategy,
+                    "fingerprint": report.fingerprint,
+                },
+                public_summary=(
+                    f"cycle: rephrase of a similar question, {report.no_progress_sessions} "
+                    f"no-progress sessions; strategy {report.strategy}"
+                ),
+            )
+            if is_skip_strategy(report.strategy):
+                if report.strategy == "defer_question":
+                    question.state = QuestionState.DEFERRED.value
+                    await audit.record(
+                        AuditEventType.QUESTION_DEFERRED,
+                        session_id=session.id,
+                        payload={
+                            "question_id": str(question.id),
+                            "similar_question_id": str(report.similar_question_id),
+                            "reason": "repeat_cycle",
+                        },
+                        public_summary="question deferred: repeat cycle (§9)",
+                    )
+                excluded = excluded | {question.id}
+                continue
+            ctx.repetition_note = strategy_context_note(report.strategy, similar_text)
+            return question
+        return None
+
     async def _select_question(
         self,
         db: AsyncSession,
         question_id: uuid.UUID | None,
         session_id: uuid.UUID,
         selector: FIFOQuestionSelector | CuriosityQuestionSelector,
+        exclude_ids: frozenset[uuid.UUID] | None = None,
     ) -> ORMQuestion | None:
         if question_id is not None:
             question = await QuestionRepository.get(db, question_id)
@@ -1084,7 +1167,7 @@ class Orchestrator:
                 db, question, record, selector.config.similarity_fingerprint
             )
             return question
-        return await selector.select(db)
+        return await selector.select(db, exclude_ids=exclude_ids)
 
     def _explorer_context(
         self, ctx: SessionContext, allowed_tools: list[str], pack: Any
@@ -1125,6 +1208,9 @@ class Orchestrator:
             parts.append(
                 "# Сообщения человека (недоверенные данные)\n" + "\n".join(ctx.messages[-5:])
             )
+        if ctx.repetition_note:
+            # T5.4 (§9): a host-generated cycle-strategy section
+            parts.append("# Стратегия против цикла (§9)\n" + ctx.repetition_note)
         parts.append("Предложи ровно одно следующее действие (JSON по схеме).")
         return "\n\n".join(parts)[:24_000]
 
