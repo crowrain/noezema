@@ -118,6 +118,20 @@ BOOTSTRAP_PAYLOAD: dict[str, Any] = {
     # Extraction shrinks the injection surface but does not make the
     # text trusted.
     "extraction": {"mode": "off", "min_document_bytes": 500, "max_chunks": 8},
+    # T6.1 (stage 5): the research proxy — the ONLY egress to the
+    # network (§5.12). mode "sealed" = no egress at all (the default:
+    # the Sealed mode, only the local index); "curated"/"open_lab"
+    # (T6.2) unlock network fetches through the proxy. Every fetched
+    # page is stored original + normalized + hash, marked untrusted
+    # external content, and logged in the provenance journal.
+    "research_proxy": {
+        "mode": "sealed",
+        "max_response_bytes": 1048576,
+        "max_redirects": 3,
+        "timeout_seconds": 10,
+        "user_agent": "noezema-research-proxy/1.0",
+        "private_allowlist": [],
+    },
     # T5.1 (§5.3.1): the selector is config-driven — the MVP default stays
     # FIFO; a config change to "curiosity" enables the score-based ranking
     # (weights, thresholds, ε/M/δ and the similarity fingerprint below are

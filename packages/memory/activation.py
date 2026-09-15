@@ -290,13 +290,13 @@ async def upsert_online_candidate(
                         model, embeddings, prompts, policy, curiosity,
                         token_budgets, session_limits, activation_limits, claim_type_rules,
                         wake_schedule, reassessment_admission, repair_admission,
-                        planning, verification, repetition, extraction
+                        planning, verification, repetition, extraction, research_proxy
                     ) VALUES (
                         :id, :base, :payload_sha, :sha, 'online', 'draft',
                         :model, :embeddings, :prompts, :policy, :curiosity,
                         :token_budgets, :session_limits, :activation_limits, :claim_type_rules,
                         :wake_schedule, :reassessment_admission, :repair_admission,
-                        :planning, :verification, :repetition, :extraction
+                        :planning, :verification, :repetition, :extraction, :research_proxy
                     )
                     ON CONFLICT (base_snapshot_id, payload_sha256)
                     WHERE activation_mode = 'online'
@@ -343,6 +343,11 @@ async def upsert_online_candidate(
                     ),
                     "extraction": _json(
                         requested_payload.get("extraction", base_snapshot.extraction)
+                    ),
+                    "research_proxy": _json(
+                        requested_payload.get(
+                            "research_proxy", base_snapshot.research_proxy
+                        )
                     ),
                 },
             )
