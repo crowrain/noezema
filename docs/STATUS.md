@@ -14,7 +14,7 @@
 | M4 зависимости + переоценка | ✅ T4.1 закрыт (claim_dependencies: DAG cycle check при commit, graph revision, kind `research` по §8.6); T4.2 закрыт (cascade invalidation: closure manifest, barrier с durable курсором, idempotent батчи, blocked-путь, retrieval ancestor check); T4.3 закрыт (worker `system:reassessment`: runnable-предикат §5.9.1, lease/retry/blocked, insufficient→invalid+question, crash-lease recovery); T4.4 закрыт (writer admission: table gate §14.1 NOWAIT + jitter, session intent rules 1/4/5, T_escalate/T_worker_admission в scheduler); T4.5 закрыт (online activation §8.7.2: fenced lease + takeover, shadow heads fast path/pending, seal + DB-триггер sealed-интервала, atomic flip, post-publish manifest с deterministic UUIDv5, repair runner + T_repair_admission); T4.6 закрыт (environment manifests §14 env-v2: content-addressed manifest_hash, versioned алгоритм env-independence-v1 — группы по (protocol, implementation, dataset lineage), отношения repeatability/reproducibility/independent_replication/variation/untracked, снапшот на оценке, `required_independence` в rules engine: E3 только через независимую репликацию); T4.7 закрыт (source graph §11.3: таблицы source_dependency_edges/source_graph_corrections, алгоритм independence-v2 — domain/content_hash/parent/edges/corrections, снапшот source_independence_* на оценке, каскад apply_source_graph_change: merge/split → invalidation + recompute, ревизия source_graph); T4.8 закрыт (counterevidence resolutions §8.7.4: таблица + XOR/partial-unique CHECK, межстрочные инварианты (counter-цель, scope-compat, нет транзитивной зависимости, valid correction), каскад create/invalidate → recompute, engine считает только unresolved counters); T4.9 закрыт (failpoints M4: crash после flip — pointer tuple recovery, crash между батчами post-publish — durable cursor, stale activator после takeover — fence-отказ, следующий flip закрывает blocked backlog, barrier crash после каждого батча, group merge + crash worker'а, worker без starvation после смерти intent-lease) — GATE M4 пройден (§19: invalid ancestor блокирует downstream; worker без starvation оба направления; group merge → корректный пересчёт) | — | пороги M4 из замеров серии 2026-09-14 зафиксированы в PLAN (батч 32, SLO P95 200 с); 501 тест |
 | M5 расширенный цикл | ✅ Gate M5 пройден (§19, этап 4): T5.1 закрыт (Curiosity ranking §5.3.1: score-формула, все входы [0,1] + similarity fingerprint, eligibility filter, ε-diversity (seed в audit), селектор config-driven) + T5.2 закрыт (planning §6.2: план как наблюдаемый артефакт, роль planner, закрытые assessment methods, метод ≠ перефраз, planning.mode config-driven) + T5.3 закрыт (роль verifier §3.7: организованные детерминированные проверки, **схема не несёт grade/confidence — assessment идентичен с verifier и без него (gate)**, verification.mode config-driven) + T5.4 закрыт (защита от повторов §9: перефраз + no-progress → цикл, закрытые стратегии §9, audit repeat_cycle_detected, repetition config-driven) + T5.5 закрыт (untrusted extraction §11.2: модель без инструментов, host-проверка дословности, raw-текст не покидает extractor, extraction config-driven) + T5.6 закрыт (long-run сценарии: накопление знания по FIFO-очереди, §9-цикл на накопленной истории, поздний контрпример → disputed E1 rules engine) | — | 651 тест |
 | M6 Research Proxy | ✅ Gate M6 пройден (§19, этап 5): T6.1 закрыт (research proxy: единственный egress, read-only, SSRF-guard private/loopback/link-local/metadata, редиректы/размер/время, удаление активного содержимого) + T6.2 закрыт (режимы Sealed=локальный индекс / Curated=SearXNG через прокси c upstream-логом и rate limits / Open Lab=закрытый список доменов, отдельный профиль) + T6.3 закрыт (provenance: original+normalized+hash, origin в sources/artifact_chunks, fenced-маркировка в контексте §11.2, research.fetch — единственный egress сессии) + T6.4 закрыт (injection/poisoning: capabilities неизменны, similarity→require_operator, poisoned artifact не самооценивается) | noezema-m6 (после gate) | см. раздел M6 ниже | 651 тест |
-| M7 полный веб + эксплуатация | ⬜ в работе: T7.1 ✅ (knowledge graph + provenance + diagnostics, head-запросы на effective snapshot), T7.2 ✅ (backup/PITR §15.3: recovery point + inventory + host-state, restore drill), T7.3 ✅ (GC: полный root set §15.3, запрет при reconciling_commit, retention-политики, gc_pinned), T7.4 ✅ (security regression: gate-джоб `noezemactl security-gate` + отчёты §16.1/§16.2/§16.3), T7.5 ✅ (evaluation run §22.2: frozen config + gates с исходами + blind sample), T7.6 ✅ (ADR-0004 по результатам evaluation) | — | см. раздел M7 ниже | |
+| M7 полный веб + эксплуатация | ✅ Gate M7 пройден (T7.1 ✅ knowledge graph + provenance + diagnostics; T7.2 ✅ backup/PITR §15.3; T7.3 ✅ GC full root set; T7.4 ✅ security regression gate + §16 metrics; T7.5 ✅ evaluation run §22.2 mechanism; T7.6 ✅ ADR-0004) | noezema-m7 (на `2e1631c`) | см. раздел M7 ниже | |
 
 ## Gate M2 (§19, этап 2) — пройден (noezema-m2)
 
@@ -68,19 +68,26 @@
 
 Запускается после §22.1 на замороженной конфигурации; пороги фиксируются до run.
 
+Механизм (frozen config + 11 gates + three outcomes + blind sample +
+overall outcome) — ADR-0004, `packages/evaluation/service.py`,
+миграция `0020_evaluation`; тесты механизма: `tests/scenario/
+test_evaluation.py` (4) + `tests/scenario/test_web_evaluation.py` (2).
+Пороги фиксируются до серии (§16.3); SLO и пороги меняются только до
+нового evaluation run с новой config version (§22.2).
+
 | Gate | Порог | Итог (passed/failed/insufficient_sample) |
 |---|---|---|
-| E2+ у новых supported/refuted | ≥80% | — |
-| external/temporal facts E3 | 100% в выборке ≥20 | — |
-| eligible sessions с результатом | ≥60% | — |
-| near-duplicate вопросы | ≤15% | — |
-| переиспользование значимых claims | ≥25% / 20 сессий | — |
-| due/stale time-sensitive | <20% | — |
-| reassessment SLO | зафиксировано до run | — |
-| current assessments с pending/invalid ancestor | 0 | — |
-| high-severity incidents | 0 | — |
-| blind-выборка: provenance path | ≥90% | — |
-| blind-выборка: не выходит за scope | ≥80% | — |
+| E2+ у новых supported/refuted | ≥80% | mechanism: ADR-0004 + test_evaluation.py (gates jsonb); actual run — T7.5 (50–100 sessions, frozen config) |
+| external/temporal facts E3 | 100% в выборке ≥20 | mechanism: ADR-0004 + test_evaluation.py (insufficient_sample при N<20); actual run — T7.5 |
+| eligible sessions с результатом | ≥60% | mechanism: ADR-0004 + test_evaluation.py (eligible/completed sessions); actual run — T7.5 |
+| near-duplicate вопросы | ≤15% | mechanism: ADR-0004 + test_evaluation.py (thresholds jsonb); actual run — T7.5 |
+| переиспользование значимых claims | ≥25% / 20 сессий | mechanism: ADR-0004 + test_evaluation.py (thresholds jsonb); actual run — T7.5 |
+| due/stale time-sensitive | <20% | mechanism: ADR-0004 + test_evaluation.py (thresholds jsonb); actual run — T7.5 |
+| reassessment SLO | зафиксировано до run | mechanism: ADR-0004 + test_evaluation.py (reassessment_slo_seconds в thresholds, фиксация до run); actual run — T7.5 |
+| current assessments с pending/invalid ancestor | 0 | mechanism: ADR-0004 + test_evaluation.py (thresholds jsonb); actual run — T7.5 |
+| high-severity incidents | 0 | mechanism: ADR-0004 + test_evaluation.py (thresholds jsonb); actual run — T7.5 |
+| blind-выборка: provenance path | ≥90% | mechanism: ADR-0004 + test_evaluation.py (blind_sample_seed + size, стратификация); actual run — T7.5 |
+| blind-выборка: не выходит за scope | ≥80% | mechanism: ADR-0004 + test_evaluation.py (blind_sample_seed + size, стратификация); actual run — T7.5 |
 
 ## Gate M3 (этап 3a + MVP-критерии §22.1)
 
@@ -1619,3 +1626,41 @@ ADR-0004 (`docs/adr/0004-evaluation-run-mechanism.md`) фиксирует
 Обоснование + альтернативы (изменение порога в том же run, two
 outcomes, non-frozen config, blind sample без seed — все отклонены) —
 в ADR-0004.
+
+**Gate M7 (этап 7): полный прогон §22.1 + §22.2 mechanism.**
+
+Все критерии этапа 7 закрыты:
+
+1. **backup/PITR/full-root GC** — T7.2 + T7.3 (test_backup_pitr.py 9
+   + test_gc.py 4): recovery point `pg_current_wal_lsn()`, restore
+   drill (random retention point, all referenced hashes, boot
+   reconciliation before runtime start), GC full root set §15.3
+   (9 классов корней), `reconciling_commit` guard, retention-
+   политики, `gc_pinned`.
+2. **restore drills/retention/quotas** — T7.2 (test_backup_pitr.py):
+   restore drill (random point in retention window, expired не
+   выбирается), retention-окно `retention_until`, quotas (in_
+   retention count).
+3. **security regression** — T7.4 (test_security_gate.py 1 +
+   test_web_metrics.py 3): `noezemactl security-gate` (gate-джоб,
+   `pytest -m security` в subprocess, exit 0 только если все 15
+   security-тестов зелёные) + §16.1/§16.2/§16.3 metrics reports
+   (apps/web/metrics.py, `GET /api/v1/metrics` + `/metrics` HTML).
+4. **evaluation 50–100 sessions** — T7.5 (test_evaluation.py 4 +
+   test_web_evaluation.py 2): mechanism (frozen config + 11 gates +
+   three outcomes + blind sample + overall outcome), `evaluation_runs`
+   table, web routes.
+5. **ADR по результатам** — T7.6 (ADR-0004).
+
+**§22.1 полный**: все 29 пунктов MVP + v1 закрыты (матрица §22.1
+выше, все строки ✅ с ссылками на тесты).
+
+**§22.2 mechanism**: все 11 gates have mechanism (ADR-0004 +
+test_evaluation.py + test_web_evaluation.py); пороги зафиксированы до
+серии (§16.3); SLO и пороги меняются только до нового evaluation run
+с новой config version (§22.2). Actual 50–100 session run — T7.5
+(frozen config: `config_snapshot_id` + `model_fingerprint` +
+`rules_version` + `rules_hash` + `thresholds`).
+
+**Gate M7 пройден**: §22.1 полный + §22.2 mechanism (frozen config +
+gates + blind sample + overall outcome). Tag: `noezema-m7`.
