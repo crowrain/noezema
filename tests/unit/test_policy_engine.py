@@ -103,6 +103,27 @@ def test_relative_path_resolves_to_workspace(engine) -> None:
 
 
 @pytest.mark.unit
+def test_research_fetch_allowed_with_proxy_network() -> None:
+    """T6.3: the curated/open_lab profiles run with network=
+    research_proxy — the url argument of research.fetch passes the
+    network gate (the guard + the mode policy are the proxy's job)."""
+    for name in ("curated", "open_lab"):
+        eng = PolicyEngine(load_profile(name))
+        ev = eng.evaluate("research.fetch", {"url": "https://example.com/"})
+        assert ev.decision is PolicyDecision.ALLOW, (name, ev.reasons)
+
+
+@pytest.mark.unit
+def test_research_fetch_denied_in_sealed_profile() -> None:
+    """sealed: no egress at all — a URL argument is denied and the tool
+    is not even granted by the sealed profile."""
+    profile = load_profile("sealed")
+    assert "research.fetch" not in profile.tools
+    ev = PolicyEngine(profile).evaluate("research.fetch", {"url": "https://x/"})
+    assert ev.decision is PolicyDecision.DENY
+
+
+@pytest.mark.unit
 def test_url_denied_when_network_none(engine) -> None:
     ev = engine.evaluate(
         "shell.execute",

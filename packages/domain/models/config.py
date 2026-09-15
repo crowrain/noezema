@@ -48,6 +48,9 @@ class ORMConfigSnapshot(Base):
     verification: Mapped[JsonDict | None] = mapped_column(JSONB, nullable=True)
     # T5.4 (stage 4): repetition section (§9) — pinned in the snapshot
     repetition: Mapped[JsonDict | None] = mapped_column(JSONB, nullable=True)
+    # T6.1 (stage 5): research proxy section (§5.12) — the only
+    # network egress; sealed by bootstrap
+    research_proxy: Mapped[JsonDict | None] = mapped_column(JSONB, nullable=True)
     # T5.5 (stage 4): extraction section (§11.2) — pinned in the
     # snapshot
     extraction: Mapped[JsonDict | None] = mapped_column(JSONB, nullable=True)

@@ -486,6 +486,11 @@ class AuditEventType(StrEnum):
     # T5.5 (stage 4): the untrusted extraction profile (§11.2)
     EXTRACTION_COMPLETED = "extraction_completed"
     EXTRACTION_FALLBACK = "extraction_fallback"
+    # T6.1 (stage 5, §5.12): the research proxy egress journal
+    RESEARCH_FETCH_COMPLETED = "research_fetch_completed"
+    RESEARCH_FETCH_REJECTED = "research_fetch_rejected"
+    RESEARCH_UPSTREAM_REQUEST = "research_upstream_request"
+    RESEARCH_CONTENT_READ = "research_content_read"
     COUNTER_RESOLUTION_INVALIDATED = "counter_resolution_invalidated"
     ALERT_RAISED = "alert_raised"
 

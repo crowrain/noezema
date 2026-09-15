@@ -4,7 +4,7 @@
 # теми же hard-лимитами ресурсов.
 version: v1
 name: open_lab
-network: none               # до M6 сеть запрещена во всех профилях
+network: research_proxy     # M6: egress only through the research proxy
 read_only_rootfs: true
 capabilities: []
 no_new_privileges: true
@@ -25,7 +25,7 @@ tools:
   question.create: true
   message.reply: true
   artifact.create: true
-  research.fetch: false
+  research.fetch: true      # M6: только через Research Proxy
 paths:
   writable: ["/workspace"]
   readable: ["/base", "/workspace"]

@@ -19,7 +19,9 @@ def test_load_profile(name: str) -> None:
     assert p.name == name
     assert p.version == "v1"
     assert p.policy_version == f"{name}-v1"
-    assert p.network is NetworkMode.NONE
+    # T6.3: curated/open_lab egress = the research proxy only
+    expected = NetworkMode.RESEARCH_PROXY if name in ("curated", "open_lab") else NetworkMode.NONE
+    assert p.network is expected
     assert p.secrets == "deny"
     assert p.metadata_endpoints == "deny"
     assert "/workspace" in p.writable_paths

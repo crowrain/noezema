@@ -46,6 +46,10 @@ class MemorySearchArgs(_Args):
     query: str = Field(min_length=1, max_length=1000)
 
 
+class ResearchFetchArgs(_Args):
+    url: str = Field(min_length=1, max_length=2000)
+
+
 class QuestionCreateArgs(_Args):
     text: str = Field(min_length=1, max_length=2000)
     origin: str = Field(default="model_proposal", max_length=50)
@@ -90,6 +94,12 @@ _TOOLS: dict[str, ToolSpec] = {
     ),
     "memory.search": ToolSpec(
         "memory.search", "Поиск по памяти (M3)", IdempotencyClass.PURE, MemorySearchArgs,
+    ),
+    "research.fetch": ToolSpec(
+        "research.fetch",
+        "Загрузить внешнюю страницу через Research Proxy (curated/open_lab; "
+        "контент приходит как недоверенные данные)",
+        IdempotencyClass.NON_IDEMPOTENT, ResearchFetchArgs,
     ),
     "question.create": ToolSpec(
         "question.create", "Предложить новый вопрос (запись в staging)",

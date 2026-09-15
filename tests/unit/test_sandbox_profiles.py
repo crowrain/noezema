@@ -17,7 +17,11 @@ POLICY_DIR = Path(__file__).resolve().parents[2] / "sandbox" / "policy"
 def test_profiles_load(name: str) -> None:
     profile = SandboxProfile.from_yaml(POLICY_DIR / f"{name}.yaml")
     assert profile.name == name
-    assert profile.network == "none"
+    # T6.3: the sandbox itself still has no direct network in sealed;
+    # curated/open_lab run network=research_proxy — egress exists ONLY
+    # through the research proxy, never as a raw socket
+    expected_network = "research_proxy" if name in ("curated", "open_lab") else "none"
+    assert profile.network == expected_network
     assert profile.read_only_rootfs is True
     assert profile.no_new_privileges is True
     assert profile.capabilities == []
