@@ -43,6 +43,7 @@ from apps.orchestrator.orchestrator import Orchestrator, SessionOutcome
 from apps.orchestrator.scheduler import WakeScheduler, data_root_from_env, node_owner_from_env
 from apps.web import diagnostics as diagnostics_queries
 from apps.web import knowledge as knowledge_queries
+from apps.web import metrics as metrics_queries
 from apps.web.host_status import HostStatus, HostStatusAdapter
 from packages.domain.db.engine import DatabaseSettings
 from packages.domain.db.uow import transaction
@@ -80,7 +81,7 @@ _MAIN_HTML = """<!doctype html>
  ul{margin:.3rem 0 .3rem 1.2rem}
 </style></head><body>
 <h1>NOEZEMA — узел</h1>
-<p><a href="/knowledge">Знание (граф)</a> · <a href="/diagnostics">Диагностика</a></p>
+<p><a href="/knowledge">Знание (граф)</a> · <a href="/diagnostics">Диагностика</a> · <a href="/metrics">Метрики</a></p>
 <div id="banner" class="none">загрузка…</div>
 <div class="card"><b>Узел:</b> <span id="node">—</span> · <b>Фазa:</b> <span id="phase">—</span></div>
 <div class="card"><b>Конфиг:</b> <code id="cfg">—</code></div>
@@ -335,6 +336,86 @@ async function tick(){
         (j.next_attempt_at ? ` · next ${j.next_attempt_at}` : '') +
         (j.claim_statement ? ` · ${esc(j.claim_statement.slice(0,60))}` : '') + '</li></ul>';
     }
+    h += '</div>';
+    document.getElementById('box').innerHTML = h;
+  }catch(e){ document.getElementById('box').textContent='ошибка чтения'; }
+}
+tick(); setInterval(tick, 5000);
+</script></body></html>
+"""
+
+_METRICS_HTML = """<!doctype html>
+<html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NOEZEMA — метрики (§16)</title>
+<style>
+ body{font-family:system-ui,sans-serif;margin:2rem;background:#0e1116;color:#e6e6e6}
+ .card{background:#171c26;border:1px solid #2a3142;border-radius:8px;padding:1rem;margin:.7rem 0}
+ code{background:#0b0e13;padding:.1rem .3rem;border-radius:4px}
+ h2{margin:.3rem 0 .5rem;font-size:1.05rem;color:#61afef}
+ ul{margin:.3rem 0 .3rem 1.2rem}
+ a{color:#61afef;text-decoration:none}
+ .bad{color:#e06c75}
+</style></head><body>
+<h1>NOEZEMA — метрики (§16)</h1>
+<p><a href="/">← узел</a> · <a href="/diagnostics">Диагностика</a></p>
+<div id="box">загрузка…</div>
+<script>
+const esc = s => (s==null?'—':String(s)).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+function obj(o){
+  return Object.entries(o||{}).map(([k,v]) =>
+    `<li><code>${esc(k)}</code>: ${esc(v)}</li>`).join('') || '<li>—</li>';
+}
+function barriers(o){
+  return Object.entries(o||{}).map(([k,v]) =>
+    `<li><code>${esc(k)}</code>: ${esc(v.n)} (members ${esc(v.members)})</li>`).join('');
+}
+function kv(label, o, fields){
+  return fields.map(f => [f, o[f]]).filter(([,v]) => v!=null)
+    .map(([k,v]) => esc(k)+' '+esc(v)).join(', ');
+}
+async function tick(){
+  try{
+    const m = await fetch('/api/v1/metrics').then(r => r.json());
+    const t = m.technical || {}, c = m.cognitive || {}, s = m.security || {};
+    let h = '';
+    h += '<div class="card"><h2>Технические (§16.1)</h2>';
+    h += '<p>commit_attempts</p><ul>' + obj(t.commit_attempts) + '</ul>';
+    h += '<p>oldest_unresolved_attempt: '
+       + esc(t.oldest_unresolved_attempt_at) + '</p>';
+    h += '<p>open_barriers</p><ul>' + barriers(t.open_barriers) + '</ul>';
+    h += '<p>reassessment_jobs</p><ul>' + obj(t.reassessment_jobs) + '</ul>';
+    if (t.backups)
+      h += '<p>backups: ' + kv('', t.backups,
+        ['total','in_retention','oldest_backup_at','last_verified_at']) + '</p>';
+    if (t.gc)
+      h += '<p>gc: ' + kv('', t.gc,
+        ['applied_sweeps','artifacts_deleted','last_sweep_at']) + '</p>';
+    if (t.session_latency)
+      h += '<p>session_latency: ' + kv('', t.session_latency,
+        ['n','avg_seconds','max_seconds']) + 's</p>';
+    h += '</div>';
+    h += '<div class="card"><h2>Познавательные (§16.2)</h2>';
+    h += '<p>claims_by_epistemic_status</p><ul>'
+       + obj(c.claims_by_epistemic_status) + '</ul>';
+    h += '<p>assessments_by_grade</p><ul>'
+       + obj(c.assessments_by_grade) + '</ul>';
+    h += '<p>reassessment_jobs</p><ul>' + obj(c.reassessment_jobs) + '</ul>';
+    if (c.counterevidence)
+      h += '<p>counterevidence: ' + kv('', c.counterevidence,
+        ['found','resolved']) + '</p>';
+    h += '</div>';
+    h += '<div class="card"><h2>Безопасность и взаимодействие (§16.3)</h2>';
+    h += '<p>policy (deny / require_operator)</p><ul>' + obj(s.policy) + '</ul>';
+    h += '<p>egress_rejections</p><ul>' + obj(s.egress_rejections) + '</ul>';
+    const badCls = s.idempotency_mismatches > 0 ? 'bad' : '';
+    h += '<p>idempotency_mismatches: <span class="' + badCls + '">'
+       + esc(s.idempotency_mismatches) + '</span></p>';
+    h += '<p>source_graph_corrections: ' + esc(s.source_graph_corrections) + '</p>';
+    h += '<p>stop/abort_commands</p><ul>' + obj(s.stop_abort_commands) + '</ul>';
+    h += '<p>command_like_messages (без исполнения): '
+       + esc(s.command_like_messages) + '</p>';
+    h += '<p>egress_rate_limited: ' + esc(s.egress_rate_limited) + '</p>';
     h += '</div>';
     document.getElementById('box').innerHTML = h;
   }catch(e){ document.getElementById('box').textContent='ошибка чтения'; }
@@ -939,6 +1020,12 @@ def create_app(
                 db, include_resolved=include_resolved, limit=limit
             )
 
+    @app.get("/api/v1/metrics")
+    async def metrics_report() -> JsonDict:
+        """T7.4 (§16, §16.3): the technical/cognitive/security report."""
+        async with factory() as db:
+            return await metrics_queries.all_metrics(db)
+
     # ── T3.20/T3.21/T7.1: HTML pages ─────────────────────────────────────
 
     @app.get("/", response_class=HTMLResponse)
@@ -960,6 +1047,10 @@ def create_app(
     @app.get("/diagnostics", response_class=HTMLResponse)
     async def diagnostics_page() -> str:
         return _DIAGNOSTICS_HTML
+
+    @app.get("/metrics", response_class=HTMLResponse)
+    async def metrics_page() -> str:
+        return _METRICS_HTML
 
     return app
 

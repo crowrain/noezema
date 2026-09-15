@@ -650,5 +650,64 @@ def gc(apply: bool, host_lib: str) -> None:
     sys.exit(code)
 
 
+@main.command("security-gate")
+@click.option(
+    "--python",
+    "python_bin",
+    type=str,
+    default=None,
+    help="Python interpreter to run pytest with (default: sys.executable).",
+)
+@click.option(
+    "--metrics-url",
+    type=str,
+    default=None,
+    help="Optional NOEZEMA_DATABASE_URL to also emit the §16.3 security report.",
+)
+def security_gate(python_bin: str | None, metrics_url: str | None) -> None:
+    """T7.4 (stage 7): the security regression gate.
+
+    Runs the full ``pytest -m security`` suite as a subprocess and
+    exits 0 only if every security test passes. If ``--metrics-url``
+    is given, also emits the §16.3 security report from the database
+    before the gate runs (so the gate log carries the metric baseline).
+    Wire this as a CI / systemd gate: non-zero exit = gate failed.
+    """
+    import asyncio
+    import os
+    import subprocess
+    import sys
+
+    # emit the §16.3 report if a DB is available
+    if metrics_url:
+        from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+        from apps.web.metrics import security_metrics
+
+        os.environ["NOEZEMA_DATABASE_URL"] = metrics_url
+        engine = create_async_engine(metrics_url)
+        factory = async_sessionmaker(engine, expire_on_commit=False)
+
+        async def _emit() -> None:
+            async with factory() as db:
+                report = await security_metrics(db)
+
+            click.echo("security report (§16.3):")
+            for k, v in report.items():
+                click.echo(f"  {k}: {v}")
+
+        try:
+            asyncio.run(_emit())
+        finally:
+            asyncio.run(engine.dispose())
+
+    # run the security suite
+    cmd = [python_bin or sys.executable, "-m", "pytest", "-m", "security", "-q"]
+    click.echo(f"running security suite: {' '.join(cmd)}")
+    proc = subprocess.run(cmd, cwd=os.getcwd())
+    click.echo(f"security gate: {'PASSED' if proc.returncode == 0 else 'FAILED'}")
+    sys.exit(proc.returncode)
+
+
 if __name__ == "__main__":
     main()
