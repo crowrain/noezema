@@ -74,7 +74,34 @@ BOOTSTRAP_PAYLOAD: dict[str, Any] = {
             "workspace_quota_mb": 512,
         },
     },
-    "curiosity": {"selector": "fifo", "epsilon": 0.0, "top_m": 1, "delta": 0.0},
+    # T5.1 (§5.3.1): the selector is config-driven — the MVP default stays
+    # FIFO; a config change to "curiosity" enables the score-based ranking
+    # (weights, thresholds, ε/M/δ and the similarity fingerprint below are
+    # part of the session config snapshot).
+    "curiosity": {
+        "selector": "fifo",
+        "epsilon": 0.0,
+        "top_m": 1,
+        "delta": 0.0,
+        "recency_sessions": 5,
+        "weights": {
+            "novelty": 0.3,
+            "coverage_gap": 0.2,
+            "evidenceability": 0.2,
+            "feasibility": 0.1,
+            "cost": 0.1,
+            "risk": 0.0,
+            "topic_recency": 0.1,
+        },
+        "normalization": {
+            "gap_debt_threshold": 4.0,
+            "feasibility_word_limit": 200.0,
+            "cost_word_threshold": 400.0,
+            "topic_overlap_threshold": 0.34,
+            "min_word_len": 3.0,
+        },
+        "similarity": {"fingerprint": "token-jaccard-v1"},
+    },
     "token_budgets": {
         "protocol": 4096,
         "identity": 2048,

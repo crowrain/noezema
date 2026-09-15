@@ -35,6 +35,10 @@ from apps.orchestrator.executor import arguments_hash
 from apps.orchestrator.state_machine import transition
 from packages.artifacts import freeze_workspace
 from packages.broker import ToolExecutor, check_idempotency
+from packages.cognition.curiosity import (
+    CuriosityConfigError,
+    CuriosityQuestionSelector,
+)
 from packages.cognition.question_selector import FIFOQuestionSelector
 from packages.domain.canonical import canonical_json_bytes
 from packages.domain.db.uow import transaction
@@ -135,7 +139,7 @@ class Orchestrator:
         gateway: LLMMiddleware,
         profile: ModelProfile,
         executor: ToolExecutor,
-        selector: FIFOQuestionSelector | None = None,
+        selector: FIFOQuestionSelector | CuriosityQuestionSelector | None = None,
         node_owner: str | None = None,
         lease_ttl: timedelta | None = None,
     ) -> None:
@@ -143,6 +147,11 @@ class Orchestrator:
         self.gateway = gateway
         self.profile = profile
         self.executor = executor
+        # T5.1: an explicitly injected selector always wins (tests);
+        # otherwise the selector is built per session from the effective
+        # config snapshot's curiosity section (the switch is a config
+        # change, §5.3.1)
+        self._injected_selector = selector
         self.selector = selector if selector is not None else FIFOQuestionSelector()
         self.prompts = {Role.EXPLORER: load_prompt(Role.EXPLORER), Role.CURATOR: load_prompt(Role.CURATOR)}
         self.node_owner = node_owner if node_owner is not None else f"node-{os.getpid()}"
@@ -344,7 +353,8 @@ class Orchestrator:
 
         # selecting_question
         await self._transition(db, audit, session, SessionState.SELECTING_QUESTION)
-        question = await self._select_question(db, question_id)
+        selector = self._build_selector(snapshot.curiosity)
+        question = await self._select_question(db, question_id, session.id, selector)
         if question is None:
             return await self._finish(
                 db, audit, session, SessionState.FAILED, None, 0, 0, 0, 0,
@@ -352,10 +362,20 @@ class Orchestrator:
             )
         session.question_id = question.id
         question.state = QuestionState.RESEARCHING.value
+        selection_payload: dict[str, Any] = {"question_id": str(question.id)}
+        if question.score_components:
+            # the curiosity selection record (T5.1, §5.3.1): normalized
+            # components, final score, mode and the similarity fingerprint
+            selection_payload["curiosity"] = {
+                "score": question.score_components.get("score"),
+                "components": question.score_components.get("components"),
+                "selected": question.score_components.get("selected"),
+                "fingerprint": question.score_components.get("fingerprint"),
+            }
         await audit.record(
             AuditEventType.QUESTION_SELECTED,
             session_id=session.id,
-            payload={"question_id": str(question.id)},
+            payload=selection_payload,
             public_summary=f"question selected: {question.text[:120]}",
         )
         ctx.question_text = question.text
@@ -753,15 +773,45 @@ class Orchestrator:
 
     # ── helpers ───────────────────────────────────────────────────────────
 
+    def _build_selector(
+        self, curiosity_section: Any
+    ) -> FIFOQuestionSelector | CuriosityQuestionSelector:
+        if self._injected_selector is not None:
+            return self._injected_selector
+        section = curiosity_section if isinstance(curiosity_section, dict) else {}
+        name = section.get("selector", "fifo")
+        if name == "fifo":
+            return FIFOQuestionSelector()
+        if name == "curiosity":
+            try:
+                return CuriosityQuestionSelector(section)
+            except CuriosityConfigError as exc:
+                raise RuntimeError(f"curiosity selector misconfigured: {exc}") from exc
+        raise RuntimeError(f"unknown curiosity selector: {name!r}")
+
     async def _select_question(
-        self, db: AsyncSession, question_id: uuid.UUID | None
+        self,
+        db: AsyncSession,
+        question_id: uuid.UUID | None,
+        session_id: uuid.UUID,
+        selector: FIFOQuestionSelector | CuriosityQuestionSelector,
     ) -> ORMQuestion | None:
         if question_id is not None:
             question = await QuestionRepository.get(db, question_id)
             if question is not None and question.state != QuestionState.CANDIDATE.value:
                 return None
             return question
-        return await self.selector.select(db)
+        if isinstance(selector, CuriosityQuestionSelector):
+            question, record = await selector.select(db, session_id=session_id)
+            if question is None or record is None:
+                return None
+            # the normalized score inputs + the fingerprint are stored
+            # together with the selected question (§5.3.1)
+            CuriosityQuestionSelector.persist(
+                db, question, record, selector.config.similarity_fingerprint
+            )
+            return question
+        return await selector.select(db)
 
     def _explorer_context(
         self, ctx: SessionContext, allowed_tools: list[str], pack: Any
