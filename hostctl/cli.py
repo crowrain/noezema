@@ -591,5 +591,64 @@ def restore_drill(host_lib: str) -> None:
     sys.exit(code)
 
 
+@main.command("gc")
+@click.option("--apply", is_flag=True, default=False, help="Actually delete (default: dry run).")
+@click.option("--host-lib", type=click.Path(), default=str(DEFAULT_HOST_LIB))
+def gc(apply: bool, host_lib: str) -> None:
+    """Run one GC sweep (§15.3, §20.12): the full root set is computed
+    and the retention candidates reported. ``--apply`` deletes in one
+    transaction (artifacts + store objects first, then registry rows)
+    and records the audit ``gc_sweep``. GC of a session in
+    ``reconciling_commit`` is forbidden (its rows are skipped)."""
+    import asyncio
+    import os
+
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from packages.artifacts.store import FilesystemArtifactStore
+    from packages.domain.db.uow import transaction
+    from packages.gc.service import run_gc
+
+    url = os.environ.get("NOEZEMA_DATABASE_URL", "")
+    if not url:
+        click.echo("NOEZEMA_DATABASE_URL is not set", err=True)
+        sys.exit(EXIT_USAGE_ERROR)
+    engine = create_async_engine(url)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    store_root = Path(os.environ.get("NOEZEMA_ARTIFACTS_ROOT", "/var/lib/noezema/artifacts"))
+
+    async def _run() -> int:
+        async with factory() as db, transaction(db):
+            result = await run_gc(
+                db,
+                artifact_store=FilesystemArtifactStore(store_root) if apply else None,
+                apply=apply,
+            )
+        click.echo(
+            f"gc ({'apply' if apply else 'dry-run'}): roots={result['root_artifact_count']} "
+            f"artifact_candidates={len(result['candidate_artifacts'])} "
+            f"workspace={len(result['candidate_workspace_manifests'])} "
+            f"terminal_attempts={len(result['candidate_terminal_attempts'])} "
+            f"config_attempts={len(result['candidate_terminal_config_attempts'])} "
+            f"barriers={len(result['candidate_resolved_barriers'])} "
+            f"expired_backups={len(result['expired_backup_manifests'])}"
+        )
+        if result["reconciling_sessions"]:
+            click.echo(
+                "skipped (reconciling_commit): "
+                + ", ".join(result["reconciling_sessions"]),
+                err=True,
+            )
+        if apply:
+            click.echo(f"deleted={result['deleted']}")
+        return 0
+
+    try:
+        code = asyncio.run(_run())
+    finally:
+        asyncio.run(engine.dispose())
+    sys.exit(code)
+
+
 if __name__ == "__main__":
     main()

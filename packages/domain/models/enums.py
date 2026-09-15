@@ -496,6 +496,8 @@ class AuditEventType(StrEnum):
     # T7.2 (stage 7, §15.3): backup/PITR
     BACKUP_CREATED = "backup_created"
     BACKUP_RESTORE_DRILL = "backup_restore_drill"
+    # T7.3 (stage 7, §15.3, §20.12): GC
+    GC_SWEEP = "gc_sweep"
 
 
 class AuditVisibility(StrEnum):

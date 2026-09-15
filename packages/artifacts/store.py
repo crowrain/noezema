@@ -20,7 +20,7 @@ from typing import Protocol
 
 
 class ArtifactStore(Protocol):
-    """Transport-swappable contract (ADR-0002): put/get/exists/head."""
+    """Transport-swappable contract (ADR-0002): put/get/exists/head/remove."""
 
     def put(self, data: bytes, *, origin: str, trust_class: str, mime: str | None = None) -> str: ...
 
@@ -29,6 +29,10 @@ class ArtifactStore(Protocol):
     def exists(self, sha256: str) -> bool: ...
 
     def head(self, sha256: str) -> ArtifactHead | None: ...
+
+    def remove(self, sha256: str) -> bool:
+        """Delete one object (T7.3 GC, §15.3); True if it was present."""
+        ...
 
 
 @dataclass(frozen=True)
@@ -94,6 +98,20 @@ class FilesystemArtifactStore:
         if not path.exists():
             return None
         return ArtifactHead(sha256=sha256, size=path.stat().st_size)
+
+    def remove(self, sha256: str) -> bool:
+        """Delete one object (T7.3 GC). Returns True if it was present."""
+        path = self._path(sha256)
+        if not path.exists():
+            return False
+        path.unlink()
+        # fsync the parent directory (the unlink is durable only after)
+        parent_fd = os.open(str(path.parent), os.O_RDONLY)
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+        return True
 
     def remove_all(self) -> None:
         """Test helper: wipe the store root."""
