@@ -41,6 +41,8 @@ from sqlalchemy.ext.asyncio import (
 
 from apps.orchestrator.orchestrator import Orchestrator, SessionOutcome
 from apps.orchestrator.scheduler import WakeScheduler, data_root_from_env, node_owner_from_env
+from apps.web import diagnostics as diagnostics_queries
+from apps.web import knowledge as knowledge_queries
 from apps.web.host_status import HostStatus, HostStatusAdapter
 from packages.domain.db.engine import DatabaseSettings
 from packages.domain.db.uow import transaction
@@ -78,6 +80,7 @@ _MAIN_HTML = """<!doctype html>
  ul{margin:.3rem 0 .3rem 1.2rem}
 </style></head><body>
 <h1>NOEZEMA — узел</h1>
+<p><a href="/knowledge">Знание (граф)</a> · <a href="/diagnostics">Диагностика</a></p>
 <div id="banner" class="none">загрузка…</div>
 <div class="card"><b>Узел:</b> <span id="node">—</span> · <b>Фазa:</b> <span id="phase">—</span></div>
 <div class="card"><b>Конфиг:</b> <code id="cfg">—</code></div>
@@ -140,6 +143,197 @@ async function tick(){
   }catch(err){ document.getElementById('detail').textContent='ошибка чтения'; }
 }
 tick(); setInterval(tick, 2500);
+</script></body></html>
+"""
+
+
+# T7.1: knowledge graph + diagnostics pages (thin viewers over the JSON
+# API; the invariant lives server-side, the HTML only renders it).
+_KNOWLEDGE_HTML = """<!doctype html>
+<html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NOEZEMA — знание</title>
+<style>
+ body{font-family:system-ui,sans-serif;margin:2rem;background:#0e1116;color:#e6e6e6}
+ table{border-collapse:collapse;width:100%}
+ td,th{border:1px solid #2a3142;padding:.4rem .6rem;text-align:left;vertical-align:top}
+ th{background:#171c26}
+ .cur{color:#7bd88f}.pen{color:#e5c07b}.inv{color:#e06c75}.non{color:#9aa0a6}
+ code{background:#0b0e13;padding:.1rem .3rem;border-radius:4px}
+ a{color:#61afef;text-decoration:none}
+</style></head><body>
+<h1>NOEZEMA — знание</h1>
+<p><a href="/">← узел</a></p>
+<div id="box">загрузка…</div>
+<script>
+async function tick(){
+  try{
+    const r = await fetch('/api/v1/knowledge/claims?limit=200');
+    const d = await r.json();
+    let h = `<table><tr><th>утверждение</th><th>тип</th><th>head</th>`+
+      `<th>статус</th><th>grade</th><th>свежесть</th></tr>`;
+    for(const c of d.claims){
+      const cls = {current:'cur',pending:'pen',invalid:'inv',none:'non'}[c.head_state]||'non';
+      h += `<tr><td><a href="/claim/${c.id}">${c.statement.slice(0,120)}</a></td>`+
+        `<td>${c.claim_type}</td><td class="${cls}">${c.head_state}</td>`+
+        `<td>${c.epistemic_status||'—'}</td><td>${c.effective_grade||'—'}</td>`+
+        `<td>${c.freshness_status}</td></tr>`;
+    }
+    h += '</table>';
+    document.getElementById('box').innerHTML = h;
+  }catch(e){ document.getElementById('box').textContent='ошибка чтения'; }
+}
+tick(); setInterval(tick, 5000);
+</script></body></html>
+"""
+
+_CLAIM_HTML = """<!doctype html>
+<html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NOEZEMA — утверждение</title>
+<style>
+ body{font-family:system-ui,sans-serif;margin:2rem;background:#0e1116;color:#e6e6e6}
+ .card{background:#171c26;border:1px solid #2a3142;border-radius:8px;padding:1rem;margin:.7rem 0}
+ code{background:#0b0e13;padding:.1rem .3rem;border-radius:4px}
+ .ok{color:#7bd88f}.warn{color:#e5c07b}.bad{color:#e06c75}
+ a{color:#61afef;text-decoration:none}
+ ul{margin:.3rem 0 .3rem 1.2rem}
+</style></head><body>
+<h1>NOEZEMA — утверждение</h1>
+<p><a href="/knowledge">← знание</a></p>
+<div id="box">загрузка…</div>
+<script>
+const cid = "__CLAIM_ID__";
+const esc = s => (s||'').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+async function tick(){
+  try{
+    const [d, p] = await Promise.all([
+      fetch('/api/v1/knowledge/claims/'+cid).then(r => r.ok ? r.json() : null),
+      fetch('/api/v1/knowledge/claims/'+cid+'/provenance').then(r => r.ok ? r.json() : null),
+    ]);
+    if(!d){ document.getElementById('box').textContent='не найдено'; return; }
+    const cur = d.heads.find(h => h.assessment_state === 'current') || d.heads[0];
+    let h = '<div class="card"><b>Утверждение:</b> ' + esc(d.statement) +
+      '<br><b>Тип:</b> ' + d.claim_type + ' · <b>свежесть:</b> ' + d.freshness_status +
+      (d.as_of ? ' · <b>as_of:</b> ' + d.as_of : '') + '</div>';
+    h += '<div class="card"><b>Оценки (по снапшотам):</b><ul>';
+    for(const hd of d.heads){
+      const cls = hd.assessment_state==='current' ? 'ok' : (hd.assessment_state==='pending' ? 'warn' : 'bad');
+      h += `<li class="${cls}">${hd.assessment_state} · ${hd.epistemic_status||'—'} · `+
+        `${hd.effective_grade||'—'} · conf ${hd.confidence ?? '—'} `+
+        `(<code>${(hd.config_snapshot_id||'').slice(0,8)}</code>, `+
+        `${hd.activation_state||hd.activation_mode||'?'})</li>`;
+    }
+    h += '</ul></div>';
+    h += '<div class="card"><b>Зависимости:</b><ul>';
+    for(const x of d.depends_on)
+      h += `<li>зависит от: <a href="/claim/${x.claim_id}">${esc(x.statement.slice(0,80))}</a> (${x.kind})</li>`;
+    for(const x of d.depended_by)
+      h += `<li>используется: <a href="/claim/${x.claim_id}">${esc(x.statement.slice(0,80))}</a> (${x.kind})</li>`;
+    if(!d.depends_on.length && !d.depended_by.length) h += '<li>нет</li>';
+    h += '</ul></div>';
+    if(p){
+      h += '<div class="card"><b>Происхождение (evidence → source/artifact):</b><ul>';
+      for(const e of p.evidence){
+        let src = '—';
+        if(e.source) src = `${e.source.source_type} <code>${esc((e.source.canonical_uri||'').slice(0,60))}</code>`+
+          (e.source.parent ? ' ← ' + esc((e.source.parent.canonical_uri||'').slice(0,60)) : '');
+        let art = '—';
+        if(e.artifact) art = `<code>${e.artifact.sha256.slice(0,16)}</code> (${e.artifact.trust_class})`;
+        h += `<li>${e.relation}/${e.evidence_kind}: source: ${src}; artifact: ${art}`;
+        for(const r of p.assessment_evidence_roles.filter(r => r.evidence_id === e.id))
+          h += ` · role: ${r.role}`;
+        h += '</li>';
+      }
+      if(p.source_groups.length){
+        h += '<br><b>Группы независимости источников:</b> ';
+        h += p.source_groups.map(g => `<code>${g.group_id}</code> (${esc((g.uri||'').slice(0,50))})`).join(', ');
+      }
+      if(p.environment_groups.length){
+        h += '<br><b>Группы окружений:</b> ' + p.environment_groups.map(g => `<code>${g.group_id}</code>`).join(', ');
+      }
+      h += '</ul></div>';
+    }
+    document.getElementById('box').innerHTML = h;
+  }catch(e){ document.getElementById('box').textContent='ошибка чтения'; }
+}
+tick(); setInterval(tick, 5000);
+</script></body></html>
+"""
+
+_DIAGNOSTICS_HTML = """<!doctype html>
+<html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NOEZEMA — диагностика</title>
+<style>
+ body{font-family:system-ui,sans-serif;margin:2rem;background:#0e1116;color:#e6e6e6}
+ .card{background:#171c26;border:1px solid #2a3142;border-radius:8px;padding:1rem;margin:.7rem 0}
+ code{background:#0b0e13;padding:.1rem .3rem;border-radius:4px}
+ .ok{color:#7bd88f}.warn{color:#e5c07b}.bad{color:#e06c75}
+ ul{margin:.3rem 0 .3rem 1.2rem}
+ a{color:#61afef;text-decoration:none}
+</style></head><body>
+<h1>NOEZEMA — диагностика</h1>
+<p><a href="/">← узел</a></p>
+<div id="box">загрузка…</div>
+<script>
+const esc = s => (s||'').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+async function tick(){
+  try{
+    const [s, rec, bar, jobs] = await Promise.all([
+      fetch('/api/v1/diagnostics').then(r => r.json()),
+      fetch('/api/v1/diagnostics/reconciliation').then(r => r.json()),
+      fetch('/api/v1/diagnostics/barriers').then(r => r.json()),
+      fetch('/api/v1/diagnostics/jobs?limit=20').then(r => r.json()),
+    ]);
+    let h = '';
+    const act = s.activation || {};
+    h += `<div class="card"><b>Активация конфига:</b> `+
+      `active <code>${(act.active_snapshot_id||'').slice(0,8)}</code>` +
+      (act.activating_snapshot_id
+        ? ` · activating <code>${act.activating_snapshot_id.slice(0,8)}</code> `+
+          `(fence ${act.fence}, owner ${esc(act.lease_owner)})`
+        : '') +
+      ` · gate: ${s.writer_gate && s.writer_gate.owner_id ? esc(s.writer_gate.owner_id) : 'свободен'}` +
+      ` · ревизии: ${Object.entries(s.revisions||{}).map(([k,v]) => k+'='+v).join(' · ')}</div>`;
+    const un = rec.unresolved;
+    h += `<div class="card"><b class="${un?'bad':'ok'}">Рекомендация/коммит:</b> `+
+      (un ? 'есть нерешённые commit_attempts — блокируют wake и GC' : 'нерешённых попыток нет');
+    for(const e of rec.entries){
+      h += `<ul><li>сессия <code>${(e.session_id||'').slice(0,8)}</code> (${e.session_state})`+
+        (e.attempt
+          ? ` · attempt ${e.attempt.status} (base k=${e.attempt.base_knowledge_revision}, `+
+            `dg=${e.attempt.base_dependency_graph_revision})`
+          : '') +
+        (e.checkpoint ? ` · checkpoint k=${e.checkpoint.knowledge_revision}` : '') + '</li></ul>';
+    }
+    h += '</div>';
+    const ob = Object.entries(s.open_barriers||{});
+    const obN = ob.reduce((a, [,v]) => a + (v.n||0), 0);
+    h += `<div class="card"><b class="${obN?'warn':'ok'}">Барьеры инвалидации:</b> `+
+      (obN ? `${obN} открытых` : 'нет открытых');
+    for(const b of bar.barriers){
+      const cls = b.status==='blocked' ? 'bad' : 'warn';
+      h += `<ul><li class="${cls}">${b.status} gen ${b.generation}: ${esc((b.root_statement||'').slice(0,80))}`+
+        ` · прогресс ${b.closure_progress}` +
+        (b.last_error ? ` · <code>${esc(b.last_error.slice(0,60))}</code>` : '') + '</li></ul>';
+    }
+    h += '</div>';
+    const jb = (s.reassessment_jobs||{}).blocked || 0;
+    h += `<div class="card"><b class="${jb?'bad':'ok'}">Джобы переоценки:</b> `+
+      Object.entries(s.reassessment_jobs||{}).map(([k,v]) => k+'='+v).join(' · ') || 'нет';
+    for(const j of jobs.jobs.slice(0,10)){
+      const cls = j.status==='blocked' ? 'bad' : (j.status==='retry' ? 'warn' : 'ok');
+      h += `<ul><li class="${cls}">${j.status} · ${j.attempts}/${j.max_attempts} попыток`+
+        (j.error_class ? ` · ${j.error_class}` : '') +
+        (j.next_attempt_at ? ` · next ${j.next_attempt_at}` : '') +
+        (j.claim_statement ? ` · ${esc(j.claim_statement.slice(0,60))}` : '') + '</li></ul>';
+    }
+    h += '</div>';
+    document.getElementById('box').innerHTML = h;
+  }catch(e){ document.getElementById('box').textContent='ошибка чтения'; }
+}
+tick(); setInterval(tick, 5000);
 </script></body></html>
 """
 
@@ -659,7 +853,87 @@ def create_app(
                 ],
             }
 
-    # ── T3.20/T3.21: minimal HTML pages (main + session) ──────────────────
+    # ── T7.1: knowledge graph (claims/assessments/dependencies/provenance) ─
+
+    @app.get("/api/v1/knowledge/claims")
+    async def knowledge_claims(
+        limit: int = 50,
+        offset: int = 0,
+        state: str | None = None,
+    ) -> JsonDict:
+        limit = max(1, min(limit, 500))
+        offset = max(0, offset)
+        if state is not None and state not in knowledge_queries.HEAD_STATES:
+            raise HTTPException(
+                status_code=422,
+                detail=f"state must be one of {', '.join(knowledge_queries.HEAD_STATES)}",
+            )
+        async with factory() as db:
+            return await knowledge_queries.list_claims(
+                db, limit=limit, offset=offset, state=state
+            )
+
+    @app.get("/api/v1/knowledge/dependencies")
+    async def knowledge_dependencies(
+        claim_id: uuid.UUID | None = None,
+        limit: int = 200,
+    ) -> JsonDict:
+        async with factory() as db:
+            return await knowledge_queries.list_dependencies(
+                db, claim_id=claim_id, limit=limit
+            )
+
+    @app.get("/api/v1/knowledge/claims/{claim_id}")
+    async def knowledge_claim_detail(claim_id: uuid.UUID) -> JsonDict:
+        async with factory() as db:
+            return await knowledge_queries.claim_detail(db, claim_id)
+
+    @app.get("/api/v1/knowledge/claims/{claim_id}/provenance")
+    async def knowledge_claim_provenance(claim_id: uuid.UUID) -> JsonDict:
+        async with factory() as db:
+            return await knowledge_queries.claim_provenance(db, claim_id)
+
+    # ── T7.1: diagnostics (reconciliation, invalidation, jobs) ────────────
+
+    @app.get("/api/v1/diagnostics")
+    async def diagnostics_summary() -> JsonDict:
+        async with factory() as db:
+            return await diagnostics_queries.summary(db)
+
+    @app.get("/api/v1/diagnostics/reconciliation")
+    async def diagnostics_reconciliation() -> JsonDict:
+        async with factory() as db:
+            return await diagnostics_queries.reconciliation(db)
+
+    @app.get("/api/v1/diagnostics/jobs")
+    async def diagnostics_jobs(
+        status: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> JsonDict:
+        if status is not None and status not in (
+            "queued", "leased", "retry", "blocked", "completed",
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="status must be queued|leased|retry|blocked|completed",
+            )
+        async with factory() as db:
+            return await diagnostics_queries.jobs(
+                db, status=status, limit=limit, offset=offset
+            )
+
+    @app.get("/api/v1/diagnostics/barriers")
+    async def diagnostics_barriers(
+        include_resolved: bool = False,
+        limit: int = 100,
+    ) -> JsonDict:
+        async with factory() as db:
+            return await diagnostics_queries.barriers(
+                db, include_resolved=include_resolved, limit=limit
+            )
+
+    # ── T3.20/T3.21/T7.1: HTML pages ─────────────────────────────────────
 
     @app.get("/", response_class=HTMLResponse)
     async def main_page() -> str:
@@ -668,6 +942,18 @@ def create_app(
     @app.get("/session/{session_id}", response_class=HTMLResponse)
     async def session_page(session_id: uuid.UUID) -> str:
         return _SESSION_HTML.replace("__SESSION_ID__", str(session_id))
+
+    @app.get("/knowledge", response_class=HTMLResponse)
+    async def knowledge_page() -> str:
+        return _KNOWLEDGE_HTML
+
+    @app.get("/claim/{claim_id}", response_class=HTMLResponse)
+    async def claim_page(claim_id: uuid.UUID) -> str:
+        return _CLAIM_HTML.replace("__CLAIM_ID__", str(claim_id))
+
+    @app.get("/diagnostics", response_class=HTMLResponse)
+    async def diagnostics_page() -> str:
+        return _DIAGNOSTICS_HTML
 
     return app
 

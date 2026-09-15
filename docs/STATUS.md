@@ -14,7 +14,7 @@
 | M4 зависимости + переоценка | ✅ T4.1 закрыт (claim_dependencies: DAG cycle check при commit, graph revision, kind `research` по §8.6); T4.2 закрыт (cascade invalidation: closure manifest, barrier с durable курсором, idempotent батчи, blocked-путь, retrieval ancestor check); T4.3 закрыт (worker `system:reassessment`: runnable-предикат §5.9.1, lease/retry/blocked, insufficient→invalid+question, crash-lease recovery); T4.4 закрыт (writer admission: table gate §14.1 NOWAIT + jitter, session intent rules 1/4/5, T_escalate/T_worker_admission в scheduler); T4.5 закрыт (online activation §8.7.2: fenced lease + takeover, shadow heads fast path/pending, seal + DB-триггер sealed-интервала, atomic flip, post-publish manifest с deterministic UUIDv5, repair runner + T_repair_admission); T4.6 закрыт (environment manifests §14 env-v2: content-addressed manifest_hash, versioned алгоритм env-independence-v1 — группы по (protocol, implementation, dataset lineage), отношения repeatability/reproducibility/independent_replication/variation/untracked, снапшот на оценке, `required_independence` в rules engine: E3 только через независимую репликацию); T4.7 закрыт (source graph §11.3: таблицы source_dependency_edges/source_graph_corrections, алгоритм independence-v2 — domain/content_hash/parent/edges/corrections, снапшот source_independence_* на оценке, каскад apply_source_graph_change: merge/split → invalidation + recompute, ревизия source_graph); T4.8 закрыт (counterevidence resolutions §8.7.4: таблица + XOR/partial-unique CHECK, межстрочные инварианты (counter-цель, scope-compat, нет транзитивной зависимости, valid correction), каскад create/invalidate → recompute, engine считает только unresolved counters); T4.9 закрыт (failpoints M4: crash после flip — pointer tuple recovery, crash между батчами post-publish — durable cursor, stale activator после takeover — fence-отказ, следующий flip закрывает blocked backlog, barrier crash после каждого батча, group merge + crash worker'а, worker без starvation после смерти intent-lease) — GATE M4 пройден (§19: invalid ancestor блокирует downstream; worker без starvation оба направления; group merge → корректный пересчёт) | — | пороги M4 из замеров серии 2026-09-14 зафиксированы в PLAN (батч 32, SLO P95 200 с); 501 тест |
 | M5 расширенный цикл | ✅ Gate M5 пройден (§19, этап 4): T5.1 закрыт (Curiosity ranking §5.3.1: score-формула, все входы [0,1] + similarity fingerprint, eligibility filter, ε-diversity (seed в audit), селектор config-driven) + T5.2 закрыт (planning §6.2: план как наблюдаемый артефакт, роль planner, закрытые assessment methods, метод ≠ перефраз, planning.mode config-driven) + T5.3 закрыт (роль verifier §3.7: организованные детерминированные проверки, **схема не несёт grade/confidence — assessment идентичен с verifier и без него (gate)**, verification.mode config-driven) + T5.4 закрыт (защита от повторов §9: перефраз + no-progress → цикл, закрытые стратегии §9, audit repeat_cycle_detected, repetition config-driven) + T5.5 закрыт (untrusted extraction §11.2: модель без инструментов, host-проверка дословности, raw-текст не покидает extractor, extraction config-driven) + T5.6 закрыт (long-run сценарии: накопление знания по FIFO-очереди, §9-цикл на накопленной истории, поздний контрпример → disputed E1 rules engine) | — | 651 тест |
 | M6 Research Proxy | ✅ Gate M6 пройден (§19, этап 5): T6.1 закрыт (research proxy: единственный egress, read-only, SSRF-guard private/loopback/link-local/metadata, редиректы/размер/время, удаление активного содержимого) + T6.2 закрыт (режимы Sealed=локальный индекс / Curated=SearXNG через прокси c upstream-логом и rate limits / Open Lab=закрытый список доменов, отдельный профиль) + T6.3 закрыт (provenance: original+normalized+hash, origin в sources/artifact_chunks, fenced-маркировка в контексте §11.2, research.fetch — единственный egress сессии) + T6.4 закрыт (injection/poisoning: capabilities неизменны, similarity→require_operator, poisoned artifact не самооценивается) | noezema-m6 (после gate) | см. раздел M6 ниже | 651 тест |
-| M7 полный веб + эксплуатация | ⬜ не начата | — | |
+| M7 полный веб + эксплуатация | ⬜ в работе: T7.1 ✅ (knowledge graph + provenance + diagnostics, head-запросы на effective snapshot) | — | см. раздел M7 ниже | |
 
 ## Gate M2 (§19, этап 2) — пройден (noezema-m2)
 
@@ -37,7 +37,7 @@
 | 6 | один fenced commit attempt | MVP | ✅ | test_orchestrator.py (prepared-строка до финального tx; fencing predicate: lease+revision+attempt=prepared; partial unique §14.2) + test_reconciler.py |
 | 7 | lost COMMIT → reconciliation | MVP | ✅ | test_reconciler.py (kill before COMMIT→aborted; after commit→accepted; open final tx→finalizer_in_progress; stale finalizer→fenced) + reconcile_with_retries (backoff+jitter, fresh conn) |
 | 8 | failpoints → старый/полный checkpoint | MVP | ✅ | test_failpoints.py (kill mid-action → outcome_unknown → session failed, staging не применён, ревизия не поднимается = полный старый checkpoint) + test_reconciler.py |
-| 9 | status/timeline/attempts/assessments + auth messages/controls | MVP (dependencies — v1) | ✅ | test_web_api.py + test_web_mvp.py (status+host/timeline+SSE/messages/commands; admin-token auth на Command, queries open; assessment view — M3 memory) |
+| 9 | status/timeline/attempts/assessments + auth messages/controls | MVP (dependencies — v1) | ✅ | test_web_api.py + test_web_mvp.py (status+host/timeline+SSE/messages/commands; admin-token auth на Command, queries open; assessment view — M3 memory) + dependencies (v1-часть): test_web_knowledge.py (T7.1: claims/heads по effective snapshot, зависимости в обе стороны §8.6, provenance-навигация source→parent/artifact/группы) |
 | 10 | раздельные messages/stop/abort/controls | MVP | ✅ | test_web_api.py (раздельные endpoints; closed enum; idempotency key; stop/abort флаги сессии) |
 | 11 | нет вслепую-ретраев | MVP | ✅ | test_tool_broker.py (§5.7 retry-классы: pure=2, idempotent=1, non_idempotent/observation=0 без вслепую-ретраев; idempotency key + different hash=incident/alert) + test_llm_gateway.py |
 | 12 | random backup point + root set | v1 | ⬜ | — |
@@ -1296,3 +1296,58 @@ fenced-контекст с chunk_id/hash/origin/transform chain,
 `research_content_read` журнал); injection/poisoning-тесты (критерий 1 gate).
 Bootstrap остаётся sealed — egress включается только операторским
 config change. 651 тест.
+
+### M7. Полный веб + эксплуатация (этапы 6-full + 7)
+
+**T7.1 закрыт: knowledge graph + diagnostics.**
+
+Веб-контур (read-only, все head-запросы зафиксированы на EFFECTIVE
+снапшоте через `runtime_config_heads` — fail-closed; кандидатные
+shadow-heads видны по claim, но никогда не подаются как current):
+
+- `GET /api/v1/knowledge/claims?state=&limit=&offset=` — список claims с
+  head-состоянием (current/pending/invalid/none), grade, статусом,
+  свежестью;
+- `GET /api/v1/knowledge/claims/{id}` — detail: тело claim, все heads по
+  снапшотам (effective первым, с activation-состоянием кандидата),
+  evidence (со source/artifact), зависимости в обе стороны;
+- `GET /api/v1/knowledge/claims/{id}/provenance` — provenance-навигация:
+  evidence → source → parent source (uri/hash/lineage), artifact
+  (sha/size/trust_class), группы независимости, которые зафиксировал
+  ТЕКУЩИЙ assessment (source_independence_members /
+  environment_independence_members), роли evidence в текущем assessment
+  (assessment_evidence); view не создаёт snapshots;
+- `GET /api/v1/knowledge/dependencies?claim_id=&limit=` — рёбра графа
+  зависимостей (from depends on to, §8.6);
+- HTML: `/knowledge`, `/claim/{id}`, `/diagnostics` (тонкие viewers над
+  JSON API, ссылки с главной).
+
+Diagnostics (read-only):
+
+- `GET /api/v1/diagnostics` — агрегат: сессии по состояниям,
+  commit_attempts по статусам + счётчик unresolved (блокируют wake и GC),
+  открытые барьеры инвалидации (members/closed), reassessment-джобы по
+  статусам + топ blocked, активационный слот (fence/owner/lease),
+  writer gate, ревизии;
+- `GET /api/v1/diagnostics/reconciliation` — сессии
+  committing/reconciling_commit с attempt (status, staging_hash, base
+  revisions) и checkpoint; флаг `unresolved`;
+- `GET /api/v1/diagnostics/jobs?status=&limit=&offset=` — retry/blocked
+  views: error_class, attempts/max_attempts, next_attempt_at, blocked_at;
+- `GET /api/v1/diagnostics/barriers?include_resolved=` — барьеры с
+  closure-прогрессом (next_offset/member_count) и immutable closure
+  manifest (sha256/count).
+
+Тесты: `tests/scenario/test_web_knowledge.py` (5 тестов: list+head-states,
+detail+deps+shadow-head, provenance-навигация с parent source/artifact/
+groups/roles, dependencies-view, HTML-страницы),
+`tests/scenario/test_web_diagnostics.py` (5 тестов: empty summary,
+reconciliation view + unresolved-переход, jobs view + summary counts,
+barriers view с progress/manifest/include_resolved, активационный слот +
+writer gate).
+
+Ловушка (→ AGENTS §7): SQLAlchemy `text()` не конвертирует nullable
+bind-параметры (`:p IS NULL` при p=None) — asyncpg не может вывести тип
+из None; `:p::text` тоже не конвертируется (литеральный `:` уходит в
+ПГ). Паттерн: динамическое WHERE-условие, параметр присутствует только
+когда не None.
