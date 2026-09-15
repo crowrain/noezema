@@ -30,6 +30,19 @@ GRADE_CONFIDENCE_BASE = {
 }
 
 
+#: §8.7.3 relation strength for ``required_independence`` (the snapshot
+#: relations from packages.memory.env_independence).
+REQUIRED_RELATIONS = ("repeatability", "reproducibility", "independent_replication")
+_RELATION_RANK = {
+    "none": 0,
+    "untracked": 1,
+    "variation": 1,  # different groups, same method: no independence either
+    "repeatability": 2,
+    "reproducibility": 3,
+    "independent_replication": 4,
+}
+
+
 @dataclass(frozen=True)
 class ClaimTypeRule:
     """One executable claim-type rule (from config_snapshots.claim_type_rules)."""
@@ -41,11 +54,21 @@ class ClaimTypeRule:
     requires_scope: bool
     requires_as_of: bool
     volatility: str
+    # §8.7.3 (T4.6): the required RELATION between independent
+    # environments — scope-dependent. Group counts alone are not
+    # enough: two runs of the same implementation are one group, and
+    # only ``independent_replication`` may lift a grade to E3.
+    required_independence: str | None = None
 
     @classmethod
     def from_payload(cls, claim_type: str, payload: JsonDict) -> ClaimTypeRule:
         if not payload:
             raise ValueError(f"no rule for claim_type {claim_type!r}")
+        required = payload.get("required_independence")
+        if required is not None and required not in REQUIRED_RELATIONS:
+            raise ValueError(
+                f"claim_type {claim_type!r}: unknown required_independence {required!r}"
+            )
         return cls(
             min_grade_for_supported=EffectiveGrade(payload["min_grade_for_supported"]),
             allowed_kinds=frozenset(payload.get("allowed_kinds", [])),
@@ -54,6 +77,7 @@ class ClaimTypeRule:
             requires_scope=bool(payload.get("requires_scope", False)),
             requires_as_of=bool(payload.get("requires_as_of", False)),
             volatility=str(payload.get("volatility", "static")),
+            required_independence=required,
         )
 
     @property
@@ -75,6 +99,30 @@ class EvaluatedEvidence:
     relation: str  # supports | counters
     scope: JsonDict = field(default_factory=dict)
     independence_group: str = "unknown"
+    # §8.7.3 (T4.6): the environment-independence relation this evidence
+    # has with the rest of the set (env_independence snapshot member);
+    # "none" when the evidence has no tracked environment
+    env_relation: str = "none"
+    # §8.7.4 (T4.8): the counters evidence has a VALID
+    # counterevidence_resolution — it does not cap the grade
+    resolved: bool = False
+
+
+def _relation_met(support: list[EvaluatedEvidence], required: str) -> bool:
+    """§8.7.3: the required relation must hold BETWEEN distinct
+    environments — ``independent_replication`` needs two distinct groups
+    whose members replicate independently; the weaker relations need two
+    members that actually have (at least) that relation."""
+    if required == "independent_replication":
+        return len(
+            {
+                e.independence_group
+                for e in support
+                if e.env_relation == "independent_replication"
+            }
+        ) >= 2
+    threshold = _RELATION_RANK[required]
+    return sum(1 for e in support if _RELATION_RANK.get(e.env_relation, 0) >= threshold) >= 2
 
 
 @dataclass(frozen=True)
@@ -113,7 +161,11 @@ def evaluate(
     op instead of silently mis-weighing it.
     """
     support = [e for e in evidences if e.relation == "supports"]
-    counter = [e for e in evidences if e.relation == "counters"]
+    # §8.7.4: only UNRESOLVED counterevidence counts against the claim —
+    # a counter with a valid resolution (verifiable basis) is out
+    # (counterevidence_unresolved == false)
+    counter = [e for e in evidences if e.relation == "counters" and not e.resolved]
+    resolved_counters = sum(1 for e in evidences if e.relation == "counters" and e.resolved)
 
     # role/relation inconsistency: a support evidence of a kind the rule
     # does not allow is rejected, not silently dropped (§14.3)
@@ -150,9 +202,13 @@ def evaluate(
             reasons=("counterevidence_only",),
         )
 
+    relation_ok = (rule.required_independence is None) or _relation_met(
+        support, rule.required_independence
+    )
     meets = (
         len(support) >= rule.min_support_evidence
         and len(groups) >= rule.min_independence_groups
+        and relation_ok
         and scope_ok
         and as_of_ok
     )
@@ -161,7 +217,7 @@ def evaluate(
         # unresolved counterevidence: disputed, capped at E1 (§3.7)
         grade = EffectiveGrade.E1
         status = EpistemicStatus.DISPUTED
-        reasons = ("counterevidence_unresolved",)
+        reasons: tuple[str, ...] = ("counterevidence_unresolved",)
     elif meets:
         grade = rule.min_grade_for_supported
         # extra independent groups lift the grade by one step (never past E4)
@@ -169,6 +225,8 @@ def evaluate(
             grade = EffectiveGrade(grade.value[0] + str(grade.level + 1))
         status = EpistemicStatus.SUPPORTED
         reasons = ("requirements_met",)
+        if resolved_counters:
+            reasons = (*reasons, "counterevidence_resolved")
     else:
         # some support, requirements not met: hypothesis (integrity checked)
         grade = EffectiveGrade.E1
@@ -177,6 +235,11 @@ def evaluate(
             reasons = ("insufficient_evidence",)
         elif len(groups) < rule.min_independence_groups:
             reasons = ("insufficient_independence",)
+        elif not relation_ok:
+            # §8.7.3: the groups exist but the required relation between
+            # environments is missing (e.g. the same implementation
+            # repeated — repeatability, not independent replication)
+            reasons = (f"independence_{rule.required_independence}_not_met",)
         elif not scope_ok:
             reasons = ("scope_not_covered",)
         else:

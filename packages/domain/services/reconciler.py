@@ -183,10 +183,14 @@ async def reconcile_commit(
 async def _mark_failed(
     db: AsyncSession, audit: AuditService, session_id: UUID, reason: str
 ) -> None:
+    # T4.4 (§5.9.1 rule 5): recovery clears a stale writer intent only
+    # AFTER the lease/commit attempt fencing above (no live lease here,
+    # and the attempt is fenced terminal).
     await db.execute(
         text(
             "UPDATE sessions SET state = 'failed', finished_at = now(), "
-            "lease_owner = NULL, lease_expires_at = NULL, termination_reason = :r "
+            "lease_owner = NULL, lease_expires_at = NULL, termination_reason = :r, "
+            "commit_intent_at = NULL "
             "WHERE id = :id AND state NOT IN ('succeeded','succeeded_partial','failed','cancelled')"
         ),
         {"id": session_id, "r": reason},

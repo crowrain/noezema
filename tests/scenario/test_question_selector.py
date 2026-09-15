@@ -63,7 +63,7 @@ def test_real_prompts_are_versioned() -> None:
     explorer = load_prompt(Role.EXPLORER)
     curator = load_prompt(Role.CURATOR)
     assert explorer.version == "explorer-v2"
-    assert curator.version == "curator-v1"
+    assert curator.version == "curator-v2"  # T4.1: the dependencies section
     assert len(explorer.sha256) == 64
     assert len(curator.sha256) == 64
     # config snapshot references these exact paths/versions

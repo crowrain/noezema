@@ -24,7 +24,10 @@ from packages.domain.models.sessions import ORMSession
 from packages.domain.services.audit import AuditService
 from packages.domain.services.reserve import HostReserveService, ReserveLimits
 from packages.domain.services.staging import StagingService
-from packages.memory.evidence import environment_manifest_hash
+from packages.memory.evidence import (
+    manifest_content_hash,
+    session_environment_fields,
+)
 from packages.memory.service import MemoryService
 
 pytestmark = [pytest.mark.unit]
@@ -186,9 +189,18 @@ async def test_head_lifecycle_invariant_current_has_assessment(migrated_db: Any)
 
 
 @pytest.mark.asyncio
-async def test_env_hash_is_deterministic(migrated_db: Any) -> None:
-    a = environment_manifest_hash("sess-1", {"m": "x"}, "tool-hash")
-    b = environment_manifest_hash("sess-1", {"m": "x"}, "tool-hash")
-    c = environment_manifest_hash("sess-2", {"m": "x"}, "tool-hash")
+async def test_env_manifest_hash_is_content_addressed(migrated_db: Any) -> None:
+    # §8.7.3 (T4.6): the manifest is content-addressed over the FULL
+    # field set — the session identity is NOT part of it (two sessions
+    # in the same environment share one manifest)
+    a = manifest_content_hash(
+        session_environment_fields(protocol_hash="p1", tool_schema_hash="t1", seed=42)
+    )
+    b = manifest_content_hash(
+        session_environment_fields(protocol_hash="p1", tool_schema_hash="t1", seed=42)
+    )
+    c = manifest_content_hash(
+        session_environment_fields(protocol_hash="p2", tool_schema_hash="t1", seed=42)
+    )
     assert a == b
     assert a != c

@@ -21,6 +21,12 @@ QUESTION_UUID5_NAMESPACE = "c0e3d3b6-dd7b-557d-a4d8-6e41049f8468"
 """UUIDv5 namespace for deterministic invalid-assessment question IDs (§8.7.1).
 Pinned by migration 0001; never part of a mutable config payload."""
 
+CLOSURE_MANIFEST_UUID5_NAMESPACE = "b3f2a9d1-7c4e-5a8f-9e2d-1c6b8a4f3e70"
+"""UUIDv5 namespace for content-addressed closure manifest IDs (T4.2, §8.6):
+id = uuid5(namespace, sha256) — the same closure under the same graph
+revision always resolves to the same manifest row (dedup by content).
+Code-pinned constant, never part of a mutable config payload."""
+
 BOOTSTRAP_SNAPSHOT_ID = uuid.uuid5(uuid.NAMESPACE_URL, "https://github.com/crowrain/noezema/bootstrap-config-snapshot")
 
 BOOTSTRAP_PAYLOAD: dict[str, Any] = {
@@ -42,7 +48,7 @@ BOOTSTRAP_PAYLOAD: dict[str, Any] = {
     "embeddings": {"enabled": False, "dimensions": None},
     "prompts": {
         "explorer": {"version": "explorer-v2", "path": "prompts/explorer.md"},
-        "curator": {"version": "curator-v1", "path": "prompts/curator.md"},
+        "curator": {"version": "curator-v2", "path": "prompts/curator.md"},
     },
     "policy": {
         "access_profile": "sealed",
@@ -88,7 +94,15 @@ BOOTSTRAP_PAYLOAD: dict[str, Any] = {
         "phase_deadline_seconds": 600,
         "session_timeout_seconds": 1800,
     },
-    "activation_limits": {"offline_activation_max_invalid_questions": 100},
+    "activation_limits": {
+        "offline_activation_max_invalid_questions": 100,
+        # T4.5 (§8.7.2): the online post-publish manifest bound (the flip
+        # refuses to publish when the pending-head question backlog would
+        # exceed it — the rules change invalidates too much at once) and
+        # the post-publish/repair retry budget
+        "online_activation_max_pending_questions": 100,
+        "online_activation_max_attempts": 78,
+    },
     # Wake scheduling (§5.2.1, T3.29). Owned by the trusted boundary: the
     # sandbox never sees it. ``interval_seconds`` is the base periodic
     # schedule (MVP cron case "every N seconds");
@@ -106,6 +120,35 @@ BOOTSTRAP_PAYLOAD: dict[str, Any] = {
         "max_consecutive_failures": 3,
         "disk_quota_mb": 1024,
         "gpu_required": False,
+    },
+    # Reassessment admission (§5.9.1, T4.4). The thresholds are pinned in the
+    # config snapshot per spec ("порог допуска, T_escalate, retry budget и
+    # SLO фиксируются в конфигурации"). Derived from the 2026-09-14 load
+    # series (PLAN M4 thresholds): wake interval 3600 s, session wall P95
+    # <= 200 s — "not more than 2 wake intervals behind": both thresholds
+    # default to 2 * 3600 = 7200 s.
+    # ``t_escalate_seconds`` — a runnable job OLDER than this is treated as
+    # dependency-critical regardless of its original reason (no row
+    # mutation: the predicate is derived at admission time).
+    # ``t_worker_admission_seconds`` — a wake is SKIPPED while the oldest
+    # runnable dependency-critical job is older than this: the queue gets
+    # the window between sessions and never fights the active one.
+    # ``queue_slo_seconds`` — the wall-clock SLO of the runnable queue
+    # (depth/age/attempts are operator metrics; a long-non-empty queue is a
+    # memory degradation, §5.9.1).
+    "reassessment_admission": {
+        "t_escalate_seconds": 7200,
+        "t_worker_admission_seconds": 7200,
+        "queue_slo_seconds": 172800,
+    },
+    # T4.5 (§8.7.2, §5.2.1): the effective runnable repair backlog (a
+    # post_publish_blocked candidate with a due cursor) has a wall-clock
+    # SLO; the wake is skipped while its age exceeds T_repair_admission
+    # (post_publish_blocked does NOT block the wake immediately — the
+    # threshold gives the repair runner its normal window).
+    "repair_admission": {
+        "t_repair_admission_seconds": 7200,
+        "repair_slo_seconds": 172800,
     },
     "claim_type_rules": {
         "local_observation": {
@@ -137,6 +180,10 @@ BOOTSTRAP_PAYLOAD: dict[str, Any] = {
             "allowed_kinds": ["experiment_run"],
             "min_support_evidence": 2,
             "min_independence_groups": 2,
+            # §8.7.3: E3 — только independent replication (независимая
+            # реализация protocol/implementation + независимый dataset
+            # lineage), а не просто два разных окружения
+            "required_independence": "independent_replication",
             "requires_scope": True,
             "volatility": "static",
         },
@@ -145,6 +192,7 @@ BOOTSTRAP_PAYLOAD: dict[str, Any] = {
             "allowed_kinds": ["experiment_run", "computation"],
             "min_support_evidence": 2,
             "min_independence_groups": 2,
+            "required_independence": "independent_replication",
             "requires_scope": True,
             "volatility": "static",
         },

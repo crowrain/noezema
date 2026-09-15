@@ -10,8 +10,8 @@
 | M0 каркас | ✅ выполнена | — | чистое дерево, скелет, CI, fake LLM, ADR-0001/0002/0003 |
 | M1 контракты + LLM | ✅ выполнена | noezema-m1 | PR #4–#10; gate пройден: 112 тестов (86 unit ≥ 40), Sealed-сессия question→action→evidence→commit на fake LLM |
 | M2 изоляция + commit | ✅ выполнена | noezema-m2 | PR #11–#16: sandbox+runtime, policy engine, tool broker, artifact store+staging+freeze, commit boundary (prepared→fenced final tx) + reconciliation; gate пройден: 206 тестов, failpoints (kill до/после COMMIT, open final tx, stale finalizer, kill mid-action), security (сеть off, cap-drop, injection, ro rootfs) |
-| M3 память + web slice (MVP) | ✅ Gate M3 пройден (T3.29 закрыл пункт 1 §22.1) | noezema-m3 (на `ec6b4b0`, T3.29 — закрытие gate); noezema-mvp остаётся на `5d94b27` (создан до T3.29 — см. раздел Gate M3) | PR #17: память — модель (0004), evidence identity (§14.3), rules engine v1, independence (PSL+overlap), lifecycle heads (§14.1), apply в fenced tx. PR #18: context pack §5.4 + retrieval (fulltext russian, pending/invalid — отдельный лимит и метка в той же строке §5.4.2). PR #19: host recovery — noezemactl CLI, recovery policy schema v1 (jitter=0, JCS-хэш), fsync-safe transition journal + head + boot reconcile, offline rules (advisory lock, cohort+seal, atomic publish с UUIDv5 invalid-вопросами), fail-closed admission, resume-классификация (transient→retry_wait/0, permanent→resume_blocked/78, unclassified→degraded) + idempotent audit replay, policy change head + event stream, unit-state publisher, systemd units + CI-verify. PR #20: web slice — Query/Command + admin-token auth, fail-closed Command API на нездоровом hostе (423), SSE timeline (committed outbox + max_events), session detail, message TTL→expired, Host Status Adapter (recovery banner: none/retry_wait/degraded/blocked), минимальные HTML-страницы main/session. PR #21: failpoints/инварианты/resume/scenario-тесты. T3.29: wake scheduling + wake admission + backoff/pause (§5.2.1, пункт 1 §22.1): `wake_schedule` в snapshot (миграция 0005) + `wake_scheduler_state`, `noezemactl wake-tick` + `noezema-wake.timer`, admission (6 gates, skip с точной причиной в audit `wake_skipped`), экспоненциальный backoff, авто-pause после 3 неудач, wake_now — без расписания но с admission; 370 тест |
-| M4 зависимости + переоценка | ⬜ не начата | — | |
+| M3 память + web slice (MVP) | ✅ Gate M3 пройден (T3.29 закрыл пункт 1 §22.1); T3.30 — дефект lease из первой реальной сессии | noezema-m3 (на `ec6b4b0`, T3.29 — закрытие gate); noezema-mvp остаётся на `5d94b27` (создан до T3.29 — см. раздел Gate M3) | PR #17: память — модель (0004), evidence identity (§14.3), rules engine v1, independence (PSL+overlap), lifecycle heads (§14.1), apply в fenced tx. PR #18: context pack §5.4 + retrieval (fulltext russian, pending/invalid — отдельный лимит и метка в той же строке §5.4.2). PR #19: host recovery — noezemactl CLI, recovery policy schema v1 (jitter=0, JCS-хэш), fsync-safe transition journal + head + boot reconcile, offline rules (advisory lock, cohort+seal, atomic publish с UUIDv5 invalid-вопросами), fail-closed admission, resume-классификация (transient→retry_wait/0, permanent→resume_blocked/78, unclassified→degraded) + idempotent audit replay, policy change head + event stream, unit-state publisher, systemd units + CI-verify. PR #20: web slice — Query/Command + admin-token auth, fail-closed Command API на нездоровом hostе (423), SSE timeline (committed outbox + max_events), session detail, message TTL→expired, Host Status Adapter (recovery banner: none/retry_wait/degraded/blocked), минимальные HTML-страницы main/session. PR #21: failpoints/инварианты/resume/scenario-тесты. T3.29: wake scheduling + wake admission + backoff/pause (§5.2.1, пункт 1 §22.1): `wake_schedule` в snapshot (миграция 0005) + `wake_scheduler_state`, `noezemactl wake-tick` + `noezema-wake.timer`, admission (6 gates, skip с точной причиной в audit `wake_skipped`), экспоненциальный backoff, авто-pause после 3 неудач, wake_now — без расписания но с admission. T3.30: фоновый heartbeat lease во время долгих LLM-вызовов + `clock_timestamp()` в lease (дефект из первой реальной MVP-сессии — см. раздел ниже); 374 тест |
+| M4 зависимости + переоценка | ✅ T4.1 закрыт (claim_dependencies: DAG cycle check при commit, graph revision, kind `research` по §8.6); T4.2 закрыт (cascade invalidation: closure manifest, barrier с durable курсором, idempotent батчи, blocked-путь, retrieval ancestor check); T4.3 закрыт (worker `system:reassessment`: runnable-предикат §5.9.1, lease/retry/blocked, insufficient→invalid+question, crash-lease recovery); T4.4 закрыт (writer admission: table gate §14.1 NOWAIT + jitter, session intent rules 1/4/5, T_escalate/T_worker_admission в scheduler); T4.5 закрыт (online activation §8.7.2: fenced lease + takeover, shadow heads fast path/pending, seal + DB-триггер sealed-интервала, atomic flip, post-publish manifest с deterministic UUIDv5, repair runner + T_repair_admission); T4.6 закрыт (environment manifests §14 env-v2: content-addressed manifest_hash, versioned алгоритм env-independence-v1 — группы по (protocol, implementation, dataset lineage), отношения repeatability/reproducibility/independent_replication/variation/untracked, снапшот на оценке, `required_independence` в rules engine: E3 только через независимую репликацию); T4.7 закрыт (source graph §11.3: таблицы source_dependency_edges/source_graph_corrections, алгоритм independence-v2 — domain/content_hash/parent/edges/corrections, снапшот source_independence_* на оценке, каскад apply_source_graph_change: merge/split → invalidation + recompute, ревизия source_graph); T4.8 закрыт (counterevidence resolutions §8.7.4: таблица + XOR/partial-unique CHECK, межстрочные инварианты (counter-цель, scope-compat, нет транзитивной зависимости, valid correction), каскад create/invalidate → recompute, engine считает только unresolved counters); T4.9 закрыт (failpoints M4: crash после flip — pointer tuple recovery, crash между батчами post-publish — durable cursor, stale activator после takeover — fence-отказ, следующий flip закрывает blocked backlog, barrier crash после каждого батча, group merge + crash worker'а, worker без starvation после смерти intent-lease) — GATE M4 пройден (§19: invalid ancestor блокирует downstream; worker без starvation оба направления; group merge → корректный пересчёт) | — | пороги M4 из замеров серии 2026-09-14 зафиксированы в PLAN (батч 32, SLO P95 200 с); 501 тест |
 | M5 расширенный цикл | ⬜ не начата | — | |
 | M6 Research Proxy | ⬜ не начата | — | |
 | M7 полный веб + эксплуатация | ⬜ не начата | — | |
@@ -42,7 +42,7 @@
 | 11 | нет вслепую-ретраев | MVP | ✅ | test_tool_broker.py (§5.7 retry-классы: pure=2, idempotent=1, non_idempotent/observation=0 без вслепую-ретраев; idempotency key + different hash=incident/alert) + test_llm_gateway.py |
 | 12 | random backup point + root set | v1 | ⬜ | — |
 | 13 | partial success на safe boundary | MVP | ✅ | test_orchestrator.py::test_budget_exhausted_partial (succeeded_partial) |
-| 14 | каскадная инвалидация | v1 | ⬜ | — |
+| 14 | каскадная инвалидация | v1 | ✅ T4.1+T4.2+T4.3+T4.4+T4.5+T4.6+T4.7+T4.8+T4.9 | T4.1 (граф + цикл): test_claim_dependencies.py (unit: cycle check — чистая функция и через apply_claim_staging: циклическое evidential-ребро отклоняется с audit `dependency_edge_rejected`, claim всё же коммитится; research-ребро не в цикле и не двигает graph revision; evidential на non-current цель — отклонено §8.6; bad kind/self/missing/unparseable — отклонены) + test_orchestrator.py (scenario: полный цикл — curator-зависимость коммитится с bump `domain_revisions(dependency_graph)` 0→1 и audit-полями; цикл — ребро отклонено, graph revision не меняется) + test_staging_schema.py (ClaimDependencyProposal: closed kind, UUID, budget ≤10, дубликаты). T4.2 (barrier/closure/manifest): test_cascade.py (8: closure-ходы; inline cascade; idempotent replay; barrier lifecycle + crash-resume; graph-change → new generation; tamper → blocked; retrieval ancestor check; moved graph при старте). T4.3 (worker reassessment_jobs): test_reassessment.py (13: runnable-предикат — activating slot/чужой snapshot/backoff-отсрочка; head promotion через rules engine с audit и knowledge bump; insufficient data → invalid + UUIDv5 question; transient → retry с backoff; permanent → blocked + alert; expired-lease recovery; admission metrics; bounded batch + priority; mid-batch loss admission). T4.4 (writer admission): test_writer_admission.py (14: gate CAS §14.1 — acquire/release/expired-takeover/NOWAIT-конфликт + CHECK holder-полей; session intent — live lease, idempotent, clear, stale-очистка reconciler'ом после fencing; worker — deferral с jitter при gate-конфликте, уступка intent на входе и mid-batch (попытка не сгорает), release после батча; activation берёт gate до pointer; scheduler — T_escalate/T_worker_admission skip `reassessment_backlog`, свежая/blocked очереди не блокируют, fail-closed секция, SLO-метрики). T4.5 (online activation §8.7.2): test_online_activation.py (12: fenced lease — acquire/resume/takeover fence+1; quiesce — gate wait timeout, active session; shadow heads — fast path carry старой оценки / pending + activation jobs; deterministic UUIDv5 вопросы post-publish; atomic flip — pointer + bootstrap immutable; crash resume без смены fence; transient backoff + slot held; exhaustion → post_publish_blocked + alert + repair runner (repair CAS, phase=repair); superseded-закрытие без reactivation; T_repair_admission — skip repair_backlog; sealed-интервал триггер 45000). T4.6 (environment independence §8.7.3): test_env_independence.py unit (17: ключ группы — только (protocol, implementation, dataset lineage), GPU/seed/data order группу не создают; untracked fail-closed; 6 исходов классификации; shared dataset lineage убивает independence; strongest-pair с variation; engine — E3 только через independent_replication ≥2 группы, repeatability/reproducibility/variation не проходят, причины insufficient_independence / independence_*_not_met; unknown relation → ValueError) + scenario (6: полный манифест §14 + manifest_hash + снапшот на оценке; 2 сессии = 1 манифест, нет ложной independence; repeatability — одна группа, E2; другой GPU — reproducibility, гипотеза; независимые implementation'ы — E3; shared lineage — variation + independence_independent_replication_not_met). T4.7 (source graph §11.3): test_source_independence.py unit (10 новых: v2 — content_hash/parent/edge/correction базы; split отменяет прямую edge, но не domain; split бьёт merge (fail-closed); invalid correction игнорируется; unknown lineage; порядок-инвариантность) + scenario test_source_graph.py (6: E3 через два независимых источника + снапшот independence-v2; зеркала одного domain — одна группа; merge correction → head pending + job + ревизия 0→1 → recompute гипотеза (свежий снапшот, audit source_graph_changed); split correction → группы расходятся → E3; unknown lineage — одна группа; staging-commit — снапшот на оценке). T4.8 (counterevidence §8.7.4): test_counter_resolutions.py unit (9: claim_depends_on — транзитивность, циклы, направление) + test_rules_engine.py (+3: resolved counter не cap'ит, только-resolved — не refuted, один unresolved — disputed) + scenario test_counter_resolutions.py (5: disputed E1 с counter'ом; evidence-basis → каскад → E3 + audit; инварианты XOR/counter/scope/транзитивная зависимость/уникальность/DB CHECK; correction-basis → E3, отзыв correction → invalid + disputed; прямая invalidation + idempotent no-op). T4.9 (failpoints): test_failpoints_m4.py (7: crash после flip — pointer tuple + один publish + idempotent resume; crash между батчами — durable cursor, без дублей UUIDv5; stale activator после takeover — fence-отказ без writes; следующий flip закрывает blocked backlog (find_repair_backlog → None); barrier crash после каждого батча — 3 batch audits + 1 resolved; group merge + expired worker lease → recovery + hypothesis на свежем снапшоте; worker завершает после смерти intent-lease). GATE M4: retrieval ancestor check (T4.2) + worker starvation оба направления (T4.4+T4.9) + group merge recompute (T4.7+T4.9) |
 | 15 | pending/invalid не current | MVP | ✅ | test_memory_service.py (lifecycle CHECK: pending/invalid ⇒ assessment/status NULL) + test_context_builder.py/test_retrieval.py (§5.4.2: отдельный лимит pending, метка в той же строке, исключение целиком если не хватает на метку) + test_invariants.py (pending/invalid не подаётся как current) + test_offline_rules.py (deferred→pending, removed-type→invalid) |
 | 16 | worker: priority, retry, no starvation | v1 | ⬜ | — |
 | 17 | repeatability/reproducibility/replication | v1 | ⬜ | — |
@@ -89,8 +89,8 @@
 T3.29 и указывает на commit до wake-scheduler; не переставляется — решение за
 пользователем (перенос — явное действие). Merge MVP в `main` выполнен отдельным
 решением пользователя (merge commit на `main`, `impl/from-scratch` синхронизирован).
-ruff + mypy (strict) + pytest (370) зелёные; `systemd-analyze verify` + hash-pin
-baseline-политики в CI.
+ruff + mypy (strict) + pytest (374 после T3.30) зелёные; `systemd-analyze verify` +
+hash-pin baseline-политики в CI.
 
 Закрыты со ссылками на тесты: строки 1–11, 13, 15, 19, 20, 21, 23, 28, 30–34 матрицы
 (см. матрицу выше). Ключевые failpoint/invariant-наборы:
@@ -137,4 +137,702 @@ M1 (PR #4–#10, T1.7–T1.11) и покрыт тестами. Оговорка 
 gateway-settings, а не из секции `model` снапшота (T1.7 «через config snapshot» —
 частично) — не блокирует пункт, но учтено при запуске реальной модели.
 
-Merge в `main` — отдельное решение (не выполняется автоматически).
+### Закрыто T3.30 (дефект из первой реальной MVP-сессии)
+
+Первая реальная (не fake-LLM) MVP-сессия 2026-09-14 (qwen36-35b-a3b-q6-mtp, llama.cpp на
+192.168.1.48, вопрос «Сколько будет 6*7?»): sandbox `python.execute` (56 мс) → ответ модели
+за 2 шага → куратор не валиден по схеме (см. ниже) → **fenced commit отклонён**:
+`commit_lease_lost`, attempt → `aborted`, reconciler → `reconciled_abort`,
+`consecutive_failures=1`. Причина — не одна, а две:
+
+1. **`now()` ≠ реальное время в долгой транзакции.** Postgres `now()`
+   (= `transaction_timestamp`) — константа старта транзакции. Phase-1-транзакция живёт
+   всю сессию, поэтому каждый heartbeat (и acquire) писал
+   `lease_expires_at = txn_start + 30 s` — одно и то же значение. Любой сессии, живущей
+   дольше TTL, leased commit был обречён независимо от частоты heartbeat; fake-LLM
+   сценарии не ловили дефект (все тестовые сессии < 30 с от старта транзакции).
+   **Исправление:** все lease-записи и лiveness-условия в `packages/domain/services/lease.py`
+   — `clock_timestamp()` (реальное время). Fenced check в `commit.py` и reconciler работают
+   в коротких новых транзакциях — для них `now()` эквивалентен, не менялись.
+2. **Heartbeat только на границах шагов.** Реальные задержки локальной модели 15–90 с
+   (в сессии: 16.6 с и 46.9 s; TTL 30 s) — между шагами lease всё равно истёк бы.
+   **Исправление:** `LeaseHeartbeatGuard` (§5.2.3 «TTL равен нескольким heartbeat
+   intervals с запасом на scheduler jitter»): background-task вокруг explorer/curator
+   LLM-вызовов, интервал = `ttl/3` (30 с → 10 с), продление — в транзакции вызывающего
+   (отдельное соединение блокировалось бы на row-lock строки сессии, который держит
+   phase-1), `progress=False` — `last_progress_at` (progress watchdog) не искажается;
+   отказ продления (phase deadline) → `LeaseLost` на выходе guard → abort, резолвит
+   reconciler (никогда не угаданный rollback). Оркестратор: `Orchestrator(lease_ttl=...)`
+   — инъекция TTL для тестов.
+
+Операционное finding (не код): модели с `reasoning_content` расходуют reasoning на
+`max_output_tokens` — куратор при бюджете 2048 отдавал пустой `content`
+(`finish_reason=length`, 3 ретрая ~84 с). Для реальных сессий `max_output_tokens ≥ 4096`
+(explorer-вызовы в 2048 укладывались: 1172/1035 токенов output с reasoning, schema_valid).
+
+Тесты: `tests/unit/test_lease.py` (guard: продление переживает операцию дольше TTL;
+продление не двигает `last_progress_at`; отказ продления → `LeaseLost` на выходе) +
+`tests/scenario/test_orchestrator.py::test_slow_llm_does_not_lose_commit_lease` (регрессия:
+4 LLM-вызова по 2.5 с при TTL 1 с → SUCCEEDED; без фикса — `commit_lease_lost`) +
+`tests/fakes/fake_openai_server.py`: `delay_seconds` у scripted response (имитация медленной
+модели). Полная проверка: ruff + mypy strict + pytest 374.
+
+**Повторная реальная сессия после T3.30 — SUCCEEDED (фикс подтверждён на реальной модели).**
+Сессия `e6a30c19` (qwen36-35b-a3b-q6-mtp, `max_output_tokens=4096`, «Сколько будет 6*7?»),
+длительность 4 мин 1 с: explorer 2 вызова (in 888/973, out 545/1195, **68.9 с и 143.4 с** —
+второй в 4.8 раза длиннее TTL 30 с, guard пережил), sandbox `python.execute` → «42»,
+куратор (in 600, out 1841, 24.4 с, schema_valid) → staging claim+evidence → fenced commit
+(prepared 16:25:45.234 → committed 16:25:45.280, 46 мс, staging_hash `b03167b7…`) →
+claim «6 * 7 = 42» (computed_result) + evidence computation (identity_hash `d49ab144…`) +
+assessment **E2 / supported / confidence 0.55** (только rules engine, rules_hash
+`19aed59f…`) → manifest `cf155a67…` (1 файл, 25 Б) → outbox 26 событий, вопрос →
+`verified`, wake: `consecutive_failures=0, node_state=idle`. БД `noezema_mvp` сохранена как
+доказательство (фореинзика — в отчёте по сессии).
+
+**Серия реальных MVP-сессий и замеры нагрузки (M4-precondition, 2026-09-14)** — 4 вопроса
+в БД `noezema_mvp` (знание накапливается между сессиями; контекст-пак видит предыдущие
+claims). Проход 1 при `max_output_tokens=4096` — **4/4 failed**: `reasoning_content` съел
+весь бюджет на первом explorer-вызове (проб минимального промпта: 15 000+ знаков
+reasoning, `finish_reason=length`, content пуст; 3 ретрая, wall 196–286 с/сессию).
+Длина reasoning модели дрейфует (4100–4250 токенов на тривиальном вопросе против
+545–1841 во 2-й сессии) — 4096 оказалось меньше P99. Авто-pause wake-планировщика
+сработал по spec (4 неудачи → sticky `paused`); operator resume (web RESUME:
+node_state→idle + сброс failure-бухгалтерии; `reset_failure_state()` планировщика —
+только бухгалтерия, node_state снимает host/web-слой) восстановил работу; отказавшие
+сессии чисто откатились (в таблицах — только wake-ledger + хост-лог).
+Проход 2 при **8192** — **3 succeeded + 1 succeeded_partial** (wall 72–184 с):
+`42:6` → partial (модель вызвала чужой инструмент `message.reply` с неверными
+аргументами → policy DENIED; free-text complete-reason вне closed enum →
+`succeeded_partial` + `partially_answered`, claim закоммичен), `12·13`, `сумма 1..10`,
+`7!` → succeeded. Замеры (проход 2, 15 LLM-вызовов): throughput ≈ 68 ток/с
+(40 585 out-токенов за 592 с); задержка вызова 8–66 с (линейно от длины вывода);
+in-токены 600–1110; fenced commit 21–50 мс; sandbox ≤1 мс на тривиальном коде.
+Итог по БД: 5 закоммиченных сессий, 5 claims (computed_result, E2/supported/0.55),
+4 verified + 1 partially_answered, node_state=idle. Операционное решение:
+`max_output_tokens=8192` — обязательный минимум для qwen36-35b-a3b-q6-mtp.
+Материал для порогов M4 (очередь, батч, SLO) собран (PLAN, блок «Серия реальных
+MVP-сессий»); старт M4 — решение пользователя.
+
+**Закрыто T4.1 (M4 старт, §8.6, §14.1, §5.2.2)** — `claim_dependencies` стал рабочей
+частью памяти:
+- **Staging**: `ClaimProposal.dependencies: list[ClaimDependencyProposal]`
+  (`{claim_id: UUID, kind: evidential|research}`, budget ≤10, closed kind, дубликаты
+  отклоняются host-валидацией). Модель видит существующие claims с ID: строки
+  контекст-пака теперь `[c:<claim_id>] …` (retrieval.line; §5.4.2 all-or-nothing
+  покрывает ID и метку), куратор получает раздел «Знание» с этими строками.
+- **Cycle check при commit** (§8.6): в `MemoryService.apply_claim_staging` (fenced tx,
+  шаг 1b) — evidential-граф = существующие рёбра + предложенные; новое ребро
+  `a → b` циклично iff `a` достижимо из `b`. Чистая функция
+  `find_evidential_cycles` + применение: циклическое ребро отклоняется (audit
+  `dependency_edge_rejected` + problems), claim всё же коммитится — инвариант DAG
+  не нарушается, знание не теряется. Research-рёбра в cycle check не участвуют
+  (явная пометка по §8.6; гипотеза — только research-зависимость).
+- **Валидация целей**: target должен существовать; self-ref запрещена; evidential на
+  non-current (pending/invalid head под effective snapshot) — отклонён («pending/invalid
+  не действуют как зависимости», §8.6); research — разрешён.
+- **Graph revision** (§14.1): `commit.finalize` — `touches_dependency_graph` вычисляется
+  по recorded staging (есть evidential-зависимость) → канонический порядок locks
+  включает строку `domain_revisions(dependency_graph)`; fencing-предикат проверяет
+  `graph_revision = base` (из prepared-строки) только при touches; bump
+  `dependency_graph` — только если evidential-ребро реально записано (research-only
+  и fully-rejected commit граф не двигают). Audit `commit_attempt_committed` несёт
+  `dependency_graph_revision`.
+- **Миграция 0006**: CHECK kind — `('evidential','research')` (M3-scaffold имел
+  `'investigative'`; spec §8.6 называет именно research-пометку; таблица пуста —
+  writers не было до T4.1).
+- **Prompt** `curator-v2` (+ pin в BOOTSTRAP_PAYLOAD: bootstrap snapshot — новый
+  payload-hash; тестовые БД мигрируют с нуля, production `noezema_mvp` не
+  пересидится — snapshot имутабелен, изменения конфигурации — путь T4.5+).
+- Решения: (1) циклическое/невалидное ребро = edge-level reject, а не отказ всей
+  сессии — консервативно: инвариант сохраняется, claim с evidence не теряется,
+  причина в audit; (2) `touches` определяется по staging ДО apply (замок берётся
+  даже если все рёбра отвергнуты — fencing честен, bump нет).
+- Тесты: test_claim_dependencies.py (8: 5 unit cycle-check + 3 DB-сценария через
+  apply_claim_staging), test_staging_schema.py (+7), test_orchestrator.py (+2
+  scenario: bump 0→1 с audit; цикл — отклонено, revision не изменился). 391 тест.
+
+**Закрыто T4.2 (каскадная инвалидация, §8.6 шаги 1–6, §14.1)** — `packages/memory/cascade.py`
++ миграция `0007_cascade` (3 таблицы: `closure_manifests`,
+`dependency_invalidation_barriers`, `reassessment_jobs` + расширение CHECK
+`prepared_by` на `system:cascade`/`system:barrier`):
+- **Closure вне транзакции** (шаг 1): reverse-closure по evidential-рёбрам против
+  ТЕКУЩЕЙ `domain_revisions(dependency_graph)`, чистая функция
+  `compute_reverse_closure` (детерминированный порядок (rank, claim_id), BFS-глубины,
+  root исключён, self-edges безопасны) → **immutable content-addressed manifest**
+  (root, graph rev, ordered IDs, ranks, count, sha256; id = uuid5(пinned namespace,
+  sha); дедуп по PK — повторный closure при том же rev = та же строка).
+- **Короткая tx старта** (шаги 2–5): writer gate (session-level advisory lock
+  `pg_try_advisory_lock(hashtext('noezema:knowledge_writer'))`, снимается после
+  settle tx — при крахе сессия закрывается, Postgres отпускает) → канонические
+  locks `runtime_config_heads → knowledge → dependency_graph` (subsequence,
+  `validate_lock_order` в `_CASCADE_LOCK_PLAN`) → верификация graph revision
+  (сдвинулся — `CascadeError`, вызывающий пересчитывает closure) → root head
+  `pending` + `reassessment_job` + UUIDv5 question (`origin=invalid_assessment`,
+  uuid5(QUESTION_UUID5_NAMESPACE, "cascade-invalidation:{snapshot}:{claim}") —
+  паттерн offline rules) → closure ≤32 inline в топологическом порядке (шаг 4)
+  ИЛИ barrier gen-1 `active` + первый батч 32 + сдвиг курсора — одной tx (шаг 5).
+  Bump `knowledge revision` только если реально кто-то инвалидирован (fencing
+  честен: in-flight commit сессии с base до инвалидации не пройдёт).
+- **Barrier-processor** (шаг 6, `process_barrier`): idempotent — всегда с
+  durable курсора. Батч: invalidation + job + сдвиг `next_offset` = ОДНА tx;
+  повторный батч no-op (pending/invalid head пропускается, unique
+  `uq_reassessment_jobs_active` не даёт дублей). Graph revision сдвинулся →
+  новая generation (строка barrier = generation: +1, курсор 0, manifest из
+  свежего closure под graph-lock'ом; обработанные claims безопасно
+  безопасно пропущены idempotent-батчами). Перед `resolved` — final closure
+  scan: manifest выхажан И в live closure нет ни одного current-descendant,
+  иначе возврат в `discovering`. `blocked` (manifest hash mismatch /
+  impossible cursor / manifest missing) — неавтономно, ancestor protection
+  держится, recovery только операторский с audit.
+- **Retrieval ancestor check**: `retrieve()` исключает из current claims из
+  closure открытых barrier'ов (`protected_claim_ids`: union manifests по
+  barrier'ам discovering/active/closing/blocked) — даже если head-row ещё
+  `current` (батч к ним не дошёл).
+- Решения: (1) writer gate T4.2 — advisory lock (session-level), T4.4
+  формализует NOWAIT-адаптацию + уступление session intent; (2) inline limit
+  = batch = 32 (пороги M4 из замеров); (3) barrier row lock берётся до
+  канонических — deadlock-free (barrier lock держит только processor,
+  канонические — в одном порядке у всех); (4) barrier-батчи тоже bump'ят
+  knowledge revision (иначе fence не видел бы изменение знания); (5)
+  `resolved_at` пишется ORM-выражением `func.now()` (flush вместе со
+  `status='resolved'` — CHECK `(resolved_at IS NULL) = (status <> 'resolved')`
+  строка-ориентированная); (6) discovering barrier без manifest защищает
+  только root (root уже pending — инвалидирован tx старта).
+- Тесты: test_cascade.py (8: чистые closure-ходы; inline cascade — heads
+  pending, 3 jobs, UUIDv5 question, knowledge bump, audit, graph нетронут;
+  idempotent replay — 0 дублей, manifest дедуп; barrier lifecycle 34 —
+  active→resolved, fresh-session resume с курсора (crash-resume), audit
+  батчей/resolve; graph-change → gen 2 (fresh closure +1, обработанные
+  skipped, `barrier_generation_published`); tamper manifest → `blocked` +
+  protection держится + повтор — `BarrierBlockedError`; retrieval ancestor
+  check; moved graph при старте — `CascadeError`, ничего не записано).
+  399 тестов.
+
+**Закрыто T4.3 (worker переоценки, §5.9.1, §8.7, §14.1)** —
+`packages/memory/reassessment.py` (актор `system:reassessment`; без LLM,
+без сети, без генерации evidence — читает только claim/evidence и
+запускает rules engine):
+- **Runnable-предикат** — точная формула §5.9.1: `status IN
+  ('queued','retry')` + `target = runtime_config_heads.active_config_snapshot_id`
+  + `activating_config_snapshot_id IS NULL` + `next_attempt_at` наступил
+  + budget не исчерпан. Literal `config_snapshots.activation_state` в
+  предикат НЕ входит. `worker_admission_metrics` (count + age старейшего
+  runnable) — примитивы для gate-ов T4.4.
+- **Lease**: короткая tx (writer gate + канонический head lock)
+  арендует ограниченный батч (`DEFAULT_BATCH_SIZE=8`, lease 300 с,
+  `attempts+1`, `status='leased'`). Job-строки перебираются
+  `priority DESC, enqueued_at ASC` (полный приоритет §5.9.1 — reverse
+  deps active questions / external-temporal — после T4.7; пока все 0).
+- **Per-job tx**: job re-fetch под FOR UPDATE ВНУТРИ job-tx (аренда
+  держится до commit job) → повторная admission-проверка под head lock
+  (активация/смена effective во время валидации — job возвращается в
+  очередь, попытка НЕ сгорает: session/activation всегда побеждает) →
+  rules engine по сохранённым evidence (scope — из последней
+  `assessed_scope` claim'а; independence groups — консервативно, как на
+  commit-пути) → новый assessment + head `current`
+  (`prepared_by='reassessment_worker'`) + bump knowledge revision одной tx
+  (fencing честен, паттерн T4.2). Head уже `current` (сессия
+  переоценила первой) — worker не затирает работу сессии, job
+  completed no-op.
+- **Недостаточно данных** (нет evidence): head → `invalid` +
+  исследовательский вопрос (uuid5(QUESTION_UUID5_NAMESPACE,
+  "reassessment-insufficient:{snapshot}:{claim}"), `origin=
+  invalid_assessment`) + job completed — по формулировке §5.9.1.
+- **Классификация ошибок** (решает доверенный код, не LLM):
+  `RuleValidationError` (детерминированная) или исчерпанный budget →
+  `blocked` (`blocked_at`, head остаётся `invalid`, critical alert
+  `alert_raised/reassessment_job_blocked`); job не runnable и не блокирует
+  global wake; перезапуск blocked — операторский audited-путь (T4.9
+  failpoints), worker blocked не трогает. Всё остальное — transient →
+  `retry` с экспоненциальным backoff + jitter (30 с · 2^min(n,7), cap
+  3600 с, jitter ≤15 с) до `max_attempts` (default 78 из 0007).
+- **Crash recovery**: lease tx и job tx раздельны — крах между ними
+  оставляет `leased`-строку; `recover_expired_leases` (вызывается
+  планировщиком перед батчем) возвращает истёкшие аренды в очередь с
+  восстановлением попытки (job tx атомарен: либо committed=completed,
+  либо rolled back).
+- **Writer admission §5.9.1** (session commit intent `commit_intent_at`,
+  NOWAIT-уступка с jitter, `T_escalate`/`T_worker_admission`) — T4.4;
+  worker уже уступает на shared advisory gate и на activating slot.
+- Решения: (1) attempt считается при lease, а не при оценке — потеря
+  admission mid-batch и crash-lease возвращают её (`attempts-1`),
+  успешная оценка не откатывает (консервативно: попытка была
+  предпринята); (2) blocked по transient'у только через исчерпание
+  `max_attempts` — worker никогда не блокирует job «на глаз»; (3)
+  head `current` во время переоценки — job completed no-op (сессия —
+  первичный writer); (4) backoff-окна не перекрываются
+  (30/60/120/240/480/960/1920→cap 3600, jitter ≤15) — нет
+  retry-storm'а.
+- Тесты: test_reassessment.py (13: чистый backoff; head promotion —
+  E2/supported, `prepared_by=reassessment_worker`, assessment→evidence
+  links, knowledge bump, audit; insufficient data → invalid + UUIDv5
+  question + outcome audit; deferral при занятом activating slot;
+  чужой snapshot не runnable; backoff-отсрочка; transient → retry
+  (не runnable до `next_attempt_at`, затем success); permanent
+  (disallowed support kind) → blocked + alert + question + повтор
+  no-op; expired lease → recovery + completion; unexpired lease не
+  крадётся; admission metrics (count/age, slot busy → 0); bounded
+  batch + priority; mid-batch loss admission → job в очередь, попытка
+  не сгорела). 412 тестов.
+
+**Закрыто T4.4 (writer admission, §5.9.1, §14.1)** —
+`packages/memory/writer_gate.py` (табличный gate + session intent),
+migration 0008, `apps/orchestrator/scheduler.py` (admission gate'ы):
+- **`knowledge_write_gate` §14.1** (0008: пересобрана из MVP-черновика
+  0003, drop+recreate — application data не хранилось): scope PK
+  ('global'), holder = `(owner_kind, owner_id, priority)` +
+  `acquired_at`/`lease_expires_at`, CHECK «поля holder'а движутся
+  вместе» (частичное заполнение невозможно), `priority ≥ 0`. Приоритеты:
+  worker 0 < cascade 1 < activation 2 < session 3 (session не берёт gate
+  — см. ниже).
+- **Протокол CAS** (`acquire_writer_gate`, один UPDATE, NOWAIT по
+  построению): пустой slot ИЛИ истёкший lease ИЛИ тот же owner —
+  acquired; живой чужой holder — False (конфликт). `release_writer_gate`
+  — только текущим holder'ом (условное). Crash-окно = lease TTL
+  (worker: 600 с); holder-строка после краха не блокирует вечно.
+- **Session commit intent (rule 1, 4, 5)** — session НЕ берёт gate:
+  `register_session_intent` (вход в consolidating, phase-1 tx
+  оркестратора; только под живым lease, `state='committing'`,
+  идемпотентно) ставит `sessions.commit_intent_at`; worker при живом
+  intent не батчит (admission) и не коммитит (mid-batch — job обратно в
+  очередь, попытка не сгорает). Очистка intent в терминальных tx:
+  finalize success/failed (commit.py), `_abort_session` (оркестратор),
+  `_mark_failed` (reconciler, после lease fencing — stale intent
+  не остаётся после crash). Финальная защита session — fencing
+  knowledge revision (rule 6).
+- **Worker** (reassessment.py): в lease tx — table gate NOWAIT →
+  конфликт: due runnable jobs отсрочены jitter'ом 5–15 с
+  (`next_attempt_at`, без lease, без attempt) и батч возвращается
+  deferred; живой session intent → deferred (gate освобождён); дальше —
+  canonical head lock + lease как в T4.3. После батча — release tx
+  (no-op, если holder сменился).
+- **Scheduler** (§5.9.1 liveness): `ReassessmentAdmission` (секция
+  `reassessment_admission` bootstrap payload: `t_escalate_seconds=7200`,
+  `t_worker_admission_seconds=7200`, `queue_slo_seconds=172800` — из
+  замеров 2026-09-14: 2 интервала wake и SLO памяти; fail-closed как
+  WakeSchedule). Wake SKIPPED (reason `reassessment_backlog`), если
+  старейший runnable job старше `t_escalate` (dependency-critical по
+  выводу — reason column не мутируется) И старше
+  `t_worker_admission`; blocked jobs не участвуют. `status()` — метрики
+  depth/age + SLO-флаг (операторский контур M7).
+- **`hostctl reassessment-tick`** — драйвер worker'а между сессиями
+  (recovery expired leases + bounded batch; v1 — свой таймер, wake-tick
+  и reassessment-tick раздельны).
+- Решения: (1) gate = табличный CAS NOWAIT (не advisory) — живой holder
+  виден worker'у через SELECT и не даёт «молчаливого» пропуска; advisory
+  lock сохраняется как mutex класса writers (cascade/barrier/worker);
+  (2) session — intent, не gate: её защита — fencing (rule 6), gate'у не
+  нужно знать о каждой session; (3) deferral при gate-конфликте — jitter
+  только due jobs, не lease/attempt (конфликт ≠ ошибка); (4)
+  dependency-critical — вывод, не запись (reason column — причина
+  enqueue, не статус критичности); (5) T_repair_admission — T4.5
+  (repair-очереди ещё нет); (6) gate-lease 600 с = crash-окно, batch
+  ≤8 jobs × 300 s lease не выходит за него при нормальной работе.
+- Тесты: test_writer_admission.py (14: gate acquire/release/
+  expired-takeover/NOWAIT-конфликт; CHECK holder-полей; intent требует
+  live lease + idempotent + clear; reconciler снимает stale intent
+  (fencing); worker defers при gate-конфликте с jitter (jobs queued,
+  attempts=0, next_attempt_at 5–15 с) и после освобождения gate работает
+  нормально; worker уступает intent на входе (без lease, без jitter);
+  mid-batch intent → job2 в очередь, попытка восстановлена, gate
+  освобождён; activation берёт gate до pointer (T4.5 preview);
+  scheduler: бэклог 10 ч → skip `reassessment_backlog` + audit; свежая
+  очередь → wake; escalated (3600) но < admission (72000) → wake, затем
+  skip; blocked job не блокирует; fail-closed валидация секции;
+  status-метрики + SLO). 426 тестов.
+
+**Закрыто T4.5 (online activation, §8.7.2)** —
+`packages/memory/activation.py` (модуль активации, ~1500 строк),
+migration 0009, `apps/orchestrator/scheduler.py` (T_repair_admission),
+`hostctl` (`activate-online`, `activation-repair-tick`):
+- **Fenced lease** (`acquire_activation`, один tx): writer gate
+  (poll 0.25–0.5 с до `gate_wait_seconds`, по умолчанию 900 с) →
+  head FOR UPDATE → active sessions FOR UPDATE + count (7 активных
+  состояний — acquire отклонён, слот не занят) → commit_attempts
+  FOR UPDATE + count (unresolved — отклонён). Слот: пуст → fence+1
+  + `activation_acquired`; тот же кандидат + тот же owner + живой
+  lease → idempotent resume (fence без изменения, без события);
+  тот же кандидат + ИСТЁКШИЙ lease (свой или чужой) → recovery
+  takeover (fence+1, `activation_takeover` — старый раннер
+  fenced out); чужой кандидат или чужой ЖИВОЙ lease → ошибка.
+  Fence монотонен, takeover его только повышает, сбросов нет.
+- **Shadow heads** (`freeze_cohort_online` → `prepare_heads_online`
+  → `verify_and_seal_online`, батчи по 128, каждый батч — свой tx):
+  freeze — idempotent manifest `{cohort_revision, claim_ids}`;
+  prepare — fast path: claim_type-rule канонически не изменился и
+  base head current с оценкой → shadow head `current`, ссылающийся
+  на СТАРУЮ оценку (assessment id + epistemic_status),
+  `prepared_by='rules_activation'`; затронутый claim → head
+  `pending` (NULL-пара) + durable job (`reason='activation'`,
+  target=candidate, unique). Verify — отдельный tx: rev ==
+  cohort_revision, count == expected, digest 5 полей (отсортирован),
+  state → `ready` + seal (verified_at/heads_sha256/expected_count).
+  **Sealed-интервал** (`ready|publishing`) держит DB-триггер 0009
+  `trg_claim_assessment_heads_sealed` — UPDATE/INSERT/DELETE shadow
+  head'ов незакрытого кандидата отклонён с ERRCODE 45000 (rebuild-путь:
+  условный `ready → preparing_heads` разрешён — CHECK'и 0001
+  не запрещают, триггер смотрит только текущее состояние).
+- **Atomic flip** (`publish_online`, один tx): ready → publishing;
+  лимит pending questions ≤ `online_activation_max_pending_questions`
+  (100); head → knowledge FOR UPDATE, active == base, seal цел,
+  rev == cohort, manifest hash, cursor 0, state → `post_publish`,
+  **переезд pointer**, previous → `superseded` (кроме immutable
+  bootstrap — его CHECK держит `active` навсегда), knowledge bump,
+  `activation_published`.
+- **Post-publish manifest** (`run_post_publish`): gate берётся ОДИН
+  раз на весь прогон (освобождается в `finally` — worker и sessions
+  quiesced до терминального cleanup). Батчи по 64 (≤32 батча/прогон):
+  head lock → refresh → терминальный state → early return;
+  state check; tuple check (fenced — takeover — deferred, manifest
+  остаётся новому owner'у); backoff-окно → deferred; pending
+  пересчёт; completion = `cursor >= len(pending)` — терминальный
+  cleanup в той же tx (`active`); иначе — срез pending, вопросы
+  (deterministic UUIDv5 `activation-pending:{candidate}:{claim}`,
+  origin=previous_result), cursor + knowledge bump в одной tx,
+  `activation_post_publish_batch`. Transient ошибка → `attempts+1` +
+  backoff 30·2^min(n-1,7) (cap 3600, jitter ≤15 с) + `last_error`,
+  прогон reraise'ится — resume по тому же курсору. Бюджет исчерпан
+  (`online_activation_max_attempts`, bootstrap 78) → inline
+  терминальный cleanup `post_publish_blocked` (blocked_at,
+  next_attempt=now, `activation_post_publish_blocked` + alert
+  `post_publish_blocked`, слот очищен) — результат RETURNED, не
+  raised.
+- **Repair runner** (`run_activation_repair`): repair CAS
+  (активный == кандидат, activating IS NULL, mode online, state
+  post_publish_blocked, cursor == expected, next_attempt ≤ now);
+  **superseded-проверка ПЕРВОЙ** — pointer на новом конфиге →
+  закрыть остаток `superseded` (`activation_superseded`), старый
+  конфиг в `active` не возвращать никогда; completion → `active`
+  (`activation_post_publish_completed`, batch'и с `phase='repair'`);
+  permanent (LookupError/ValueError) → park
+  (`next_attempt_at=NULL`) + alert `repair_backlog_permanent_failure`
+  (до audited operator retry).
+- **Terminal cleanup** — ОДИН tx: state + слот/lease + audit
+  (`activation_cleaned_up` с outcome). «Терминальный state с
+  непустым слотом» — нарушение инварианта.
+- **Драйвер** (`run_online_change`, plain session, шаг = свой tx):
+  upsert → ранний выход «payload уже эффективен» ТОЛЬКО при
+  `active` (post_publish effective — manifest открыт, resume;
+  post_publish_blocked — repair lane, вернуть состояние, слот не
+  трогать) → слот/lease → prepare-блок (preparing/ready/publishing)
+  → flip (ready) → post-publish. Pre-publish `ActivationError` →
+  терминальный cleanup `failed` + reraise (слот очищен, pointer не
+  тронут); post-publish backoff/blocked — RETURNED; generic
+  (RuntimeError) — propagates без cleanup (crash-семантика: слот
+  держится, resume/idempotent takeover).
+- **`hostctl activate-online --payload <file> --reason`** — драйвер
+  (exit 1 при ActivationError); **`activation-repair-tick`** —
+  find_repair_backlog → no-op или один `run_activation_repair`.
+- **Scheduler** (T_repair_admission, §5.9.1): runnable blocked
+  backlog (владеет pointer, due, next_attempt не NULL) старше
+  `t_repair_admission_seconds` (bootstrap 7200) → wake SKIPPED
+  (reason `repair_backlog`); свежий backlog не блокирует (у repair
+  lane своё окно). `status()` — oldest age + `repair_slo_seconds`
+  (172800) + SLO-флаг.
+- Решения: (1) shadow heads — fast path (carry старой оценки) для
+  неизменённых claim_type + pending+job для затронутых; «затронут»
+  = canonical-сравнение entry claim_type_rules; (2) post-publish
+  follow-ups — deterministic UUIDv5 вопросы для pending head'ов
+  (origin=previous_result), replay-идемпотентность; (3) completion —
+  `cursor >=` пересчитанному числу pending (не зафиксированному
+  manifest — cohort может сдвинуться между прогонами); (4) normal-run
+  CAS держит слот занятым весь post-publish (quiesce), repair CAS —
+  post-cleanup по спеке; (5) previous → superseded только для
+  non-bootstrap (immutable CHECK); (6) sealed-интервал — DB-триггер
+  0009 (не только код); (7) пороги T_repair_admission 7200/172800 —
+  аналог T_worker_admission из замеров.
+- Тесты: test_online_activation.py (12: happy path mixed — fast
+  head'ы с carry + pending + jobs + deterministic вопросы +
+  audit'ы + worker досасывает activation jobs до `current`;
+  all-fast path — без jobs/вопросов, carry старой assessment id,
+  prepared_by=rules_activation; pre-publish failure → `failed` +
+  слот очищен + pointer не тронут; crash mid-prepare → idempotent
+  resume с НЕИЗМЕННЫМ fence; takeover → fence+1 + audit; gate wait
+  timeout → `draft` без слота, повтор — `active`; active session →
+  acquire отклонён (без слота), удаление session → успех;
+  post-publish transient → attempts=1 + backoff в будущем + слот
+  занят + pointer переехал, fast-forward → `active`; exhaustion
+  (budget=1) → `post_publish_blocked` + alert + cleanup, repair
+  runner → `active` + вопросы + batch'и phase=repair; pointer на
+  новом конфиге → repair закрывает `superseded` (не reactivates) +
+  audit; scheduler: старый (100 ч) backlog → skip `repair_backlog` +
+  audit, свежий (1 ч) → wake; sealed-интервал: UPDATE head'ов в
+  `ready` → 45000, условный return в preparing_heads разрешён).
+  438 тестов.
+
+**Закрыто T4.6 (environment manifests + environment independence, §8.7.3, §14)** —
+`packages/memory/env_independence.py` (versioned алгоритм),
+`packages/memory/evidence.py` (env-v2), `packages/memory/rules_engine.py`
+(`required_independence`), migration 0010:
+- **Полный набор полей §14** (`normalizer_version='env-v2'`):
+  `protocol_hash` (canonical snapshot'а `prompts`), `implementation_hash`
+  (`noezema-impl-v1`), `code_lineage`/`dataset_hash`/`dataset_lineage`/
+  `dependency_hash` (у session-запусков None — нет датасета),
+  `toolchain_hash` (tool schema), `runtime_hash` (`tool_fingerprint()`),
+  `hardware_hash` (`hardware_fingerprint()`: canonical uname
+  system/machine/processor/node — другой хост = другое окружение,
+  консервативно), `seed` (bootstrap sampling seed 42),
+  `data_order_hash`. **`session_id` и `model_fingerprint` — НЕ поля
+  манифеста**: модель живёт в `model_runs`, сессия — не окружение.
+- **Content-addressed манифест**: `manifest_hash =
+  canonical_sha256(все 12 полей)` + уникальный индекс 0010 (двашаговый
+  add + backfill `env-legacy:{id}` для MVP-строк). Две сессии с
+  одинаковым конфигом = ОДИН манифест = одно окружение: их повторы —
+  не независимые доказательства.
+- **Versioned алгоритм `env-independence-v1`**
+  (`env_independence.py`): группы строятся ТОЛЬКО по
+  (protocol, implementation, dataset_lineage) — другой GPU/бэкенд/seed/
+  порядок данных группу НЕ создают. Отношения пар: `repeatability`
+  (метод+окружение равны, включая execution-ключ из 6 полей),
+  `reproducibility` (тот же метод, другое runtime/hardware/toolchain/
+  dependency/seed/data_order — переносимость, НЕ независимость),
+  `independent_replication` (независимый protocol ИЛИ implementation;
+  два ИЗВЕСТНЫХ равных dataset_lineage независимость убивают, если
+  claim data-dependent), `variation` (разные группы, тот же метод),
+  `untracked` (у любой стороны нет записанной lineage — fail-closed,
+  независимости не даёт ни в каком направлении), `none` (один
+  манифест). Отношение члена = сильнейшая пара (ранг
+  none=0 < untracked=variation=1 < repeatability=2 <
+  reproducibility=3 < independent_replication=4; тир — меньший id
+  counterpart'а, basis `pair:{id12}:{rel}`/`single`).
+- **Снапшот на оценке**: `environment_independence_snapshots`
+  (algorithm_version + rules_hash) + `environment_independence_members`
+  (group_id, relation, basis; PK snapshot+manifest, CASCADE). Оценка
+  фиксирует `environment_independence_snapshot_id` (и в audit
+  `claim_assessed`) — считается distinct GROUPS, а не хеши; строки
+  иммутабельны, без dedup (строка на каждую оценку). Строится и в
+  staging-commit (`service.py`), и в worker'е (`reassessment.py`).
+- **Rules engine `required_independence`** (scope-dependent критерий,
+  §8.7.3): `independent_replication` — ≥2 support-доказательств С
+  этим отношением в ≥2 разных группах; `reproducibility`/
+  `repeatability` — ≥2 support'ов с рангом ≥ порога. Не выполнено →
+  гипотеза с отдельной причиной `independence_{required}_not_met`
+  (после group-check, до scope-check). Bootstrap:
+  `empirical_conjecture` + `procedural` → `independent_replication`;
+  остальные типы — без требования (критерий переносимости,
+  `reproducibility`, доступен правилам, но в bootstrap не
+  используется).
+- Решения: (1) манифест content-addressed по `manifest_hash` (а не по
+  `session_id`) — дедуп между сессиями одного окружения; (2) группа =
+  lineage-тройка, execution-поля — в repeatability/reproducibility;
+  (3) `variation` рангом с `untracked` (1) — никаких положительных
+  отношений не даёт (регрессия KeyError закреплена тестом);
+  (4) регистрация host-experiment манифестов (hostctl) — deferred:
+  тесты сидят манифесты как trusted host (паттерн T4.5);
+  (5) independence-snapshot колонки в `session_staging` (спека) —
+  deferred, как и в MVP (манифесты — только в evidence);
+  (6) parent+children flush — два ЯВНЫХ flush (unit-of-work не
+  гарантирует порядок для свежего родителя + детей с composite PK).
+- Тесты: unit test_env_independence.py (17: ключ группы игнорирует
+  GPU/seed/data order и меняется на метод/lineage; untracked fail-
+  closed; классификация всех 6 исходов; shared lineage убивает
+  independence; strongest-pair с variation (регрессия); engine — E3
+  только через independent_replication, повторы одной группы и
+  группы-без-отношения — гипотеза с правильными причинами,
+  reproducibility-правило выполняется, unknown relation → ValueError)
+  + scenario test_env_independence.py (6: staging-commit — полный
+  манифест + manifest_hash + снапшот на оценке; две сессии одного
+  окружения — ОДИН манифест, один group, нет ложной independence;
+  repeatability-пара (разные инстансы данных, та же lineage) — одна
+  группа, E2 не выше; другой GPU — reproducibility, одна группа,
+  empirical_conjecture остаётся гипотезой (insufficient_independence);
+  независимые implementation'ы — две группы + E3 supported через
+  worker; общие dataset lineage — variation, гипотеза с причиной
+  independence_independent_replication_not_met). 461 тест.
+
+**Закрыто T4.7 (полный source graph, §11.3, §14)** —
+`packages/memory/source_graph.py` (снапшот + каскад),
+`packages/memory/independence.py` (versioned алгоритм v2), migration 0011:
+- **Таблицы §14**: `source_dependency_edges` (id, from/to_source_id,
+  kind из closed-set `link_to_primary`/`derived_from`/`quote_of`/
+  `republish_of`, basis_artifact_id, origin; unique по
+  (from, to, kind, origin)) + `source_graph_corrections` (actor, kind
+  `merge`/`split`, from/to, basis_artifact_id, rules_version, valid,
+  reason_audit_event_id; unique по (actor, from, to, kind,
+  rules_version)) + scope `source_graph` в `domain_revisions`
+  (ревизия графа, паттерн T4.1) + `system:source_graph` в closed-set
+  `prepared_by`.
+- **Versioned алгоритм `independence-v2`**
+  (`group_source_graph`, расширяет T3.5 `group_sources` v1):
+  merge-базы — тот же registrable domain (PSL-lite + URI-
+  нормализация, как v1), равный `content_hash` (один документ, N
+  зеркал = одна группа), parent source (двое детей одного родителя
+  сливаются через него — родитель = узел графа, не член снапшота),
+  валидные dependency edges, валидные correction'ы `merge`.
+  **Semantics split-коррекции (решение v1)**: валидный `split` на паре
+  отменяет ТОЛЬКО прямую edge/correction-базу между парой (и бьёт
+  конфликтующий явный `merge` — fail-closed) и НИКОГДА не отменяет
+  алгоритмические факты (domain/parent/content/text) — это данные, не
+  отношения графа. Operator attestation без correction'а группу не
+  разбивает (§11.3). Unknown lineage (нет URI и content_hash) —
+  общая консервативная группа. Дедетерминированно: порядок импута
+  (сортировка по id) фиксирует имена групп.
+- **Снапшот на оценке**: `build_source_independence_snapshot` — по
+  source-based evidence claim'а (+ родители, edges, correction'ы,
+  только узлы графа) → `source_independence_snapshots` (algorithm_
+  version, thresholds, psl_fingerprint, uri_normalizer_version) +
+  `_members` (group_id, basis; два ЯВНЫХ flush, ловушка T4.6).
+  Оценка фиксирует `source_independence_snapshot_id` (колонка была с
+  0004, ранее не заполнялась) + audit `claim_assessed`/
+  `reassessment_job_completed`. Строится и в staging-commit
+  (`service.py`), и в worker'е (`reassessment.py`); строки
+  иммутабельны, без dedup.
+- **Распределение групп по evidence**: source-based evidence
+  (source_id не NULL) → группа ИСТОЧНИКА (провенанс данных);
+  execution-еvidence → группа окружения (T4.6); ни того ни другого →
+  `UNTRACKED_GROUP` (консервативно).
+- **Каскад слияния групп (§11.3)**: `apply_source_graph_change(db,
+  audit, source_ids, actor)` — trusted-host путь (графовые строки
+  пишет вызывающий в той же tx): lock ревизии `source_graph` →
+  affected claims (evidence.source_id ∈ набор) → head → pending (NULL-
+  пара, `prepared_by='system:source_graph'`) + один durable job
+  (`reason='source_graph_change'`, idempotent по partial unique index)
+  → bump ревизии → audit `source_graph_changed` (актор, counts,
+  ревизия) в той же tx. Worker пересчитывает: новый снапшот, правила
+  переградуют (слияние групп может опустить supported → гипотеза;
+  split возвращает). Коррекция — НЕ evidence для claim'а (§11.3).
+- Решения: (1) session-commit путь в v1 НЕ создаёт sources (sources —
+  модуль retrieval, M5); сессия пере-ассессирует claim с уже
+  host-засиденной source-evidence (тест); (2) каскад — по
+  evidence-затронутому claim'ам (прямой набор), не через
+  claim-зависимости (closure §8.6 — другой механизм, T4.2);
+  (3) text-overlap по Jaccard на sample_text остаётся в чистом
+  алгоритме (host-путь); DB-путь использует равный `content_hash`
+  (artifact_chunks MVP не имеет source_id — join невозможен);
+  (4) hostctl-команды для edges/corrections — deferred (тесты сидят
+  как trusted host, паттерн T4.6).
+- Тесты: unit test_source_independence.py (18 = 8 старых v1 + 10 новых
+  v2: content_hash-слияние; parent-дети через родителя; edge-слияние с
+  basis; split отменяет прямую edge (группы расходятся, basis
+  `single`); split НЕ отменяет domain; merge correction через домены;
+  split бьёт конфликтующий merge (fail-closed); invalid correction
+  игнорируется; unknown lineage — общая группа; транзитивное слияние +
+  инвариантность к порядку) + scenario test_source_graph.py (6: два
+  независимых источника — E3 supported + снапшот independence-v2 с
+  PSL/URI-отпечатками; зеркала одного registrable domain — одна
+  группа, гипотеза insufficient_independence; **merge correction →
+  каскад**: head pending + job source_graph_change + ревизия 0→1 →
+  worker — гипотеза, одна группа, basis correction:merge, СВЕЖИЙ
+  снапшот (старый не переиспользуется), audit source_graph_changed;
+  **split correction** — edge-слияние (гипотеза) → split → две группы
+  → E3 supported; unknown lineage — одна группа; staging-commit
+  (re-claim) — снапшот на оценке + audit). 477 тест.
+
+**Закрыто T4.8 (counterevidence resolutions, §8.7.4, §14, §20.11)** —
+`packages/memory/resolutions.py`, `rules_engine.py` (resolved-флаг),
+migration 0012:
+- **Таблица §14**: `counterevidence_resolutions` (id, evidence_id —
+  ЦЕЛЬ, basis_evidence_id / basis_correction_id, actor, rules_version,
+  reason_audit_event_id, valid, created_in_session) + DB-инварианты:
+  **XOR** CHECK (ровно одно основание — spec line 2141) + partial
+  unique `evidence_id WHERE valid` (не более одной valid-строки на
+  цель — spec line 2142) + `system:counter_resolution` в closed-set
+  `prepared_by`.
+- **Межстрочные инварианты** (deferred trigger / rules engine —
+  детерминированная проверка `resolutions.py`, до записи строки):
+  цель существует и имеет relation `counters`; basis-evidence ≠ цель;
+  basis scope **покрывает** scope цели (scope-compatible); basis-claim
+  **не зависит транзитивно** от claim-цели по claim_dependencies
+  (циклическое обоснование отклоняется; тот же claim = зависимость);
+  basis-correction — **valid** строка source_graph_corrections,
+  трогающая один из источников claim-цели. Нарушение →
+  `ResolutionError` до записи (невалидная строка не рождается, §20.11).
+- **Каскад**: `apply_counter_resolution` (trusted host, одна tx) →
+  строка + head цели → pending (`system:counter_resolution`) + durable
+  job `counter_resolution_change` (idempotent, partial unique index) +
+  audit `counter_resolution_created` (актор, basis, counts). Worker
+  пересчитывает: rules engine считает только **UNRESOLVED**
+  counterevidence (`EvaluatedEvidence.resolved`) — снятый counter
+  grade не ограничивает (supported, reason
+  `counterevidence_resolved`); неснятый — disputed ≤E1 (§3.7).
+- **Invalidation** (§8.7.4, spec line 2148):
+  `invalidate_counter_resolution` (valid=false, idempotent no-op,
+  audit `counter_resolution_invalidated`) +
+  `invalidate_resolutions_for_correction` — отзыв correction делает
+  invalid все опирающиеся на неё resolution **в той же revision** и
+  каскадно инвалидирует assessments, считавшие counterevidence
+  resolved (worker возвращает claim в disputed). Строки иммутабельны
+  по смыслу: invalid-строка остаётся для истории.
+- Решения: (1) v1 — только trusted-host путь (staging-op для
+  resolutions — M5 поверхность, паттерн T4.7: «Curator предлагает» =
+  trusted host); (2) «basis is current» для evidence-basis = строка
+  существует (evidence иммутабельны — инвалидация уровня evidence
+  в v1 отсутствует); (3) каскад — по прямому claim-цели, не через
+  claim-зависимости (closure §8.6 — механизм T4.2); (4)
+  scope-compatible = basis scope покрывает target scope (тот же
+  критерий, что у support-еvidence).
+- Тесты: unit test_counter_resolutions.py (9: claim_depends_on — тот
+  же claim, прямая/транзитивная/алмазная, обратное направление,
+  циклы) + test_rules_engine.py (+3: resolved counter не ограничивает
+  (E2 + reason counterevidence_resolved); только resolved counter —
+  не refuted (hypothesis no_evidence); один unresolved среди resolved
+  — disputed E1) + scenario test_counter_resolutions.py (5:
+  unresolved counter — disputed E1; evidence-basis → каскад → E3
+  supported + audit (актор/basis/kind); инварианты — XOR (оба/ни
+  одного), non-counter цель, несуществующая цель, basis=цель,
+  scope-miss, транзитивная зависимость, тот же claim, уникальность,
+  DB CHECK на bypass-запись; correction-basis (split s1↔s3 — valid
+  строка, трогающая источники claim) → E3; отзыв correction →
+  resolution invalid + каскад → disputed; прямая invalidation →
+  disputed + idempotent no-op). 494 тест.
+
+**Закрыто T4.9 (failpoints M4, §8.6/§8.7.2/§11.3, §19 этап 3b)** —
+`tests/scenario/test_failpoints_m4.py` (crash-инъекция на границах
+состояний, 7 тестов):
+- **crash после flip (pointer tuple recovery)**: flip (pointer move +
+  previous → superseded) коммитится отдельно от post-publish манифеста —
+  после краха НОВЫЙ снапшот эффективен (pointer), предыдущий online —
+  superseded, слот удержан; resume тем же owner — без повторного flip
+  (ровно 1 `activation_published`), fence не меняется (idempotent
+  resume, 0 takeovers), манифест доходит до active, слот освобождён.
+- **crash между батчами post-publish**: процесс умирает после первого
+  батча (курсор=1 из 2 durable) — рестарт продолжается с durable
+  курсора, вопрос не дублируется (UUIDv5 + cursor), manifest
+  завершается вторым прогоном.
+- **stale activator после takeover**: O1 флипает и умирает в
+  post-publish; lease умирает; O2 делает takeover (fence+1) и батч;
+  O1 «возрождается» со СТАЛЫМ кортежем (старый fence/owner) —
+  fence-предикат отказывает: ни вопросов, ни ошибки, ни смены
+  состояния; O2 завершает manifest.
+- **repair vs следующий flip**: post_publish_blocked-кандидат владеет
+  pointer (terminal cleanup освободил слот) — НОВЫЙ online flip
+  закрывает blocked-предшественника как superseded: backlog repair
+  закрывается самим flip'ом, `find_repair_backlog` → None, новый
+  pointer repair не трогает.
+- **barrier crash после КАЖДОГО батча**: 3 батча (65 членов), процесс
+  умирает после каждого — resume с durable курсора в свежей сессии;
+  финальный closure scan + resolved только в последнем resume; ровно 3
+  `barrier_batch_applied` + 1 `barrier_resolved`, все heads closure —
+  pending, все jobs durable.
+- **group merge + crash worker'а**: merge-коррекция каскадит
+  (head pending + durable job `source_graph_change`); worker умирает
+  с занятым lease — expired lease, `recover_expired_leases` возвращает
+  job в очередь, следующий батч завершает пересчёт: supported →
+  hypothesis на СВЕЖЕМ снапшоте (группы слиты).
+- **worker без starvation (второе направление)**: живая session
+  commit-intent — worker уступает (defer, job нетронут); lease сессии
+  умирает (crash mid-commit) — интент перестаёт быть декларацией,
+  тот же батч завершается сразу: сессионная полоса не может
+  удерживать окно worker'а бесконечно.
+
+**Gate M4 пройден** (§19, этап 3b):
+1. invalid ancestor блокирует downstream —
+   `test_retrieval_ancestor_check` (T4.2, test_cascade.py) +
+   `test_barrier_blocked_on_manifest_tamper_keeps_protection`
+   (защита closure до resolved);
+2. worker без starvation (оба направления) —
+   `test_worker_yields_to_session_intent_at_admission` +
+   `test_worker_unleases_when_intent_appears_midbatch` (сессия
+   побеждает) + `test_worker_not_starved_after_intent_lease_expiry`
+   (T4.9 — worker не засевает после смерти lease) +
+   `test_worker_defers_on_gate_conflict_with_jitter` (окно между
+   сессиями, T4.4);
+3. group merge запускает корректный пересчёт —
+   `test_merge_correction_cascades_recompute` (T4.7) +
+   `test_group_merge_recompute_survives_worker_crash` (T4.9).
+
+501 тест.
+
+Merge в `main` — отдельное решение пользователя (не выполняется
+автоматически). **M4 merge выполнен 2026-09-15** (merge-commit на
+`main` после Gate M4; до этого — `c069475` Merge MVP M0–M3).

@@ -1,4 +1,4 @@
-version: curator-v1
+version: curator-v2
 
 # Curator
 
@@ -21,6 +21,15 @@ version: curator-v1
     `external_fact`, `temporal_fact`, `self_model`;
   - `scope` — структурный scope утверждения (объект);
   - `as_of` — для `temporal_fact` момент времени (ISO-8601);
+  - `dependencies` — (опционально) зависимости нового claim на
+    СУЩЕСТВУЮЩИЕ claim из раздела «Знание» — по полному UUID из строки
+    `[c:<uuid>]`: список объектов `{"claim_id": "<uuid>", "kind":
+    "evidential" | "research"}`. `evidential` — истинность claim
+    зависит от истинности того claim (граф зависимостей — DAG, цикл
+    отклоняется). `research` — исследовательская зависимость (например,
+    на гипотезу); гипотеза никогда не служит достаточным evidence,
+    поэтому связь с ней — только `research`. Ссылки на несуществующие
+    claim не выдумывать; само-ссылка запрещена;
 - `evidence_links` — связь каждого evidence (по индексу из списка) с
   claim: `relation`: `supports | counters`;
 - `new_questions` — вопросы, которые открылись (противоречия,

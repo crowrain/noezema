@@ -1,13 +1,23 @@
-"""Session lease, heartbeat and progress watchdog (T2.16, §5.2.3).
+"""Session lease, heartbeat and progress watchdog (T2.16, T3.30, §5.2.3).
 
 The lease is a conditional UPDATE on the session row — no separate lease
 table. A heartbeat only succeeds while the caller still owns a live
 lease; the progress watchdog compares last_progress_at / phase_deadline
 so a stuck session is not renewed past its deadline.
+
+T3.30 (first real MVP session): the lease timestamps use
+``clock_timestamp()`` (real time), never ``now()`` — the latter is the
+transaction start and is constant inside the long phase-1 session
+transaction, which would pin ``lease_expires_at`` at
+``txn_start + ttl`` and make every session longer than the TTL lose the
+fenced commit. Long operations (LLM calls) are additionally covered by
+:class:`LeaseHeartbeatGuard`.
 """
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from uuid import UUID
@@ -47,18 +57,23 @@ class LeaseService:
         """Take the lease (session must be nonterminal) and start the
         phase deadline. Conditional: fails if another owner holds a live
         lease."""
+        # T3.30: clock_timestamp() (real time), not now() (transaction
+        # start): the phase-1 transaction is long-lived, and now() would
+        # pin lease_expires_at at txn_start + ttl — a session longer than
+        # the TTL would lose the fenced commit regardless of heartbeats
+        # (first real MVP session, qwen36-35b-a3b-q6-mtp, 2026-09-14).
         result = await db.execute(
             text(
                 """
                 UPDATE sessions SET
                     lease_owner = :owner,
-                    lease_expires_at = now() + :ttl,
-                    last_heartbeat_at = now(),
-                    last_progress_at = now(),
-                    phase_deadline = now() + :deadline
+                    lease_expires_at = clock_timestamp() + :ttl,
+                    last_heartbeat_at = clock_timestamp(),
+                    last_progress_at = clock_timestamp(),
+                    phase_deadline = clock_timestamp() + :deadline
                 WHERE id = :id
                   AND state NOT IN ('succeeded','succeeded_partial','failed','cancelled','reconciling_commit')
-                  AND (lease_owner IS NULL OR lease_expires_at < now() OR lease_owner = :owner)
+                  AND (lease_owner IS NULL OR lease_expires_at < clock_timestamp() OR lease_owner = :owner)
                 RETURNING id
                 """
             ),
@@ -73,18 +88,20 @@ class LeaseService:
         """Conditional renewal. ``progress=True`` also advances
         last_progress_at; the renewal is refused once the phase deadline
         has passed (the watchdog refuses to keep a stuck session alive)."""
-        progress_set = ", last_progress_at = now()" if progress else ""
+        # T3.30: clock_timestamp() — see acquire(): now() is the
+        # transaction start and would make mid-transaction renewals no-ops.
+        progress_set = ", last_progress_at = clock_timestamp()" if progress else ""
         result = await db.execute(
             text(
                 f"""
                 UPDATE sessions SET
-                    lease_expires_at = now() + :ttl,
-                    last_heartbeat_at = now()
+                    lease_expires_at = clock_timestamp() + :ttl,
+                    last_heartbeat_at = clock_timestamp()
                     {progress_set}
                 WHERE id = :id
                   AND lease_owner = :owner
-                  AND lease_expires_at > now()
-                  AND (phase_deadline IS NULL OR phase_deadline > now())
+                  AND lease_expires_at > clock_timestamp()
+                  AND (phase_deadline IS NULL OR phase_deadline > clock_timestamp())
                 RETURNING id
                 """
             ),
@@ -131,3 +148,70 @@ class LeaseService:
             last_progress_at=row["last_progress_at"],
             phase_deadline=row["phase_deadline"],
         )
+
+
+class LeaseHeartbeatGuard:
+    """Background lease renewal while a long operation (an LLM call) runs
+    (T3.30, §5.2.3).
+
+    The step-boundary heartbeat alone cannot keep the lease alive across a
+    model call: a real local model answers in 15–90 s against a 30 s TTL
+    (first real MVP session, qwen36-35b-a3b-q6-mtp — the fenced commit
+    observed an expired lease and the reconciler aborted the session).
+    §5.2.3: «TTL равен нескольким heartbeat intervals с запасом на
+    scheduler jitter» — the renewal interval is therefore derived from the
+    TTL (ttl / 3), not from the step boundary.
+
+    Renewals run on the CALLER's session/transaction (no commit here): a
+    separate connection would block on the session-row lock the caller's
+    long transaction already holds, and the extension becomes durable with
+    the caller's commit. Crash semantics stay clean — a mid-call crash
+    rolls the whole phase back, exactly like today. Renewals use
+    ``progress=False``: a mid-step renewal is a health confirmation, not a
+    step completion, so ``last_progress_at`` (the progress watchdog) only
+    advances at the step boundary. If a renewal is refused (phase deadline
+    passed), ``LeaseLost`` is raised at guard exit and the caller aborts;
+    the fenced commit / reconciler remain the final gate.
+    """
+
+    def __init__(
+        self,
+        lease: LeaseService,
+        db: AsyncSession,
+        session_id: UUID,
+        owner: str,
+    ) -> None:
+        self._lease = lease
+        self._db = db
+        self._session_id = session_id
+        self._owner = owner
+        self._interval = lease.ttl.total_seconds() / 3
+        self._task: asyncio.Task[None] | None = None
+        self._lost = False
+
+    async def __aenter__(self) -> LeaseHeartbeatGuard:
+        self._task = asyncio.create_task(self._renew_loop())
+        return self
+
+    async def __aexit__(self, exc_type: object, exc: object, tb: object) -> bool:
+        assert self._task is not None
+        self._task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await self._task
+        self._task = None
+        if self._lost:
+            raise LeaseLost(f"lease lost during long operation for session {self._session_id}")
+        return False
+
+    async def _renew_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self._interval)
+            try:
+                # the guard task only runs while the main coroutine awaits
+                # the long operation — the session is not used concurrently
+                await self._lease.heartbeat(self._db, self._session_id, self._owner, progress=False)
+            except LeaseLost:
+                self._lost = True
+                return
+            except Exception:  # infra error: keep trying; the fenced commit is the gate
+                continue

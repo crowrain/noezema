@@ -38,10 +38,17 @@ class ORMCommitAttempt(Base):
 
 
 class ORMKnowledgeWriteGate(Base):
+    """The knowledge writer gate (§14.1, T4.4): exactly one scope='global'
+    row. Acquired with a single CAS UPDATE (NOWAIT semantics): a held,
+    unexpired gate by another owner is a conflict, an expired lease is
+    taken over. The holder's lease bounds the crash-recovery window; the
+    gate is never held across a long DB transaction."""
+
     __tablename__ = "knowledge_write_gate"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    owner: Mapped[str | None] = mapped_column(Text)
-    intent_kind: Mapped[str | None] = mapped_column(Text)
+    scope: Mapped[str] = mapped_column(Text, primary_key=True)
+    owner_kind: Mapped[str | None] = mapped_column(Text)
+    owner_id: Mapped[str | None] = mapped_column(Text)
+    priority: Mapped[int | None] = mapped_column(Integer)
     acquired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    intent_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

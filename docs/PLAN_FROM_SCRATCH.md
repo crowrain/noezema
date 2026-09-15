@@ -365,9 +365,47 @@ host recovery. После этой вехи — merge MVP в `main`.
 | # | Задача |
 |---|---|
 | T3.29 | Пробуждение по расписанию + wake admission + backoff/pause (§5.2.1): секция `wake_schedule` в config snapshot (периодический интервал = MVP-случай cron, мин. интервал между сессиями, backoff base/multiplier/max, лимит disk quota, GPU) + `wake_scheduler_state` (миграция `0005`); tick — `noezemactl wake-tick` (systemd `noezema-wake.timer`, 5 мин): расписание читается из effective snapshot, не из таймера; wake admission (paused / не-терминальная сессия / unresolved commit attempt / активный activation slot / disk quota / GPU fail-closed) — пропуск с точной причиной в audit `wake_skipped` (никогда не в очередь); экспоненциальный backoff после failed-сессии; авто-pause после N последовательных неудач (sticky до операторного resume, resume сбрасывает failure-бухгалтерию); `wake_now` обходит расписание (интервал/gap/backoff), но не admission — тот же gate в web Command API (REJECTED с reason); состояние wake (backoff/pause) в /status; fail-closed на битый `wake_schedule` |
+| T3.30 | Фоновый heartbeat lease во время долгих операций + честное время в lease (§5.2.3, дефект из первой реальной MVP-сессии): (а) lease-таймстампы пишутся через `clock_timestamp()`, не `now()` — в долгой phase-1-транзакции `now()` = старт транзакции, и `lease_expires_at` был «зацементирован» на `txn_start + ttl`: любая сессия длиннее TTL проигрывала fenced commit независимо от heartbeat (первая реальная сессия, qwen36-35b-a3b-q6-mtp, LLM-вызов 47 с против TTL 30 с → `commit_lease_lost`); (б) `LeaseHeartbeatGuard` — background-task продление lease (интервал = ttl/3, §5.2.3 «TTL равен нескольким heartbeat intervals») вокруг explorer/curator LLM-вызовов; продление в транзакции вызывающего (отдельное соединение блокировалось бы на row-lock сессии), `progress=False` — watchdog прогресса не искажается; отказ продления (phase deadline) → `LeaseLost` на выходе guard, abort + reconciler (никогда не угаданный rollback); оркестратор: `Orchestrator(lease_ttl=...)` — инъекция TTL для тестов (регрессия: LLM-вызовы 2.5 с при TTL 1 с → SUCCEEDED) |
 
 **Gate M3** = gate этапа 3a (§19) + MVP-критерии §22.1 `[MVP]` (пункты 1–11, 13, 15, 19, 20, 21,
 23, 28, 30–34) — каждый со ссылкой на тест. После gate: tag `noezema-mvp`, merge в `main` (отдельное решение).
+
+**Серия реальных MVP-сессий** (замер нагрузки до M4, §M4): 1-я сессия 2026-09-14 (qwen36-35b-a3b-q6-mtp,
+llama.cpp на 192.168.1.48, «Сколько будет 6*7?»): sandbox `python.execute` 56 мс, ответ модели 2 шага,
+fenced commit отклонён по истёкшему lease → T3.30; куратор: `reasoning_content` съедает бюджет
+`max_output_tokens` (2048 → пустой content, `finish_reason=length`, 3 ретрая ~84 с) → операционное
+решение: `max_output_tokens ≥ 4096` для реальной сессии. 2-я сессия (после T3.30, 2026-09-14) —
+**SUCCEEDED**: explorer 68.9 с + 143.4 с (4.8×TTL, guard), куратор 24.4 с (out 1841, schema_valid),
+fenced commit 46 мс, claim «6*7=42» → E2/supported/0.55, вопрос → verified.
+
+Результат серии (2026-09-14, БД `noezema_mvp`, накопление знания между сессиями):
+- **Проход 1 (бюджет 4096): 4/4 failed** — `LLMSchemaError` на первом explorer-вызове:
+  `reasoning_content` съел весь бюджет (проб минимального промпта: 15 000+ знаков reasoning,
+  `finish_reason=length`, content пуст; 3 ретрая ≈ 200–286 с/сессию). Поведение модели
+  дрейфует: длина reasoning на тривиальном вопросе выросла до 4100–4250 токенов (ср. 545–1841
+  во 2-й сессии). Авто-pause wake-планировщика сработал (4 последовательных неудач → sticky
+  `paused`); operator resume (RESUME: node_state→idle + сброс failure-бухгалтерии) восстановил
+  работу. Отказавшие сессии чисто откатились: в таблицах лишь wake-ledger + хост-лог.
+- **Проход 2 (бюджет 8192): 3 succeeded + 1 succeeded_partial** (wall 72–184 с):
+  | сессия | итог | LLM-вызовы (out/ток, с) | sandbox | commit |
+  |---|---|---|---|---|
+  | 42:6 | succeeded_partial (4 шага) | 702/10.8, 4222/65.9, 541/8.4, 2448/33.0, 4252/65.9 | ~0–1 мс ×2 | 50 мс |
+  | 12·13 | succeeded (2 шага) | 857/13.1, 1288/19.3, 3132/39.7 | ~0 мс | 22 мс |
+  | сумма 1..10 | succeeded (2 шага) | 4233/60.6, 4189/63.8, 2944/38.3 | ~0 мс | 21 мс |
+  | 7! | succeeded (3 шага) | 4226/63.5, 4184/64.4, 994/14.9, 2373/30.8 | ~0 мс | 21 мс |
+- **Замеры нагрузки (проход 2, 15 LLM-вызовов)**: throughput ≈ 68 ток/с (40 585 out-токенов за
+  592 с); LLM-задержка 8–66 с (линейно от длины вывода); wall сессии = LLM-время + 5–10 с
+  оверхеда; fenced commit 21–50 мс; sandbox `python.execute` ≤1 мс на тривиальном коде;
+  in-токены 600–1110/вызов (контекст-пак с накопленным знанием).
+- **Отклонения протокола модели** (защиты отработали): чужой инструмент `message.reply` с
+  неверными аргументами → policy DENIED (action_failed); free-text complete-reason вне closed
+  enum → `succeeded_partial` + вопрос `partially_answered` (claim всё же закоммичен, E2).
+- **Операционное решение**: `max_output_tokens = 8192` — обязательный минимум для
+  qwen36-35b-a3b-q6-mtp (бюджет ≥ P99(reasoning) + payload, с запасом); `reset_failure_state()`
+  планировщика — только failure-бухгалтерия, node_state снимает web RESUME (полная процедура).
+- Итог: 5 закоммиченных сессий, 5 claims (все computed_result, E2/supported/0.55),
+  вопросы: 4 verified + 1 partially_answered. Материал для порогов M4 (очередь, батч, SLO) —
+  собран; старт M4 — решение пользователя.
 
 ---
 
@@ -376,17 +414,30 @@ host recovery. После этой вехи — merge MVP в `main`.
 Начинается **после** серии реальных MVP-сессий: пороги очереди, размер батча, SLO выводятся из
 измеренной нагрузки.
 
+**Пороги M4 (выведены из замеров серии 2026-09-14, см. блок «Серия реальных MVP-сессий»):**
+LLM-хост (qwen36-35b-a3b-q6-mtp, MTP/ROCm) — throughput ≈ 68 ток/с, задержка вызова 8–66 с
+(линейно от длины вывода; P99 серии ≈ 66 с), in-токены 600–1110/вызов. SLO сессии: wall
+72–184 с (серии) → целевой P95 ≤ 200 с при бюджете `max_output_tokens=8192` (худший вызов
+≈ 121 с при измеренном throughput — в пределах gateway timeout 300 с). Fenced commit 21–50 мс,
+sandbox ≤1 мс на тривиальном коде. Знание: 1–2 claim/сессию, степень зависимости ≤3.
+Из этого: **размер батча cascade invalidation = 32 claim** (короткая транзакция остаётся в
+десятках мс по замеру commit; closure локального корпуса мал); **очередь**: одна активная
+сессия (single node) — worker-батчи выполняются между сессиями, окно между сессиями ≥
+измеренного wall (72–184 с); runnable-job-возраст для эскалации `T_escalate` и admission-порог
+`T_worker_admission` задаются дефолтами в config snapshot при T4.3/T4.4 из этих чисел
+(база: не отставать на >2 интервалов wake при wall ≤ 200 с).
+
 | # | Задача |
 |---|---|
-| T4.1 | `claim_dependencies`: направление `from depends on to`; DAG-цикл check при commit; graph revision при изменении evidential edges |
-| T4.2 | Cascade invalidation: closure вне блокировки, immutable closure manifest (root, graph rev, упорядоченные IDs, rank, count, sha256); barrier `discovering/active/closing/resolved/blocked`, durable cursor, идемпотентные батчи; final closure scan перед `resolved` |
-| T4.3 | `reassessment_jobs`: durable очередь, lease/retry/blocked, unique active job, runnable-предикат (effective pointer, пустой activating slot); worker `system:reassessment` (без LLM, без сети, без evidence) |
-| T4.4 | Writer admission: NOWAIT gate, уступление session intent, `T_escalate`, admission gates `T_worker_admission`/`T_repair_admission` в scheduler |
-| T4.5 | Online-активация §8.7.2: fenced lease + activating pointer + fence, quiesce, shadow heads, seal, atomic flip `publishing→post_publish`, post-publish manifest, terminal-cleanup, repair runner (post-cleanup CAS, superseded-закрытие) |
-| T4.6 | Environment manifests (полные поля §14) + environment independence: repeatability/reproducibility/independent replication (§8.7.3) |
-| T4.7 | Полный source graph: dependency edges, merge/correction (`source_graph_corrections`), cascade reassessment при слиянии групп |
-| T4.8 | Counterevidence resolutions (§8.7.4): XOR-инварианты, uniqueness, valid basis, cascade при инвалидации basis |
-| T4.9 | Failpoint: crash в каждом activation state (pointer tuple recovery); stale activator после takeover; repair vs следующий flip; barrier crash между батчами; group merge |
+| T4.1 ✅ | `claim_dependencies`: направление `from depends on to`; DAG-цикл check при commit (циклическое evidential-ребро отклоняется с audit, claim коммитится); graph revision только при изменении evidential edges (fencing по base из prepared-строки). Claim ID в контекст-паке `[c:<uuid>]`, `dependencies` в staging-схеме (evidential/research), migration 0006 (kind по §8.6), curator-v2. Тесты: test_claim_dependencies.py, test_staging_schema.py, test_orchestrator.py |
+| T4.2 ✅ | Cascade invalidation: closure вне блокировки, immutable closure manifest (root, graph rev, упорядоченные IDs, rank, count, sha256); barrier `discovering/active/closing/resolved/blocked`, durable cursor, идемпотентные батчи; final closure scan перед `resolved`. Реализовано: `packages/memory/cascade.py` (start_cascade + process_barrier + protected_claim_ids), migration 0007, retrieval ancestor check, test_cascade.py (8) |
+| T4.3 ✅ | `reassessment_jobs`: durable очередь, lease/retry/blocked, unique active job, runnable-предикат (effective pointer, пустой activating slot); worker `system:reassessment` (без LLM, без сети, без evidence). Реализовано: `packages/memory/reassessment.py` (run_reassessment_batch + recover_expired_leases + worker_admission_metrics), audit `reassessment_job_*`, test_reassessment.py (13) |
+| T4.4 ✅ | Writer admission: NOWAIT gate, уступление session intent, `T_escalate`, admission gates `T_worker_admission`/`T_repair_admission` в scheduler. Реализовано: `packages/memory/writer_gate.py` (table gate §14.1 CAS NOWAIT + session intent rules 1/4/5), migration 0008 (gate-форма §14.1 + `reassessment_admission` секция: t_escalate=7200, t_worker_admission=7200, queue_slo=172800), worker — deferral с jitter при конфликте + уступка intent (admission и mid-batch), scheduler — `ReassessmentAdmission` + skip `reassessment_backlog`, `hostctl reassessment-tick`; T_repair_admission — T4.5. Тесты: test_writer_admission.py (14) |
+| T4.5 ✅ | Online-активация §8.7.2. Реализовано: `packages/memory/activation.py` (fenced lease — acquire/idempotent resume/takeover fence+1, quiesce: gate wait + active sessions + unresolved attempts; shadow heads: freeze → prepare (fast path carry / pending + activation job) → verify+seal; atomic flip: pointer + previous→superseded (non-bootstrap) + knowledge bump; post-publish manifest: deterministic UUIDv5 вопросы, батчи 64/≤32, cursor, transient backoff, exhaustion → post_publish_blocked + alert; terminal cleanup одним tx; repair runner: repair CAS, superseded-закрытие, permanent park + alert; драйвер `run_online_change` crash-idempotent), migration 0009 (partial unique online non-terminal, repair_admission секция 7200/172800, DB-триггер sealed-интервала ready|publishing → 45000), config bootstrap (online_activation_max_pending_questions=100, online_activation_max_attempts=78, repair_admission), scheduler — `RepairAdmission` + skip `repair_backlog` + SLO-метрики, hostctl `activate-online` + `activation-repair-tick`. Тесты: test_online_activation.py (12) |
+| T4.6 ✅ | Environment manifests (полные поля §14, normalizer env-v2) + environment independence: repeatability/reproducibility/independent replication (§8.7.3). Реализовано: `packages/memory/env_independence.py` (versioned алгоритм `env-independence-v1`: группы ТОЛЬКО по (protocol, implementation, dataset lineage) — GPU/seed/data order группу не создают; отношения пар: repeatability/reproducibility/independent_replication/variation/untracked/none; strongest-pair reduction, untracked fail-closed; снапшот `environment_independence_snapshots`+`_members` — оценка фиксирует snapshot_id и считает distinct группы), `evidence.py` (session_environment_fields 12 полей §14 + hardware_fingerprint + manifest_content_hash), `rules_engine.py` (`required_independence`: independent_replication — ≥2 support'ов в ≥2 группах; причины independence_*_not_met), config bootstrap (empirical_conjecture+procedural → independent_replication), `service.py` (staging-commit: content-addressed манифест manifest_hash — 2 сессии = 1 манифест; снапшот на оценке), `reassessment.py` (worker rebuild снапшота), migration 0010 (manifest_hash + unique, snapshots, members). Тесты: test_env_independence.py unit (17) + scenario (6) |
+| T4.7 ✅ | Полный source graph: dependency edges, merge/correction (`source_graph_corrections`), cascade reassessment при слиянии групп (§11.3). Реализовано: `packages/memory/source_graph.py` (`build_source_independence_snapshot` — снапшот по source-based evidence claim'а + родители/edges/corrections, оценка фиксирует `source_independence_snapshot_id`; `apply_source_graph_change` — trusted-host каскад: affected claims → head pending + durable job `source_graph_change` → ревизия `source_graph` → audit `source_graph_changed`, одна tx), `independence.py` (versioned алгоритм `independence-v2`: domain (PSL-lite)/content_hash/parent/edges/merge-corrections; split-коррекция отменяет ТОЛЬКО прямую edge/correction-базу пары (fail-closed бьёт конфликтующий merge), алгоритмические факты не отменяет; unknown lineage — общая группа; операторская attestation без correction не разбивает группу), `service.py`+`reassessment.py` (снапшот на оценке в обоих путях; source-based evidence → группа источника, execution → группа окружения, иначе untracked), migration 0011 (`source_dependency_edges`, `source_graph_corrections`, scope `source_graph` в domain_revisions, `system:source_graph` в prepared_by). Тесты: test_source_independence.py unit (18) + scenario test_source_graph.py (6) |
+| T4.8 ✅ | Counterevidence resolutions (§8.7.4): XOR-инварианты, uniqueness, valid basis, cascade при инвалидации basis. Реализовано: migration 0012 (`counterevidence_resolutions` §14: XOR CHECK ровно одно основание + partial unique evidence_id WHERE valid + FK evidence/source_graph_corrections, `system:counter_resolution` в prepared_by), `packages/memory/resolutions.py` (детерминированная проверка межстрочных инвариантов до записи: counter-цель, basis≠цель, basis scope покрывает target scope, basis-claim не зависит транзитивно от claim-цели (claim_dependencies), correction-basis — valid строка, трогающая источники claim; `apply_counter_resolution` — строка + head pending + durable job + audit, одна tx; `invalidate_counter_resolution` — idempotent, audit; `invalidate_resolutions_for_correction` — отзыв correction инвалидирует все опирающиеся resolution в той же revision + каскад), `rules_engine.py` (EvaluatedEvidence.resolved — engine считает только UNRESOLVED counters: снятый не cap'ит grade (reason counterevidence_resolved), неснятый — disputed ≤E1), `service.py`+`reassessment.py` (загрузка valid resolutions на обе стороны). Тесты: test_counter_resolutions.py unit (9) + test_rules_engine.py (+3) + scenario test_counter_resolutions.py (5) |
+| T4.9 ✅ | Failpoint: crash в каждом activation state (pointer tuple recovery); stale activator после takeover; repair vs следующий flip; barrier crash между батчами; group merge. Тесты: tests/scenario/test_failpoints_m4.py (7: crash после flip — pointer tuple durable, предыдущий superseded, ровно 1 publish, idempotent resume без смены fence; crash между батчами post-publish — durable cursor, без дублей вопросов (UUIDv5); stale activator со старым fence/owner после takeover — fence-отказ без writes; следующий flip закрывает post_publish_blocked backlog как superseded (find_repair_backlog → None); barrier crash после КАЖДОГО из 3 батчей — resume с durable курсора, 3 batch audits + 1 resolved; group merge + crash worker'а — expired lease, recover_expired_leases, пересчёт до hypothesis на свежем снапшоте; worker завершает батч после смерти intent-lease (оба направления без starvation)). Gate M4 пройден (§19: invalid ancestor блокирует downstream — test_retrieval_ancestor_check; worker без starvation оба направления — test_writer_admission.py + T4.9; group merge → корректный пересчёт — test_source_graph.py + T4.9) |
 
 **Gate M4** (§19, этап 3b): invalid ancestor блокирует downstream; worker без starvation (оба
 направления); group merge запускает корректный пересчёт.

@@ -66,7 +66,7 @@ from packages.domain.services.commit import FinalizeResult
 from packages.domain.services.commit import finalize as commit_finalize
 from packages.domain.services.commit import prepare as commit_prepare
 from packages.domain.services.config import ConfigService
-from packages.domain.services.lease import LeaseService
+from packages.domain.services.lease import DEFAULT_LEASE_TTL, LeaseHeartbeatGuard, LeaseLost, LeaseService
 from packages.domain.services.reconciler import reconcile_commit
 from packages.domain.services.reserve import HostReserveService, ReserveLimits
 from packages.domain.services.staging import StagingService
@@ -137,6 +137,7 @@ class Orchestrator:
         executor: ToolExecutor,
         selector: FIFOQuestionSelector | None = None,
         node_owner: str | None = None,
+        lease_ttl: timedelta | None = None,
     ) -> None:
         self.session_factory = session_factory
         self.gateway = gateway
@@ -145,6 +146,9 @@ class Orchestrator:
         self.selector = selector if selector is not None else FIFOQuestionSelector()
         self.prompts = {Role.EXPLORER: load_prompt(Role.EXPLORER), Role.CURATOR: load_prompt(Role.CURATOR)}
         self.node_owner = node_owner if node_owner is not None else f"node-{os.getpid()}"
+        # T3.30: the lease TTL is injectable for tests (scenario regression:
+        # an LLM call longer than the TTL must not starve the fenced commit)
+        self.lease = LeaseService(ttl=lease_ttl if lease_ttl is not None else DEFAULT_LEASE_TTL)
 
     async def run_session(self, question_id: uuid.UUID | None = None) -> SessionOutcome:
         """M2 session lifecycle (T2.15-T2.21):
@@ -219,6 +223,9 @@ class Orchestrator:
                 "evidence_added": result.evidence_added,
                 "evidence_deduped": result.evidence_deduped,
                 "assessments": result.assessments,
+                "dependencies_added": result.dependencies_added,
+                "dependencies_evidential_added": result.dependencies_evidential_added,
+                "dependencies_rejected": list(result.dependencies_rejected),
                 "problems": list(result.problems),
             }
 
@@ -314,8 +321,8 @@ class Orchestrator:
         await audit.record(
             AuditEventType.SESSION_STARTED, session_id=session.id, public_summary="session started"
         )
-        # T2.16: take the lease before any real work
-        lease = LeaseService()
+        # T2.16: take the lease before any real work (T3.30: shared instance)
+        lease = self.lease
         await lease.acquire(
             db, session.id, self.node_owner,
             phase_deadline=timedelta(seconds=int(limits.get("phase_deadline_seconds", 600))),
@@ -401,9 +408,19 @@ class Orchestrator:
         # verifying (MVP: no-op; verifier profile lands in M5)
         await self._transition(db, audit, session, SessionState.VERIFYING)
 
-        # consolidating: curator (proposals go to session_staging, T2.13)
+        # consolidating: curator (proposals go to session_staging, T2.13).
+        # T4.4 (§5.9.1 rule 1, §5.2.2 step 4): the priority writer intent
+        # is registered under the live lease BEFORE the heavy validation —
+        # the reassessment worker yields to it for the rest of the
+        # consolidation/reporting/committing span (cleared in the
+        # terminal transaction).
         await self._transition(db, audit, session, SessionState.CONSOLIDATING)
-        claims, _questions_created = await self._curator(db, audit, session, ctx, snapshot, staging)
+        from packages.memory.writer_gate import register_session_intent
+
+        await register_session_intent(db, session.id)
+        claims, _questions_created = await self._curator(
+            db, audit, session, ctx, snapshot, staging, pack
+        )
 
         # reporting
         await self._transition(db, audit, session, SessionState.REPORTING)
@@ -523,15 +540,28 @@ class Orchestrator:
                 policy_version=cap_profile.policy_version,
             )
             try:
-                response, record = await self.gateway.chat(
-                    system=explorer.text, user=user_ctx, response_schema=ModelResponse, fingerprint=fingerprint
-                )
+                # T3.30: renew the lease in the background while the model
+                # call is in flight (§5.2.3: TTL = several heartbeat intervals)
+                async with LeaseHeartbeatGuard(lease, db, session.id, self.node_owner):
+                    response, record = await self.gateway.chat(
+                        system=explorer.text, user=user_ctx, response_schema=ModelResponse, fingerprint=fingerprint
+                    )
             except LLMError as exc:
                 await audit.record(
                     AuditEventType.SESSION_FAILED,
                     session_id=session.id,
                     payload={"error": str(exc)[:500], "phase": "exploring"},
                     public_summary="LLM unavailable; host failure report",
+                )
+                raise
+            except LeaseLost as exc:
+                # T3.30: lease lost mid-call — abort; the reconciler resolves
+                # the session, never a guessed rollback (§5.2.3)
+                await audit.record(
+                    AuditEventType.SESSION_FAILED,
+                    session_id=session.id,
+                    payload={"error": str(exc)[:500], "phase": "exploring"},
+                    public_summary="lease lost during LLM call; host failure report",
                 )
                 raise
 
@@ -809,6 +839,7 @@ class Orchestrator:
         ctx: SessionContext,
         snapshot: ORMConfigSnapshot,
         staging: StagingService,
+        pack: Any,
     ) -> tuple[int, int]:
         """Run the curator; host-validate the proposal. Returns
         (claims_proposed, questions_created)."""
@@ -817,8 +848,20 @@ class Orchestrator:
             f"[{i}] {e.kind.value} {e.identity_hash[:16]} {_cap_args(e.payload)}"
             for i, e in enumerate(ctx.evidence)
         )
+        # T4.1: the curator needs the existing claim IDs to declare
+        # `dependencies` — the context pack's claim sections carry them
+        # (each line is prefixed with [c:<claim_id>])
+        knowledge_lines: list[str] = []
+        if pack is not None:
+            for section in ("claims_evidence", "pending_claims", "contradictions"):
+                sec = pack.section(section)
+                if sec is not None and sec.content:
+                    knowledge_lines.extend(sec.content.splitlines())
+        knowledge = "\n".join(knowledge_lines) or "(пусто)"
         user = (
-            f"# Вопрос\n{ctx.question_text}\n\n# Evidence\n{ev_lines or '(пусто)'}\n\n"
+            f"# Вопрос\n{ctx.question_text}\n\n"
+            f"# Знание (claim ID в строке [c:...])\n{knowledge}\n\n"
+            f"# Evidence\n{ev_lines or '(пусто)'}\n\n"
             "Предложи изменения памяти (JSON по схеме)."
         )
         fingerprint = build_model_fingerprint(
@@ -828,12 +871,15 @@ class Orchestrator:
             policy_version="sealed-m1-stub",
         )
         try:
-            proposal, record = await self.gateway.chat(
-                system=curator.text,
-                user=user,
-                response_schema=CuratorProposal,
-                fingerprint=fingerprint,
-            )
+            # T3.30: renew the lease in the background while the model
+            # call is in flight (§5.2.3: TTL = several heartbeat intervals)
+            async with LeaseHeartbeatGuard(self.lease, db, session.id, self.node_owner):
+                proposal, record = await self.gateway.chat(
+                    system=curator.text,
+                    user=user,
+                    response_schema=CuratorProposal,
+                    fingerprint=fingerprint,
+                )
         except LLMError as exc:
             # host-generated failure report (§6.5): curator unavailable
             await audit.record(
@@ -843,6 +889,16 @@ class Orchestrator:
                 public_summary="curator unavailable; host failure report, no claims proposed",
             )
             return 0, 0
+        except LeaseLost as exc:
+            # T3.30: lease lost mid-call — abort; the reconciler resolves
+            # the session, never a guessed rollback (§5.2.3)
+            await audit.record(
+                AuditEventType.SESSION_FAILED,
+                session_id=session.id,
+                payload={"error": str(exc)[:500], "phase": "consolidating"},
+                public_summary="lease lost during curator call; host failure report",
+            )
+            raise
 
         run = ORMModelRun(
             session_id=session.id,
@@ -1028,7 +1084,8 @@ class Orchestrator:
             await db.execute(
                 text(
                     "UPDATE sessions SET state = 'failed', finished_at = now(), "
-                    "lease_owner = NULL, lease_expires_at = NULL, termination_reason = :r "
+                    "lease_owner = NULL, lease_expires_at = NULL, termination_reason = :r, "
+                    "commit_intent_at = NULL "
                     "WHERE id = :id AND state = 'committing'"
                 ),
                 {"id": plan.session_id, "r": reason},

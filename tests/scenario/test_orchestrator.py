@@ -6,7 +6,9 @@ Runs a real Sealed session against PostgreSQL + the deterministic fake LLM.
 from __future__ import annotations
 
 import uuid
+from datetime import timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 from sqlalchemy import text
@@ -66,6 +68,7 @@ def _make_orchestrator(
     scratch_url: str,
     fake: FakeLLM,
     workspace: Path,
+    lease_ttl: timedelta | None = None,
 ) -> tuple[Orchestrator, LLMMiddleware, object]:
     engine = create_async_engine(scratch_url)
     factory = async_sessionmaker(engine, expire_on_commit=False)
@@ -77,19 +80,28 @@ def _make_orchestrator(
         gateway=gateway,
         profile=ModelProfile(model_alias="fake-thinker"),
         executor=StubToolExecutor(workspace),
+        lease_ttl=lease_ttl,
     )
     return orch, gateway, engine
 
 
-async def _seed_question(scratch_url: str) -> uuid.UUID:
+async def _seed_question(scratch_url: str, text: str = "Сколько будет 6*7?") -> uuid.UUID:
     engine = create_async_engine(scratch_url)
     factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with factory() as db, transaction(db):
-            q = await QuestionRepository.create(
-                db, ORMQuestion(text="Сколько будет 6*7?", origin=QuestionOrigin.SEEDED.value)
-            )
+            q = await QuestionRepository.create(db, ORMQuestion(text=text, origin=QuestionOrigin.SEEDED.value))
             return q.id
+    finally:
+        await engine.dispose()
+
+
+async def _scalar(scratch_url: str, sql: str, params: dict | None = None) -> Any:
+    """One-shot row read on the scratch DB (test plumbing only)."""
+    engine = create_async_engine(scratch_url)
+    try:
+        async with engine.connect() as conn:
+            return (await conn.execute(text(sql), params or {})).first()
     finally:
         await engine.dispose()
 
@@ -133,6 +145,40 @@ async def test_full_sealed_session(migrated_db, fake_llm: FakeLLM, tmp_path: Pat
     assert outcome.claims_proposed == 1
     assert outcome.termination_reason == "goal_reached"
 
+    assert await _session_state(scratch_url, outcome.session_id) == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_slow_llm_does_not_lose_commit_lease(migrated_db, fake_llm: FakeLLM, tmp_path: Path) -> None:
+    """T3.30 regression (first real MVP session, qwen36-35b-a3b-q6-mtp):
+
+    a model call longer than the lease TTL must not starve the fenced
+    commit — the background guard renews the lease mid-call (§5.2.3).
+    Without the guard this session ends commit_lease_lost → reconciled_abort.
+    """
+    scratch_url, _engine = migrated_db
+    question_id = await _seed_question(scratch_url)
+
+    # every model call takes 2.5 s — more than 2x the 1 s lease TTL below
+    fake_llm.script(
+        [
+            {"content": TOOL_PYTHON, "delay_seconds": 2.5},
+            {"content": TOOL_WRITE, "delay_seconds": 2.5},
+            {"content": COMPLETE, "delay_seconds": 2.5},
+            {"content": CURATOR_OK, "delay_seconds": 2.5},
+        ]
+    )
+    orch, gateway, engine = _make_orchestrator(
+        scratch_url, fake_llm, tmp_path / "ws", lease_ttl=timedelta(seconds=1)
+    )
+    try:
+        outcome = await orch.run_session(question_id)
+    finally:
+        await gateway.close()
+        await engine.dispose()
+
+    assert outcome.final_state is SessionState.SUCCEEDED
+    assert outcome.termination_reason == "goal_reached"
     assert await _session_state(scratch_url, outcome.session_id) == "succeeded"
 
     # causal chain rows
@@ -419,3 +465,196 @@ async def test_curator_failure_reports_but_commits(migrated_db, fake_llm: FakeLL
     # curator failed but the session still commits with zero claims
     assert outcome.final_state is SessionState.SUCCEEDED
     assert outcome.claims_proposed == 0
+
+
+async def _run_fake_session(
+    scratch_url: str, fake: FakeLLM, tmp_path: Path, question_id: uuid.UUID, script: list[dict]
+) -> Any:
+    fake_llm_script = script
+    orch, gateway, engine = _make_orchestrator(scratch_url, fake, tmp_path / f"ws-{len(fake_llm_script)}")
+    try:
+        fake.script(list(script))
+        return await orch.run_session(question_id)
+    finally:
+        await gateway.close()
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_curator_dependency_committed_bumps_graph_revision(
+    migrated_db, fake_llm: FakeLLM, tmp_path: Path
+) -> None:
+    """T4.1: the curator declares an evidential dependency on an existing
+    claim; the fenced commit writes the edge AND bumps the
+    dependency_graph revision (fence = base revision from prepare)."""
+    scratch_url, _engine = migrated_db
+
+    # session 1: a plain session that commits claim A
+    q1 = await _seed_question(scratch_url)
+    outcome1 = await _run_fake_session(
+        scratch_url, fake_llm, tmp_path, q1, [{"content": TOOL_PYTHON}, {"content": COMPLETE}, {"content": CURATOR_OK}]
+    )
+    assert outcome1.final_state is SessionState.SUCCEEDED
+
+    row = await _scalar(
+        scratch_url, "SELECT id, statement FROM claims ORDER BY observed_at LIMIT 1"
+    )
+    assert row is not None
+    a_id = row[0] if isinstance(row[0], uuid.UUID) else uuid.UUID(str(row[0]))
+
+    # session 2: the curator proposes claim B with an evidential
+    # dependency on A (the model would see A in the [c:<uuid>] lines)
+    q2 = await _seed_question(scratch_url, text="Проверьте 42*1 ещё раз")
+    curator_dep: dict[str, Any] = {
+        "summary": "Зависимость от A",
+        "claims": [
+            {
+                "statement": "42*1 равно 42",
+                "claim_type": "computed_result",
+                "scope": {"expr": "42*1"},
+                "dependencies": [{"claim_id": str(a_id), "kind": "evidential"}],
+            }
+        ],
+        "evidence_links": [{"evidence_index": 0, "claim_index": 0, "relation": "supports"}],
+        "new_questions": [],
+    }
+    outcome2 = await _run_fake_session(
+        scratch_url,
+        fake_llm,
+        tmp_path,
+        q2,
+        [{"content": TOOL_PYTHON}, {"content": COMPLETE}, {"content": curator_dep}],
+    )
+    assert outcome2.final_state is SessionState.SUCCEEDED
+
+    # the edge is committed, direction: from(B) depends on to(A)
+    edge = await _scalar(
+        scratch_url,
+        "SELECT from_claim_id, to_claim_id, kind FROM claim_dependencies",
+    )
+    assert edge is not None
+    b_id = edge[0] if isinstance(edge[0], uuid.UUID) else uuid.UUID(str(edge[0]))
+    assert edge[1] == a_id
+    assert b_id != a_id
+    assert edge[2] == "evidential"
+
+    # the graph revision moved 0 -> 1 (it was bumped in the fenced commit)
+    rev = await _scalar(
+        scratch_url, "SELECT revision FROM domain_revisions WHERE scope='dependency_graph'"
+    )
+    assert int(rev[0]) == 1
+
+    # the commit audit carries the new graph revision
+    audit = await _scalar(
+        scratch_url,
+        "SELECT payload FROM audit_events "
+        "WHERE type='commit_attempt_committed' AND session_id=:s",
+        {"s": str(outcome2.session_id)},
+    )
+    assert audit is not None
+    assert int(audit[0].get("dependency_graph_revision", -1)) == 1
+
+
+@pytest.mark.asyncio
+async def test_curator_cycle_dependency_rejected_graph_unchanged(
+    migrated_db, fake_llm: FakeLLM, tmp_path: Path
+) -> None:
+    """T4.1: a dependency that would close an evidential cycle is
+    rejected at the commit boundary; the claim still commits and the
+    dependency_graph revision is NOT bumped (no evidential edge changed)."""
+    scratch_url, _engine = migrated_db
+
+    # session 1: two claims A and B, no dependencies
+    q1 = await _seed_question(scratch_url)
+    curator_two: dict[str, Any] = {
+        "summary": "Два утверждения",
+        "claims": [
+            {"statement": "A: база", "claim_type": "external_fact", "scope": {"obj": "a"}},
+            {"statement": "B: из A", "claim_type": "computed_result", "scope": {"expr": "b"}},
+        ],
+        "evidence_links": [],
+        "new_questions": [],
+    }
+    outcome1 = await _run_fake_session(
+        scratch_url, fake_llm, tmp_path, q1, [{"content": TOOL_PYTHON}, {"content": COMPLETE}, {"content": curator_two}]
+    )
+    assert outcome1.final_state is SessionState.SUCCEEDED
+
+    async def _claim_id(stmt: str) -> uuid.UUID:
+        row = await _scalar(scratch_url, "SELECT id FROM claims WHERE statement=:s", {"s": stmt})
+        assert row is not None
+        return row[0] if isinstance(row[0], uuid.UUID) else uuid.UUID(str(row[0]))
+
+    a_id = await _claim_id("A: база")
+    b_id = await _claim_id("B: из A")
+
+    # session 2: REUSED A with dependency A -> B (legal: B is current, no
+    # path from B back to A) → the edge commits, graph revision 0 -> 1
+    q2 = await _seed_question(scratch_url, text="Свяжите A и B")
+    curator_a_dep: dict[str, Any] = {
+        "summary": "A зависит от B",
+        "claims": [
+            {
+                "statement": "A: база",
+                "claim_type": "external_fact",
+                "scope": {"obj": "a"},
+                "dependencies": [{"claim_id": str(b_id), "kind": "evidential"}],
+            }
+        ],
+        "evidence_links": [],
+        "new_questions": [],
+    }
+    outcome2 = await _run_fake_session(
+        scratch_url,
+        fake_llm,
+        tmp_path,
+        q2,
+        [{"content": TOOL_PYTHON}, {"content": COMPLETE}, {"content": curator_a_dep}],
+    )
+    assert outcome2.final_state is SessionState.SUCCEEDED
+    rev = await _scalar(
+        scratch_url, "SELECT revision FROM domain_revisions WHERE scope='dependency_graph'"
+    )
+    assert int(rev[0]) == 1
+
+    # session 3: REUSED B with dependency B -> A: closes the cycle
+    # A -> B -> A. The edge must be rejected (audit), the claim still
+    # commits, and the graph revision stays at 1.
+    q3 = await _seed_question(scratch_url, text="Свяжите B и A обратно")
+    curator_b_dep: dict[str, Any] = {
+        "summary": "B зависит от A (цикл!)",
+        "claims": [
+            {
+                "statement": "B: из A",
+                "claim_type": "computed_result",
+                "scope": {"expr": "b"},
+                "dependencies": [{"claim_id": str(a_id), "kind": "evidential"}],
+            }
+        ],
+        "evidence_links": [],
+        "new_questions": [],
+    }
+    outcome3 = await _run_fake_session(
+        scratch_url,
+        fake_llm,
+        tmp_path,
+        q3,
+        [{"content": TOOL_PYTHON}, {"content": COMPLETE}, {"content": curator_b_dep}],
+    )
+    assert outcome3.final_state is SessionState.SUCCEEDED
+
+    edges = await _scalar(scratch_url, "SELECT count(*) FROM claim_dependencies")
+    assert int(edges[0]) == 1  # the cyclic edge was not written
+
+    rev = await _scalar(
+        scratch_url, "SELECT revision FROM domain_revisions WHERE scope='dependency_graph'"
+    )
+    assert int(rev[0]) == 1  # unchanged
+
+    rejected = await _scalar(
+        scratch_url,
+        "SELECT count(*) FROM audit_events "
+        "WHERE type='dependency_edge_rejected' AND session_id=:s",
+        {"s": str(outcome3.session_id)},
+    )
+    assert int(rejected[0]) == 1

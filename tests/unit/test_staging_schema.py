@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import uuid
 from datetime import datetime
 
 import pytest
 from pydantic import ValidationError
 
-from packages.domain.models.enums import ClaimType, EvidenceRelation, QuestionOrigin
+from packages.domain.models.enums import ClaimType, DependencyKind, EvidenceRelation, QuestionOrigin
 from packages.domain.schemas.staging import (
+    MAX_DEPENDENCIES_PER_CLAIM,
+    ClaimDependencyProposal,
     ClaimProposal,
     CuratorProposal,
     EvidenceLink,
@@ -89,3 +92,62 @@ def test_extra_fields_rejected() -> None:
 def test_relations_closed() -> None:
     with pytest.raises(ValidationError):
         EvidenceLink(evidence_index=0, claim_index=0, relation="neutral")
+
+
+# ─── claim dependencies (T4.1) ──────────────────────────────────────────────
+
+
+def test_dependencies_default_empty() -> None:
+    c = ClaimProposal(statement="X", claim_type=ClaimType.SELF_MODEL)
+    assert c.dependencies == []
+
+
+def test_dependency_valid_kinds() -> None:
+    target = uuid.uuid4()
+    c = ClaimProposal(
+        statement="X",
+        claim_type=ClaimType.SELF_MODEL,
+        dependencies=[
+            ClaimDependencyProposal(claim_id=target),  # evidential default
+            ClaimDependencyProposal(claim_id=target, kind=DependencyKind.RESEARCH),
+        ],
+    )
+    assert c.dependencies[0].kind is DependencyKind.EVIDENTIAL
+    assert c.dependencies[1].kind is DependencyKind.RESEARCH
+    p = CuratorProposal(summary="s", claims=[c])
+    assert p.validate_against(evidence_count=0) == []
+
+
+def test_dependency_closed_kind() -> None:
+    with pytest.raises(ValidationError):
+        ClaimDependencyProposal(claim_id=uuid.uuid4(), kind="friend")
+
+
+def test_dependency_requires_uuid() -> None:
+    with pytest.raises(ValidationError):
+        ClaimDependencyProposal(claim_id="not-a-uuid")
+
+
+def test_dependency_extra_field_rejected() -> None:
+    with pytest.raises(ValidationError):
+        ClaimDependencyProposal(claim_id=uuid.uuid4(), grade="E4")
+
+
+def test_dependency_budget_enforced() -> None:
+    deps = [ClaimDependencyProposal(claim_id=uuid.uuid4()) for _ in range(MAX_DEPENDENCIES_PER_CLAIM + 1)]
+    with pytest.raises(ValidationError):
+        ClaimProposal(statement="X", claim_type=ClaimType.SELF_MODEL, dependencies=deps)
+
+
+def test_duplicate_dependencies_flagged() -> None:
+    target = uuid.uuid4()
+    c = ClaimProposal(
+        statement="X",
+        claim_type=ClaimType.SELF_MODEL,
+        dependencies=[
+            ClaimDependencyProposal(claim_id=target),
+            ClaimDependencyProposal(claim_id=target),
+        ],
+    )
+    p = CuratorProposal(summary="s", claims=[c])
+    assert any("duplicate" in x for x in p.validate_against(evidence_count=0))

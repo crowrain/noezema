@@ -32,13 +32,19 @@ def _rule(**overrides) -> ClaimTypeRule:
     return ClaimTypeRule.from_payload("computed_result", base)
 
 
-def _ev(kind: str = "computation", relation: str = "supports", group: str = "g0") -> EvaluatedEvidence:
+def _ev(
+    kind: str = "computation",
+    relation: str = "supports",
+    group: str = "g0",
+    resolved: bool = False,
+) -> EvaluatedEvidence:
     return EvaluatedEvidence(
-        identity_hash=f"hash-{kind}-{relation}-{group}",
+        identity_hash=f"hash-{kind}-{relation}-{group}-{resolved}",
         kind=kind,
         relation=relation,
         scope={},
         independence_group=group,
+        resolved=resolved,
     )
 
 
@@ -68,6 +74,48 @@ def test_counterevidence_disputes_and_caps_E1():
     assert r.grade is EffectiveGrade.E1
     # disputed confidence is damped below a clean E1
     assert r.confidence < 0.3
+
+
+def test_resolved_counterevidence_does_not_cap():
+    """§8.7.4: a counter with a VALID resolution does not count against
+    the claim — supported, with the audit-visible reason."""
+    r = evaluate(
+        "computed_result",
+        _rule(),
+        {},
+        [_ev(), _ev(relation="counters", resolved=True)],
+        has_as_of=False,
+    )
+    assert r.epistemic_status is EpistemicStatus.SUPPORTED
+    assert r.grade is EffectiveGrade.E2
+    assert "counterevidence_resolved" in r.reasons
+
+
+def test_resolved_counter_only_is_not_refuted():
+    """All counters resolved + no support: nothing is refuted, nothing
+    is supported — hypothesis (no_evidence), not refuted."""
+    r = evaluate(
+        "computed_result", _rule(), {}, [_ev(relation="counters", resolved=True)], has_as_of=False
+    )
+    assert r.epistemic_status is EpistemicStatus.HYPOTHESIS
+    assert "no_evidence" in r.reasons
+
+
+def test_one_unresolved_counter_among_resolved_still_disputes():
+    r = evaluate(
+        "computed_result",
+        _rule(),
+        {},
+        [
+            _ev(),
+            _ev(relation="counters", resolved=True),
+            _ev(relation="counters", group="g9"),
+        ],
+        has_as_of=False,
+    )
+    assert r.epistemic_status is EpistemicStatus.DISPUTED
+    assert r.grade is EffectiveGrade.E1
+    assert "counterevidence_unresolved" in r.reasons
 
 
 def test_insufficient_independence_stays_hypothesis():

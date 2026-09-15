@@ -227,6 +227,124 @@ class ORMEnvironmentManifest(Base):
     normalizer_version: Mapped[str] = mapped_column(Text, nullable=False, default="env-v1")
     created_at: Mapped[datetime] = created_at_column()
 
+    # T4.6 (§8.7.3): content hash of the FULL field set — content-
+    # addressed dedup (uq_environment_manifests_hash)
+    manifest_hash: Mapped[str] = mapped_column(Text, nullable=False, default="")
+
+
+class ORMEnvironmentIndependenceSnapshot(Base):
+    __tablename__ = "environment_independence_snapshots"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    algorithm_version: Mapped[str] = mapped_column(Text, nullable=False)
+    rules_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = created_at_column()
+
+
+class ORMEnvironmentIndependenceMember(Base):
+    __tablename__ = "environment_independence_members"
+
+    snapshot_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("environment_independence_snapshots.id", ondelete="CASCADE"), primary_key=True
+    )
+    environment_manifest_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("environment_manifests.id", ondelete="CASCADE"), primary_key=True
+    )
+    group_id: Mapped[str] = mapped_column(Text, nullable=False)
+    relation: Mapped[str] = mapped_column(Text, nullable=False)
+    basis: Mapped[str] = mapped_column(Text, nullable=False)
+
+
+class ORMSourceDependencyEdge(Base):
+    """A source points at another source (T4.7, §11.3, §14): link to a
+    primary source, derived content, quote, republish — a merge basis of
+    the source-independence algorithm."""
+
+    __tablename__ = "source_dependency_edges"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    from_source_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("sources.id", ondelete="CASCADE"), nullable=False
+    )
+    to_source_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("sources.id", ondelete="CASCADE"), nullable=False
+    )
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    basis_artifact_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("artifacts.id", ondelete="SET NULL")
+    )
+    origin: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = created_at_column()
+
+    __table_args__ = (
+        CheckConstraint(
+            "kind IN ('link_to_primary','derived_from','quote_of','republish_of')"
+        ),
+    )
+
+
+class ORMSourceGraphCorrection(Base):
+    """An operator correction of the source graph (T4.7, §11.3): it
+    changes the independence classification (merge / split) with a
+    verifiable provenance chain — but is NOT evidence for a claim, and
+    an operator attestation without one never splits a group."""
+
+    __tablename__ = "source_graph_corrections"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    actor: Mapped[str] = mapped_column(Text, nullable=False)
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    from_source_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("sources.id", ondelete="CASCADE"), nullable=False
+    )
+    to_source_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("sources.id", ondelete="CASCADE"), nullable=False
+    )
+    basis_artifact_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("artifacts.id", ondelete="SET NULL")
+    )
+    rules_version: Mapped[str] = mapped_column(Text, nullable=False)
+    valid: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    reason_audit_event_id: Mapped[uuid.UUID | None] = mapped_column()
+    created_at: Mapped[datetime] = created_at_column()
+
+    __table_args__ = (CheckConstraint("kind IN ('merge','split')"),)
+
+
+class ORMCounterevidenceResolution(Base):
+    """A resolution of ONE counterevidence (T4.8, §8.7.4): a separate
+    audited entity with exactly one verifiable basis — an evidence row
+    or a valid source-graph correction. It is not a model flag: the
+    rules engine counts only UNRESOLVED counters against the claim."""
+
+    __tablename__ = "counterevidence_resolutions"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    evidence_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("evidence.id", ondelete="CASCADE"), nullable=False
+    )
+    basis_evidence_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("evidence.id", ondelete="SET NULL")
+    )
+    basis_correction_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("source_graph_corrections.id", ondelete="SET NULL")
+    )
+    actor: Mapped[str] = mapped_column(Text, nullable=False)
+    rules_version: Mapped[str] = mapped_column(Text, nullable=False)
+    reason_audit_event_id: Mapped[uuid.UUID | None] = mapped_column()
+    valid: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_in_session: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("sessions.id", ondelete="SET NULL")
+    )
+    created_at: Mapped[datetime] = created_at_column()
+
+    __table_args__ = (
+        CheckConstraint(
+            "(basis_evidence_id IS NULL) <> (basis_correction_id IS NULL)",
+            name="counterevidence_resolutions_basis_xor_check",
+        ),
+    )
+
 
 class ORMCheckpoint(Base):
     __tablename__ = "checkpoints"
@@ -242,6 +360,105 @@ class ORMCheckpoint(Base):
     created_at: Mapped[datetime] = created_at_column()
 
     __table_args__ = (UniqueConstraint("session_id"),)
+
+
+class ORMClosureManifest(Base):
+    """Immutable, content-addressed reverse-closure snapshot (T4.2, §8.6).
+
+    ``id = uuid5(CLOSURE_MANIFEST_UUID5_NAMESPACE, sha256)``; the same
+    closure under the same graph revision resolves to the same row, so
+    manifest creation is dedup-by-content (UNIQUE sha256).
+    """
+
+    __tablename__ = "closure_manifests"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    root_claim_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("claims.id", ondelete="CASCADE"))
+    graph_revision: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    #: ordered (topological rank, claim id) list of the closure members
+    claim_ids: Mapped[list[str]] = mapped_column(JSONB, nullable=False)
+    #: claim id (str) -> depth (direct dependents of the root are depth 1)
+    ranks: Mapped[dict[str, int]] = mapped_column(JSONB, nullable=False)
+    count: Mapped[int] = mapped_column(nullable=False)
+    sha256: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    created_at: Mapped[datetime] = created_at_column()
+
+    __table_args__ = (
+        CheckConstraint("count = jsonb_array_length(claim_ids)"),
+    )
+
+
+class ORMDependencyInvalidationBarrier(Base):
+    """Durable work item / GC root for a large invalidation closure (T4.2, §8.6).
+
+    The cursor (``next_offset``) moves only in the same transaction as
+    the idempotent invalidation batch it advances. Open barriers
+    (discovering/active/closing/blocked) keep ancestor protection on
+    their closure (§8.6).
+    """
+
+    __tablename__ = "dependency_invalidation_barriers"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    root_claim_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("claims.id", ondelete="CASCADE"))
+    graph_revision: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    generation: Mapped[int] = mapped_column(nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    closure_manifest_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("closure_manifests.id", ondelete="RESTRICT")
+    )
+    member_count: Mapped[int] = mapped_column(nullable=False, default=0)
+    next_offset: Mapped[int] = mapped_column(nullable=False, default=0)
+    last_error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = created_at_column()
+    updated_at: Mapped[datetime] = created_at_column()
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        UniqueConstraint("root_claim_id", "generation"),
+        CheckConstraint("status IN ('discovering','active','closing','resolved','blocked')"),
+        CheckConstraint("(closure_manifest_id IS NULL) = (status = 'discovering')"),
+        CheckConstraint("(resolved_at IS NULL) = (status <> 'resolved')"),
+        CheckConstraint("generation >= 1"),
+        CheckConstraint("next_offset >= 0"),
+    )
+
+
+class ORMReassessmentJob(Base):
+    """Durable reassessment queue scaffold (T4.2; worker — T4.3, §14.1).
+
+    The cascade enqueues one job per invalidated claim. The partial
+    unique index keeps a single active (queued/leased/retry) job per
+    (claim, target snapshot); terminal rows stay for history.
+    """
+
+    __tablename__ = "reassessment_jobs"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    claim_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("claims.id", ondelete="CASCADE"))
+    target_config_snapshot_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("config_snapshots.id", ondelete="RESTRICT")
+    )
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    reason: Mapped[str | None] = mapped_column(Text)
+    priority: Mapped[int] = mapped_column(nullable=False, default=0)
+    enqueued_at: Mapped[datetime] = created_at_column()
+    attempts: Mapped[int] = mapped_column(nullable=False, default=0)
+    max_attempts: Mapped[int] = mapped_column(nullable=False, default=78)
+    error_class: Mapped[str | None] = mapped_column(Text)
+    lease_owner: Mapped[str | None] = mapped_column(Text)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    blocked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text)
+
+    __table_args__ = (
+        CheckConstraint("status IN ('queued','leased','retry','blocked','completed')"),
+        CheckConstraint("(lease_owner IS NULL) = (lease_expires_at IS NULL)"),
+        CheckConstraint("(blocked_at IS NULL) = (status <> 'blocked')"),
+        CheckConstraint("(completed_at IS NULL) = (status <> 'completed')"),
+    )
 
 
 class ORMBackupManifest(Base):

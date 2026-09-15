@@ -242,6 +242,71 @@ class ClaimType(StrEnum):
     SELF_MODEL = "self_model"
 
 
+class DependencyKind(StrEnum):
+    """claim_dependencies.kind (T4.1, §8.6).
+
+    ``evidential`` edges form the DAG used by cascade invalidation
+    (cycle check at commit, graph revision bump). ``research`` is the
+    explicit marker for a research dependency (e.g. on a hypothesis,
+    which never serves as sufficient evidence); research edges do not
+    participate in the cycle check or the graph revision.
+    """
+
+    EVIDENTIAL = "evidential"
+    RESEARCH = "research"
+
+
+class BarrierStatus(StrEnum):
+    """dependency_invalidation_barriers.status (T4.2, §8.6).
+
+    ``discovering`` — (re)building the closure manifest outside the
+    barrier transaction; ``active`` — applying batches from the durable
+    cursor; ``closing`` — manifest exhausted, final closure check before
+    ``resolved``; ``blocked`` — manifest hash mismatch / impossible
+    cursor / closure-invariant violation: ancestor protection is kept
+    and only an audited operator recovery may close it (it never
+    auto-resolves).
+    """
+
+    DISCOVERING = "discovering"
+    ACTIVE = "active"
+    CLOSING = "closing"
+    RESOLVED = "resolved"
+    BLOCKED = "blocked"
+
+    @property
+    def is_open(self) -> bool:
+        """Open barriers keep ancestor protection on their closure."""
+        return self in (
+            BarrierStatus.DISCOVERING,
+            BarrierStatus.ACTIVE,
+            BarrierStatus.CLOSING,
+            BarrierStatus.BLOCKED,
+        )
+
+
+class ReassessmentJobStatus(StrEnum):
+    """reassessment_jobs.status (T4.2 scaffold, T4.3 worker, §14.1).
+
+    At most one ``queued|leased|retry`` job per (claim, target snapshot)
+    (partial unique index); ``blocked|completed`` rows stay for history.
+    """
+
+    QUEUED = "queued"
+    LEASED = "leased"
+    RETRY = "retry"
+    BLOCKED = "blocked"
+    COMPLETED = "completed"
+
+    @property
+    def is_active(self) -> bool:
+        return self in (
+            ReassessmentJobStatus.QUEUED,
+            ReassessmentJobStatus.LEASED,
+            ReassessmentJobStatus.RETRY,
+        )
+
+
 # ─── Questions (§9) ────────────────────────────────────────────────────────
 
 
@@ -373,6 +438,15 @@ class AuditEventType(StrEnum):
     CLAIM_REVISION = "claim_revision"
     CLAIM_ASSESSED = "claim_assessed"
     CLAIM_INVALIDATED = "claim_invalidated"
+    DEPENDENCY_EDGE_REJECTED = "dependency_edge_rejected"
+    CASCADE_STARTED = "cascade_started"
+    BARRIER_GENERATION_PUBLISHED = "barrier_generation_published"
+    BARRIER_BATCH_APPLIED = "barrier_batch_applied"
+    BARRIER_RESOLVED = "barrier_resolved"
+    BARRIER_BLOCKED = "barrier_blocked"
+    REASSESSMENT_JOB_COMPLETED = "reassessment_job_completed"
+    REASSESSMENT_JOB_RETRY = "reassessment_job_retry"
+    REASSESSMENT_JOB_BLOCKED = "reassessment_job_blocked"
     COMMIT_ATTEMPT_PREPARED = "commit_attempt_prepared"
     COMMIT_ATTEMPT_COMMITTED = "commit_attempt_committed"
     COMMIT_ATTEMPT_ABORTED = "commit_attempt_aborted"
@@ -386,6 +460,20 @@ class AuditEventType(StrEnum):
     OPERATOR_COMMAND_REJECTED = "operator_command_rejected"
     CONFIG_SNAPSHOT_CREATED = "config_snapshot_created"
     CONFIG_ACTIVATED = "config_activated"
+    # T4.5 (§8.7.2): the online activation lifecycle
+    ACTIVATION_ACQUIRED = "activation_acquired"
+    ACTIVATION_TAKEOVER = "activation_takeover"
+    ACTIVATION_PUBLISHED = "activation_published"
+    ACTIVATION_POST_PUBLISH_BATCH = "activation_post_publish_batch"
+    ACTIVATION_POST_PUBLISH_COMPLETED = "activation_post_publish_completed"
+    ACTIVATION_POST_PUBLISH_BLOCKED = "activation_post_publish_blocked"
+    ACTIVATION_CLEANED_UP = "activation_cleaned_up"
+    ACTIVATION_SUPERSEDED = "activation_superseded"
+    # T4.7 (§11.3, §14): the full source graph
+    SOURCE_GRAPH_CHANGED = "source_graph_changed"
+    # T4.8 (§8.7.4): counterevidence resolutions
+    COUNTER_RESOLUTION_CREATED = "counter_resolution_created"
+    COUNTER_RESOLUTION_INVALIDATED = "counter_resolution_invalidated"
     ALERT_RAISED = "alert_raised"
 
 
