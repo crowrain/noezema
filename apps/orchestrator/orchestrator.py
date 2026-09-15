@@ -379,7 +379,13 @@ class Orchestrator:
         # changes (§5.2.2); the reserve is checked before each record
         staging = StagingService(HostReserveService.for_snapshot(snapshot))
 
-        session = ORMSession(state=SessionState.CREATED.value, config_snapshot_id=snapshot.id)
+        # T7.7: started_at is the evaluation window anchor (§22.2);
+        # recorded at creation — before any real work
+        session = ORMSession(
+            state=SessionState.CREATED.value,
+            config_snapshot_id=snapshot.id,
+            started_at=datetime.now(UTC),
+        )
         await SessionRepository.create(db, session)
         await audit.record(
             AuditEventType.SESSION_STARTED, session_id=session.id, public_summary="session started"
