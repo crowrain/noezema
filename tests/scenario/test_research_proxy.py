@@ -153,7 +153,9 @@ async def make_factory():
 # ---------------------------------------------------------------- the
 # proxy service on the scratch DB
 
-def _proxy_section(**overrides: Any) -> dict[str, Any]:
+def _proxy_section(
+    origin_base: str = "http://127.0.0.1:0", **overrides: Any
+) -> dict[str, Any]:
     section = {
         "mode": "curated",
         "max_response_bytes": 65536,
@@ -161,6 +163,10 @@ def _proxy_section(**overrides: Any) -> dict[str, Any]:
         "timeout_seconds": 2,
         "user_agent": "noezema-test/1.0",
         "private_allowlist": [],
+        "searxng_url": origin_base,
+        "allowed_domains": [],
+        "rate_limit_max": 20,
+        "rate_limit_window_seconds": 3600,
     }
     section.update(overrides)
     return section
@@ -220,7 +226,7 @@ async def test_fetch_persists_provenance_and_marks_untrusted(
     store = FilesystemArtifactStore(tmp_path / "artifacts")
     await _set_section(
         scratch_url,
-        _proxy_section(private_allowlist=origin.allowlist, max_response_bytes=65536),
+        _proxy_section(origin.base, private_allowlist=origin.allowlist, max_response_bytes=65536),
     )
     factory = make_factory(scratch_url)
     service = ResearchProxyService(factory, store)
@@ -298,7 +304,7 @@ async def test_sealed_mode_refuses_every_fetch(
     store = FilesystemArtifactStore(tmp_path / "artifacts")
     await _set_section(
         scratch_url,
-        _proxy_section(mode="sealed", private_allowlist=origin.allowlist),
+        _proxy_section(origin.base, mode="sealed", private_allowlist=origin.allowlist),
     )
     factory = make_factory(scratch_url)
     service = ResearchProxyService(factory, store)
@@ -325,7 +331,7 @@ async def test_guard_blocks_metadata_and_private_targets(
     store = FilesystemArtifactStore(tmp_path / "artifacts")
     await _set_section(
         scratch_url,
-        _proxy_section(private_allowlist=origin.allowlist),
+        _proxy_section(origin.base, private_allowlist=origin.allowlist),
     )
     factory = make_factory(scratch_url)
     service = ResearchProxyService(factory, store)
@@ -364,7 +370,7 @@ async def test_size_and_redirect_limits(
     store = FilesystemArtifactStore(tmp_path / "artifacts")
     await _set_section(
         scratch_url,
-        _proxy_section(private_allowlist=origin.allowlist, max_response_bytes=1024),
+        _proxy_section(origin.base, private_allowlist=origin.allowlist, max_response_bytes=1024),
     )
     factory = make_factory(scratch_url)
     service = ResearchProxyService(factory, store)
@@ -391,7 +397,7 @@ async def test_redirect_chain_within_limit_follows(
     store = FilesystemArtifactStore(tmp_path / "artifacts")
     await _set_section(
         scratch_url,
-        _proxy_section(private_allowlist=origin.allowlist),
+        _proxy_section(origin.base, private_allowlist=origin.allowlist),
     )
     factory = make_factory(scratch_url)
     service = ResearchProxyService(factory, store)
@@ -408,7 +414,7 @@ async def test_timeout_and_non200(
     store = FilesystemArtifactStore(tmp_path / "artifacts")
     await _set_section(
         scratch_url,
-        _proxy_section(private_allowlist=origin.allowlist, timeout_seconds=1),
+        _proxy_section(origin.base, private_allowlist=origin.allowlist, timeout_seconds=1),
     )
     factory = make_factory(scratch_url)
     service = ResearchProxyService(factory, store)
@@ -430,7 +436,7 @@ async def test_http_api_envelope_and_sealed_status(
     store = FilesystemArtifactStore(tmp_path / "artifacts")
     await _set_section(
         scratch_url,
-        _proxy_section(private_allowlist=origin.allowlist),
+        _proxy_section(origin.base, private_allowlist=origin.allowlist),
     )
     factory = make_factory(scratch_url)
     app: FastAPI = create_proxy_app(ResearchProxyService(factory, store))
@@ -450,14 +456,14 @@ async def test_http_api_envelope_and_sealed_status(
         # sealed mode → 403 with the exact reason
         await _set_section(
             scratch_url,
-            _proxy_section(mode="sealed", private_allowlist=origin.allowlist),
+            _proxy_section(origin.base, mode="sealed", private_allowlist=origin.allowlist),
         )
         r = await client.post("/fetch", json={"url": f"{origin.base}/page"})
         assert r.status_code == 403
         assert r.json()["detail"]["reason"] == "sealed mode: no network egress"
 
         # a guard refusal → 403
-        await _set_section(scratch_url, _proxy_section(private_allowlist=origin.allowlist))
+        await _set_section(scratch_url, _proxy_section(origin.base, private_allowlist=origin.allowlist))
         r = await client.post(
             "/fetch", json={"url": "http://169.254.169.254/latest/meta-data/"}
         )

@@ -23,6 +23,7 @@ untrusted-data fence (T6.3 wires that into the explorer context).
 
 from __future__ import annotations
 
+import json
 import uuid
 from typing import Any
 
@@ -33,17 +34,26 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from apps.research_proxy.fetch import FetchClient, FetchError
+from apps.research_proxy.modes import ModeError, ModePolicy, ResearchMode
 from apps.research_proxy.normalization import (
     PARSER_FINGERPRINT,
     normalize_content,
 )
-from apps.research_proxy.ssrf_guard import SSRFError, SSRFPolicy
+from apps.research_proxy.search import (
+    SearchResults,
+    UpstreamHit,
+    count_upstream_requests,
+    parse_searxng,
+    search_local,
+    upstream_request_url,
+)
+from apps.research_proxy.ssrf_guard import SSRFError, SSRFPolicy, validate_url
 from packages.artifacts.store import ArtifactStore
 from packages.domain.canonical import canonical_json_bytes
 from packages.domain.db.uow import transaction
 from packages.domain.models.enums import AuditEventType
 from packages.domain.services.audit import AuditService
-from packages.domain.services.config import ConfigService
+from packages.domain.services.config import ConfigError, ConfigService
 
 #: the trust class for everything the proxy fetches — the DB check
 #: constraint (0003) is the closed set local_trusted|session_workspace|
@@ -82,17 +92,24 @@ class ResearchProxyService:
         async with self.session_factory() as db:
             snapshot = await ConfigService.get_effective(db)
             section = snapshot.research_proxy
-            mode = section.get("mode", "sealed") if isinstance(section, dict) else "sealed"
-            if mode == "sealed":
+            mode_policy = self._mode_policy(section)
+            if not mode_policy.egress:
                 async with transaction(db):
                     await self._reject(db, url, "sealed_mode_no_egress")
                 raise ResearchProxyError("sealed mode: no network egress", "rejected")
             try:
                 policy = SSRFPolicy.from_section(section)
+                if mode_policy.mode is ResearchMode.OPEN_LAB:
+                    host, _port = validate_url(url)
+                    if not mode_policy.domain_allowed(host):
+                        raise SSRFError(
+                            f"open_lab: domain {host!r} is not in the allowed list"
+                        )
             except SSRFError as exc:
                 async with transaction(db):
-                    await self._reject(db, url, f"invalid_research_proxy_section: {exc}")
+                    await self._reject(db, url, str(exc))
                 raise ResearchProxyError(str(exc), "rejected") from exc
+        mode = mode_policy.mode.value
 
         client = FetchClient(policy)
         try:
@@ -253,6 +270,133 @@ class ResearchProxyService:
             "trust_class": UNTRUSTED_EXTERNAL,
             "note": "недоверенный внешний контент: использовать только за fence-ом",
         }
+
+    def _mode_policy(self, section: Any) -> ModePolicy:
+        try:
+            return ModePolicy.from_section(section)
+        except (ModeError, SSRFError) as exc:
+            raise ConfigError(f"invalid research_proxy section: {exc}") from exc
+
+    async def search(self, query: str) -> dict[str, Any]:
+        """Search in the effective mode (§5.12.1).
+
+        - every mode: the local index (committed knowledge, no egress);
+        - curated: SearXNG through the guarded fetch client — the
+          upstream log (audit ``research_upstream_request``) and the
+          rate limit apply;
+        - sealed/open_lab: no upstream (open_lab's egress is the
+          domain-allowlisted ``fetch``, not search).
+        """
+        async with self.session_factory() as db:
+            snapshot = await ConfigService.get_effective(db)
+            mode_policy = self._mode_policy(snapshot.research_proxy)
+
+        local = None
+        async with self.session_factory() as db:
+            local = await search_local(db, query)
+
+        upstream: tuple[UpstreamHit, ...] = ()
+        upstream_logged = False
+        if mode_policy.mode is ResearchMode.CURATED and mode_policy.searxng_url:
+            upstream = await self._search_upstream(mode_policy, query)
+            upstream_logged = True
+
+        results = SearchResults(
+            mode=mode_policy.mode.value,
+            profile=mode_policy.profile_name,
+            local=local or (),
+            upstream=upstream,
+            upstream_logged=upstream_logged and bool(upstream),
+        )
+        return {
+            "mode": results.mode,
+            "profile": results.profile,
+            "local": [
+                {
+                    "claim_id": h.claim_id,
+                    "statement": h.statement,
+                    "claim_type": h.claim_type,
+                    "relevance": h.relevance,
+                }
+                for h in results.local
+            ],
+            "upstream": [
+                {"url": h.url, "title": h.title, "content": h.content}
+                for h in results.upstream
+            ]
+            if upstream_logged
+            else None,
+            "note": "недоверенный внешний контент: использовать только за fence-ом",
+        }
+
+    async def _search_upstream(
+        self, mode_policy: ModePolicy, query: str
+    ) -> tuple[UpstreamHit, ...]:
+        assert mode_policy.searxng_url is not None
+        async with self.session_factory() as db:
+            snapshot = await ConfigService.get_effective(db)
+            section_policy = SSRFPolicy.from_section(snapshot.research_proxy)
+            # rate limit against the upstream log (fail-closed: the
+            # count query and the eventual log entry share the table)
+            recent = await count_upstream_requests(
+                db, window_seconds=mode_policy.rate_limit_window_seconds
+            )
+            if recent >= mode_policy.rate_limit_max:
+                async with transaction(db):
+                    await AuditService(db).record(
+                        AuditEventType.RESEARCH_FETCH_REJECTED,
+                        payload={
+                            "url": upstream_request_url(
+                                mode_policy.searxng_url, query
+                            ),
+                            "reason": "upstream_rate_limit_exceeded",
+                            "mode": mode_policy.mode.value,
+                        },
+                        actor="research_proxy",
+                        public_summary="egress refused: upstream rate limit",
+                    )
+                raise ResearchProxyError(
+                    "upstream rate limit exceeded", "rate_limited"
+                )
+
+        client = FetchClient(section_policy)
+        target = upstream_request_url(mode_policy.searxng_url, query)
+        try:
+            result = await client.fetch(target)
+            payload = json.loads(result.data)
+        except (SSRFError, FetchError, ValueError) as exc:
+            async with self.session_factory() as db, transaction(db):
+                await AuditService(db).record(
+                    AuditEventType.RESEARCH_UPSTREAM_REQUEST,
+                    payload={
+                        "upstream_host": mode_policy.searxng_host,
+                        "query": query,
+                        "mode": mode_policy.mode.value,
+                        "status": "failed",
+                        "error": str(exc),
+                    },
+                    actor="research_proxy",
+                    public_summary="upstream request failed (logged)",
+                )
+            raise ResearchProxyError(f"upstream request failed: {exc}", "failed") from exc
+        finally:
+            await client.aclose()
+
+        hits = parse_searxng(payload)
+        async with self.session_factory() as db, transaction(db):
+            await AuditService(db).record(
+                AuditEventType.RESEARCH_UPSTREAM_REQUEST,
+                payload={
+                    "upstream_host": mode_policy.searxng_host,
+                    "query": query,
+                    "mode": mode_policy.mode.value,
+                    "status": "ok",
+                    "results": len(hits),
+                },
+                actor="research_proxy",
+                public_summary=f"upstream search via {mode_policy.searxng_host} (logged)",
+            )
+        return hits
 
     async def _reject(self, db: AsyncSession, url: str, reason: str) -> None:
         await AuditService(db).record(

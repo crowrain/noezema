@@ -465,7 +465,7 @@ sandbox ≤1 мс на тривиальном коде. Знание: 1–2 clai
 | # | Задача |
 |---|---|
 | T6.1 | `apps/research_proxy`: единственный egress; read-only; SSRF-guard (private/loopback/link-local/metadata), редиректы/размер/время; удаление активного содержимого | ✅ |
-| T6.2 | Режимы: Sealed (локальный индекс), Curated (SearXNG через прокси, upstream-лог, rate limits), Open Lab (разрешённые домены, отдельный профиль) |
+| T6.2 | Режимы: Sealed (локальный индекс), Curated (SearXNG через прокси, upstream-лог, rate limits), Open Lab (разрешённые домены, отдельный профиль) | ✅ |
 | T6.3 | Provenance: original + normalized text + hash; `sources`/`artifact_chunks` с origin; маркировка «недоверенный внешний контент» в контексте (data boundaries §11.2) |
 | T6.4 | Injection/poisoning-тесты: страница с инъекцией → capabilities не меняются; similarity-сигнал → require_operator; poisoning артефактов прошлых сессий |
 

@@ -6,6 +6,9 @@ service for humans:
 - ``POST /fetch`` — the controlled egress (the only way out to the
   network); refused in sealed mode (the bootstrap default) and on any
   guard/limit violation;
+- ``POST /search`` — the mode backend (§5.12.1): the local index in
+  every mode, the SearXNG upstream in curated (logged + rate-limited,
+  429 on the limit);
 - ``GET /healthz`` — liveness.
 
 The response envelope never contains page content: only the
@@ -31,6 +34,10 @@ class FetchRequest(BaseModel):
     url: str
 
 
+class SearchRequest(BaseModel):
+    query: str
+
+
 def create_proxy_app(service: ResearchProxyService) -> FastAPI:
     app = FastAPI(title="noezema-research-proxy", version="1.0")
     app.state.service = service
@@ -51,6 +58,23 @@ def create_proxy_app(service: ResearchProxyService) -> FastAPI:
             ) from exc
         except ValueError as exc:
             # ConfigError (no effective config) and similar
+            raise HTTPException(status_code=503, detail={"reason": str(exc)}) from exc
+
+    @app.post("/search")
+    async def search(body: SearchRequest) -> dict[str, Any]:
+        try:
+            return await service.search(body.query)
+        except ResearchProxyError as exc:
+            status = {
+                "rejected": 403,
+                "rate_limited": 429,
+                "failed": 502,
+            }.get(exc.status, 502)
+            raise HTTPException(
+                status_code=status,
+                detail={"reason": exc.reason},
+            ) from exc
+        except ValueError as exc:
             raise HTTPException(status_code=503, detail={"reason": str(exc)}) from exc
 
     return app

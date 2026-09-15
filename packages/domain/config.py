@@ -131,6 +131,14 @@ BOOTSTRAP_PAYLOAD: dict[str, Any] = {
         "timeout_seconds": 10,
         "user_agent": "noezema-research-proxy/1.0",
         "private_allowlist": [],
+        # T6.2 (stage 5, §5.12.1): mode backends. sealed = local index
+        # only (no egress); curated = SearXNG through the proxy
+        # (upstream log + rate limits); open_lab = fetch restricted to
+        # the closed allowed_domains list under the open_lab profile.
+        "searxng_url": None,
+        "allowed_domains": [],
+        "rate_limit_max": 20,
+        "rate_limit_window_seconds": 3600,
     },
     # T5.1 (§5.3.1): the selector is config-driven — the MVP default stays
     # FIFO; a config change to "curiosity" enables the score-based ranking
