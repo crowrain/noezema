@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import uuid
 from pathlib import Path
 
 from packages.domain.canonical import canonical_sha256
@@ -29,9 +30,13 @@ class UnknownToolError(ValueError):
 
 
 class StubToolExecutor:
-    def __init__(self, workspace_dir: Path) -> None:
+    def __init__(self, workspace_dir: Path, snapshot_id: uuid.UUID | None = None) -> None:
         self.workspace_dir = workspace_dir
         self.workspace_dir.mkdir(parents=True, exist_ok=True)
+        # T7.7 (EVAL-2): memory.search needs the effective config snapshot
+        # (retrieval is pinned to the pointer, §14.1) — set by the
+        # orchestrator for the session's snapshot
+        self.snapshot_id = snapshot_id
 
     def _resolve(self, path: str) -> Path:
         candidate = (self.workspace_dir / path).resolve()
@@ -57,11 +62,7 @@ class StubToolExecutor:
             if tool == "python.execute":
                 return await self._python_execute(arguments)
             if tool == "memory.search":
-                return Observation(
-                    tool=tool,
-                    ok=True,
-                    data={"results": [], "note": "durable memory search lands in M3"},
-                )
+                return await self._memory_search(str(arguments.get("query", "")), db=db)
             if tool in ("question.create", "message.reply"):
                 # Host-side effects are applied by the orchestrator, which
                 # owns the DB transaction.
@@ -69,6 +70,32 @@ class StubToolExecutor:
             return Observation(tool=tool, ok=False, error="unreachable")  # pragma: no cover
         except Exception as exc:
             return Observation(tool=tool, ok=False, error=str(exc)[:500])
+
+    async def _memory_search(self, query: str, *, db: object | None) -> Observation:
+        """T7.7 (EVAL-2): real durable memory search (M3 retrieval).
+
+        Same retrieval the context pack uses (pointer equality §14.1,
+        FTS `russian`): current claims first, then pending/invalid —
+        each rendered with the `[c:<id>]` prefix the protocol uses for
+        `dependencies` proposals.
+        """
+        if db is None or self.snapshot_id is None:
+            return Observation(
+                "memory.search",
+                ok=True,
+                data={"results": [], "note": "memory search unavailable in this context"},
+            )
+        from packages.cognition.retrieval import retrieve
+
+        result = await retrieve(db, query, snapshot_id=self.snapshot_id)  # type: ignore[arg-type]
+        return Observation(
+            "memory.search",
+            ok=True,
+            data={
+                "results": [c.line for c in result.current],
+                "pending_invalid": [c.line for c in result.pending_invalid],
+            },
+        )
 
     async def _workspace_read(self, arguments: JsonDict) -> Observation:
         path = self._resolve(str(arguments.get("path", "")))

@@ -166,6 +166,98 @@ async def test_full_sealed_session(migrated_db, fake_llm: FakeLLM, tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_memory_search_and_claim_reuse(migrated_db, fake_llm: FakeLLM, tmp_path: Path) -> None:
+    """T7.7 (EVAL-2, failed gate significant_claim_reuse):
+
+    1. memory.search executes against durable memory (no more stub);
+    2. a claim proposed with `dependencies` on an existing claim commits
+       a claim_dependencies edge (the reuse gate's numerator source).
+    """
+    scratch_url, _engine = migrated_db
+
+    # session 1: seed the corpus with one claim
+    q1 = await _seed_question(scratch_url, "Сколько будет 6*7?")
+    fake_llm.script([
+        {"content": TOOL_PYTHON},
+        {"content": TOOL_WRITE},
+        {"content": COMPLETE},
+        {"content": CURATOR_OK},
+    ])
+    orch, gateway, engine = _make_orchestrator(scratch_url, fake_llm, tmp_path / "ws1")
+    try:
+        outcome1 = await orch.run_session(q1)
+    finally:
+        await gateway.close()
+        await engine.dispose()
+    assert outcome1.final_state is SessionState.SUCCEEDED
+
+    row = await _scalar(
+        scratch_url,
+        "SELECT id FROM claims WHERE statement = :s",
+        {"s": "6*7 равно 42"},
+    )
+    assert row is not None, "session 1 claim missing"
+    claim1_id = str(row[0])
+
+    # session 2: the related question; the model searches memory and
+    # references the existing claim in dependencies
+    q2 = await _seed_question(scratch_url, "Умножение 6 и 7, проверь результат.")
+    TOOL_PYTHON2: JsonDict = {
+        "public_rationale": "Пересчитать 6*7",
+        "expected_information": "Результат 42",
+        "decision": {
+            "kind": "tool",
+            "tool": "python.execute",
+            "arguments": {"code": "print(6*7)"},
+        },
+    }
+    TOOL_SEARCH: JsonDict = {
+        "public_rationale": "Искать уже известные claims",
+        "expected_information": "Существующие claims про 6*7",
+        "decision": {
+            "kind": "tool",
+            "tool": "memory.search",
+            "arguments": {"query": "6 7 42 произведение"},
+        },
+    }
+    CURATOR_REUSE: JsonDict = {
+        "summary": "Проверка: произведение 6 и 7",
+        "claims": [
+            {
+                "statement": "Произведение 6 и 7 равно 42",
+                "claim_type": "computed_result",
+                "scope": {"expr": "6*7"},
+                "dependencies": [{"claim_id": claim1_id}],
+            }
+        ],
+        "evidence_links": [{"evidence_index": 0, "claim_index": 0, "relation": "supports"}],
+        "new_questions": [],
+    }
+    fake_llm.script([
+        {"content": TOOL_PYTHON2},
+        {"content": TOOL_SEARCH},
+        {"content": COMPLETE},
+        {"content": CURATOR_REUSE},
+    ])
+    orch2, gateway2, engine2 = _make_orchestrator(scratch_url, fake_llm, tmp_path / "ws2")
+    try:
+        outcome2 = await orch2.run_session(q2)
+    finally:
+        await gateway2.close()
+        await engine2.dispose()
+    assert outcome2.final_state is SessionState.SUCCEEDED
+
+    # the reuse edge exists at the commit boundary
+    dep = await _scalar(
+        scratch_url,
+        "SELECT from_claim_id, to_claim_id FROM claim_dependencies "
+        "WHERE to_claim_id = :to",
+        {"to": claim1_id},
+    )
+    assert dep is not None, "claim_dependencies edge for the reused claim missing"
+
+
+@pytest.mark.asyncio
 async def test_slow_llm_does_not_lose_commit_lease(migrated_db, fake_llm: FakeLLM, tmp_path: Path) -> None:
     """T3.30 regression (first real MVP session, qwen36-35b-a3b-q6-mtp):
 

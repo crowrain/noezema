@@ -1731,3 +1731,28 @@ gates + blind sample + overall outcome). Tag: `noezema-m7`.
    (баг `sessions.started_at`: оркестратор теперь записывает якорь
    window; 48 строк run-а backfill'нуты из audit trail, config не
    менялась) — **ADR-0005**.
+
+5. **EVAL-2: доработка failed-гейта `significant_claim_reuse`
+   (решение пользователя: работа над reuse; редкие типы — после
+   EVAL-2).** Диагностика EVAL-1: (а) `memory.search` был
+   заглушкой (всегда `[]`, «lands in M3»), хотя модель искала
+   память 20 раз (Canberra, 1969, 404, Einstein…); (б) claims были
+   в контексте сессии только в 7 из 48 (FTS-совпадение слов на
+   разнородном корпусе низкое); (в) путь reuse существует
+   (`[c:<id>]` в контексте + `dependencies` в staging +
+   curator-промпт) — модель просто не получала результатов поиска.
+   Изменения:
+   - `memory.search` реализован по-настоящему (stub executor и
+     ToolBroker): тот же retrieval, что и context pack
+     (`packages/cognition/retrieval`, pointer equality §14.1,
+     FTS `russian`); результаты — строки `[c:<id>] …`; retrieval
+     прикован к snapshot сессии (оркестратор передаёт
+     `snapshot_id`). Результаты поиска — наблюдения, НЕ evidence.
+   - Протокол (`_protocol_text`): правило переиспользования —
+     связанные существующие claims указывать в `dependencies`
+     предложенного claim.
+   - Тесты: `test_memory_search_and_claim_reuse`
+     (tests/scenario/test_orchestrator.py) — memory.search
+     выполняется, dependency-edge коммитится (источник числителя
+     гейта); `test_memory_search_without_db`
+     (tests/unit/test_stub_executor.py).

@@ -23,6 +23,7 @@ decision) and the one-shot container (which enforces isolation). It owns:
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -120,6 +121,9 @@ class SandboxToolBroker:
         self.profile = profile
         self.runtime = runtime
         self.staging = staging_writer if staging_writer is not None else DeferredStagingWriter()
+        # T7.7 (EVAL-2): memory.search retrieval is pinned to the
+        # session's effective snapshot (set by the orchestrator)
+        self.snapshot_id: uuid.UUID | None = None
 
     @property
     def workspace_dir(self) -> Path:
@@ -161,11 +165,7 @@ class SandboxToolBroker:
             elif tool in ("workspace.read", "workspace.list", "workspace.write"):
                 obs = self._workspace(tool, arguments)
             elif tool == "memory.search":
-                obs = Observation(
-                    tool=tool,
-                    ok=True,
-                    data={"results": [], "note": "durable memory search lands in M3"},
-                )
+                obs = await self._memory_search(str(arguments.get("query", "")), db)
             elif tool in ("question.create", "message.reply"):
                 if db is None:
                     obs = Observation(tool=tool, ok=False, error="staging requires a db session", transient=True)
@@ -200,6 +200,29 @@ class SandboxToolBroker:
         return obs
 
     # ── tools ─────────────────────────────────────────────────────────────
+
+    async def _memory_search(
+        self, query: str, db: AsyncSession | None
+    ) -> Observation:
+        """T7.7 (EVAL-2): durable memory search — the same retrieval the
+        context pack uses (pointer equality §14.1)."""
+        if db is None or self.snapshot_id is None:
+            return Observation(
+                "memory.search",
+                ok=True,
+                data={"results": [], "note": "memory search unavailable in this context"},
+            )
+        from packages.cognition.retrieval import retrieve
+
+        result = await retrieve(db, query, snapshot_id=self.snapshot_id)
+        return Observation(
+            "memory.search",
+            ok=True,
+            data={
+                "results": [c.line for c in result.current],
+                "pending_invalid": [c.line for c in result.pending_invalid],
+            },
+        )
 
     async def _sandbox_exec(self, tool: str, arguments: JsonDict) -> Observation:
         if tool == "shell.execute":
