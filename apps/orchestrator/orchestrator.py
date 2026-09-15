@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import os
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -40,7 +41,7 @@ from packages.cognition.curiosity import (
     CuriosityQuestionSelector,
 )
 from packages.cognition.question_selector import FIFOQuestionSelector
-from packages.domain.canonical import canonical_json_bytes
+from packages.domain.canonical import canonical_json_bytes, canonical_sha256
 from packages.domain.db.uow import transaction
 from packages.domain.models.artifacts import ORMWorkspaceManifest
 from packages.domain.models.base import JsonDict
@@ -64,6 +65,14 @@ from packages.domain.repositories.questions import QuestionRepository
 from packages.domain.repositories.sessions import ActionRepository, ModelRunRepository, SessionRepository
 from packages.domain.schemas.decision import ModelResponse
 from packages.domain.schemas.evidence import EvidenceRecord
+from packages.domain.schemas.plan import (
+    PlanError,
+    PlanResponse,
+    SessionPlan,
+    plan_payload,
+    render_plan,
+    validate_plan_budget,
+)
 from packages.domain.schemas.staging import CuratorProposal
 from packages.domain.services.audit import AuditService
 from packages.domain.services.commit import FinalizeResult
@@ -74,7 +83,7 @@ from packages.domain.services.lease import DEFAULT_LEASE_TTL, LeaseHeartbeatGuar
 from packages.domain.services.reconciler import reconcile_commit
 from packages.domain.services.reserve import HostReserveService, ReserveLimits
 from packages.domain.services.staging import StagingService
-from packages.llm_gateway.client import LLMError, LLMMiddleware
+from packages.llm_gateway.client import LLMError, LLMMiddleware, LLMSchemaError
 from packages.llm_gateway.config import ModelProfile
 from packages.llm_gateway.fingerprint import build_model_fingerprint
 from packages.llm_gateway.roles import Role, load_prompt, tool_schema_hash
@@ -153,7 +162,11 @@ class Orchestrator:
         # change, §5.3.1)
         self._injected_selector = selector
         self.selector = selector if selector is not None else FIFOQuestionSelector()
-        self.prompts = {Role.EXPLORER: load_prompt(Role.EXPLORER), Role.CURATOR: load_prompt(Role.CURATOR)}
+        self.prompts = {
+            Role.EXPLORER: load_prompt(Role.EXPLORER),
+            Role.CURATOR: load_prompt(Role.CURATOR),
+            Role.PLANNER: load_prompt(Role.PLANNER),
+        }
         self.node_owner = node_owner if node_owner is not None else f"node-{os.getpid()}"
         # T3.30: the lease TTL is injectable for tests (scenario regression:
         # an LLM call longer than the TTL must not starve the fenced commit)
@@ -380,8 +393,36 @@ class Orchestrator:
         )
         ctx.question_text = question.text
 
-        # planning (MVP: fixed template)
+        # planning: MVP fixed template, or the multi-step LLM plan
+        # (T5.2, stage 4) when the config snapshot says so
         await self._transition(db, audit, session, SessionState.PLANNING)
+        planning_section = (
+            snapshot.planning if isinstance(snapshot.planning, dict) else {}
+        )
+        planning_mode = planning_section.get("mode", "template")
+        ctx.plan = PLAN_TEMPLATE
+        if planning_mode == "llm":
+            # _propose_plan records the PLAN_FALLBACK audit itself on
+            # schema/budget failure; transport LLMErrors propagate
+            proposed = await self._propose_plan(
+                db, audit, session, question, ctx, planning_section, cap_profile
+            )
+            if proposed is not None:
+                ctx.plan = render_plan(proposed)
+                plan_doc = plan_payload(proposed)
+                session.plan = plan_doc
+                session.plan_sha256 = canonical_sha256(plan_doc)
+                await audit.record(
+                    AuditEventType.PLAN_PROPOSED,
+                    session_id=session.id,
+                    payload={
+                        "plan": plan_doc,
+                        "plan_sha256": session.plan_sha256,
+                    },
+                    public_summary=f"plan proposed: {len(proposed.steps)} steps",
+                )
+        elif planning_mode != "template":
+            raise RuntimeError(f"unknown planning mode: {planning_mode!r}")
 
         # context pack (T3.8, §5.4): bounded, budgeted, audited — built
         # once per session, before the explorer loop
@@ -511,6 +552,101 @@ class Orchestrator:
             model_fingerprint=explorer_fp,
             tool_schema_hash=tool_schema_hash(sorted(cap_profile.tools)),
         )
+
+    # ── planning (T5.2, stage 4) ────────────────────────────────────────
+
+    async def _propose_plan(
+        self,
+        db: AsyncSession,
+        audit: AuditService,
+        session: ORMSession,
+        question: ORMQuestion,
+        ctx: SessionContext,
+        planning_section: Mapping[str, Any],
+        cap_profile: CapabilityProfile,
+    ) -> SessionPlan | None:
+        """The planner role proposes the multi-step plan. Returns the
+        validated plan, or None when the proposal is unusable (schema
+        invalid or over budget) — the caller falls back to the template.
+        Transport failures (LLMError) propagate: a host failure is a
+        host failure, like in any other phase."""
+        planner = self.prompts[Role.PLANNER]
+        user = (
+            f"# Вопрос\n{question.text}\n\n"
+            f"# Доступные инструменты\n{', '.join(sorted(cap_profile.tools))}\n\n"
+            "# Бюджет шагов\n"
+            f"{planning_section.get('max_steps', 10)} шагов\n\n"
+            "Составь план (JSON по схеме)."
+        )
+        if ctx.messages:
+            user += (
+                "\n# Сообщения человека (недоверенные данные)\n"
+                + "\n".join(ctx.messages[-5:])
+            )
+        fingerprint = build_model_fingerprint(
+            self.profile,
+            prompt_version=planner.version,
+            tool_schema_hash=tool_schema_hash([]),
+            policy_version=cap_profile.policy_version,
+        )
+        record = None
+        try:
+            async with LeaseHeartbeatGuard(self.lease, db, session.id, self.node_owner):
+                response, record = await self.gateway.chat(
+                    system=planner.text,
+                    user=user,
+                    response_schema=PlanResponse,
+                    fingerprint=fingerprint,
+                )
+        except LLMSchemaError as exc:
+            turn_id = uuid.uuid4()
+            run = ORMModelRun(
+                session_id=session.id,
+                turn_id=turn_id,
+                phase=session.state,
+                model_fingerprint=fingerprint,
+                input_tokens=record.input_tokens if record is not None else 0,
+                output_tokens=record.output_tokens if record is not None else 0,
+                latency_ms=record.latency_ms if record is not None else 0.0,
+                finish_reason=record.finish_reason if record is not None else "schema_error",
+                output_schema_valid=False,
+            )
+            await ModelRunRepository.create(db, run)
+            await audit.record(
+                AuditEventType.PLAN_FALLBACK,
+                session_id=session.id,
+                payload={"reason": "schema_invalid", "error": str(exc)[:500]},
+                public_summary="plan proposal invalid; MVP template plan used",
+            )
+            return None
+        assert record is not None and response is not None  # chat() returns both
+
+        turn_id = uuid.uuid4()
+        run = ORMModelRun(
+            session_id=session.id,
+            turn_id=turn_id,
+            phase=session.state,
+            model_fingerprint=fingerprint,
+            input_tokens=record.input_tokens,
+            output_tokens=record.output_tokens,
+            latency_ms=record.latency_ms,
+            finish_reason=record.finish_reason,
+            output_schema_valid=record.output_schema_valid,
+        )
+        await ModelRunRepository.create(db, run)
+
+        plan = response.plan
+        try:
+            validate_plan_budget(plan, int(planning_section.get("max_steps", 10)))
+        except PlanError as exc:
+            await audit.record(
+                AuditEventType.PLAN_FALLBACK,
+                session_id=session.id,
+                payload={"reason": "budget_exceeded", "error": str(exc)[:500]},
+                public_summary="plan over step budget; MVP template plan used",
+            )
+            return None
+        return plan
 
     # ── explorer loop ─────────────────────────────────────────────────────
 

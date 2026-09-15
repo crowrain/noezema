@@ -49,6 +49,8 @@ BOOTSTRAP_PAYLOAD: dict[str, Any] = {
     "prompts": {
         "explorer": {"version": "explorer-v2", "path": "prompts/explorer.md"},
         "curator": {"version": "curator-v2", "path": "prompts/curator.md"},
+        # T5.2 (stage 4): the planner role (multi-step planning)
+        "planner": {"version": "planner-v1", "path": "prompts/planner.md"},
     },
     "policy": {
         "access_profile": "sealed",
@@ -74,6 +76,13 @@ BOOTSTRAP_PAYLOAD: dict[str, Any] = {
             "workspace_quota_mb": 512,
         },
     },
+    # T5.2 (stage 4): multi-step planning. mode "template" = MVP fixed
+    # template plan (the default, unchanged behavior); "llm" = the
+    # planner role proposes a structured plan (schema-validated by the
+    # host; an invalid proposal falls back to the template, never a
+    # session failure). max_steps caps the plan against the session
+    # step budget.
+    "planning": {"mode": "template", "max_steps": 10},
     # T5.1 (§5.3.1): the selector is config-driven — the MVP default stays
     # FIFO; a config change to "curiosity" enables the score-based ranking
     # (weights, thresholds, ε/M/δ and the similarity fingerprint below are

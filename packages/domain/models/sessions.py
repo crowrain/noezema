@@ -41,6 +41,11 @@ class ORMSession(Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     termination_reason: Mapped[str | None] = mapped_column(Text)
+    # T5.2 (stage 4): the structured multi-step plan proposed in the
+    # planning phase (observable artifact; NULL = MVP fixed template).
+    # Written once per session, never mutated.
+    plan: Mapped[JsonDict | None] = mapped_column(JSONB, nullable=True)
+    plan_sha256: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = created_at_column()
 
     def __repr__(self) -> str:

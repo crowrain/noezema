@@ -473,6 +473,9 @@ class AuditEventType(StrEnum):
     SOURCE_GRAPH_CHANGED = "source_graph_changed"
     # T4.8 (§8.7.4): counterevidence resolutions
     COUNTER_RESOLUTION_CREATED = "counter_resolution_created"
+    # T5.2 (stage 4): the plan as an observable artifact
+    PLAN_PROPOSED = "plan_proposed"
+    PLAN_FALLBACK = "plan_fallback"
     COUNTER_RESOLUTION_INVALIDATED = "counter_resolution_invalidated"
     ALERT_RAISED = "alert_raised"
 

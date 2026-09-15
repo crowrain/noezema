@@ -12,7 +12,7 @@
 | M2 изоляция + commit | ✅ выполнена | noezema-m2 | PR #11–#16: sandbox+runtime, policy engine, tool broker, artifact store+staging+freeze, commit boundary (prepared→fenced final tx) + reconciliation; gate пройден: 206 тестов, failpoints (kill до/после COMMIT, open final tx, stale finalizer, kill mid-action), security (сеть off, cap-drop, injection, ro rootfs) |
 | M3 память + web slice (MVP) | ✅ Gate M3 пройден (T3.29 закрыл пункт 1 §22.1); T3.30 — дефект lease из первой реальной сессии | noezema-m3 (на `ec6b4b0`, T3.29 — закрытие gate); noezema-mvp остаётся на `5d94b27` (создан до T3.29 — см. раздел Gate M3) | PR #17: память — модель (0004), evidence identity (§14.3), rules engine v1, independence (PSL+overlap), lifecycle heads (§14.1), apply в fenced tx. PR #18: context pack §5.4 + retrieval (fulltext russian, pending/invalid — отдельный лимит и метка в той же строке §5.4.2). PR #19: host recovery — noezemactl CLI, recovery policy schema v1 (jitter=0, JCS-хэш), fsync-safe transition journal + head + boot reconcile, offline rules (advisory lock, cohort+seal, atomic publish с UUIDv5 invalid-вопросами), fail-closed admission, resume-классификация (transient→retry_wait/0, permanent→resume_blocked/78, unclassified→degraded) + idempotent audit replay, policy change head + event stream, unit-state publisher, systemd units + CI-verify. PR #20: web slice — Query/Command + admin-token auth, fail-closed Command API на нездоровом hostе (423), SSE timeline (committed outbox + max_events), session detail, message TTL→expired, Host Status Adapter (recovery banner: none/retry_wait/degraded/blocked), минимальные HTML-страницы main/session. PR #21: failpoints/инварианты/resume/scenario-тесты. T3.29: wake scheduling + wake admission + backoff/pause (§5.2.1, пункт 1 §22.1): `wake_schedule` в snapshot (миграция 0005) + `wake_scheduler_state`, `noezemactl wake-tick` + `noezema-wake.timer`, admission (6 gates, skip с точной причиной в audit `wake_skipped`), экспоненциальный backoff, авто-pause после 3 неудач, wake_now — без расписания но с admission. T3.30: фоновый heartbeat lease во время долгих LLM-вызовов + `clock_timestamp()` в lease (дефект из первой реальной MVP-сессии — см. раздел ниже); 374 тест |
 | M4 зависимости + переоценка | ✅ T4.1 закрыт (claim_dependencies: DAG cycle check при commit, graph revision, kind `research` по §8.6); T4.2 закрыт (cascade invalidation: closure manifest, barrier с durable курсором, idempotent батчи, blocked-путь, retrieval ancestor check); T4.3 закрыт (worker `system:reassessment`: runnable-предикат §5.9.1, lease/retry/blocked, insufficient→invalid+question, crash-lease recovery); T4.4 закрыт (writer admission: table gate §14.1 NOWAIT + jitter, session intent rules 1/4/5, T_escalate/T_worker_admission в scheduler); T4.5 закрыт (online activation §8.7.2: fenced lease + takeover, shadow heads fast path/pending, seal + DB-триггер sealed-интервала, atomic flip, post-publish manifest с deterministic UUIDv5, repair runner + T_repair_admission); T4.6 закрыт (environment manifests §14 env-v2: content-addressed manifest_hash, versioned алгоритм env-independence-v1 — группы по (protocol, implementation, dataset lineage), отношения repeatability/reproducibility/independent_replication/variation/untracked, снапшот на оценке, `required_independence` в rules engine: E3 только через независимую репликацию); T4.7 закрыт (source graph §11.3: таблицы source_dependency_edges/source_graph_corrections, алгоритм independence-v2 — domain/content_hash/parent/edges/corrections, снапшот source_independence_* на оценке, каскад apply_source_graph_change: merge/split → invalidation + recompute, ревизия source_graph); T4.8 закрыт (counterevidence resolutions §8.7.4: таблица + XOR/partial-unique CHECK, межстрочные инварианты (counter-цель, scope-compat, нет транзитивной зависимости, valid correction), каскад create/invalidate → recompute, engine считает только unresolved counters); T4.9 закрыт (failpoints M4: crash после flip — pointer tuple recovery, crash между батчами post-publish — durable cursor, stale activator после takeover — fence-отказ, следующий flip закрывает blocked backlog, barrier crash после каждого батча, group merge + crash worker'а, worker без starvation после смерти intent-lease) — GATE M4 пройден (§19: invalid ancestor блокирует downstream; worker без starvation оба направления; group merge → корректный пересчёт) | — | пороги M4 из замеров серии 2026-09-14 зафиксированы в PLAN (батч 32, SLO P95 200 с); 501 тест |
-| M5 расширенный цикл | 🔄 T5.1 закрыт (Curiosity ranking §5.3.1: score-формула novelty/coverage_gap/evidenceability/feasibility − cost − risk − topic_recency, все входы [0,1] + similarity fingerprint в score_components выбранного вопроса, eligibility filter, детерминированная ε-diversity (seed в audit), веса/пороги/ε/M/δ в config snapshot, селектор config-driven) | — | v1-решения: token-Jaccard как similarity (embeddings off, pgvector ADR-gated), risk = 0.0 (sealed profile), coverage_gap по origin-слабостям; 519 тест |
+| M5 расширенный цикл | 🔄 T5.1 закрыт (Curiosity ranking §5.3.1: score-формула novelty/coverage_gap/evidenceability/feasibility − cost − risk − topic_recency, все входы [0,1] + similarity fingerprint в score_components, eligibility filter, детерминированная ε-diversity (seed в audit), селектор config-driven) + T5.2 закрыт (многошаговое planning §6.2: план как наблюдаемый артефакт — sessions.plan + sha256 + audit plan_proposed, роль planner, закрытые assessment methods, метод проверки ≠ перефраз, fallback на template, planning.mode config-driven) | — | v1-решения T5.2: LLM-план — заявка, не evidence; невалидный/сверхбюджетный → template (не failure); assessment methods — закрытый хостовый enum; 534 тест |
 | M6 Research Proxy | ⬜ не начата | — | |
 | M7 полный веб + эксплуатация | ⬜ не начата | — | |
 
@@ -886,6 +886,50 @@ topic_recency как доля, config defaults/custom/fail-closed ×5,
 другой бросок; полный оркестратор — online config change
 `curiosity.selector=curiosity` переключает ранжирование, сессия
 выбирает новый вопрос, score в audit). 519 тест.
+
+**Закрыто T5.2 (многошаговое planning, план как наблюдаемый
+артефакт, §6.2, этап 4)** —
+`packages/domain/schemas/plan.py` + planning-фаза оркестратора:
+- структура плана (закрытая, extra=forbid): шаги
+  `{observation, method, tool_hint?}` — **метод проверки отдельное
+  структурированное поле, не перефраз наблюдения** (критерий Gate M5),
+  `stopping_criteria` (1..16, непустые ≤400),
+  `assessment_methods` — **закрытый хостовый enum**
+  (`recompute | cross_source_check | rules_only | no_change`);
+  план не несёт grade/confidence (§3.7) и не создаёт evidence —
+  host-owned evidence/assessment boundary не тронута;
+- кто составляет: роль `planner` (новый prompt snapshot
+  `prompts/planner.md`, version planner-v1; роль-переключение =
+  новый prefill, §5.5) — LLM-вызов в planning-фазе, записан в
+  model_runs (phase=planning);
+- host-валидация: pydantic-схема + бюджет шагов
+  (`planning.max_steps` из snapshot, по умолчанию 10); невалидная
+  заявка (схема) или сверхбюджетная → **fallback на MVP template plan**
+  + audit `plan_fallback` (reason schema_invalid / budget_exceeded) —
+  сессия не падает; транспортный LLMError — failure сессии, как в
+  любой другой фазе;
+- наблюдаемость: план персистится на сессии (`sessions.plan` JSONB +
+  `sessions.plan_sha256` — canonical hash, миграция 0013), пишется
+  один раз, не мутируется; audit `plan_proposed` (документ плана +
+  sha256) — план виден в operator-таймлайне; отрендеренный план
+  идёт в explorer-контекст (question_plan);
+- config: секция `planning` в snapshot (`mode: template|llm`,
+  `max_steps`); bootstrap = `template` (MVP-поведение не меняется,
+  planner-вызова нет); включение — online config change; NULL-секция
+  (старые БД) трактуется как `template`; online-активация наследует
+  секцию из base snapshot (pattern wake_schedule).
+
+Тесты: `tests/unit/test_plan_schema.py` (11: закрытые поля,
+extra=forbid, tool_hint namespace.name, границы steps/criteria,
+закрытый enum assessment methods, budget, render — метод
+отдельной строкой от наблюдения, стабильность payload/hash) +
+`tests/scenario/test_planning.py` (4: полный цикл — online change
+planning.mode=llm, planner-вызов в model_runs, sessions.plan +
+sha256 = canonical, audit plan_proposed, вопрос verified;
+schema-invalid → fallback, план NULL, audit plan_fallback
+schema_invalid, сессия SUCCEEDED; 4 шага при max_steps=3 → fallback
+budget_exceeded; template-mode — ни одного planner-вызова и ни
+одного plan_proposed). 534 тест.
 
 Merge в `main` — отдельное решение пользователя (не выполняется
 автоматически). **M4 merge выполнен 2026-09-15** (merge-commit на
