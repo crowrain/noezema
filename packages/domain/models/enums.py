@@ -483,6 +483,9 @@ class AuditEventType(StrEnum):
     # T5.4 (stage 4): protection against semantic repetition (§9)
     REPEAT_CYCLE_DETECTED = "repeat_cycle_detected"
     QUESTION_DEFERRED = "question_deferred"
+    # T5.5 (stage 4): the untrusted extraction profile (§11.2)
+    EXTRACTION_COMPLETED = "extraction_completed"
+    EXTRACTION_FALLBACK = "extraction_fallback"
     COUNTER_RESOLUTION_INVALIDATED = "counter_resolution_invalidated"
     ALERT_RAISED = "alert_raised"
 

@@ -54,6 +54,9 @@ BOOTSTRAP_PAYLOAD: dict[str, Any] = {
         # T5.3 (stage 4): the verifier role (deterministic checks;
         # never assigns grade/confidence — §3.7)
         "verifier": {"version": "verifier-v1", "path": "prompts/verifier.md"},
+        # T5.5 (stage 4): the extraction profile (untrusted documents,
+        # §11.2) — a model without tools extracts verbatim chunks
+        "extractor": {"version": "extractor-v1", "path": "prompts/extractor.md"},
     },
     "policy": {
         "access_profile": "sealed",
@@ -105,6 +108,16 @@ BOOTSTRAP_PAYLOAD: dict[str, Any] = {
         "plan_cycle_threshold": 0.5,
         "no_progress_limit": 2,
     },
+    # T5.5 (stage 4): untrusted extraction profile (§11.2, §10.1).
+    # mode "off" = MVP raw read (the default); "llm" = a document
+    # read of >= min_document_bytes is first passed to the extractor
+    # (a model without tools), which must return verbatim quotes;
+    # the explorer then receives only the extracted chunks with
+    # host-computed provenance. A non-verbatim or over-budget report
+    # falls back to the raw read (audited, never a session failure).
+    # Extraction shrinks the injection surface but does not make the
+    # text trusted.
+    "extraction": {"mode": "off", "min_document_bytes": 500, "max_chunks": 8},
     # T5.1 (§5.3.1): the selector is config-driven — the MVP default stays
     # FIFO; a config change to "curiosity" enables the score-based ranking
     # (weights, thresholds, ε/M/δ and the similarity fingerprint below are

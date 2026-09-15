@@ -71,13 +71,29 @@ def state() -> dict[str, Any]:
     return {"queue_left": len(_state["queue"]), "request_count": len(_state["requests"])}
 
 
+@app.get("/_noezema/requests")
+def requests_log() -> dict[str, Any]:
+    # T5.5: scenario tests assert what actually reached the model
+    return {"requests": _state["requests"]}
+
+
 def _record(body: dict[str, Any]) -> None:
+    messages = body.get("messages") or []
+    last_user = ""
+    for message in reversed(messages):
+        if message.get("role") == "user":
+            content = message.get("content")
+            last_user = content if isinstance(content, str) else str(content)
+            break
     _state["requests"].append(
         {
             "n": next(_state["seq"]),
             "model": body.get("model"),
             "response_format": body.get("response_format"),
-            "messages_count": len(body.get("messages", [])),
+            "messages_count": len(messages),
+            # T5.5: scenario tests assert what actually reached the model
+            # (e.g. that raw untrusted content never enters the context)
+            "last_user": last_user[:20_000],
         }
     )
 

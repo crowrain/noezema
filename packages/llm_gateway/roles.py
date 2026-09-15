@@ -28,6 +28,9 @@ class Role(StrEnum):
     # and interprets their results; never assigns grade/confidence
     # (§3.7, §5.5)
     VERIFIER = "verifier"
+    # T5.5 (stage 4): the extractor — a model without tools that
+    # extracts verbatim chunks from untrusted documents (§11.2)
+    EXTRACTOR = "extractor"
 
 
 @dataclass(frozen=True, slots=True)
