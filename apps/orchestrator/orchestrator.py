@@ -74,6 +74,13 @@ from packages.domain.schemas.plan import (
     validate_plan_budget,
 )
 from packages.domain.schemas.staging import CuratorProposal
+from packages.domain.schemas.verification import (
+    VerificationError,
+    VerifierReport,
+    render_verification,
+    validate_verifier_report,
+    verification_payload,
+)
 from packages.domain.services.audit import AuditService
 from packages.domain.services.commit import FinalizeResult
 from packages.domain.services.commit import finalize as commit_finalize
@@ -102,6 +109,9 @@ class SessionContext:
     evidence: list[EvidenceRecord] = field(default_factory=list)
     messages: list[str] = field(default_factory=list)
     complete_reason: str | None = None
+    # T5.3 (stage 4): the verifier's rendered report (a proposal for
+    # the curator; empty = MVP no-op verifying phase or fallback)
+    verification_report: str = ""
 
 
 @dataclass(frozen=True)
@@ -166,6 +176,7 @@ class Orchestrator:
             Role.EXPLORER: load_prompt(Role.EXPLORER),
             Role.CURATOR: load_prompt(Role.CURATOR),
             Role.PLANNER: load_prompt(Role.PLANNER),
+            Role.VERIFIER: load_prompt(Role.VERIFIER),
         }
         self.node_owner = node_owner if node_owner is not None else f"node-{os.getpid()}"
         # T3.30: the lease TTL is injectable for tests (scenario regression:
@@ -466,8 +477,39 @@ class Orchestrator:
         if stopped:
             await self._transition(db, audit, session, SessionState.STOPPING)
 
-        # verifying (MVP: no-op; verifier profile lands in M5)
+        # verifying: MVP no-op, or the verifier role's structured
+        # report of organized deterministic checks (T5.3, stage 4)
+        # when the config snapshot says so. The report is a proposal:
+        # it carries no grade/confidence and never changes a claim's
+        # status (§3.7) — it is persisted, audited and passed to the
+        # curator context only.
         await self._transition(db, audit, session, SessionState.VERIFYING)
+        verification_section = (
+            snapshot.verification if isinstance(snapshot.verification, dict) else {}
+        )
+        verification_mode = verification_section.get("mode", "off")
+        if verification_mode == "llm":
+            # _verify records the VERIFICATION_FALLBACK audit itself on
+            # schema/budget failure; transport LLM errors propagate
+            report = await self._verify(
+                db, audit, session, ctx, verification_section, cap_profile
+            )
+            if report is not None:
+                ctx.verification_report = render_verification(report)
+                report_doc = verification_payload(report)
+                session.verification = report_doc
+                session.verification_sha256 = canonical_sha256(report_doc)
+                await audit.record(
+                    AuditEventType.VERIFICATION_COMPLETED,
+                    session_id=session.id,
+                    payload={
+                        "verification": report_doc,
+                        "verification_sha256": session.verification_sha256,
+                    },
+                    public_summary=f"verification: {len(report.checks)} checks, {len(report.gaps)} gaps",
+                )
+        elif verification_mode != "off":
+            raise RuntimeError(f"unknown verification mode: {verification_mode!r}")
 
         # consolidating: curator (proposals go to session_staging, T2.13).
         # T4.4 (§5.9.1 rule 1, §5.2.2 step 4): the priority writer intent
@@ -552,6 +594,101 @@ class Orchestrator:
             model_fingerprint=explorer_fp,
             tool_schema_hash=tool_schema_hash(sorted(cap_profile.tools)),
         )
+
+    # ── verification (T5.3, stage 4) ───────────────────────────────────
+
+    async def _verify(
+        self,
+        db: AsyncSession,
+        audit: AuditService,
+        session: ORMSession,
+        ctx: SessionContext,
+        verification_section: Mapping[str, Any],
+        cap_profile: CapabilityProfile,
+    ) -> VerifierReport | None:
+        """The verifier role organizes deterministic checks over the
+        session's typed evidence and interprets their results. Returns
+        the validated report, or None when the proposal is unusable
+        (schema invalid, over budget, dangling evidence reference) —
+        the caller keeps the MVP no-op phase. Transport LLM errors
+        propagate: a host failure is a host failure."""
+        verifier = self.prompts[Role.VERIFIER]
+        ev_lines = "\n".join(
+            f"[{i}] {e.kind.value} {e.identity_hash[:16]} {_cap_args(e.payload)}"
+            for i, e in enumerate(ctx.evidence)
+        )
+        user = (
+            f"# Вопрос\n{ctx.question_text}\n\n"
+            f"# Наблюдения\n{chr(10).join(ctx.observations[-15:]) or '(пусто)'}\n\n"
+            f"# Evidence (индексы)\n{ev_lines or '(пусто)'}\n\n"
+            "# Бюджет проверок\n"
+            f"{verification_section.get('max_checks', 8)} проверок\n\n"
+            "Организуй детерминированные проверки и интерпретируй результаты (JSON по схеме)."
+        )
+        fingerprint = build_model_fingerprint(
+            self.profile,
+            prompt_version=verifier.version,
+            tool_schema_hash=tool_schema_hash([]),
+            policy_version=cap_profile.policy_version,
+        )
+        record = None
+        try:
+            async with LeaseHeartbeatGuard(self.lease, db, session.id, self.node_owner):
+                response, record = await self.gateway.chat(
+                    system=verifier.text,
+                    user=user,
+                    response_schema=VerifierReport,
+                    fingerprint=fingerprint,
+                )
+        except LLMSchemaError as exc:
+            turn_id = uuid.uuid4()
+            run = ORMModelRun(
+                session_id=session.id,
+                turn_id=turn_id,
+                phase=session.state,
+                model_fingerprint=fingerprint,
+                input_tokens=record.input_tokens if record is not None else 0,
+                output_tokens=record.output_tokens if record is not None else 0,
+                latency_ms=record.latency_ms if record is not None else 0.0,
+                finish_reason=record.finish_reason if record is not None else "schema_error",
+                output_schema_valid=False,
+            )
+            await ModelRunRepository.create(db, run)
+            await audit.record(
+                AuditEventType.VERIFICATION_FALLBACK,
+                session_id=session.id,
+                payload={"reason": "schema_invalid", "error": str(exc)[:500]},
+                public_summary="verifier report invalid; MVP no-op verifying phase",
+            )
+            return None
+
+        assert record is not None and response is not None  # chat() returns both
+        turn_id = uuid.uuid4()
+        run = ORMModelRun(
+            session_id=session.id,
+            turn_id=turn_id,
+            phase=session.state,
+            model_fingerprint=fingerprint,
+            input_tokens=record.input_tokens,
+            output_tokens=record.output_tokens,
+            latency_ms=record.latency_ms,
+            finish_reason=record.finish_reason,
+            output_schema_valid=record.output_schema_valid,
+        )
+        await ModelRunRepository.create(db, run)
+
+        report = response
+        try:
+            validate_verifier_report(report, len(ctx.evidence), int(verification_section.get("max_checks", 8)))
+        except VerificationError as exc:
+            await audit.record(
+                AuditEventType.VERIFICATION_FALLBACK,
+                session_id=session.id,
+                payload={"reason": str(exc)[:300]},
+                public_summary="verifier report rejected by host; MVP no-op verifying phase",
+            )
+            return None
+        return report
 
     # ── planning (T5.2, stage 4) ────────────────────────────────────────
 
@@ -1048,8 +1185,13 @@ class Orchestrator:
             f"# Вопрос\n{ctx.question_text}\n\n"
             f"# Знание (claim ID в строке [c:...])\n{knowledge}\n\n"
             f"# Evidence\n{ev_lines or '(пусто)'}\n\n"
-            "Предложи изменения памяти (JSON по схеме)."
         )
+        if ctx.verification_report:
+            # T5.3: the verifier's proposal (checks + gaps) — a
+            # proposal, not an assessment: it carries no grade
+            user += f"\n# Верификация (предложение верификатора, не оценка)\n{ctx.verification_report}\n\n"
+        user += "Предложи изменения памяти (JSON по схеме)."
+
         fingerprint = build_model_fingerprint(
             self.profile,
             prompt_version=curator.version,

@@ -43,6 +43,9 @@ class ORMConfigSnapshot(Base):
     # T5.2 (stage 4): multi-step planning (mode "template" | "llm",
     # max_steps) — pinned in the snapshot
     planning: Mapped[JsonDict | None] = mapped_column(JSONB, nullable=True)
+    # T5.3 (stage 4): verification section (mode "off" | "llm",
+    # max_checks) — pinned in the snapshot
+    verification: Mapped[JsonDict | None] = mapped_column(JSONB, nullable=True)
     token_budgets: Mapped[JsonDict] = mapped_column(JSONB, nullable=False)
     session_limits: Mapped[JsonDict] = mapped_column(JSONB, nullable=False)
     activation_limits: Mapped[JsonDict] = mapped_column(JSONB, nullable=False)

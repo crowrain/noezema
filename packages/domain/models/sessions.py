@@ -46,6 +46,11 @@ class ORMSession(Base):
     # Written once per session, never mutated.
     plan: Mapped[JsonDict | None] = mapped_column(JSONB, nullable=True)
     plan_sha256: Mapped[str | None] = mapped_column(Text)
+    # T5.3 (stage 4): the verifier's structured report (observable
+    # artifact; NULL = MVP no-op verifying phase or fallback). Written
+    # once per session, never mutated. No grade/confidence by design.
+    verification: Mapped[JsonDict | None] = mapped_column(JSONB, nullable=True)
+    verification_sha256: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = created_at_column()
 
     def __repr__(self) -> str:

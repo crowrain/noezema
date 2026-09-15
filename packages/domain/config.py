@@ -51,6 +51,9 @@ BOOTSTRAP_PAYLOAD: dict[str, Any] = {
         "curator": {"version": "curator-v2", "path": "prompts/curator.md"},
         # T5.2 (stage 4): the planner role (multi-step planning)
         "planner": {"version": "planner-v1", "path": "prompts/planner.md"},
+        # T5.3 (stage 4): the verifier role (deterministic checks;
+        # never assigns grade/confidence — §3.7)
+        "verifier": {"version": "verifier-v1", "path": "prompts/verifier.md"},
     },
     "policy": {
         "access_profile": "sealed",
@@ -83,6 +86,13 @@ BOOTSTRAP_PAYLOAD: dict[str, Any] = {
     # session failure). max_steps caps the plan against the session
     # step budget.
     "planning": {"mode": "template", "max_steps": 10},
+    # T5.3 (stage 4): the verifier role in the verifying phase.
+    # mode "off" = MVP no-op (the default, unchanged behavior);
+    # "llm" = the verifier proposes a structured report of organized
+    # deterministic checks (host-validated; an invalid/over-budget
+    # report falls back to the no-op phase, never a session failure).
+    # The report never carries a grade/confidence (§3.7).
+    "verification": {"mode": "off", "max_checks": 8},
     # T5.1 (§5.3.1): the selector is config-driven — the MVP default stays
     # FIFO; a config change to "curiosity" enables the score-based ranking
     # (weights, thresholds, ε/M/δ and the similarity fingerprint below are

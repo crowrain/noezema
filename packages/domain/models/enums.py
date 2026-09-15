@@ -476,6 +476,10 @@ class AuditEventType(StrEnum):
     # T5.2 (stage 4): the plan as an observable artifact
     PLAN_PROPOSED = "plan_proposed"
     PLAN_FALLBACK = "plan_fallback"
+    # T5.3 (stage 4): the verifier role (organizes deterministic
+    # checks; never assigns grade/confidence — §3.7)
+    VERIFICATION_COMPLETED = "verification_completed"
+    VERIFICATION_FALLBACK = "verification_fallback"
     COUNTER_RESOLUTION_INVALIDATED = "counter_resolution_invalidated"
     ALERT_RAISED = "alert_raised"
 
