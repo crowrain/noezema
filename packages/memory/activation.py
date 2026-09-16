@@ -63,6 +63,8 @@ from typing import Any
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.cognition.context import PENDING_SECTION
+from packages.cognition.tokenizer import TokenBudgets
 from packages.domain.canonical import canonical_sha256
 from packages.domain.config import QUESTION_UUID5_NAMESPACE, config_snapshot_sha256
 from packages.domain.db.uow import transaction
@@ -111,6 +113,24 @@ DEFAULT_MAX_ATTEMPTS = 78
 class ActivationError(RuntimeError):
     """The online activation cannot proceed (fence mismatch, seal
     mismatch, preconditions, ...)."""
+
+
+def _validate_payload_budgets(requested_payload: dict[str, Any]) -> None:
+    """Fail-closed before publishing (§5.4.1): the payload must be
+    STARTABLE — a config whose section limits sum past the input budget
+    fails every session at start, so it is rejected before the
+    candidate row exists. The check mirrors ContextBuilder exactly
+    (the §5.4.2 pending_claims limit is excluded from the sum).
+    Regression: first EVAL-3 launch (2026-09-16) — the published v2
+    payload had Σ sections 26624 > input_budget 22528 and all 50
+    sessions failed at start."""
+    token_budgets = dict(requested_payload.get("token_budgets") or {})
+    token_budgets.pop(PENDING_SECTION, None)
+    problems = TokenBudgets.from_snapshot(
+        dict(requested_payload.get("model") or {}), token_budgets
+    ).validate()
+    if problems:
+        raise ActivationError("invalid token budgets in payload: " + "; ".join(problems))
 
 
 @dataclass(frozen=True)
@@ -1405,6 +1425,7 @@ async def run_online_change(
     a terminal cleanup with ``failed`` (re-raised); a post-publish
     backoff/blocked state is RETURNED (the repair runner or the next
     run continues it)."""
+    _validate_payload_budgets(requested_payload)
     async with transaction(db):
         head_row = (
             await db.execute(

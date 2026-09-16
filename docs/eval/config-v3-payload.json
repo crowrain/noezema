@@ -128,7 +128,8 @@
     "mode": "off"
   },
   "model": {
-    "context_window": 32768,
+    "backend_context_limit": 262144,
+    "context_window": 40960,
     "max_output_tokens": 8192,
     "model_alias": "thinker-local",
     "provider": "openai-compatible",

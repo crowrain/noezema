@@ -1908,7 +1908,9 @@ gates + blind sample + overall outcome). Tag: `noezema-m7`.
     тестовые домены должны быть двухlabel'ными. 693 tests.
 
 12. **Заморозка конфигурации EVAL-3 (T7.7, 2026-09-16) — подготовка
-    завершена, запуск — после решения пользователя.** Предусловия
+    завершена; первый запуск сорвался (дефект конфига, fail-fast до
+    первого вызова модели), пере-заморожено (§2.6 freeze-дока);
+    перезапуск — после решения пользователя.** Предусловия
     закрыты: кросс-язычный поиск (п. 10), research.fetch →
     source_assertion (п. 11), live-проверка v2→v3-активации
     (old as_of → due, current → fresh, отдельная БД), SearXNG
@@ -1933,10 +1935,11 @@ gates + blind sample + overall outcome). Tag: `noezema-m7`.
       уникальность текстов).
     - **Замороженные артефакты** (`docs/eval/`, детали + план запуска
       + арифметика 11 гейтов + риски — `docs/eval/EVAL-3-freeze.md`):
-      `config-v2-payload.json` (canonical sha256 `73b5f14e…`; curated
-      profile, research proxy searxng 8888 + allowlist 127.0.0.1:8888,
-      phase_deadline **1800** (решение по LeaseLost), fifo) и
-      `config-v3-payload.json` (canonical sha256 `dbfd11b1…`; diff =
+      `config-v2-payload.json` (canonical sha256 `ffc98c9e…`,
+      пере-заморозка §2.6; curated profile, research proxy searxng 8888 +
+      allowlist 127.0.0.1:8888, phase_deadline **1800** (решение по
+      LeaseLost), fifo) и `config-v3-payload.json` (canonical sha256
+      `2e93889c…`, пере-заморозка §2.6; diff =
       ровно 2 строки: volatility external_fact/temporal_fact →
       `temporal` — поведенчески нейтрально (30d), но активация v3
       запускает re-evaluation всех external/temporal head-ов →
@@ -1981,6 +1984,37 @@ gates + blind sample + overall outcome). Tag: `noezema-m7`.
       `tests/scenario/test_blind_sample_dump.py` (совпадение выгруженной
       выборки с измеренной гейтами + поля + фрагмент из хранилища),
       ci95-закрепление в `tests/scenario/test_evaluation_gates.py`.
-    - 706 tests (701 + 5 новых). Запуск НЕ выполнялся — конфигурация
-      показывается пользователю ДО запуска (решение 2026-09-16, п. 9);
-      допуски к запуску получены 2026-09-16, старт — после их коммита.
+    - **Первый запуск сорвался (2026-09-16) + пере-заморозка (§2.6
+      freeze-дока).** Все 50 сессий упали мгновенно (0 steps / 0 с / 0
+      model-calls): `token budgets invalid: section limits sum 26624 >
+      input_budget 22528`. Причина: при заморозке max_output 4096→8192
+      поднят без пересчёта секций — в EVAL-2 бюджет сходился впритык
+      (32768−4096−2048 = 26624 = Σ секций); payload был live-проверен
+      только на активацию, а `activate-online` бюджеты не валидировал.
+      Правка (решение пользователя): ровно 2 строки model-секции каждого
+      payload — `context_window 32768→40960` + `backend_context_limit
+      262144` (фактический предел слота бэкенда: llama-swap
+      `-c 524288 --parallel 2`) → input_budget 30720, секции — байт в
+      байт как в EVAL-2/bootstrap (Σ 26624, A/B-сопоставимость). Новые
+      канонические хэши: v2 `ffc98c9e…`, v3 `2e93889c…`; хэш
+      `question-set-v2.jsonl` (`93c1a93a…`) НЕ изменился; пороги §22.2,
+      rules engine, корпус — не тронуты; diff v2→v3 = те же 2 строки
+      volatility. Доказательства срыва СОХРАНЕНЫ: БД `noezema-eval3`
+      (run `83366765-e795-44d6-a5d0-b2027270fa54`, outcome=
+      insufficient_sample, 0 сессий/claims/model_runs) + логи
+      `/home/denis/dsh1/eval3-logs/` — не переиспользуются; перезапуск —
+      в чистой `noezema-eval3b`. Регрессия-защита: `activate-online`
+      fail-closed на нестартующихся payload'ах (`packages/memory/
+      activation.py: _validate_payload_budgets` — проверка ДО записи
+      candidate, зеркалирует ContextBuilder) — тест
+      `tests/scenario/test_online_activation.py::test_online_rejects_unstartable_token_budgets`;
+      замороженные payload'ы закреплены `tests/unit/test_freeze_payloads.py`
+      (validate() == [], секции = EVAL-2-значения, model/token_budgets
+      идентичны в v2 и v3).
+    - 710 tests (706 + 4 новых). Первый запуск сорвался по технической
+      причине (до первого вызова модели); перезапуск — после слова
+      пользователя: чистая `noezema-eval3b`, тот же план (§3
+      freeze-дока, обновлён: env с `NOEZEMA_LLM_BASE_URL`/
+      `NOEZEMA_LLM_MODEL`, прогрев модели), запуск через setsid nohup
+      (worker-цикл / eval-run / watchdog — отсоединённые процессы с
+      логами в `/home/denis/dsh1/eval3-logs/`).

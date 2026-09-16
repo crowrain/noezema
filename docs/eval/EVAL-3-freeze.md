@@ -1,6 +1,6 @@
 # EVAL-3 — замороженная конфигурация (готово, НЕ запущено)
 
-Статус: **подготовка завершена, запуск — только после явного решения пользователя.**
+Статус: **подготовка завершена; первый запуск (2026-09-16) сорвался — дефект конфига, пойманный fail-fast до первого вызова модели; пере-заморожено (§2.6); перезапуск — только после явного решения пользователя.**
 Все пороги §22.2 неизменны; исключение типов через ADR не делается (решение от 16.09.2026).
 
 ## 1. Что изменилось относительно EVAL-1 / EVAL-2
@@ -18,14 +18,14 @@
 
 ### 2.1 Конфигурации (`docs/eval/`)
 
-- **v2** `config-v2-payload.json`, canonical sha256 `73b5f14e6630f086d2465a42308effe7d10e517ef39fe8b1ce2f563c417c1aaf`
+- **v2** `config-v2-payload.json`, canonical sha256 `ffc98c9e54b5ba0b3621d5f3fb37616fabbb6b159a4a9d5d46710adee75a6e2d` (пере-заморожен 2026-09-16, §2.6)
   - `access_profile: curated`, tools: +`research.fetch`;
   - `research_proxy`: mode curated, searxng `http://127.0.0.1:8888`, private_allowlist `["127.0.0.1:8888"]`, max_response 4 MiB, timeout 10 c, rate 20/3600 c;
-  - `model`: context 32768, max_output 8192, thinker-local;
+  - `model`: context 40960, `backend_context_limit` 262144 (фактический предел слота бэкенда, §2.6), max_output 8192, thinker-local; input_budget = min(40960, 262144) − 8192 − 2048 = **30720** ≥ Σ секций 26624 (запас 4096);
   - `session_limits`: phase_deadline 1800, session_timeout 1800, max_explorer_steps 10;
   - `curiosity.selector: fifo`; repetition enabled (no_progress 2, rephrase 0.6);
   - `claim_type_rules`: external_fact/temporal_fact — allowed `source_assertion|quote_integrity`, min_grade_for_supported E3, min_independence_groups 2, min_support_evidence 2, requires_scope (+`requires_as_of` для temporal), volatility `configurable`; local_observation E2/1/1; computed_result E2/1/1.
-- **v3** `config-v3-payload.json`, canonical sha256 `dbfd11b1a6fc83cf8695b44753448fce1049ce7614e2a1d40bad9a2ba92d1f62`
+- **v3** `config-v3-payload.json`, canonical sha256 `2e93889ce4b4f943f3c4e03d9a87ce9740c2012f2781a65637cd0ce831501d92` (пере-заморожен 2026-09-16, §2.6)
   - **diff v2→v3 = ровно 2 строки**: volatility `external_fact` и `temporal_fact` → `temporal`. Поведенчески нейтрально (оба 30 дней, `VOLATILITY_REVERIFY_DAYS`), но активация v3 меняет snapshot head'ов → enqueued re-evaluation всех external/temporal claim (механизм due/stale).
 
 ### 2.2 Корпус v2 (`docs/eval/question-set-v2.jsonl`)
@@ -82,7 +82,7 @@ sha256 (файл, как его хеширует eval-run): `93c1a93a4d6cbb4b29d
 
 - SearXNG: контейнер `noezema-searxng`, 127.0.0.1:8888, конфиг `/home/denis/dsh1/searxng-config/settings.yml` (formats html+json, limiter off). **В самом ране `research.search` модель не вызывает** (инструмента нет в реестре) — search-путь проэ2е-проверен вне рана; in-run fetch идёт напрямую по URL из вопросов. Контейнер держать запущенным (e2e-проверка proxy search по запросу).
 - Свежая БД `noezema-eval3` (тестовый контейнер `noezema-test-db`, порт 54329). EVAL-БД noezema-eval/noezema-eval2 заморожены, не трогать.
-- Модель тёплая: thinker-local, `NOEZEMA_LLM_MAX_OUTPUT_TOKENS=8192` (reasoning-бюджет ≥P99, AGENTS.md §7), `NOEZEMA_LLM_TIMEOUT_SECONDS=600`.
+- Модель: `qwen36-35b-a3b-q6-mtp` (Qwen3.6 35B A3B Q6 MTP) @ `http://192.168.1.48:8080/v1` (llama-swap; слот модели: `-c 524288 --parallel 2` — отсюда `backend_context_limit` 262144). Env: `NOEZEMA_LLM_BASE_URL` + `NOEZEMA_LLM_MODEL`, `NOEZEMA_LLM_MAX_OUTPUT_TOKENS=8192` (reasoning-бюджет ≥P99, AGENTS.md §7), `NOEZEMA_LLM_TIMEOUT_SECONDS=600`. Модель грузится llama-swap'ом по первому infer-запросу — перед серией прогреть малым запросом и убедиться в `status=loaded`.
 
 ### 2.5 Допуски к запуску (правки по решению пользователя, после заморозки)
 
@@ -90,14 +90,40 @@ sha256 (файл, как его хеширует eval-run): `93c1a93a4d6cbb4b29d
 2. **Выгрузка слепой выборки для ручной проверки:** `hostctl blind-sample --run <id|label> [--out file] [--fragment-chars N]` — тот же seeded/стратифицированный отбор, что меряют blind-гейты (общий код отбора: `packages/evaluation/blind.py: blind_sample_claim_ids`, используется и гейтами, и выгрузкой). Формат — §5 «Ограничение метода». Тест: `tests/scenario/test_blind_sample_dump.py` (совпадение выборки с измеренной + поля claim/evidence + фрагмент из content-addressed хранилища).
 3. **Документ:** новый раздел §5 «Ограничение метода» (blind-гейты = структурная проверка; в отчёте рана вынесены в отдельный блок), пересчёт reuse-ожидания в §4, оговорка о хэшах в §8.
 
+### 2.6 Пере-заморозка (2026-09-16): первый запуск сорвался — дефект конфига
+
+Первый запуск (тот же день) сорвался по технической причине: **все 50 сессий упали мгновенно** (0 steps, 0 с, 0 вызовов модели) с ошибкой `token budgets invalid: section limits sum 26624 > input_budget 22528` — fail-closed валидация §5.4.1 сработала до первого model-call, данных в БД нет.
+
+**Причина:** при заморозке `max_output_tokens` был поднят с 4096 (EVAL-2) до 8192 без пересчёта суммы секций. В EVAL-2 бюджет сходился впритык: 32768 − 4096 − 2048 = **26624** = Σ секций; после подъёма input_budget = 32768 − 8192 − 2048 = 22528 < 26624. Payload при заморозке live-проверялся только на активацию (freeze-когорта), полная сессия под v2 не исполнялась, а `activate-online` валидировал канонический хэш, но не бюджеты токенов — дефект дожил до запуска.
+
+**Что изменено — ровно 2 строки в секции `model` каждого payload, ничего больше:**
+`context_window: 32768 → 40960` и добавлено `backend_context_limit: 262144` (фактический предел слота бэкенда: модель на 192.168.1.48 запущена с `-c 524288 --parallel 2`, конфиг llama-swap проверен). Итог: input_budget = min(40960, 262144) − 8192 − 2048 = **30720** при Σ секций **26624** (запас 4096).
+
+| payload | canonical ДО | canonical ПОСЛЕ |
+|---|---|---|
+| v2 | `73b5f14e6630f086d2465a42308effe7d10e517ef39fe8b1ce2f563c417c1aaf` | `ffc98c9e54b5ba0b3621d5f3fb37616fabbb6b159a4a9d5d46710adee75a6e2d` |
+| v3 | `dbfd11b1a6fc83cf8695b44753448fce1049ce7614e2a1d40bad9a2ba92d1f62` | `2e93889ce4b4f943f3c4e03d9a87ce9740c2012f2781a65637cd0ce831501d92` |
+
+**Почему подъём окна, а не урезание секций:** секции бюджета остаются байт в байт как в EVAL-2 и bootstrap (Σ = 26624) — урезание contradictions/protocol/recent_errors изменило бы то, что видит модель, и сломало бы A/B-сопоставимость с baseline EVAL-2, ради которой прогон и делается. Diff v2→v3 после правки не изменился по смыслу: ровно 2 строки volatility. Пороги §22.2, rules engine и корпус (`question-set-v2.jsonl`, sha256 `93c1a93a4d6cbb4b…` — **не изменился**) не тронуты.
+
+**Доказательства срыва (сохранены, не удалять):** БД `noezema-eval3` — run `83366765-e795-44d6-a5d0-b2027270fa54` (`outcome=insufficient_sample`, 0 строк сессий / 0 claims / 0 model_runs), БД оставлена как есть и НЕ переиспользуется; логи: `/home/denis/dsh1/eval3-logs/` — `eval3-run.log` (все 50 мгновенных падений), `eval3-activate-v2.log`, `eval3-watchdog.log` (watchdog штатно зафиксировал завершение рана без v3-активации, `et=0 < 20`), `eval3-worker.log`.
+
+**Регрессия-защита (код, тот же коммит-блок):**
+1. `activate-online` — **fail-closed на невалидных бюджетах**: `packages/memory/activation.py: _validate_payload_budgets` проверяет `TokenBudgets.from_snapshot(model, token_budgets).validate()` (зеркалируя `ContextBuilder`: §5.4.2-секция `pending_claims` исключена из суммы) **ДО** записи candidate-строки; конфиг, на котором не стартует ни одна сессия, не публикуется. Тест: `tests/scenario/test_online_activation.py::test_online_rejects_unstartable_token_budgets` (ошибка до записи, candidate не создан, head не тронут).
+2. Замороженные payload'ы закреплены тестом: `tests/unit/test_freeze_payloads.py` — грузит оба файла из репо, требует `validate() == []`, закрепляет секции за EVAL-2-значениями (Σ 26624) и идентичность `model`/`token_budgets` между v2 и v3.
+
 ## 3. План запуска (после утверждения)
 
 ```
-0. docker start noezema-searxng   (если остановлен); модель тёплая; тестовый контейнер БД жив
-1. CREATE DATABASE noezema-eval3;  alembic upgrade head
-   (NOEZEMA_DATABASE_URL=postgresql+asyncpg://noezema:noezema_dev@127.0.0.1:54329/noezema-eval3)
-2. env рана: NOEZEMA_DATABASE_URL=...noezema-eval3, NOEZEMA_DATA_ROOT=<свежая директория>,
-   NOEZEMA_NODE_OWNER=eval3, NOEZEMA_LLM_MAX_OUTPUT_TOKENS=8192, NOEZEMA_LLM_TIMEOUT_SECONDS=600
+0. docker start noezema-searxng   (если остановлен); прогрев модели (малый infer-запрос,
+   status=loaded); тестовый контейнер БД жив
+1. CREATE DATABASE noezema-eval3b;  alembic upgrade head
+   (NOEZEMA_DATABASE_URL=postgresql+asyncpg://noezema:noezema_dev@127.0.0.1:54329/noezema-eval3b)
+   (noezema-eval3 — доказательства сорванного первого запуска, §2.6; не трогать, не переиспользовать)
+2. env рана: NOEZEMA_DATABASE_URL=...noezema-eval3b, NOEZEMA_DATA_ROOT=<свежая директория>,
+   NOEZEMA_NODE_OWNER=eval3, NOEZEMA_LLM_BASE_URL=http://192.168.1.48:8080/v1,
+   NOEZEMA_LLM_MODEL=qwen36-35b-a3b-q6-mtp, NOEZEMA_LLM_MAX_OUTPUT_TOKENS=8192,
+   NOEZEMA_LLM_TIMEOUT_SECONDS=600
 3. hostctl activate-online --payload docs/eval/config-v2-payload.json --reason "EVAL-3: curated research profile"
 4. фоновый цикл worker (ДО активации v3 и на всё время рана):
    while :; do hostctl reassessment-tick --batch-size 50 --lease-seconds 120; sleep 15; done
@@ -155,7 +181,7 @@ sha256 (файл, как его хеширует eval-run): `93c1a93a4d6cbb4b29d
 7. **LeaseLost** — цель ≤2–3% (phase_deadline 1800); EVAL-2: 14% при 300 c.
 8. **Pending heads в момент гейтов** — исключено фоновым циклом (проверка п. 8).
 9. **SearXNG down** — ран не блокирует (search не вызывается in-run), но e2e-проверка search-пути невозможна.
-10. **Context overflow** — max_output 8192 (reasoning), context 32768, страницы мелкие.
+10. **Context overflow** — max_output 8192 (reasoning), context 40960 (input_budget 30720, запас над Σ секций 4096, §2.6), страницы мелкие.
 
 ## 7. Baseline EVAL-2 (сравнение после рана)
 
@@ -163,4 +189,4 @@ sha256 (файл, как его хеширует eval-run): `93c1a93a4d6cbb4b29d
 
 ## 8. Что НЕ меняется
 
-Пороги §22.2 (immutable), rules engine, SQL гейтов, ADR-0005/0006, staging/fenced-commit инварианты, EVAL-БД (закрыты), `ARCHITECTURE.md`. **Замороженные артефакты** (`config-v2/v3-payload.json`, `question-set-v2.jsonl`) — хэши, приведённые в §2, пересчитаны до и после допусков к запуску и **не изменились** (правки касались только отчётности: ci95 в гейт-таблице, blind-выгрузка, этот документ).
+Пороги §22.2 (immutable), rules engine, SQL гейтов, ADR-0005/0006, staging/fenced-commit инварианты, EVAL-БД (закрыты), `ARCHITECTURE.md`. **Замороженные артефакты** (`config-v2/v3-payload.json`, `question-set-v2.jsonl`) — хэши, приведённые в §2: после допусков к запуску (2026-09-16, правки только отчётности: ci95, blind-выгрузка) пересчитаны и **не изменились**; после пере-заморозки (§2.6) изменились v2/v3 (ровно 2 строки model-секции, таблица ДО/ПОСЛЕ там же), хэш `question-set-v2.jsonl` **не изменился** ни в один из двух раз.
