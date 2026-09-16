@@ -64,6 +64,18 @@
 | 33 | recovery policy protocol | MVP | ✅ | test_host_policy.py (schema v1, jitter=0, диапазоны, JCS-хэш, symlink/missing reject) + test_policy_change_unit_state.py (install/resolve, head + event stream, terminal effective_hash, accept_current/install_replacement) |
 | 34 | web degraded observer | MVP | ✅ | test_web_mvp.py (Host Status Adapter: recovery_state none/retry_wait/degraded/blocked; fail-closed Command API 423 на unresolved transition; status.host; stale/missing unit-state; SSE + session detail + pages) |
 
+> **Оговорки к MVP-строкам (честные).** Строка 1 — задача добавлена в план
+> ретроспективно (пропуск плана, T3.29); строка 2 — ModelProfile частично
+> (секция `model` снапшота не подключена). Третья оговорка (2026-09-16,
+> post-mortem EVAL-3b): **curated-путь до прогона EVAL-3b не исполнялся
+> end-to-end ни разу** — research.search/fetch через SearXNG/fetch →
+> source_assertion → external/temporal claim: все тесты M6 — на фейках
+> (FakeFetchClient, fake SearXNG), реальные MVP-сессии работали в sealed-
+> профиле (computed_result), корпуса EVAL-1/EVAL-2 не содержали URL-вопросов.
+> MVP-приёмка (§22.2 `external_temporal_e3`) и gate M3 опираются на этот
+> путь; первая реальная попытка (EVAL-3b) показала дефекты самого пути —
+> `docs/eval/EVAL-3b-postmortem.md`, задачи T7.8–T7.15.
+
 ## Матрица §22.2 (познавательная оценка)
 
 Запускается после §22.1 на замороженной конфигурации; пороги фиксируются до run.
@@ -2018,3 +2030,43 @@ gates + blind sample + overall outcome). Tag: `noezema-m7`.
       `NOEZEMA_LLM_MODEL`, прогрев модели), запуск через setsid nohup
       (worker-цикл / eval-run / watchdog — отсоединённые процессы с
       логами в `/home/denis/dsh1/eval3-logs/`).
+
+13. **EVAL-3b: прогон прерван (решение пользователя) + post-mortem
+    (2026-09-16).** Run `34e06d35…` (`noezema-eval3b`, started
+    2026-09-16 13:10:30 UTC): 7 сессий завершено + 8-я остановлена
+    mid-exploration (её phase-1-транзакция откатилась; следы proxy —
+    cbr.ru/consultant.ru — источники её собственного вопроса «ключевая
+    ставка», priority 90). et=0 на всём протяжении: 0
+    external/temporal claims. Остановка — решением пользователя после
+    4-й сессии (watchdog: et=0). **Строка прогона в `evaluation_runs`
+    оставлена незакрытой** (`outcome='running'`, `finished_at=NULL`):
+    штатного способа закрыть «как прерванный» нет — closed-set
+    `running/passed/failed/insufficient_sample` (миграция 0020), а
+    единственная функция закрытия `finish_evaluation_run` вычисляет итог
+    по гейтам и поставила бы убитому рану постфактумное состояние;
+    `running`+NULL — точная запись об остановке. БД `noezema-eval3b` и
+    логи `/home/denis/dsh1/eval3-logs/` сохранены без изменений.
+    **Post-mortem** (закоммичен как доказательная база до правок) —
+    `docs/eval/EVAL-3b-postmortem.md`: P.1 — payload `source_assertion`
+    не несёт текст утверждения (куратор мог лишь мета-claim, §6.4);
+    P.2 — commit применяется при отклонённом assessment rules engine
+    (claim без head — невидим, яд для dedup, §14.1); P.3 — 24k-обрезка
+    explorer-промпта отбрасывает самое свежее наблюдение + неидемпотентный
+    refetch (500 UniqueViolation на `artifact_chunks`); P.4 —
+    `message.reply` предложен при пустом inbox (3 потерянных шага из 10
+    в двух сессиях); P.5 — корпус чист (37 уникальных URL — 200, все 24
+    пары фактов присутствуют; повторная проверка методом заморозки), 404
+    по ООН — опечатка модели (самоисправилась), не дефект корпуса.
+    Две предпосылки разбора опровергнуты данными: chocolatey —
+    собственный источник Python-вопроса (сессия 2), cbr.ru/consultant.ru
+    — вопросы сессии 8, а не «чужой дрейф» сессии 7.
+    **Зарегистрированы задачи T7.8–T7.15** (PLAN, M7): T7.8 текст
+    утверждения в source_assertion; T7.9 claim без head не коммитится;
+    T7.10 newest-first обрезка explorer-контекста; T7.11 идемпотентный
+    refetch; T7.12 intra-session repeat guard; T7.13 message.reply
+    inbox-gating; T7.14 правила в промптах; T7.15 E2E-валидация на
+    черновой БД (условие перезапуска EVAL-3). Честная оговорка
+    «curated-путь не исполнялся end-to-end до этого прогона» — под
+    матрицей §22.1 (вместе с оговорками строк 1–2). Новый прогон не
+    планируется, корпус не перезамораживается, хэши конфигов v2/v3 и
+    корпуса не меняются — решение за пользователем.
