@@ -297,6 +297,61 @@ async def test_fetch_persists_provenance_and_marks_untrusted(
     assert arow == ("research_proxy", "external", "text/html; charset=utf-8")
 
 
+async def test_refetch_is_idempotent_reuses_source_and_chunk(
+    migrated_db: tuple[str, Any], origin: FakeOrigin, tmp_path: Path, make_factory: Any
+) -> None:
+    """T7.11 (EVAL-3b P.4): refetching already-seen content (same content
+    hash) must NOT 500 — the old blind INSERT INTO artifact_chunks hit
+    UNIQUE(artifact_id, chunk_id) — and must return the EXISTING source +
+    chunk, not create duplicates (EVAL-3b: 500 on the 2nd fetch of the
+    same URL, sess3 ×8 europa.eu / sess7 ×3 / sess2 python.org)."""
+    scratch_url, _engine = migrated_db
+    store = FilesystemArtifactStore(tmp_path / "artifacts")
+    await _set_section(
+        scratch_url,
+        _proxy_section(origin.base, private_allowlist=origin.allowlist, max_response_bytes=65536),
+    )
+    factory = make_factory(scratch_url)
+    service = ResearchProxyService(factory, store)
+
+    url = f"{origin.base}/page"
+    envelope1 = await service.fetch(url)
+    source_id1 = envelope1["source_id"]
+    # the second fetch of the SAME content (same hash) must succeed,
+    # not 500
+    envelope2 = await service.fetch(url)
+
+    # idempotent: the SAME source is returned, not a new one
+    assert envelope2["source_id"] == source_id1
+    assert envelope2["original_sha256"] == envelope1["original_sha256"]
+    assert envelope2["normalized_sha256"] == envelope1["normalized_sha256"]
+
+    # exactly ONE source + ONE chunk for this content (no duplicates)
+    source_count = await _scalar_sync(
+        scratch_url,
+        "SELECT count(*) FROM sources WHERE content_hash = :s",
+        {"s": envelope1["original_sha256"]},
+    )
+    assert source_count == 1
+    chunk_count = await _scalar_sync(
+        scratch_url,
+        "SELECT count(*) FROM artifact_chunks c "
+        "JOIN artifacts a ON a.id = c.artifact_id "
+        "WHERE a.sha256 = :s AND c.chunk_id = 'chunk-0'",
+        {"s": envelope1["original_sha256"]},
+    )
+    assert chunk_count == 1
+
+    # the refetch is audited as idempotent (exactly one such event)
+    idem_count = await _scalar_sync(
+        scratch_url,
+        "SELECT count(*) FROM audit_events WHERE type = :t "
+        "AND payload->>'idempotent' = 'true'",
+        {"t": AuditEventType.RESEARCH_FETCH_COMPLETED.value},
+    )
+    assert idem_count == 1
+
+
 async def test_sealed_mode_refuses_every_fetch(
     migrated_db: tuple[str, Any], origin: FakeOrigin, tmp_path: Path, make_factory: Any
 ) -> None:

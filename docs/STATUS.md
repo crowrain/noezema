@@ -2181,3 +2181,29 @@ full-budget наблюдений: результат ПОСЛЕДНЕГО `resea
 список инструментов всё равно есть). End-to-end подтверждение, что
 fetch-результат попадает в промпт, — существующий
 `tests/scenario/test_research_provenance.py::test_research_content_enters_context_fenced`.
+
+**T7.11 закрыт: идемпотентный refetch — существующий source+chunk, не 500 (EVAL-3b P.4, §6.4).**
+
+Дефект EVAL-3b: повторный `research.fetch` уже виденного контента (тот же
+content-hash → тот же artifact) завершался 500: `sources` на каждый fetch
+писалась новая строка, а `artifact_chunks` вставлялся слепым
+`INSERT … 'chunk-0'` → `UNIQUE (artifact_id, chunk_id)` (ключ
+`61a8f927-…/chunk-0`): sess3 ×8 europa.eu, sess7 ×3, sess2 python.org,
+chocolatey ×7 дублей.
+
+Фикс (`apps/research_proxy/service.py`):
+1. **Source по content-hash идемпотентен**: перед вставкой source ищется
+   существующий `sources WHERE content_hash = original_sha AND
+   source_type='external_url'`; при наличии переиспользуется его `id`
+   (новая строка не создаётся), иначе — создаётся как раньше.
+2. **Chunk идемпотентен**: `INSERT INTO artifact_chunks … ON CONFLICT
+   (artifact_id, chunk_id) DO NOTHING` — повторный chunk-0 для того же
+   artifact молча пропускается (500 больше невозможен; race на
+   одновременный первый fetch тоже закрыт).
+3. Аудит `research_fetch_completed` получает флаг `idempotent` (true на
+   refetch) — наблюдаемо, что контент был переиспользован.
+
+Тест: `tests/scenario/test_research_proxy.py::test_refetch_is_idempotent_reuses_source_and_chunk`
+(два fetch одной страницы: второй НЕ 500, возвращает тот же
+`source_id`; ровно 1 source + 1 chunk по content-hash; ровно 1 аудит с
+`idempotent=true`).

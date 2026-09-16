@@ -145,49 +145,74 @@ class ResearchProxyService:
         # copy of fetched content
         result.data = b""
 
-        async with self.session_factory() as db:
-            source_id = uuid.uuid4()
-            async with transaction(db):
-                # the content-addressed registry rows (fs store + DB row
-                # in the same transaction, deduped by sha)
-                for sha, size, mime in (
-                    (original_sha, original_size, result.content_type),
+        async with self.session_factory() as db, transaction(db):
+            # the content-addressed registry rows (fs store + DB row
+            # in the same transaction, deduped by sha)
+            for sha, size, mime in (
+                (original_sha, original_size, result.content_type),
+                (
+                    normalized_sha,
+                    len((normalized.text or "").encode("utf-8")),
+                    "text/plain",
+                ),
+            ):
+                if sha is None:
+                    continue
+                existing = (
                     (
-                        normalized_sha,
-                        len((normalized.text or "").encode("utf-8")),
-                        "text/plain",
-                    ),
-                ):
-                    if sha is None:
-                        continue
-                    existing = (
-                        (
-                            await db.execute(
-                                text("SELECT id FROM artifacts WHERE sha256 = :s"),
-                                {"s": sha},
-                            )
-                        )
-                        .mappings()
-                        .first()
-                    )
-                    if existing is None:
                         await db.execute(
-                            text(
-                                """
-                                INSERT INTO artifacts (id, sha256, size, mime,
-                                                       origin, trust_class)
-                                VALUES (:id, :s, :size, :mime, 'research_proxy',
-                                       :trust)
-                                """
-                            ),
-                            {
-                                "id": str(uuid.uuid4()),
-                                "s": sha,
-                                "size": size,
-                                "mime": mime,
-                                "trust": UNTRUSTED_EXTERNAL,
-                            },
+                            text("SELECT id FROM artifacts WHERE sha256 = :s"),
+                            {"s": sha},
                         )
+                    )
+                    .mappings()
+                    .first()
+                )
+                if existing is None:
+                    await db.execute(
+                        text(
+                            """
+                            INSERT INTO artifacts (id, sha256, size, mime,
+                                                   origin, trust_class)
+                            VALUES (:id, :s, :size, :mime, 'research_proxy',
+                                   :trust)
+                            """
+                        ),
+                        {
+                            "id": str(uuid.uuid4()),
+                            "s": sha,
+                            "size": size,
+                            "mime": mime,
+                            "trust": UNTRUSTED_EXTERNAL,
+                        },
+                    )
+            # T7.11 (EVAL-3b P.4): idempotent refetch. Content is
+            # content-addressed, so a source row for this content hash
+            # means the content was fetched before — reuse the existing
+            # source instead of inserting a duplicate (the old blind
+            # INSERT INTO artifact_chunks hit UNIQUE(artifact_id,
+            # chunk_id) and 500'd the second fetch of the same URL).
+            existing_source = (
+                (
+                    await db.execute(
+                        text(
+                            "SELECT id FROM sources WHERE content_hash = :s "
+                            "AND source_type = 'external_url' "
+                            "ORDER BY retrieved_at DESC, id"
+                        ),
+                        {"s": original_sha},
+                    )
+                )
+                .mappings()
+                .first()
+            )
+            idempotent = existing_source is not None
+            source_id = (
+                str(existing_source["id"])
+                if existing_source is not None
+                else str(uuid.uuid4())
+            )
+            if not idempotent:
                 await db.execute(
                     text(
                         """
@@ -198,7 +223,7 @@ class ResearchProxyService:
                         """
                     ),
                     {
-                        "id": str(source_id),
+                        "id": source_id,
                         "uri": result.final_url,
                         "hash": original_sha,
                         "meta": canonical_json_bytes(
@@ -214,47 +239,53 @@ class ResearchProxyService:
                         ).decode("utf-8"),
                     },
                 )
-                await db.execute(
-                    text(
-                        """
-                        INSERT INTO artifact_chunks (
-                            id, artifact_id, chunk_id, byte_range, origin_kind,
-                            source_uri, obtained_at, content_hash, transform_chain,
-                            parser_fingerprint, trust_class, usage_constraints
-                        ) VALUES (
-                            :id, (SELECT id FROM artifacts WHERE sha256 = :sha),
-                            'chunk-0', NULL, 'research_proxy', :uri, now(),
-                            :sha, CAST(:chain AS jsonb), :fingerprint, :trust,
-                            '{}'::jsonb
-                        )
-                        """
-                    ),
-                    {
-                        "id": str(uuid.uuid4()),
-                        "sha": original_sha,
-                        "uri": result.final_url,
-                        "chain": canonical_json_bytes(
-                            list(normalized.transform_chain)
-                        ).decode("utf-8"),
-                        "fingerprint": PARSER_FINGERPRINT,
-                        "trust": UNTRUSTED_EXTERNAL,
-                    },
-                )
-                await AuditService(db).record(
-                    AuditEventType.RESEARCH_FETCH_COMPLETED,
-                    payload={
-                        "url": result.url,
-                        "final_url": result.final_url,
-                        "sha256": original_sha,
-                        "normalized_sha256": normalized_sha,
-                        "source_id": str(source_id),
-                        "mode": mode,
-                        "redirects": result.redirects,
-                        "elapsed_ms": result.elapsed_ms,
-                    },
-                    actor="research_proxy",
-                    public_summary=f"fetched {result.final_url} (untrusted external)",
-                )
+            await db.execute(
+                text(
+                    """
+                    INSERT INTO artifact_chunks (
+                        id, artifact_id, chunk_id, byte_range, origin_kind,
+                        source_uri, obtained_at, content_hash, transform_chain,
+                        parser_fingerprint, trust_class, usage_constraints
+                    ) VALUES (
+                        :id, (SELECT id FROM artifacts WHERE sha256 = :sha),
+                        'chunk-0', NULL, 'research_proxy', :uri, now(),
+                        :sha, CAST(:chain AS jsonb), :fingerprint, :trust,
+                        '{}'::jsonb
+                    )
+                    ON CONFLICT (artifact_id, chunk_id) DO NOTHING
+                    """
+                ),
+                {
+                    "id": str(uuid.uuid4()),
+                    "sha": original_sha,
+                    "uri": result.final_url,
+                    "chain": canonical_json_bytes(
+                        list(normalized.transform_chain)
+                    ).decode("utf-8"),
+                    "fingerprint": PARSER_FINGERPRINT,
+                    "trust": UNTRUSTED_EXTERNAL,
+                },
+            )
+            await AuditService(db).record(
+                AuditEventType.RESEARCH_FETCH_COMPLETED,
+                payload={
+                    "url": result.url,
+                    "final_url": result.final_url,
+                    "sha256": original_sha,
+                    "normalized_sha256": normalized_sha,
+                    "source_id": source_id,
+                    "mode": mode,
+                    "idempotent": idempotent,
+                    "redirects": result.redirects,
+                    "elapsed_ms": result.elapsed_ms,
+                },
+                actor="research_proxy",
+                public_summary=(
+                    f"refetch (idempotent) {result.final_url} (untrusted external)"
+                    if idempotent
+                    else f"fetched {result.final_url} (untrusted external)"
+                ),
+            )
 
         return {
             "source_id": str(source_id),
