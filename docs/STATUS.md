@@ -1906,3 +1906,54 @@ gates + blind sample + overall outcome). Tag: `noezema-m7`.
     (зафиксирована в тесте): `registrable_domain` = последние 2
     label'а — 127.0.0.1:port и 127.0.0.1:port2 = ОДНА группа,
     тестовые домены должны быть двухlabel'ными. 693 tests.
+
+12. **Заморозка конфигурации EVAL-3 (T7.7, 2026-09-16) — подготовка
+    завершена, запуск — после решения пользователя.** Предусловия
+    закрыты: кросс-язычный поиск (п. 10), research.fetch →
+    source_assertion (п. 11), live-проверка v2→v3-активации
+    (old as_of → due, current → fresh, отдельная БД), SearXNG
+    (127.0.0.1:8888) + e2e search/fetch через прокси.
+    - **Wiring research proxy (зазор, найденный при подготовке):**
+      `build_orchestrator` (wake-tick И eval-run) собирал
+      оркестратор БЕЗ `research_service` → `research.fetch` был
+      fail-closed «not configured» на любом хост-входе. Стало:
+      `ResearchProxyService(session_factory,
+      FilesystemArtifactStore(workspace_root.parent/"artifacts"))`;
+      в sealed-профиле wiring инертен (tool profile-gated + proxy
+      fail-closed). Тест: `tests/unit/test_research_wiring.py`.
+    - **Приоритет в корпусе `eval-run`:** JSONL-строка
+      `{"text", "priority"?}` (int, default 0), fail-closed парсинг с
+      номером строки; seed записывает `questions.priority`. Причина:
+      seed = одна транзакция ⇒ `created_at = now()` = старт
+      транзакции у ВСЕХ строк (ловушка §7 AGENTS.md) ⇒ тайбрейк по
+      случайному uuid ⇒ порядок потребления случаен; priority даёт
+      детерминированный FIFO-порядок (§5.3.2: priority DESC).
+      Тест: `tests/unit/test_corpus_parse.py` (+ закреплена форма
+      замороженного корпуса: 50 / 100×3 / 90×11 / 80×22 / 0×14,
+      уникальность текстов).
+    - **Замороженные артефакты** (`docs/eval/`, детали + план запуска
+      + арифметика 11 гейтов + риски — `docs/eval/EVAL-3-freeze.md`):
+      `config-v2-payload.json` (canonical sha256 `73b5f14e…`; curated
+      profile, research proxy searxng 8888 + allowlist 127.0.0.1:8888,
+      phase_deadline **1800** (решение по LeaseLost), fifo) и
+      `config-v3-payload.json` (canonical sha256 `dbfd11b1…`; diff =
+      ровно 2 строки: volatility external_fact/temporal_fact →
+      `temporal` — поведенчески нейтрально (30d), но активация v3
+      запускает re-evaluation всех external/temporal head-ов →
+      old-as_of claim'ы становятся `due`); `question-set-v2.jsonl`
+      (sha256 `93c1a93a…`): 50 вопросов — 24 URL-факта (20 temporal +
+      4 external), у каждого 2 источника на 2 registrable domains
+      (lift ⇒ ровно E3; все 24 пары факт-проверены в ≤40 KiB
+      нормализованного текста), 11 паков ×3 (7 URL + 4
+      workspace-файла; follow-up'ы «перепроверь ранее установленное»
+      — путь reuse: dedup или dependency-edge на якорный claim),
+      3 old-as_of (as_of 15.04.2026 / 01.01.2026, priority 100 →
+      сессии 1–3). План запуска: чистая `noezema-eval3`,
+      `activate-online` v2, фоновый цикл `reassessment-tick`,
+      `eval-run --count 50 --slo-seconds 3600 --seed 20260915
+      --blind-size 50`, watchdog → `activate-online` v3 при ≥20
+      external/temporal claim'ов (driver сам мостит
+      activation_slot_busy), гейты после серии (SLO-знаменатель ≥20 —
+      только через activation jobs).
+    - 701 tests (693 + 8 новых). Запуск НЕ выполнялся — конфигурация
+      показывается пользователю ДО запуска (решение 2026-09-16, п. 9).

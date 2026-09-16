@@ -7,6 +7,7 @@ policy_change, unit_state); all invariants live in those modules, not here.
 
 from __future__ import annotations
 
+import json
 import sys
 import uuid
 from pathlib import Path
@@ -709,6 +710,34 @@ def security_gate(python_bin: str | None, metrics_url: str | None) -> None:
     sys.exit(proc.returncode)
 
 
+def parse_corpus_questions(raw: str) -> list[tuple[str, int]]:
+    """Parse the eval-run JSONL question corpus (T7.7, EVAL-3).
+
+    One object per line: ``{"text": ...}`` plus an optional integer
+    ``priority`` (default 0). Blank lines and lines starting with ``#``
+    are skipped. The seed preserves the priority: the FIFO selector
+    consumes (priority DESC, created_at ASC, id), so the corpus
+    controls the consumption order through priorities (§5.3.2).
+    Raises ValueError (with the line number) on a malformed line.
+    """
+    out: list[tuple[str, int]] = []
+    for line_no, line in enumerate(raw.splitlines(), start=1):
+        if not line.strip() or line.startswith("#"):
+            continue
+        try:
+            obj = json.loads(line)
+            text_value = str(obj["text"])
+            priority = obj.get("priority", 0)
+        except (ValueError, KeyError, TypeError) as exc:
+            raise ValueError(f"corpus line {line_no}: {exc}") from exc
+        if isinstance(priority, bool) or not isinstance(priority, int):
+            raise ValueError(f"corpus line {line_no}: 'priority' must be an integer")
+        if not text_value:
+            raise ValueError(f"corpus line {line_no}: empty 'text'")
+        out.append((text_value, priority))
+    return out
+
+
 @main.command("eval-run")
 @click.option("--label", required=True, help="Run label (e.g. EVAL-1).")
 @click.option(
@@ -716,7 +745,8 @@ def security_gate(python_bin: str | None, metrics_url: str | None) -> None:
     "questions_file",
     required=True,
     type=click.Path(exists=True, dir_okay=False),
-    help="JSONL question corpus (one {'text': ...} per line); seeded as origin='seeded'.",
+    help="JSONL question corpus (one {'text': ..., 'priority': N?} per line); "
+    "seeded as origin='seeded' with the given priority (default 0).",
 )
 @click.option("--count", default=50, show_default=True, help="Number of sessions to run.")
 @click.option(
@@ -752,7 +782,6 @@ def eval_run(
     """
     import asyncio
     import hashlib
-    import json
     import os
 
     from sqlalchemy import text
@@ -786,11 +815,11 @@ def eval_run(
     llm = LLMGatewayConfig()
 
     raw = Path(questions_file).read_text(encoding="utf-8")
-    questions = [
-        json.loads(line)
-        for line in raw.splitlines()
-        if line.strip() and not line.startswith("#")
-    ]
+    try:
+        questions = parse_corpus_questions(raw)
+    except ValueError as exc:
+        click.echo(f"corpus: {exc}", err=True)
+        sys.exit(EXIT_USAGE_ERROR)
     corpus_sha = hashlib.sha256(raw.encode("utf-8")).hexdigest()
     click.echo(f"corpus: {len(questions)} questions, sha256={corpus_sha[:16]}…")
 
@@ -827,8 +856,7 @@ def eval_run(
     async def _seed_questions() -> None:
         async with factory() as db, db.begin():
             n = 0
-            for q in questions:
-                t = str(q["text"])
+            for t, priority in questions:
                 exists = (
                     await db.execute(
                         text("SELECT 1 FROM questions WHERE text = :t"), {"t": t}
@@ -838,10 +866,10 @@ def eval_run(
                     continue
                 await db.execute(
                     text(
-                        "INSERT INTO questions (id, text, origin, state) "
-                        "VALUES (:id, :t, 'seeded', 'candidate')"
+                        "INSERT INTO questions (id, text, origin, state, priority) "
+                        "VALUES (:id, :t, 'seeded', 'candidate', :p)"
                     ),
-                    {"id": uuid.uuid4(), "t": t},
+                    {"id": uuid.uuid4(), "t": t, "p": priority},
                 )
                 n += 1
             click.echo(f"seeded {n} new questions (corpus frozen)")
