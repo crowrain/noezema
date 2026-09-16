@@ -224,6 +224,17 @@ async def test_research_content_enters_context_fenced(
     assert "transform: fetch" in ctx2 and "parser: noezema-normalize-v1" in ctx2
     assert f"{origin.base}/page" in ctx2
 
+    # 1b) T7.8 (§6.4): the curator — a fresh chat call that never saw
+    #     the explorer's fenced content — must see the assertion text
+    #     fragment itself in the evidence lines, not only URL and hashes
+    curator_reqs = [r["last_user"] for r in fake_llm.requests() if "Предложи изменения памяти" in r["last_user"]]
+    assert curator_reqs, "no curator request"
+    curator_ctx = max(curator_reqs, key=len)
+    assert "source_assertion" in curator_ctx
+    assert "Энергопотребление процессора растёт квадратично с частотой." in curator_ctx, (
+        "the curator must see the source text the assertion is grounded in"
+    )
+
     # 2) the read is journaled with the source link
     read_rows = (
         await _row(

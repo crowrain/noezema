@@ -99,9 +99,10 @@ def fake_fetch(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(svc, "FetchClient", FakeFetchClient)
 
 
-def _research_obs(url: str, source_id: str, osha: str, nsha: str) -> Observation:
+def _research_obs(url: str, source_id: str, osha: str, nsha: str, normalized_text: str = "") -> Observation:
     """The observation shape _research_fetch produces (the data fields
-    observation_to_evidence consumes)."""
+    observation_to_evidence consumes; normalized_text — T7.8, the clean
+    normalized chunk text the host read back from the store)."""
     return Observation(
         tool="research.fetch",
         ok=True,
@@ -110,6 +111,7 @@ def _research_obs(url: str, source_id: str, osha: str, nsha: str) -> Observation
             "mode": "curated",
             "fenced": True,
             "content": "<<<UNTRUSTED DATA BEGIN>>>\n...\n<<<UNTRUSTED DATA END>>>\n",
+            "normalized_text": normalized_text,
             "source_id": source_id,
             "original_sha256": osha,
             "normalized_sha256": nsha,
@@ -289,9 +291,16 @@ async def test_research_fetch_produces_source_assertion_e3(
     # 1. the host adapter maps each observation to a source_assertion
     #    record with durable provenance and the §14.3 identity
     for src in sources:
+        # T7.8 (§6.4): the payload carries the normalized chunk text the
+        # assertion is grounded in — the host reads it back from the
+        # store; here we pass the page text the host would have read
         rec = observation_to_evidence(
             _research_obs(
-                src["url"], src["source_id"], src["original_sha256"], src["normalized_sha256"]
+                src["url"],
+                src["source_id"],
+                src["original_sha256"],
+                src["normalized_sha256"],
+                normalized_text=PAGES[src["url"]],
             ),
             {"url": src["url"]},
         )
@@ -301,6 +310,28 @@ async def test_research_fetch_produces_source_assertion_e3(
         assert rec.chunk_id == "chunk-0"
         assert rec.identity_hash == source_assertion_identity(
             src["original_sha256"], "chunk-0", "source_assertion"
+        )
+        # the assertion text fragment is the source text (pages here are
+        # short, so the full text is carried under the budget)
+        assert rec.payload["assertion_text"] == PAGES[src["url"]], (
+            "payload must carry the normalized text the assertion is grounded in"
+        )
+        # the fragment is NOT part of the identity: same original hash +
+        # chunk + kind, different text → identical identity (dedupe
+        # semantics unchanged)
+        alt = observation_to_evidence(
+            _research_obs(
+                src["url"],
+                src["source_id"],
+                src["original_sha256"],
+                src["normalized_sha256"],
+                normalized_text="completely different text",
+            ),
+            {"url": src["url"]},
+        )
+        assert alt is not None
+        assert alt.identity_hash == rec.identity_hash, (
+            "assertion_text must not participate in the §14.3 identity"
         )
 
     # a failed observation and one without a durable source reference
@@ -318,7 +349,11 @@ async def test_research_fetch_produces_source_assertion_e3(
     records = [
         observation_to_evidence(
             _research_obs(
-                s["url"], s["source_id"], s["original_sha256"], s["normalized_sha256"]
+                s["url"],
+                s["source_id"],
+                s["original_sha256"],
+                s["normalized_sha256"],
+                normalized_text=PAGES[s["url"]],
             ),
             {"url": s["url"]},
         )
@@ -384,7 +419,11 @@ async def test_same_registrable_domain_is_one_group(
     records = [
         observation_to_evidence(
             _research_obs(
-                s["url"], s["source_id"], s["original_sha256"], s["normalized_sha256"]
+                s["url"],
+                s["source_id"],
+                s["original_sha256"],
+                s["normalized_sha256"],
+                normalized_text=PAGES[s["url"]],
             ),
             {"url": s["url"]},
         )
@@ -405,3 +444,31 @@ async def test_same_registrable_domain_is_one_group(
     assert not (row[0] == "E3" and row[1] == "supported"), (
         f"same-registrable-domain sources must not grant E3 supported, got {tuple(row)}"
     )
+
+
+def test_assertion_text_budget_is_explicit_and_identity_ignores_text() -> None:
+    """T7.8 (EVAL-3b post-mortem P.1, §6.4): the assertion-text fragment
+    is bounded by an explicit budget (SOURCE_ASSERTION_TEXT_BUDGET chars
+    of the normalized chunk text), and the fragment does NOT participate
+    in the §14.3 identity (identity stays over the original content
+    hash + chunk + kind, so dedupe semantics are unchanged)."""
+    from apps.orchestrator.evidence import SOURCE_ASSERTION_TEXT_BUDGET
+
+    long_text = "x" * (SOURCE_ASSERTION_TEXT_BUDGET + 500)
+    obs = _research_obs("u", "s" * 36, "o" * 64, "n" * 64, normalized_text=long_text)
+    rec = observation_to_evidence(obs, {"url": "u"})
+    assert rec is not None
+    # the fragment is truncated to the explicit budget
+    assert rec.payload["assertion_text"] == long_text[:SOURCE_ASSERTION_TEXT_BUDGET]
+    assert len(rec.payload["assertion_text"]) == SOURCE_ASSERTION_TEXT_BUDGET
+
+    # the identity ignores the text entirely: two observations with the
+    # same original hash + chunk + kind but different text → same identity
+    rec2 = observation_to_evidence(
+        _research_obs("u", "s" * 36, "o" * 64, "n" * 64, normalized_text="entirely different"),
+        {"url": "u"},
+    )
+    assert rec2 is not None
+    assert rec2.identity_hash == rec.identity_hash
+    # and both equal the pure §14.3 identity
+    assert rec.identity_hash == source_assertion_identity("o" * 64, "chunk-0", "source_assertion")

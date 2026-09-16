@@ -2070,3 +2070,31 @@ gates + blind sample + overall outcome). Tag: `noezema-m7`.
     матрицей §22.1 (вместе с оговорками строк 1–2). Новый прогон не
     планируется, корпус не перезамораживается, хэши конфигов v2/v3 и
     корпуса не меняются — решение за пользователем.
+
+**T7.8 закрыт: текст утверждения в `source_assertion` (EVAL-3b post-mortem P.1, §6.4).**
+
+Payload evidence `source_assertion` теперь несёт `assertion_text` —
+фрагмент нормализованного текста chunk, из которого читается
+утверждение (явный бюджет `SOURCE_ASSERTION_TEXT_BUDGET = 2_000`
+символов, `apps/orchestrator/evidence.py`). Хост (`_research_fetch`)
+кладёт чистый нормализованный текст (уже обрезанный
+RESEARCH_CONTEXT_BUDGET) в данные наблюдения (`normalized_text`),
+адаптер берёт его бюджетированный фрагмент. Куратор (и верификатор)
+теперь видят текст в evidence-строках роли-промпта
+(`_evidence_lines` в `apps/orchestrator/orchestrator.py`: метаданные —
+URL/хэши/chunk — по-прежнему `_cap_args`, фрагмент — отдельным блоком
+`[текст фрагмента]`), а не только URL и хэши, как в EVAL-3b.
+
+Identity не меняется (§14.3): `source_assertion_identity(original_sha,
+chunk_id, kind)` — фрагмент не участвует в identity; тест
+`test_assertion_text_budget_is_explicit_and_identity_ignores_text`
+фиксирует: другое содержимое текста при том же хэше исходного
+содержимого → тот же identity (семантика дедупликации не поменялась),
+и что фрагмент обрезается ровно до явного бюджета.
+
+Тесты: `tests/scenario/test_research_evidence.py` (E3-тест теперь
+ассертит payload-текст и инвариант identity по тексту; новый тест
+явного бюджета + identity, не зависящий от текста),
+`tests/scenario/test_research_provenance.py` (полная curated-сессия:
+промпт куратора — свежего chat-вызова, не видевшего fenced-контент
+explorer'а — содержит предложение страницы end-to-end).

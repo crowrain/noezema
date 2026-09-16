@@ -875,6 +875,12 @@ class Orchestrator:
                 "mode": envelope.get("mode"),
                 "fenced": True,
                 "content": fenced,
+                # T7.8 (§6.4): the clean normalized chunk text (already
+                # context-budgeted above) — observation_to_evidence
+                # carries a bounded fragment of it as the payload
+                # assertion_text so the curator sees the text the
+                # assertion is grounded in
+                "normalized_text": text_body,
                 "source_id": str(envelope.get("source_id") or ""),
                 "original_sha256": str(envelope.get("original_sha256") or ""),
                 "normalized_sha256": nsha,
@@ -900,10 +906,7 @@ class Orchestrator:
         the caller keeps the MVP no-op phase. Transport LLM errors
         propagate: a host failure is a host failure."""
         verifier = self.prompts[Role.VERIFIER]
-        ev_lines = "\n".join(
-            f"[{i}] {e.kind.value} {e.identity_hash[:16]} {_cap_args(e.payload)}"
-            for i, e in enumerate(ctx.evidence)
-        )
+        ev_lines = _evidence_lines(ctx.evidence)
         user = (
             f"# Вопрос\n{ctx.question_text}\n\n"
             f"# Наблюдения\n{chr(10).join(ctx.observations[-15:]) or '(пусто)'}\n\n"
@@ -1579,10 +1582,7 @@ class Orchestrator:
         """Run the curator; host-validate the proposal. Returns
         (claims_proposed, questions_created)."""
         curator = self.prompts[Role.CURATOR]
-        ev_lines = "\n".join(
-            f"[{i}] {e.kind.value} {e.identity_hash[:16]} {_cap_args(e.payload)}"
-            for i, e in enumerate(ctx.evidence)
-        )
+        ev_lines = _evidence_lines(ctx.evidence)
         # T4.1: the curator needs the existing claim IDs to declare
         # `dependencies` — the context pack's claim sections carry them
         # (each line is prefixed with [c:<claim_id>])
@@ -1851,3 +1851,24 @@ def _cap_args(value: object) -> str:
         value = {"value": value}
     text = canonical_json_bytes(value).decode("utf-8", "replace")
     return text[:1000]
+
+
+def _evidence_lines(evidence: list[EvidenceRecord]) -> str:
+    """Evidence lines for the role prompts (curator, verifier).
+
+    T7.8 (EVAL-3b post-mortem P.1, §6.4): a source_assertion line
+    carries the assertion_text fragment itself — the curator's chat
+    call never saw the explorer's fenced fetch content, so without the
+    fragment it could only meta-claim about the URL. The fragment is
+    host-budgeted (SOURCE_ASSERTION_TEXT_BUDGET in evidence.py); the
+    reference metadata (URL, hashes, chunk) stays _cap_args-capped as
+    before."""
+    lines = []
+    for i, e in enumerate(evidence):
+        meta = {k: v for k, v in e.payload.items() if k != "assertion_text"}
+        line = f"[{i}] {e.kind.value} {e.identity_hash[:16]} {_cap_args(meta)}"
+        text_body = str(e.payload.get("assertion_text") or "")
+        if text_body:
+            line += f"\n    [текст фрагмента]\n{text_body}"
+        lines.append(line)
+    return "\n".join(lines)
