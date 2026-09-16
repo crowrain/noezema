@@ -2151,3 +2151,33 @@ curated-сессия end-to-end: curator предлагает local_observation,
 поддержанную source_assertion — ровно кейс EVAL-3b → proposal отбит до
 commit: audit с точной причиной, 0 claim/0 head/0 evidence/0
 staging-опов в БД, session SUCCEEDED).
+
+**T7.10 закрыт: newest-first обрезка explorer-контекста (EVAL-3b post-mortem P.3, §5.4).**
+
+Дефект EVAL-3b: builder explorer-контекста (`_explorer_context`) собирал
+pack + инструменты + наблюдения + evidence + сообщение и обрезал хвост
+жёстким `[:24_000]` — сохраняя НАЧАЛО (старейшие наблюдения) и вырезая
+КОНЕЦ, где лежал последний `research.fetch` (fenced, до 40k). Модель не
+видела результат последнего fetch и переиспускала тот же fetch: в EVAL-3b
+`input_tokens` был константным (sess2 9895×6, sess3 8521×9),
+`CONTEXT_PACKED` 317–330 токенов.
+
+Фикс (`apps/orchestrator/orchestrator.py`):
+1. Новый бюджет `EXPLORER_CONTEXT_BUDGET = RESEARCH_CONTEXT_BUDGET + 8_000`
+   (48k) — помещает целый fetch (до `RESEARCH_CONTEXT_BUDGET`) плюс
+   overhead (инструкция, инструменты, evidence, pack, сообщения).
+2. Обрезка newest-first: отбрасываются САМЫЕ СТАРЫЕ наблюдения одно за
+   другим, пока промпт не влезает в бюджет; последнее наблюдение (самый
+   свежий `research.fetch`) и финальная инструкция никогда не
+   отбрасываются. Старая `[:24_000]` (keep-head) удалена.
+
+Тесты: `tests/unit/test_explorer_context.py` —
+`test_latest_fetch_present_and_oldest_dropped_under_budget` (15
+full-budget наблюдений: результат ПОСЛЕДНЕГО `research.fetch`
+присутствует в промпте шага, fence цел, инструкция на месте, старейшие
+отброшены, промпт ≤ бюджета), `test_no_truncation_when_prompt_fits`
+(малые наблюдения — ничего не отбрасывается),
+`test_empty_observations_still_offers_instruction` (пусто — инструкция и
+список инструментов всё равно есть). End-to-end подтверждение, что
+fetch-результат попадает в промпт, — существующий
+`tests/scenario/test_research_provenance.py::test_research_content_enters_context_fenced`.

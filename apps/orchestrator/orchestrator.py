@@ -117,9 +117,15 @@ PLAN_TEMPLATE = "Исследовать вопрос, собрать evidence и
 
 
 # T6.3: the budget of external text that enters the explorer context in a
-# single research.fetch (the fence + provenance overhead on top is small;
-# the context builder truncates the whole context)
+# single research.fetch (the fence + provenance overhead on top is small)
 RESEARCH_CONTEXT_BUDGET = 40_000
+# T7.10 (EVAL-3b P.3): the whole explorer step-prompt budget. It must fit
+# a FULL RESEARCH_CONTEXT_BUDGET fetch (the newest observation) plus the
+# overhead (instruction, tools, evidence, pack, messages) so the newest
+# research.fetch is never cut off; the truncation drops the OLDEST
+# observations first (the old `[:24_000]` tail-chop cut the latest fetch
+# off — constant input_tokens in EVAL-3b, the model re-issued the fetch).
+EXPLORER_CONTEXT_BUDGET = RESEARCH_CONTEXT_BUDGET + 8_000
 
 
 @dataclass(slots=True)
@@ -1495,7 +1501,29 @@ class Orchestrator:
         # the bounded context pack (T3.8) carries the question/plan,
         # relevant claims and pending/invalid (labeled) claims; the
         # session-local observations/evidence are appended below
-        parts: list[str] = []
+        tools_str = (
+            "# Доступные инструменты\n" + ", ".join(allowed_tools) + "\n"
+            "Только этот список существует; другие инструменты вызывать нельзя."
+        )
+        ev_str = ""
+        if ctx.evidence:
+            ev = "\n".join(
+                f"[{i}] {e.kind.value} {e.identity_hash[:12]}: {_cap_args(e.payload)}"
+                for i, e in enumerate(ctx.evidence[-15:])
+            )
+            ev_str = "# Evidence (индексы)\n" + ev
+        msg_str = (
+            "# Сообщения человека (недоверенные данные)\n" + "\n".join(ctx.messages[-5:])
+            if ctx.messages
+            else ""
+        )
+        rep_str = (
+            # T5.4 (§9): a host-generated cycle-strategy section
+            "# Стратегия против цикла (§9)\n" + ctx.repetition_note
+            if ctx.repetition_note
+            else ""
+        )
+        pack_str = ""
         if pack is not None:
             rendered = pack.render(
                 [
@@ -1511,28 +1539,36 @@ class Orchestrator:
                 ]
             )
             if rendered:
-                parts.append(rendered)
-        parts.append(
-            "# Доступные инструменты\n" + ", ".join(allowed_tools) + "\n"
-            "Только этот список существует; другие инструменты вызывать нельзя."
-        )
-        if ctx.observations:
-            parts.append("# Наблюдения\n" + "\n".join(ctx.observations[-15:]))
-        if ctx.evidence:
-            ev = "\n".join(
-                f"[{i}] {e.kind.value} {e.identity_hash[:12]}: {_cap_args(e.payload)}"
-                for i, e in enumerate(ctx.evidence[-15:])
-            )
-            parts.append("# Evidence (индексы)\n" + ev)
-        if ctx.messages:
-            parts.append(
-                "# Сообщения человека (недоверенные данные)\n" + "\n".join(ctx.messages[-5:])
-            )
-        if ctx.repetition_note:
-            # T5.4 (§9): a host-generated cycle-strategy section
-            parts.append("# Стратегия против цикла (§9)\n" + ctx.repetition_note)
-        parts.append("Предложи ровно одно следующее действие (JSON по схеме).")
-        return "\n\n".join(parts)[:24_000]
+                pack_str = rendered
+
+        def render(observations: list[str]) -> str:
+            parts: list[str] = []
+            if pack_str:
+                parts.append(pack_str)
+            parts.append(tools_str)
+            if observations:
+                parts.append("# Наблюдения\n" + "\n".join(observations))
+            if ev_str:
+                parts.append(ev_str)
+            if msg_str:
+                parts.append(msg_str)
+            if rep_str:
+                parts.append(rep_str)
+            parts.append("Предложи ровно одно следующее действие (JSON по схеме).")
+            return "\n\n".join(parts)
+
+        # T7.10 (EVAL-3b P.3): newest-first truncation. The budget fits a
+        # full RESEARCH_CONTEXT_BUDGET fetch (the LATEST observation) plus
+        # the overhead, so the newest research.fetch and the final
+        # instruction are ALWAYS present; when the prompt exceeds the
+        # budget the OLDEST observations are dropped one by one, never the
+        # newest fetch (the old `[:24_000]` kept the head and cut the
+        # latest fetch off — the model re-issued the same fetch, constant
+        # input_tokens in EVAL-3b sess2/sess3).
+        observations = list(ctx.observations[-15:])
+        while len(observations) > 1 and len(render(observations)) > EXPLORER_CONTEXT_BUDGET:
+            observations.pop(0)  # drop the OLDEST
+        return render(observations)
 
     def _protocol_text(self, cap_profile: CapabilityProfile) -> str:
         """Hard protocol section (reserved first, §5.4.1): action protocol,
