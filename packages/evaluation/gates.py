@@ -1,9 +1,12 @@
 """T7.7 (§22.2): gate computation for an evaluation run.
 
 Computes all 11 §22.2 gates from the domain data of the run's session
-window (sessions with ``started_at >= run.started_at``). Each gate
-returns ``{"outcome", "numerator", "denominator", ...}`` where
-``outcome`` is one of the three §22.2 outcomes:
+window (sessions with ``started_at >= run.started_at``). Each ratio
+gate returns ``{"outcome", "numerator", "denominator", "ci95":
+{"low", "high"}, ...}`` where ``ci95`` is the 95% Wilson score
+interval for the measured share («95% доверительный интервал
+публикуется», §22.2; reporting only — the outcome is decided by the
+ratio alone) and ``outcome`` is one of the three §22.2 outcomes:
 
 - ``passed`` — the threshold is met on a sufficient sample;
 - ``failed`` — the threshold is not met on a sufficient sample;
@@ -64,16 +67,27 @@ The blind sample is drawn deterministically from ``run.blind_sample_
 seed`` + ``run.blind_sample_size``: seeded shuffle within each
 stratum, proportional allocation, remainder from the global seeded
 shuffle (reproducible for the same run row).
+
+METHOD LIMITATION (docs/eval/EVAL-3-freeze.md «Ограничение метода»):
+§22.2 defines the blind sample as a MANUAL procedure — a person
+judges whether each sampled claim follows from its evidence and the
+95% confidence interval is published. The two blind gates measure
+only the STRUCTURAL projection (linked evidence exists, scope is
+declared); the run report marks them as a structural check, not as
+passed §22.2 gates. The sample rendered for human review
+(``noezemactl blind-sample``) uses exactly this selection
+(``packages.evaluation.blind``).
 """
 
 from __future__ import annotations
 
-import random
+import math
 from typing import Any
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.evaluation.blind import blind_sample_claim_ids
 from packages.evaluation.service import EvaluationRun
 
 #: «при N<20 gate получает insufficient_sample» (§22.2)
@@ -113,7 +127,7 @@ async def compute_gates(
     gates["reassessment_slo"] = await _gate_slo(db, run)
     gates["current_pending_invalid_ancestor"] = await _gate_pending_ancestor(db)
     gates["high_severity_incidents"] = await _gate_incidents(db, run)
-    blind = await _blind_sample(db, run)
+    blind = await blind_sample_claim_ids(db, run)
     gates["blind_provenance_path"] = await _gate_blind_provenance(db, blind, run)
     gates["blind_scope"] = await _gate_blind_scope(db, blind, run)
     return gates
@@ -133,6 +147,30 @@ def _grade_at_least(sql_grade: str, grade: str) -> str:
     return f"({_GRADE_CASE.format(g=sql_grade)} >= {_GRADE_CASE.format(g=literal)})"
 
 
+def wilson_ci95(numerator: int, denominator: int) -> tuple[float, float] | None:
+    """95% Wilson score interval for the share numerator/denominator.
+
+    §22.2 requires publishing a 95% confidence interval with the blind
+    sample / gate results. Reporting only: the gate outcome is decided
+    by the point ratio alone, never by the interval. Returns None when
+    the denominator is empty (no measurement).
+    """
+    if denominator <= 0:
+        return None
+    z = 1.959963984540054  # 95% two-sided
+    p = numerator / denominator
+    denom = 1.0 + z * z / denominator
+    center = (p + z * z / (2.0 * denominator)) / denom
+    half = (
+        z
+        * math.sqrt(p * (1.0 - p) / denominator + z * z / (4.0 * denominator * denominator))
+    ) / denom
+    return (
+        round(max(0.0, center - half), 4),
+        round(min(1.0, center + half), 4),
+    )
+
+
 def _gate(
     *,
     numerator: int,
@@ -141,11 +179,14 @@ def _gate(
     direction: str,
 ) -> dict[str, Any]:
     """Apply the three-outcome rule to one ratio gate."""
-    base = {
+    base: dict[str, Any] = {
         "numerator": numerator,
         "denominator": denominator,
         "threshold": threshold,
     }
+    ci = wilson_ci95(numerator, denominator)
+    if ci is not None:
+        base["ci95"] = {"low": ci[0], "high": ci[1]}
     if denominator < MIN_SAMPLE:
         return {**base, "outcome": "insufficient_sample"}
     ratio = numerator / denominator
@@ -429,59 +470,6 @@ async def _gate_incidents(db: AsyncSession, run: EvaluationRun) -> dict[str, Any
         "threshold": 0,
         "outcome": "passed" if count == 0 else "failed",
     }
-
-
-async def _blind_sample(db: AsyncSession, run: EvaluationRun) -> list[Any]:
-    """The seeded, stratified blind sample (claim ids).
-
-    Stratification: (claim_type, epistemic_status) of the current head.
-    Seeded shuffle within each stratum; proportional allocation of
-    ``run.blind_sample_size``; the remainder (rounding) is drawn from
-    the global seeded shuffle. Deterministic for the same run row.
-    """
-    rows = (
-        await db.execute(
-            text(
-                "SELECT c.id, c.claim_type, h.epistemic_status "
-                "FROM claims c "
-                "JOIN claim_assessment_heads h "
-                "  ON h.claim_id = c.id AND h.assessment_state = 'current' "
-                "ORDER BY c.created_at, c.id"
-            )
-        )
-    ).all()
-    if not rows:
-        return []
-    rng = random.Random(run.blind_sample_seed)
-    strata: dict[tuple[str, str], list[Any]] = {}
-    for r in rows:
-        strata.setdefault((r[1], r[2]), []).append(r[0])
-    for members in strata.values():
-        rng.shuffle(members)
-    size = min(run.blind_sample_size, len(rows))
-    total = len(rows)
-    picked: list[Any] = []
-    for members in strata.values():
-        share = max(1, round(size * len(members) / total))
-        picked.extend(members[:share])
-    # deterministic dedup + top-up from the global seeded shuffle
-    seen: set[Any] = set()
-    unique: list[Any] = []
-    for cid in picked:
-        if cid not in seen:
-            seen.add(cid)
-            unique.append(cid)
-    if len(unique) < size:
-        global_pool = [r[0] for r in rows]
-        rng2 = random.Random(run.blind_sample_seed)
-        rng2.shuffle(global_pool)
-        for cid in global_pool:
-            if cid not in seen:
-                seen.add(cid)
-                unique.append(cid)
-                if len(unique) >= size:
-                    break
-    return unique[:size]
 
 
 async def _gate_blind_provenance(

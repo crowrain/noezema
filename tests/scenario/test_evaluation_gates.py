@@ -505,6 +505,19 @@ async def test_gates_rich_dataset(migrated_db: tuple[str, AsyncEngine]) -> None:
     assert g11["denominator"] == 57 and g11["numerator"] == 49
     assert g11["outcome"] == "passed"  # 0.86 >= 0.80
 
+    # 95% Wilson CI on every ratio gate (§22.2: интервал публикуется;
+    # reporting only — исходы выше не изменились)
+    ratio_gates = [g for k, g in gates.items() if k not in (
+        "current_pending_invalid_ancestor",
+        "high_severity_incidents",
+    )]
+    for g in ratio_gates:
+        ci = g["ci95"]
+        assert g["denominator"] > 0
+        assert ci["low"] <= g["numerator"] / g["denominator"] <= ci["high"]
+    assert g1["ci95"] == {"low": 0.8725, "high": 0.9896}
+    assert g6["ci95"] == {"low": 0.0524, "high": 0.3604}
+
 
 @pytest.mark.asyncio
 async def test_gates_empty_db(migrated_db: tuple[str, AsyncEngine]) -> None:
@@ -535,15 +548,15 @@ async def test_gates_empty_db(migrated_db: tuple[str, AsyncEngine]) -> None:
 @pytest.mark.asyncio
 async def test_blind_sample_deterministic(migrated_db: tuple[str, AsyncEngine]) -> None:
     """Same run row → same blind sample (seeded, stratified)."""
-    from packages.evaluation.gates import _blind_sample
+    from packages.evaluation.blind import blind_sample_claim_ids
 
     _scratch, engine = migrated_db
     seeder = await _seed_rich(engine)
     run = await _mk_run(engine, seed=7)
     factory = async_sessionmaker(engine)
     async with factory() as db:
-        s1 = await _blind_sample(db, run)
-        s2 = await _blind_sample(db, run)
+        s1 = await blind_sample_claim_ids(db, run)
+        s2 = await blind_sample_claim_ids(db, run)
     assert s1 == s2
     # only claims with a CURRENT head enter the sample: the pending/
     # invalid heads (claims 44..46) are excluded
