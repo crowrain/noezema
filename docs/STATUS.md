@@ -1811,3 +1811,27 @@ gates + blind sample + overall outcome). Tag: `noezema-m7`.
    считается успешной, а не техническим срывом (§5.2.3: durable
    row wins). Серия перезапускается на чистой БД, один драйвер,
    модель уже загружена.
+
+8. **Серия EVAL-2 проведена, ADR-0006 (2026-09-16).** Run
+   `260571ef-cdf9-4f20-90a8-185699002a7b` (`noezema-eval2`,
+   23:27:39 → 03:59:24 UTC, ~4 ч 32 м): 50 попыток, 43 terminal
+   (25 succeeded / 18 succeeded_partial), 7 LeaseLost (технические
+   срывы, строк сессий нет), 41 claim (28 significant E2+), 240
+   model_runs. Исходы гейтов (A/B с EVAL-1): все те же, кроме
+   `significant_claim_reuse`: **1/28 = 3.6% < 25% — failed**
+   (EVAL-1: 1/29 = 3.4% failed); итог `outcome=failed`.
+   Разбор (ADR-0006): механизм reuse работает end-to-end (16
+   вызовов memory.search, 3 dependency-рёбра Q46→workspace-claim,
+   числитель формируется), но все 16 поисков вернули пусто
+   (cross-lingual: запросы EN против RU-claims; и нет связанных
+   claims), а корпус v1 не содержит тематического перекрытия
+   (near_duplicate = 0) — верхняя достижимая доля reuse ≈ 7–11%,
+   порог 25% недостижим на этом корпусе при любом механизме.
+   Решение ADR-0006: T7.7 «доработка reuse» выполнена; failed-гейт
+   — артефакт корпуса v1; закрытие — валидационная серия EVAL-3 на
+   корпусе v2 с гарантированным перекрытием (10–15 пачек по 3–5
+   вопросов); пороги §22.2 не меняются. Общий acceptance MVP
+   (§22.2: нет failed И нет insufficient) не пройден: failed —
+   reuse (путь закрытия — EVAL-3), insufficient — редкие типы
+   (external/temporal E3, due/stale, reassessment SLO) — отложены
+   решением пользователя.
