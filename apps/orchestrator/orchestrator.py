@@ -126,6 +126,15 @@ RESEARCH_CONTEXT_BUDGET = 40_000
 # observations first (the old `[:24_000]` tail-chop cut the latest fetch
 # off — constant input_tokens in EVAL-3b, the model re-issued the fetch).
 EXPLORER_CONTEXT_BUDGET = RESEARCH_CONTEXT_BUDGET + 8_000
+# T7.12 (EVAL-3b P.5): how many times the EXACT same (tool, arguments) may
+# be executed in one session before the host denies the next repetition.
+# The per-step idempotency key (turn_id-scoped) never matches across steps,
+# so without this guard the model can re-issue the same call indefinitely
+# (EVAL-3b: the same research.fetch re-issued 6–9× with constant
+# input_tokens). The result of the earlier calls is already in the
+# observations, so a further identical call adds nothing — the denial says
+# so and tells the model to change strategy.
+TOOL_REPEAT_DENY_LIMIT = 2
 
 
 @dataclass(slots=True)
@@ -1104,6 +1113,10 @@ class Orchestrator:
         steps = 0
         stop_requested = False
         abort_requested = False
+        # T7.12 (EVAL-3b P.5): per-session count of executed (tool, args) —
+        # the host-side backstop against the model re-issuing the same call
+        # (the turn_id-scoped idempotency key never matches across steps).
+        tool_call_counts: dict[str, int] = {}
         for step in range(1, max_steps + 1):
             steps = step
 
@@ -1240,6 +1253,34 @@ class Orchestrator:
                 ctx.observations.append(f"[{step}] {tool_name}: повтор (replay), действие уже зафиксировано")
                 continue
 
+            # T7.12 (EVAL-3b P.5): the EXACT same (tool, arguments) has
+            # already been executed enough times in this session — the
+            # result is already in the observations, so deny the repetition
+            # and tell the model to change strategy (the turn_id-scoped
+            # idempotency key above never matches across steps).
+            rep_key = f"{tool_name}:{args_hash}"
+            rep_count = tool_call_counts.get(rep_key, 0)
+            if rep_count >= TOOL_REPEAT_DENY_LIMIT:
+                await audit.record(
+                    AuditEventType.ACTION_FAILED,
+                    session_id=session.id,
+                    payload={
+                        "denied": True,
+                        "reason": "tool_call_repeated",
+                        "tool": tool_name,
+                        "arguments_hash": args_hash,
+                        "executed_count": rep_count,
+                    },
+                    public_summary=f"tool call repeated (denied): {tool_name} x{rep_count}",
+                )
+                ctx.observations.append(
+                    f"[{step}] {tool_name}({_cap_args(args)}): ОТКЛОНЕНО — этот же вызов "
+                    f"(инструмент + аргументы) уже выполнялся {rep_count} раз(а) в этой сессии; "
+                    "его результат уже в наблюдениях выше. Повтор не даст нового — "
+                    "смени стратегию: другой инструмент, другие аргументы или завершение."
+                )
+                continue
+
             action = ORMAction(
                 session_id=session.id,
                 model_run_id=run.id,
@@ -1289,6 +1330,8 @@ class Orchestrator:
                 },
                 public_summary=f"action: {tool_name}",
             )
+            # T7.12: count the execution so a later identical call is denied
+            tool_call_counts[rep_key] = rep_count + 1
 
             if tool_name == "research.fetch":
                 # T6.3 (stage 5, §11.2): host-side egress through the

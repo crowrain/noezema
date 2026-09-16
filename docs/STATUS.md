@@ -2207,3 +2207,30 @@ chocolatey ×7 дублей.
 (два fetch одной страницы: второй НЕ 500, возвращает тот же
 `source_id`; ровно 1 source + 1 chunk по content-hash; ровно 1 аудит с
 `idempotent=true`).
+
+**T7.12 закрыт: N одинаковых (tool, args_hash) — deny с наблюдением (EVAL-3b P.5, §5.4).**
+
+Дефект EVAL-3b: idempotency-key действия скопирован на `turn_id`, который
+генерируется заново на каждом шаге — поэтому `check_idempotency` (replay)
+никогда не совпадал между шагами, и модель могла переиспускать ОДИН И ТОТ
+ЖЕ вызов (инструмент + аргументы) бесконечно: в EVAL-3b один
+`research.fetch` повторялся 6–9× при константных `input_tokens`
+(sess2 9895×6, sess3 8521×9).
+
+Фикс (`apps/orchestrator/orchestrator.py`):
+1. Константа `TOOL_REPEAT_DENY_LIMIT = 2` — сколько раз один и тот же
+   (tool, args_hash) может быть исполнен в сессии до deny следующего
+   повтора.
+2. Счётчик `tool_call_counts` (per-сессия) в explorer-цикле: после
+   каждого исполнения (после `ACTION_STARTED`) увеличивается.
+3. Перед созданием действия: если счётчик ≥ лимита — действие НЕ
+   исполняется, пишется аудит `action_failed`
+   (`reason="tool_call_repeated"`, `executed_count`) и наблюдение модели:
+   «этот же вызов уже выполнялся N раз; результат уже в наблюдениях —
+   смени стратегию (другой инструмент / аргументы / завершение)».
+
+Тест: `tests/scenario/test_research_provenance.py::test_repeated_tool_call_is_denied_after_limit`
+(модель переиспускает один `research.fetch` на `TOOL_REPEAT_DENY_LIMIT+1`
+раз: первые N исполнены, последний ОТКЛОНЁН; ровно 1 аудит
+`tool_call_repeated` с `executed_count=N`; в промпте последующего шага —
+наблюдение «ОТКЛОНЕНО»).
