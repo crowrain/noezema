@@ -1664,6 +1664,38 @@ class Orchestrator:
             )
             return 0, 0
 
+        # T7.9 (EVAL-3b post-mortem P.2, §14.1): the rules engine
+        # pre-commit check — a proposal the rules engine would reject
+        # (a support evidence of a kind the claim-type rule does not
+        # allow) is bounced BEFORE any staging op is recorded: the
+        # commit boundary never continues with a problems entry and
+        # never commits a claim without a head (the rules engine is the
+        # only producer, §3.7)
+        from packages.memory import MemoryService
+
+        rule_problems = MemoryService(snapshot).validate_claim_proposal(
+            [c.model_dump(mode="json") for c in proposal.claims],
+            [
+                {
+                    "evidence_index": link.evidence_index,
+                    "claim_index": link.claim_index,
+                    "relation": link.relation.value,
+                }
+                for link in proposal.evidence_links
+            ],
+            list(ctx.evidence),
+        )
+        if rule_problems:
+            await audit.record(
+                AuditEventType.SESSION_STATE_CHANGED,
+                session_id=session.id,
+                payload={"curator_rejected_by_rules": rule_problems[:10]},
+                public_summary=(
+                    f"curator proposal rejected by the rules engine: {rule_problems[0][:200]}"
+                ),
+            )
+            return 0, 0
+
         # T2.13: proposals go to session_staging, applied at commit
         for claim in proposal.claims:
             await staging.record(

@@ -429,17 +429,14 @@ async def test_staging_commit_records_source_snapshot(migrated_db: Any) -> None:
     _url, engine = migrated_db
     statement = "факт, перечитанный сессией"
     claim_id = uuid.uuid4()
-    # host-seeded claim + two independent sources (no head yet: the
-    # session commit creates it)
+    # host-seeded claim IN the lifecycle (a pending head from rules
+    # activation) + two independent sources. T7.9 (EVAL-3b P.2): a
+    # truly HEADLESS claim (no head row at all) is NOT a dedup target —
+    # it is invisible and must not be reused — so the session commit
+    # re-evaluates a claim that already has a head, and builds the
+    # source-independence snapshot in that assessment.
+    await _seed_claim_pending(engine, claim_id, statement, "external_fact")
     factory = async_sessionmaker(engine)
-    async with factory() as db, db.begin():
-        await db.execute(
-            text(
-                "INSERT INTO claims (id, statement, claim_type, freshness_status) "
-                "VALUES (:id, :s, 'external_fact', 'fresh')"
-            ),
-            {"id": claim_id, "s": statement},
-        )
     s1 = await _host_source(engine, uri="https://one.press/story")
     s2 = await _host_source(engine, uri="https://two.media/story")
     await _host_source_evidence(engine, claim_id, s1, tag="v1")

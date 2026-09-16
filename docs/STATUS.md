@@ -2098,3 +2098,56 @@ chunk_id, kind)` — фрагмент не участвует в identity; те�
 `tests/scenario/test_research_provenance.py` (полная curated-сессия:
 промпт куратора — свежего chat-вызова, не видевшего fenced-контент
 explorer'а — содержит предложение страницы end-to-end).
+
+**T7.9 закрыт: claim без head не коммитится (EVAL-3b post-mortem P.2, §14.1).**
+
+Два дефекта, зафиксированных в EVAL-3b (headless claim'ы
+`e098b6d3…`/`c005b58a…` сессии `46849cec…` — audit seq=69:
+`problems=["assessment rejected for …: support evidence kind
+'source_assertion' not allowed for local_observation", …]`,
+assessments=0, claims_created=2, commit продолжился), закрыты двумя
+уровнями:
+
+1. **Pre-commit отбой предложения** (`validate_claim_proposal` в
+   `packages/memory/service.py` + проверка в `_curator`
+   `apps/orchestrator/orchestrator.py`): до записи каких-либо
+   staging-опов хост прогоняет предложение куратора через rules engine
+   (единственный производитель оценок, §3.7) — ровно тот путь
+   `RuleValidationError` из `evaluate()` (support-вид, не входящий в
+   `allowed_kinds` claim-типа; он не зависит от групп независимости,
+   поэтому pre-check тождествен проверке на границе commit). Отбитое
+   предложение аудируется (`session_state_changed` с
+   `curator_rejected_by_rules`) и не попадает в staging: commit-граница
+   применяет ничего, problems-записи при продолжении commit нет.
+   Session завершается (SUCCEEDED — исследование удалось), но
+   отравленный claim не коммитится.
+2. **Fail-closed на самой границе** (`apply_claim_staging`, шаг 3):
+   `RuleValidationError` больше НЕ превращается в `problems.append +
+   continue` — apply прерывается, fenced-транзакция откатывается;
+   reconciler атомарно разрешает prepared-attempt (aborted + failed +
+   staging discarded, T2.20). Инвариант «закоммиченный claim всегда
+   имеет head в активном снапшоте» теперь держится границей, а не
+   только оркестратором.
+3. **Dedup не переиспользует headless** (`apply_claim_staging`, шаг 1):
+   запрос дедупликации требует `EXISTS` head claim'а в
+   `config_snapshot_id` сессии — legacy headless claim'ы (невидимые для
+   retrieval, `claim_view` = None) больше не могут быть переиспользованы:
+   вместо reuse создаётся новый claim и оценивается как положено.
+
+Тесты: `tests/unit/test_memory_service.py` —
+`test_rules_rejected_claim_aborts_apply_no_headless_claim` (инвариант:
+apply с rejected-оценкой бросает `RuleValidationError`, после отката в
+БД нет ни claim, ни evidence, ни head),
+`test_headless_claim_is_never_reused_by_dedup` (legacy headless claim с
+тем же statement/type НЕ переиспользуется: claims_created=1,
+claims_reused=0, новый claim имеет current head; legacy остаётся без
+head; контроль — повторный apply из новой сессии переиспользует новый
+claim с head), `test_validate_claim_proposal_bounces_rules_rejected_claim`
+(pre-check: кейс EVAL-3b отбит, допустимое предложение
+external_fact+source_assertion проходит, неизвестный claim_type отбит);
+`tests/scenario/test_research_provenance.py` —
+`test_rules_rejected_proposal_is_bounced_before_commit` (полная
+curated-сессия end-to-end: curator предлагает local_observation,
+поддержанную source_assertion — ровно кейс EVAL-3b → proposal отбит до
+commit: audit с точной причиной, 0 claim/0 head/0 evidence/0
+staging-опов в БД, session SUCCEEDED).

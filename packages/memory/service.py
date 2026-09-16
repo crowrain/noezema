@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import select, text
+from sqlalchemy import exists, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.domain.canonical import canonical_sha256
@@ -181,6 +181,63 @@ class MemoryService:
             return FreshnessStatus.FRESH
         return FreshnessStatus.DUE
 
+    # ── T7.9: pre-commit proposal validation (EVAL-3b post-mortem P.2) ───
+
+    def validate_claim_proposal(
+        self,
+        claims: list[JsonDict],
+        evidence_links: list[JsonDict],
+        evidence_records: list[Any],
+    ) -> list[str]:
+        """T7.9 (EVAL-3b post-mortem P.2, §14.1): the pre-commit check of
+        the curator's proposal — the rules engine's role/kind validation
+        runs BEFORE any staging op is recorded, so a proposal the rules
+        engine would reject is bounced before commit, never turned into a
+        problems entry while the commit continues (which left a claim
+        without a head — invisible, and poison for dedup).
+
+        The check is exact for the ``RuleValidationError`` path of
+        ``evaluate()`` (a support evidence of a kind the claim-type rule
+        does not allow): that check depends only on the claim type and
+        the (kind, relation) pairs of the linked evidence — the same
+        inputs the commit-boundary assessment uses — and runs before any
+        group-dependent logic. Returns the rejection reasons (empty =
+        the proposal is admissible)."""
+        problems: list[str] = []
+        for i, payload in enumerate(claims):
+            claim_type = str(payload.get("claim_type", ""))
+            if claim_type not in self._rules:
+                problems.append(f"claim {i}: unknown claim_type {claim_type!r}")
+                continue
+            scope = dict(payload.get("scope") or {})
+            evs: list[EvaluatedEvidence] = []
+            for link in evidence_links:
+                if int(link.get("claim_index", -1)) != i:
+                    continue
+                index = int(link.get("evidence_index", -1))
+                if index < 0 or index >= len(evidence_records):
+                    continue  # host validation already rejects it
+                record = evidence_records[index]
+                evs.append(
+                    EvaluatedEvidence(
+                        identity_hash=str(record.identity_hash),
+                        kind=str(record.kind.value),
+                        relation=str(link.get("relation", "supports")),
+                        scope=scope,
+                    )
+                )
+            try:
+                evaluate(
+                    claim_type,
+                    self._rules[claim_type],
+                    claim_scope=scope,
+                    evidences=evs,
+                    has_as_of=payload.get("as_of") is not None,
+                )
+            except RuleValidationError as exc:
+                problems.append(f"claim {i} ({claim_type}): {exc}")
+        return problems
+
     # ── commit-boundary apply ─────────────────────────────────────────────
 
     async def apply_claim_staging(
@@ -261,11 +318,25 @@ class MemoryService:
                 search_statements = [
                     str(s).strip()[:300] for s in raw_search if str(s).strip()
                 ][:2]
+            # T7.9 (EVAL-3b post-mortem P.2, §14.1): dedup reuses only
+            # claims that have a head in this session's snapshot. A
+            # headless claim (created but never assessed — the legacy
+            # poison of the old problems-and-continue path) is invisible
+            # to retrieval and must never be reused: the new apply
+            # creates a fresh claim and assesses it properly.
             existing_claim = (
                 (
                     await db.execute(
                         select(ORMClaim).where(
-                            ORMClaim.statement == statement, ORMClaim.claim_type == claim_type
+                            ORMClaim.statement == statement,
+                            ORMClaim.claim_type == claim_type,
+                            exists(
+                                select(ORMClaimAssessmentHead.claim_id).where(
+                                    ORMClaimAssessmentHead.claim_id == ORMClaim.id,
+                                    ORMClaimAssessmentHead.config_snapshot_id
+                                    == session.config_snapshot_id,
+                                )
+                            ),
                         )
                     )
                 )
@@ -397,7 +468,7 @@ class MemoryService:
                     proposed = [e for e in proposed if e[:2] not in drop]
 
             for f, t, k in proposed:
-                exists = (
+                existing_edge = (
                     (
                         await db.execute(
                             select(ORMClaimDependency).where(
@@ -410,7 +481,7 @@ class MemoryService:
                     .scalars()
                     .first()
                 )
-                if exists is not None:
+                if existing_edge is not None:
                     continue  # idempotent: the edge already exists
                 db.add(
                     ORMClaimDependency(
@@ -526,9 +597,18 @@ class MemoryService:
                 ok = await self._assess(
                     db, audit, session, claim, claim_scopes.get(claim.id, {}), all_evidence, now
                 )
-            except RuleValidationError as exc:
-                problems.append(f"assessment rejected for {claim.id}: {exc}")
-                continue
+            except RuleValidationError:
+                # T7.9 (EVAL-3b post-mortem P.2, §14.1): a rules engine
+                # rejection is NOT a problems entry — the commit must not
+                # continue with a claim that has no head (invisible to
+                # retrieval, poison for dedup). The orchestrator's
+                # pre-commit validation (validate_claim_proposal) makes
+                # this unreachable through the session path; at the
+                # boundary itself the fail-closed action is to abort the
+                # whole apply — the fenced transaction rolls back, and
+                # the reconciler resolves the attempt (never a mixed
+                # state, T2.20).
+                raise
             if ok:
                 counters["assessments"] += 1
 

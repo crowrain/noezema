@@ -286,6 +286,118 @@ async def test_research_content_enters_context_fenced(
     assert norm is not None  # the normalized text is stored too
 
 
+async def test_rules_rejected_proposal_is_bounced_before_commit(
+    migrated_db: tuple[str, Any],
+    origin: FakeOrigin,
+    fake_llm: FakeLLM,
+    tmp_path: Path,
+) -> None:
+    """T7.9 (EVAL-3b post-mortem P.2, §14.1): a curator proposal the
+    rules engine rejects — the exact EVAL-3b case, a local_observation
+    claim supported by source_assertion evidence — is bounced BEFORE
+    commit: no staging ops for it are recorded, the commit boundary
+    applies nothing, and the DB contains no claim (headless or
+    otherwise). The session completes, but without the poisoned claim."""
+    scratch_url, engine = migrated_db
+    store = FilesystemArtifactStore(tmp_path / "artifacts")
+
+    payload = copy.deepcopy(BOOTSTRAP_PAYLOAD)
+    rp = payload["research_proxy"]
+    rp["mode"] = "curated"
+    rp["searxng_url"] = origin.base
+    rp["private_allowlist"] = origin.allowlist
+    rp["rate_limit_max"] = 10
+    pol = payload["policy"]
+    pol["access_profile"] = "curated"
+    pol["capabilities"]["tools"] = [*pol["capabilities"]["tools"], "research.fetch"]
+    result = await _run_online(engine, payload)
+    assert result.state == "active"
+
+    question_id = await _seed_question(scratch_url, "Каково энергопотребление процессора?")
+
+    gateway = LLMMiddleware(
+        LLMGatewayConfig(
+            base_url=fake_llm.base_url, model="fake-thinker", max_retries=2, retry_base_delay=0.01
+        )
+    )
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    service = ResearchProxyService(factory, store)
+    orch = Orchestrator(
+        session_factory=factory,
+        gateway=gateway,
+        profile=ModelProfile(model_alias="fake-thinker"),
+        executor=StubToolExecutor(tmp_path / "ws"),
+        research_service=service,
+    )
+    fake_llm.script(
+        [
+            {
+                "content": {
+                    "public_rationale": "Найти источник",
+                    "decision": {
+                        "kind": "tool",
+                        "tool": "research.fetch",
+                        "arguments": {"url": f"{origin.base}/page"},
+                    },
+                }
+            },
+            {
+                "content": {
+                    "public_rationale": "Данные собраны",
+                    "decision": {"kind": "complete", "reason": "goal_reached"},
+                }
+            },
+            {
+                "content": {
+                    "summary": "Утверждение о процессоре",
+                    "claims": [
+                        {
+                            "statement": "Страница утверждает квадратичный рост энергопотребления",
+                            # the EVAL-3b mistake: the claim type does not
+                            # allow source_assertion support evidence
+                            "claim_type": "local_observation",
+                            "scope": {"url": f"{origin.base}/page"},
+                        }
+                    ],
+                    "evidence_links": [
+                        {"evidence_index": 0, "claim_index": 0, "relation": "supports"}
+                    ],
+                    "new_questions": [],
+                }
+            },
+        ]
+    )
+    try:
+        outcome = await orch.run_session(question_id)
+    finally:
+        await gateway.close()
+
+    # the session completes (exploration succeeded) — but without the claim
+    assert outcome.final_state is SessionState.SUCCEEDED
+
+    # 1) the proposal was rejected by the rules engine — audited with the
+    #    exact reason, before any staging op for it
+    audit_row = await _row(
+        scratch_url,
+        "SELECT payload->'curator_rejected_by_rules' FROM audit_events "
+        "WHERE type = :t AND payload->'curator_rejected_by_rules' IS NOT NULL "
+        "AND session_id = (SELECT id FROM sessions ORDER BY created_at DESC LIMIT 1)",
+        {"t": AuditEventType.SESSION_STATE_CHANGED.value},
+    )
+    assert audit_row is not None, "the rules rejection must be audited"
+    reasons = audit_row[0]
+    assert isinstance(reasons, list) and len(reasons) == 1
+    assert "local_observation" in reasons[0] and "source_assertion" in reasons[0]
+
+    # 2) the commit boundary applied nothing: no claim, no head, no
+    #    evidence — never a headless claim (the EVAL-3b poison)
+    assert await _count(scratch_url, "SELECT count(*) FROM claims") == 0
+    assert await _count(scratch_url, "SELECT count(*) FROM claim_assessment_heads") == 0
+    assert await _count(scratch_url, "SELECT count(*) FROM evidence") == 0
+    # no staging ops for the rejected proposal survived
+    assert await _count(scratch_url, "SELECT count(*) FROM session_staging") == 0
+
+
 async def _seed_question(scratch_url: str, text_: str) -> Any:
     engine = create_async_engine(scratch_url)
     factory = async_sessionmaker(engine, expire_on_commit=False)
