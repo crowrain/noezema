@@ -272,6 +272,125 @@ async def test_memory_search_and_claim_reuse(migrated_db, fake_llm: FakeLLM, tmp
 
 
 @pytest.mark.asyncio
+async def test_cross_lingual_search_and_staging(migrated_db, fake_llm: FakeLLM, tmp_path: Path) -> None:
+    """ADR-0006 rev (T7.7, EVAL-3 precondition): the cross-lingual fix,
+    end-to-end through the orchestrator.
+
+    1. session 1 seeds a Russian claim WITH an English search_statements
+       rendering (the protocol now requires the model to provide it);
+    2. session 2's model searches in ENGLISH ("what is caching") — the
+       exact EVAL-2 failure — and memory.search returns the Russian
+       claim (the [c:<id>] line reaches the model);
+    3. the proposed claim's search_statements persist to the claims row.
+    """
+    scratch_url, _engine = migrated_db
+
+    CURATOR_EN: JsonDict = {
+        "summary": "О кэшировании",
+        "claims": [
+            {
+                "statement": "Кэширование — сохранение результатов вычислений для повторного использования.",
+                "claim_type": "external_fact",
+                "scope": {"topic": "caching"},
+                "search_statements": [
+                    "Caching is storing computation results for reuse."
+                ],
+            }
+        ],
+        "evidence_links": [],
+        "new_questions": [],
+    }
+    # session 1: seed the claim (no tools → direct complete)
+    q1 = await _seed_question(scratch_url, "Что такое кэширование?")
+    fake_llm.script([
+        {"content": COMPLETE},
+        {"content": CURATOR_EN},
+    ])
+    orch1, gateway1, engine1 = _make_orchestrator(scratch_url, fake_llm, tmp_path / "ws1")
+    try:
+        outcome1 = await orch1.run_session(q1)
+    finally:
+        await gateway1.close()
+        await engine1.dispose()
+    assert outcome1.final_state is SessionState.SUCCEEDED
+
+    row = await _scalar(
+        scratch_url,
+        "SELECT id, search_statements FROM claims WHERE statement LIKE 'Кэширование%' "
+        "AND claim_type = 'external_fact'",
+        {},
+    )
+    assert row is not None, "session 1 claim missing"
+    claim1_id, stored_search = str(row[0]), row[1]
+    # the model-provided EN renderings were persisted (search index only)
+    assert list(stored_search) == ["Caching is storing computation results for reuse."]
+
+    # session 2: the related question phrased in ENGLISH; the model
+    # searches in English and must find the Russian claim
+    q2 = await _seed_question(scratch_url, "What is caching?")
+    TOOL_SEARCH_EN: JsonDict = {
+        "public_rationale": "Search memory for caching",
+        "expected_information": "Existing claims about caching",
+        "decision": {
+            "kind": "tool",
+            "tool": "memory.search",
+            "arguments": {"query": "what is caching"},
+        },
+    }
+    CURATOR_REUSE_EN: JsonDict = {
+        "summary": "Проверка: кэширование",
+        "claims": [
+            {
+                "statement": "Кэширование уменьшает время отклика повторными запросами.",
+                "claim_type": "external_fact",
+                "scope": {"topic": "caching"},
+                "search_statements": [
+                    "Caching reduces response time on repeated requests."
+                ],
+                "dependencies": [{"claim_id": claim1_id}],
+            }
+        ],
+        "evidence_links": [],
+        "new_questions": [],
+    }
+    fake_llm.script([
+        {"content": TOOL_SEARCH_EN},
+        {"content": COMPLETE},
+        {"content": CURATOR_REUSE_EN},
+    ])
+    orch2, gateway2, engine2 = _make_orchestrator(scratch_url, fake_llm, tmp_path / "ws2")
+    try:
+        outcome2 = await orch2.run_session(q2)
+    finally:
+        await gateway2.close()
+        await engine2.dispose()
+    assert outcome2.final_state is SessionState.SUCCEEDED
+
+    # the ENGLISH query returned the Russian claim to the model: the
+    # prompt right after the search step carries the observation
+    # ("-> N claims" + the [c:<id>] line) — find it among the requests
+    # (FakeLLM is per-test, so the log covers both sessions)
+    reqs = fake_llm.requests()
+    hit = [
+        r for r in reqs
+        if re.search(r"memory\.search\([^)]*\) -> \d+ claims", str(r.get("last_user", "")))
+    ]
+    assert hit, "memory.search (EN query) returned no claims to the model"
+    assert f"[c:{claim1_id}]" in str(hit[0].get("last_user", "")), (
+        "the Russian claim's [c:<id>] line never reached the model on the EN query"
+    )
+
+    # and the new claim's search_statements persisted too
+    row2 = await _scalar(
+        scratch_url,
+        "SELECT search_statements FROM claims WHERE statement LIKE 'Кэширование уменьшает%'",
+        {},
+    )
+    assert row2 is not None
+    assert list(row2[0]) == ["Caching reduces response time on repeated requests."]
+
+
+@pytest.mark.asyncio
 async def test_slow_llm_does_not_lose_commit_lease(migrated_db, fake_llm: FakeLLM, tmp_path: Path) -> None:
     """T3.30 regression (first real MVP session, qwen36-35b-a3b-q6-mtp):
 

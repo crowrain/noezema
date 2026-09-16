@@ -1858,3 +1858,22 @@ gates + blind sample + overall outcome). Tag: `noezema-m7`.
    (network=none), правила external/temporal требуют ≥2
    source_assertion из ≥2 доменов + grade E3; в ходе серии нужен
    цикл `hostctl reassessment-tick`.
+
+10. **Кросс-язычный поиск (ADR-0006 rev, T7.7) — реализован.**
+    Миграция `0021_search_statements`: `claims.search_statements`
+    (jsonb, [] — англоязычные отображения statement, ТОЛЬКО индекс
+    поиска; текст знания не меняется). `ClaimProposal.search_statements`
+    (1–2, ≤300 символов) + валидация; apply — host-trusted
+    (strip/trim/list-of-str); retrieval — `GREATEST(ts_rank(russian,
+    statement), ts_rank(english, search_statements))` — запрос на
+    любом из языков матчит тот же claim. Протокол: «ищи на языке
+    вопроса и/или языка claims; для каждого claim заполни
+    search_statements». Ловушка (зафиксирована в коде): `ts_rank`
+    возвращает ~1e-20, а не 0, для несовпавшего/частичного-AND
+    tsquery — SQL-фильтр `> 0` не фильтрует, реальный порог —
+    `MIN_RELEVANCE` в Python (частичный-AND = no match, семантика
+    не менялась). Тесты: unit — EN-запрос находит RU-claim через
+    search_statements, RU-запрос работает, без отображения
+    кросс-язык не матчит; scenario — end-to-end через оркестратор
+    (seed RU+EN → EN memory.search → [c:<id>] в контексте модели →
+    search_statements персистятся). 691 tests.

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import uuid
 from typing import Any
 
@@ -43,6 +44,7 @@ async def _make_claim(
     epistemic: str | None,
     grade: str | None,
     confidence: float | None,
+    search_statements: list[str] | None = None,
 ) -> uuid.UUID:
     """Insert a claim + head (+assessment when current). Returns claim_id."""
     factory = async_sessionmaker(engine, expire_on_commit=False)
@@ -50,10 +52,11 @@ async def _make_claim(
     async with factory() as db, db.begin():
         await db.execute(
             text(
-                "INSERT INTO claims (id, statement, claim_type, freshness_status) "
-                "VALUES (:id, :st, 'computed_result', 'fresh')"
+                "INSERT INTO claims (id, statement, search_statements, claim_type, "
+                "freshness_status) "
+                "VALUES (:id, :st, :ss, 'computed_result', 'fresh')"
             ),
-            {"id": cid, "st": statement},
+            {"id": cid, "st": statement, "ss": json.dumps(search_statements or [])},
         )
         assessment_id = None
         if state == "current":
@@ -190,3 +193,56 @@ async def test_epistemic_status_reflected(migrated_db: Any) -> None:
     async with factory() as db:
         res = await retrieve(db, "6*7 оспариваемое", snapshot_id=snap)
     assert res.current[0].epistemic_status is EpistemicStatus.DISPUTED
+
+
+# ── cross-lingual search (ADR-0006 rev, T7.7) ────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_retrieval_english_query_finds_russian_claim(
+    migrated_db: Any,
+) -> None:
+    """A Russian claim with an English search_statements rendering is
+    found by an ENGLISH query — the exact EVAL-2 failure
+    («caching» vs «кэширование» matched nothing)."""
+    _url, engine = migrated_db
+    snap = await _snapshot_id(engine)
+    await _make_claim(
+        engine, snap,
+        statement="Кэширование — сохранение результатов вычислений для повторного использования.",
+        state="current", epistemic="supported", grade="E2", confidence=0.55,
+        search_statements=[
+            "Caching is storing computation results for reuse."
+        ],
+    )
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with factory() as db:
+        en = await retrieve(db, "what is caching", snapshot_id=snap)
+        ru = await retrieve(db, "кэширование", snapshot_id=snap)
+    # the cross-lingual hit (the requirement under test)
+    assert len(en.current) == 1
+    assert en.current[0].statement.startswith("Кэширование")
+    # and the native language still works (single-lexeme full match;
+    # partial-AND matches rank ~1e-20 = no match, pre-existing FTS
+    # semantics, unchanged by the cross-lingual index)
+    assert len(ru.current) == 1
+    assert ru.current[0].statement.startswith("Кэширование")
+
+
+@pytest.mark.asyncio
+async def test_retrieval_foreign_query_without_rendering_still_empty(
+    migrated_db: Any,
+) -> None:
+    """A claim WITHOUT search_statements is not matched by a foreign-
+    language query (no phantom cross-lingual hits)."""
+    _url, engine = migrated_db
+    snap = await _snapshot_id(engine)
+    await _make_claim(
+        engine, snap,
+        statement="Кэширование — сохранение результатов для повторного использования.",
+        state="current", epistemic="supported", grade="E2", confidence=0.55,
+    )
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with factory() as db:
+        res = await retrieve(db, "what is caching", snapshot_id=snap)
+    assert res.current == []

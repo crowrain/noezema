@@ -252,6 +252,14 @@ class MemoryService:
             as_of_raw = payload.get("as_of")
             deps = payload.get("dependencies")
             deps_list: list[Any] = list(deps) if isinstance(deps, list) else []
+            # cross-lingual search index (ADR-0006 rev): host-trusted —
+            # stripped, truncated, list-of-str only
+            raw_search = payload.get("search_statements")
+            search_statements: list[str] = []
+            if isinstance(raw_search, list):
+                search_statements = [
+                    str(s).strip()[:300] for s in raw_search if str(s).strip()
+                ][:2]
             existing_claim = (
                 (
                     await db.execute(
@@ -272,6 +280,7 @@ class MemoryService:
                 claim = ORMClaim(
                     id=uuid.uuid4(),
                     statement=statement,
+                    search_statements=search_statements,
                     claim_type=claim_type,
                     as_of=datetime.fromisoformat(as_of_raw) if as_of_raw else None,
                     observed_at=now,

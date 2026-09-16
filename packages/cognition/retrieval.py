@@ -138,20 +138,41 @@ async def retrieve(
     candidate), ranked by ``ts_rank`` + significance; the strict
     all-words AND of ``plainto_tsquery`` would drop near-misses.
     """
+    # Cross-lingual ranking (ADR-0006 rev): ``statement`` is indexed
+    # with the ``russian`` config, ``search_statements`` (the
+    # model-provided English renderings) with ``english``; a query in
+    # either language matches (plainto_tsquery yields an empty tsquery
+    # for a foreign-language query → ts_rank 0 → GREATEST picks the
+    # language that actually matched).
     query = text(
         """
         SELECT c.id, c.statement, c.claim_type, c.freshness_status,
                h.assessment_state, h.epistemic_status,
                a.effective_grade, a.confidence,
-               ts_rank(to_tsvector('russian', c.statement),
-                       plainto_tsquery('russian', :q)) AS relevance
+               GREATEST(
+                 ts_rank(to_tsvector('russian', c.statement),
+                         plainto_tsquery('russian', :q)),
+                 ts_rank(to_tsvector('english',
+                         coalesce((SELECT string_agg(s, ' ')
+                                   FROM jsonb_array_elements_text(
+                                     coalesce(c.search_statements, '[]'::jsonb)) s),
+                                   '')),
+                         plainto_tsquery('english', :q))
+               ) AS relevance
         FROM claims c
         JOIN claim_assessment_heads h
           ON h.claim_id = c.id
          AND h.config_snapshot_id = :snap
         LEFT JOIN claim_assessments a ON a.id = h.current_assessment_id
-        WHERE ts_rank(to_tsvector('russian', c.statement),
-                      plainto_tsquery('russian', :q)) > 0
+        WHERE GREATEST(
+                ts_rank(to_tsvector('russian', c.statement),
+                        plainto_tsquery('russian', :q)),
+                ts_rank(to_tsvector('english',
+                        coalesce((SELECT string_agg(s, ' ')
+                                  FROM jsonb_array_elements_text(
+                                    coalesce(c.search_statements, '[]'::jsonb)) s),
+                                  '')),
+                        plainto_tsquery('english', :q))) > 0
         ORDER BY relevance DESC
         LIMIT :limit
         """
@@ -170,6 +191,11 @@ async def retrieve(
 
     current: list[RetrievedClaim] = []
     pending_invalid: list[RetrievedClaim] = []
+    # MIN_RELEVANCE is the noise floor: ts_rank returns ~1e-20 (not 0)
+    # for a non-matching / partial-AND tsquery, so the SQL `> 0` filter
+    # never actually filters — this floor is the real match/no-match
+    # boundary (a full query match ranks ≥ ~1e-2, partial AND matches
+    # rank ~1e-20 = no match by design, pre-existing semantics).
     for row in all_rows:
         if float(row["relevance"]) < MIN_RELEVANCE:
             continue  # float-noise "match" = no match
