@@ -47,8 +47,8 @@ BOOTSTRAP_PAYLOAD: dict[str, Any] = {
     },
     "embeddings": {"enabled": False, "dimensions": None},
     "prompts": {
-        "explorer": {"version": "explorer-v2", "path": "prompts/explorer.md"},
-        "curator": {"version": "curator-v2", "path": "prompts/curator.md"},
+        "explorer": {"version": "explorer-v3", "path": "prompts/explorer.md"},
+        "curator": {"version": "curator-v3", "path": "prompts/curator.md"},
         # T5.2 (stage 4): the planner role (multi-step planning)
         "planner": {"version": "planner-v1", "path": "prompts/planner.md"},
         # T5.3 (stage 4): the verifier role (deterministic checks;
