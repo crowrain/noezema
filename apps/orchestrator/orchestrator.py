@@ -862,6 +862,11 @@ class Orchestrator:
             },
             public_summary=f"research content read into context (fenced): {nsha[:12]}",
         )
+        # the durable source reference rides in the observation data —
+        # observation_to_evidence maps it to a source_assertion record
+        # (EVAL-3 precondition, ADR-0006 rev); without it the evidence
+        # has no provenance and the source-independence groups are
+        # untracked
         return Observation(
             tool="research.fetch",
             ok=True,
@@ -870,6 +875,10 @@ class Orchestrator:
                 "mode": envelope.get("mode"),
                 "fenced": True,
                 "content": fenced,
+                "source_id": str(envelope.get("source_id") or ""),
+                "original_sha256": str(envelope.get("original_sha256") or ""),
+                "normalized_sha256": nsha,
+                "chunk_id": "chunk-0",
             },
         )
 

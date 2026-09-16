@@ -141,9 +141,10 @@ async def retrieve(
     # Cross-lingual ranking (ADR-0006 rev): ``statement`` is indexed
     # with the ``russian`` config, ``search_statements`` (the
     # model-provided English renderings) with ``english``; a query in
-    # either language matches (plainto_tsquery yields an empty tsquery
-    # for a foreign-language query → ts_rank 0 → GREATEST picks the
-    # language that actually matched).
+    # either language matches — the non-matching language ranks ~1e-20
+    # (ts_rank's no-match epsilon, NOT 0), which the Python-side
+    # MIN_RELEVANCE floor filters, so GREATEST simply picks the language
+    # that actually matched.
     query = text(
         """
         SELECT c.id, c.statement, c.claim_type, c.freshness_status,

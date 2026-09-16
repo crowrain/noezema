@@ -22,3 +22,8 @@ class EvidenceRecord(BaseModel):
     identity_hash: str = Field(min_length=16, max_length=128)
     payload: JsonDict = Field(default_factory=dict)
     note: str | None = Field(default=None, max_length=500)
+    # provenance link to a durable source row (source_assertion /
+    # quote_integrity only): the source the assertion was read from
+    source_id: str | None = Field(default=None, min_length=36, max_length=36)
+    # the chunk of that source the assertion covers (e.g. "chunk-0")
+    chunk_id: str | None = Field(default=None, max_length=100)

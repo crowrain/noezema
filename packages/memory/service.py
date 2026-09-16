@@ -54,6 +54,7 @@ from packages.memory.evidence import (
     observation_artifact_hash,
     rules_hash,
     session_environment_fields,
+    source_assertion_identity,
 )
 from packages.memory.rules_engine import (
     ClaimTypeRule,
@@ -476,6 +477,22 @@ class MemoryService:
                 ev: ORMEvidence = existing_ev
                 counters["deduped"] += 1
             else:
+                # source provenance (source_assertion / quote_integrity):
+                # the host-verified sources row the assertion was read
+                # from — drives the source-independence groups (§11.3)
+                rec_source_id: uuid.UUID | None = None
+                if kind in ("source_assertion", "quote_integrity"):
+                    raw_sid = getattr(record, "source_id", None)
+                    if raw_sid:
+                        try:
+                            rec_source_id = uuid.UUID(str(raw_sid))
+                        except ValueError:
+                            rec_source_id = None
+                    if rec_source_id is None:
+                        problems.append(
+                            f"evidence staging rejected: no source provenance for {kind} ({row.id})"
+                        )
+                        continue
                 ev = ORMEvidence(
                     id=uuid.uuid4(),
                     claim_id=claim.id,
@@ -483,6 +500,8 @@ class MemoryService:
                     evidence_kind=kind,
                     identity_hash=identity,
                     scope=claim_scopes.get(claim.id, {}),
+                    source_id=rec_source_id,
+                    chunk_id=getattr(record, "chunk_id", None),
                     observation_artifact_id=artifact_id,
                     environment_manifest_id=env.id
                     if kind in ("experiment_run", "local_observation")
@@ -541,7 +560,16 @@ class MemoryService:
         elif kind in ("local_observation", "experiment_run"):
             content = str(payload.get("content", payload.get("entries", "")))
             identity = local_observation_identity(content, env_hash)
-        else:  # source kinds are not produced by session tools in M3
+        elif kind in ("source_assertion", "quote_integrity"):
+            # §14.3: provenance identity over the ORIGINAL source content
+            # hash + chunk + kind — stable across re-fetches, independent
+            # of the (budget-truncated) context copy in the payload
+            identity = source_assertion_identity(
+                str(payload.get("original_sha256", "")),
+                str(payload.get("chunk_id", "chunk-0")),
+                kind,
+            )
+        else:
             identity = observation_artifact_hash(payload)
         return identity, artifact.id
 

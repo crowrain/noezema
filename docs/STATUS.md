@@ -1877,3 +1877,32 @@ gates + blind sample + overall outcome). Tag: `noezema-m7`.
     кросс-язык не матчит; scenario — end-to-end через оркестратор
     (seed RU+EN → EN memory.search → [c:<id>] в контексте модели →
     search_statements персистятся). 691 tests.
+
+11. **Путь research.fetch → source_assertion evidence (ADR-0006 rev,
+    T7.7) — реализован.** Было: `observation_to_evidence` для
+    research.fetch возвращала None — fetched-контент не мог стать
+    evidence (предрасположенное препятствие редких типов:
+    external/temporal E3 требует ≥2 source_assertion из ≥2
+    независимых source-групп). Стало: observation data несёт
+    `source_id/original_sha256/normalized_sha256/chunk_id`
+    (оркестратор `_research_fetch` — из envelope прокси; без них —
+    evidence не рождается, unprovenanced-контент в знание не
+    входит); адаптер строит `EvidenceRecord(kind=source_assertion,
+    identity_hash=source_assertion_identity(original_sha256,
+    chunk_id, kind), source_id, chunk_id)`; commit-граница
+    (`_identity_for`) пересчитывает тот же identity и требует
+    `source_id` (иначе problem + skip); ORMEvidence получает
+    `source_id`/`chunk_id` (колонки с миграции 0004) —
+    independence snapshot на оценке видит оба источника. Тесты:
+    scenario `tests/scenario/test_research_evidence.py` (2: полный
+    путь — два fetch из разных registrable domains (alpha.example /
+    beta.example) → staging → apply_claim_staging → claim E3
+    supported, 2 evidence rows с source provenance, 2 группы в
+    independence snapshot; отрицательный контроль — subdomain
+    (beta.alpha.example) = ОДНА registrable domain → одна группа →
+    НЕ E3 supported; сеть заменена FakeFetchClient c явным
+    URL→page map, остальное — реальный код: прокси-регистрация,
+    store, identity, independence, rules engine). Ловушка
+    (зафиксирована в тесте): `registrable_domain` = последние 2
+    label'а — 127.0.0.1:port и 127.0.0.1:port2 = ОДНА группа,
+    тестовые домены должны быть двухlabel'ными. 693 tests.
