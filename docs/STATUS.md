@@ -1731,3 +1731,107 @@ gates + blind sample + overall outcome). Tag: `noezema-m7`.
    (баг `sessions.started_at`: оркестратор теперь записывает якорь
    window; 48 строк run-а backfill'нуты из audit trail, config не
    менялась) — **ADR-0005**.
+
+5. **EVAL-2: доработка failed-гейта `significant_claim_reuse`
+   (решение пользователя: работа над reuse; редкие типы — после
+   EVAL-2).** Диагностика EVAL-1: (а) `memory.search` был
+   заглушкой (всегда `[]`, «lands in M3»), хотя модель искала
+   память 20 раз (Canberra, 1969, 404, Einstein…); (б) claims были
+   в контексте сессии только в 7 из 48 (FTS-совпадение слов на
+   разнородном корпусе низкое); (в) путь reuse существует
+   (`[c:<id>]` в контексте + `dependencies` в staging +
+   curator-промпт) — модель просто не получала результатов поиска.
+   Изменения:
+   - `memory.search` реализован по-настоящему (stub executor и
+     ToolBroker): тот же retrieval, что и context pack
+     (`packages/cognition/retrieval`, pointer equality §14.1,
+     FTS `russian`); результаты — строки `[c:<id>] …`; retrieval
+     прикован к snapshot сессии — `executor.snapshot_id`
+     задаётся ДО explorer-цикла (дефект, найденный до запуска:
+     шепот был только в phase 3, поиск в ходе exploration всегда
+     получал `None` и возвращал «пусто»). Результаты поиска —
+     наблюдения, НЕ evidence.
+   - Протокол (`_protocol_text`): правило переиспользования —
+     связанные существующие claims указывать в `dependencies`
+     предложенного claim.
+   - Тесты: `test_memory_search_and_claim_reuse`
+     (tests/scenario/test_orchestrator.py) — memory.search
+     возвращает claim в контекст модели (наблюдение
+     `-> N claims` со строкой `[c:<id>]`, не «пусто») и
+     dependency-edge коммитится (источник числителя гейта);
+     регрессия без phase-1 шепота падает.
+     `test_memory_search_without_db`
+     (tests/unit/test_stub_executor.py).
+
+6. **Заморозка конфигурации серии EVAL-2 (зафиксировано ДО
+   запуска).** Цель: A/B-сравнение с EVAL-1 — те же вопросы, та же
+   модель, те же пороги; изменился только путь reuse (реальный
+   `memory.search` + протокол). БД EVAL-1 (`noezema-eval`) не
+   тронута — она доказательная база ADR-0005; серия идёт в чистой
+   `noezema-eval2`.
+
+   | Параметр | Значение |
+   | --- | --- |
+   | модель | `qwen36-35b-a3b-q6-mtp` @ `http://192.168.1.48:8080/v1` (llama-swap) |
+   | LLM env | `NOEZEMA_LLM_MAX_OUTPUT_TOKENS=8192`, `NOEZEMA_LLM_TIMEOUT_SECONDS=600` |
+   | config snapshot | bootstrap (activation_mode='bootstrap', active head) |
+   | rules | `rules-v1` + rules_hash(snapshot.claim_type_rules) — фиксируются в run |
+   | пороги гейтов | без изменений (reuse ≥ 25%, MIN_SAMPLE 20, …) |
+   | SLO reassessment | **3600 с** (зафиксировано до серии) |
+   | blind seed / size | **20260915** / **50** (как в EVAL-1, для сопоставимости) |
+   | сессий | **50** |
+   | corpus | `docs/eval/question-set-v1.jsonl` (те же 50 вопросов, тот же sha256) |
+   | БД | `noezema-eval2` @ 127.0.0.1:54329 (alembic head `0020_evaluation`, чистая) |
+   | node owner / data root | `eval-node` / `/home/denis/dsh1/noezema-eval-data` |
+
+   Smoke-прогон (run `EVAL-2-SMOKE` `cf09b404…`, 1 сессия): pipeline
+   подтверждён (freeze → seed 50 → finish + gates). Сессия сорвалась
+   `LeaseLost` на 642-й секунде — load модели llama-swap'ом дольше
+   phase_deadline 600 с (известный риск §22.2, как сессии 32/38 в
+   EVAL-1; технические срывы так же учитывают, конфигурацию не
+   меняем — A/B-сравнимо с EVAL-1). Строк сессии/claims в БД нет
+   (phase-1 транзакция откатилась), БД чиста для серии: 50 seeded
+   вопросов, 0 sessions.
+
+7. **Инцидент перед серией EVAL-2 + фикс драйвера (2026-09-15
+   вечер).** Первая попытка серии (`EVAL-2` `6e4c8d40…`)
+   прервана: (а) сессии 1–2 сорвались `LeaseLost` (639/636 с) —
+   холодный load модели дольше phase_deadline 600 с; (б)
+   smoke-драйвер был запущен ПАРАЛЛЕЛЬНО с серией против той же
+   БД/owner (ошибка оператора — два драйвера одновременно
+   запрещены); (в) во время серии БД была дропнута и пересоздана
+   → сессии 6–50 завершились `no_question` (0 вопросов),
+   run-row утерян, `_finish` упал на `assert run is not None`.
+   Серия отбрасывается целиком, доказательства — в
+   `eval-run-2.log`. Фикс драйвера (`hostctl/cli.py`,
+   `_run_sessions`): после `LeaseLost` состояние пересчитывается
+   по строке сессии в БД — если сессия уже устойчиво
+   `succeeded|succeeded_partial` (guard-отказ обнаружен на
+   выходе из guard'а ПОСЛЕ успешного fenced commit), попытка
+   считается успешной, а не техническим срывом (§5.2.3: durable
+   row wins). Серия перезапускается на чистой БД, один драйвер,
+   модель уже загружена.
+
+8. **Серия EVAL-2 проведена, ADR-0006 (2026-09-16).** Run
+   `260571ef-cdf9-4f20-90a8-185699002a7b` (`noezema-eval2`,
+   23:27:39 → 03:59:24 UTC, ~4 ч 32 м): 50 попыток, 43 terminal
+   (25 succeeded / 18 succeeded_partial), 7 LeaseLost (технические
+   срывы, строк сессий нет), 41 claim (28 significant E2+), 240
+   model_runs. Исходы гейтов (A/B с EVAL-1): все те же, кроме
+   `significant_claim_reuse`: **1/28 = 3.6% < 25% — failed**
+   (EVAL-1: 1/29 = 3.4% failed); итог `outcome=failed`.
+   Разбор (ADR-0006): механизм reuse работает end-to-end (16
+   вызовов memory.search, 3 dependency-рёбра Q46→workspace-claim,
+   числитель формируется), но все 16 поисков вернули пусто
+   (cross-lingual: запросы EN против RU-claims; и нет связанных
+   claims), а корпус v1 не содержит тематического перекрытия
+   (near_duplicate = 0) — верхняя достижимая доля reuse ≈ 7–11%,
+   порог 25% недостижим на этом корпусе при любом механизме.
+   Решение ADR-0006: T7.7 «доработка reuse» выполнена; failed-гейт
+   — артефакт корпуса v1; закрытие — валидационная серия EVAL-3 на
+   корпусе v2 с гарантированным перекрытием (10–15 пачек по 3–5
+   вопросов); пороги §22.2 не меняются. Общий acceptance MVP
+   (§22.2: нет failed И нет insufficient) не пройден: failed —
+   reuse (путь закрытия — EVAL-3), insufficient — редкие типы
+   (external/temporal E3, due/stale, reassessment SLO) — отложены
+   решением пользователя.

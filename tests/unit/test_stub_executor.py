@@ -59,7 +59,8 @@ async def test_unknown_tool(tmp_path: Path) -> None:
 
 
 @pytest.mark.unit
-async def test_memory_search_stub(tmp_path: Path) -> None:
+async def test_memory_search_without_db(tmp_path: Path) -> None:
+    # T7.7 (EVAL-2): no db / no snapshot pin → empty, never an error
     ex = StubToolExecutor(tmp_path)
     obs = await ex.execute("memory.search", {"query": "x"})
     assert obs.ok and obs.data["results"] == []
