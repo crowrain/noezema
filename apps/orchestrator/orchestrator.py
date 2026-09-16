@@ -137,6 +137,20 @@ EXPLORER_CONTEXT_BUDGET = RESEARCH_CONTEXT_BUDGET + 8_000
 TOOL_REPEAT_DENY_LIMIT = 2
 
 
+def filter_offered_tools(base_tools: list[str], *, has_message: bool) -> list[str]:
+    """T7.13 (EVAL-3b P.6): the per-step tool list the explorer is shown.
+
+    ``message.reply`` answers an operator message by its id; with an empty
+    inbox there is nothing to answer, so the tool is dropped from the list
+    the model sees (in EVAL-3b the model kept calling it into the void).
+    With a message in the inbox the tool is offered again. The order of the
+    other tools is preserved.
+    """
+    if has_message or "message.reply" not in base_tools:
+        return base_tools
+    return [t for t in base_tools if t != "message.reply"]
+
+
 @dataclass(slots=True)
 class SessionContext:
     question_text: str
@@ -1109,7 +1123,7 @@ class Orchestrator:
         """Returns (steps_done, stop_requested, abort_requested)."""
         explorer = self.prompts[Role.EXPLORER]
         # only profile-allowed tools are in the model's schema (T2.6)
-        allowed_tools = sorted(cap_profile.tools)
+        base_tools = sorted(cap_profile.tools)
         steps = 0
         stop_requested = False
         abort_requested = False
@@ -1135,6 +1149,12 @@ class Orchestrator:
                 ctx.complete_reason = CompleteReason.OPERATOR_STOP.value
                 break
 
+            # T7.13 (EVAL-3b P.6): message.reply is offered only while the
+            # inbox has a message to reply to. An empty inbox makes the tool
+            # meaningless — and in EVAL-3b the model kept calling it and
+            # getting denied. With nothing to reply to, it is dropped from
+            # the per-step tool list the model is shown.
+            allowed_tools = filter_offered_tools(base_tools, has_message=bool(ctx.messages))
             user_ctx = self._explorer_context(ctx, allowed_tools, pack)
             fingerprint = build_model_fingerprint(
                 self.profile,
@@ -1586,9 +1606,12 @@ class Orchestrator:
 
         def render(observations: list[str]) -> str:
             parts: list[str] = []
+            # the tool list first: it is the authoritative, per-step-filtered
+            # list (T7.13: message.reply is dropped while the inbox is
+            # empty), so the model sees it before the context pack
+            parts.append(tools_str)
             if pack_str:
                 parts.append(pack_str)
-            parts.append(tools_str)
             if observations:
                 parts.append("# Наблюдения\n" + "\n".join(observations))
             if ev_str:
@@ -1634,7 +1657,12 @@ class Orchestrator:
             "предложенного claim заполни `search_statements` — 1–2 "
             "англоязычных варианта формулировки (только для поиска).\n\n"
             f"# Профиль\n{cap_profile.policy_version}\n"
-            f"Инструменты: {', '.join(sorted(cap_profile.tools))}\n"
+            # T7.13 (EVAL-3b P.6): the authoritative per-step tool list is
+            # the "# Доступные инструменты" block in the explorer context
+            # (it is filtered — e.g. message.reply is dropped while the
+            # inbox is empty). Listing the profile tools here too would
+            # contradict that filter, so the protocol carries only the
+            # version and network mode.
             f"Сеть: {cap_profile.network.value}"
         )
 

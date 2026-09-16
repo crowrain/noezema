@@ -17,6 +17,7 @@ from apps.orchestrator.orchestrator import (
     RESEARCH_CONTEXT_BUDGET,
     Orchestrator,
     SessionContext,
+    filter_offered_tools,
 )
 
 pytestmark = [pytest.mark.unit]
@@ -90,3 +91,21 @@ def test_empty_observations_still_offers_instruction() -> None:
     assert "Предложи ровно одно следующее действие (JSON по схеме)." in result
     assert "# Доступные инструменты" in result
     assert "research.fetch" in result
+
+
+def test_filter_offered_tools_drops_message_reply_without_message() -> None:
+    """T7.13 (EVAL-3b P.6): message.reply is dropped from the offered tool
+    list while the inbox has no message to reply to, and offered again once
+    a message arrives."""
+    base = ["message.reply", "memory.search", "workspace.read"]
+    # empty inbox: message.reply is dropped, the others keep their order
+    assert filter_offered_tools(base, has_message=False) == [
+        "memory.search",
+        "workspace.read",
+    ]
+    # non-empty inbox: message.reply is offered again (the full list)
+    assert filter_offered_tools(base, has_message=True) == base
+    # no message.reply in the base: the list is unchanged either way
+    plain = ["memory.search", "workspace.read"]
+    assert filter_offered_tools(plain, has_message=False) == plain
+    assert filter_offered_tools(plain, has_message=True) == plain
