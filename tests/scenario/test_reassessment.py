@@ -253,7 +253,10 @@ async def test_worker_promotes_head_to_current(migrated_db: tuple[str, AsyncEngi
     )
     assert head is not None
     assert head[0] is not None and head[1] == "supported" and head[2] == "reassessment_worker"
-    assert head[3] == "E2" and head[4] == "rules-v1" and head[5] is not None
+    # T7.17: the worker writes the CURRENT engine version (rules-v2);
+    # the seeded legacy scopes ({"x": 1}) are evaluated by the
+    # unchanged legacy predicate, so the grade is as before
+    assert head[3] == "E2" and head[4] == "rules-v2" and head[5] is not None
     assert head[6] == pytest.approx(0.55)
 
     # the assessment is linked to the evidence (support role)

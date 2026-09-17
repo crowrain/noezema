@@ -14,7 +14,7 @@
 | M4 зависимости + переоценка | ✅ T4.1 закрыт (claim_dependencies: DAG cycle check при commit, graph revision, kind `research` по §8.6); T4.2 закрыт (cascade invalidation: closure manifest, barrier с durable курсором, idempotent батчи, blocked-путь, retrieval ancestor check); T4.3 закрыт (worker `system:reassessment`: runnable-предикат §5.9.1, lease/retry/blocked, insufficient→invalid+question, crash-lease recovery); T4.4 закрыт (writer admission: table gate §14.1 NOWAIT + jitter, session intent rules 1/4/5, T_escalate/T_worker_admission в scheduler); T4.5 закрыт (online activation §8.7.2: fenced lease + takeover, shadow heads fast path/pending, seal + DB-триггер sealed-интервала, atomic flip, post-publish manifest с deterministic UUIDv5, repair runner + T_repair_admission); T4.6 закрыт (environment manifests §14 env-v2: content-addressed manifest_hash, versioned алгоритм env-independence-v1 — группы по (protocol, implementation, dataset lineage), отношения repeatability/reproducibility/independent_replication/variation/untracked, снапшот на оценке, `required_independence` в rules engine: E3 только через независимую репликацию); T4.7 закрыт (source graph §11.3: таблицы source_dependency_edges/source_graph_corrections, алгоритм independence-v2 — domain/content_hash/parent/edges/corrections, снапшот source_independence_* на оценке, каскад apply_source_graph_change: merge/split → invalidation + recompute, ревизия source_graph); T4.8 закрыт (counterevidence resolutions §8.7.4: таблица + XOR/partial-unique CHECK, межстрочные инварианты (counter-цель, scope-compat, нет транзитивной зависимости, valid correction), каскад create/invalidate → recompute, engine считает только unresolved counters); T4.9 закрыт (failpoints M4: crash после flip — pointer tuple recovery, crash между батчами post-publish — durable cursor, stale activator после takeover — fence-отказ, следующий flip закрывает blocked backlog, barrier crash после каждого батча, group merge + crash worker'а, worker без starvation после смерти intent-lease) — GATE M4 пройден (§19: invalid ancestor блокирует downstream; worker без starvation оба направления; group merge → корректный пересчёт) | — | пороги M4 из замеров серии 2026-09-14 зафиксированы в PLAN (батч 32, SLO P95 200 с); 501 тест |
 | M5 расширенный цикл | ✅ Gate M5 пройден (§19, этап 4): T5.1 закрыт (Curiosity ranking §5.3.1: score-формула, все входы [0,1] + similarity fingerprint, eligibility filter, ε-diversity (seed в audit), селектор config-driven) + T5.2 закрыт (planning §6.2: план как наблюдаемый артефакт, роль planner, закрытые assessment methods, метод ≠ перефраз, planning.mode config-driven) + T5.3 закрыт (роль verifier §3.7: организованные детерминированные проверки, **схема не несёт grade/confidence — assessment идентичен с verifier и без него (gate)**, verification.mode config-driven) + T5.4 закрыт (защита от повторов §9: перефраз + no-progress → цикл, закрытые стратегии §9, audit repeat_cycle_detected, repetition config-driven) + T5.5 закрыт (untrusted extraction §11.2: модель без инструментов, host-проверка дословности, raw-текст не покидает extractor, extraction config-driven) + T5.6 закрыт (long-run сценарии: накопление знания по FIFO-очереди, §9-цикл на накопленной истории, поздний контрпример → disputed E1 rules engine) | — | 651 тест |
 | M6 Research Proxy | ✅ Gate M6 пройден (§19, этап 5): T6.1 закрыт (research proxy: единственный egress, read-only, SSRF-guard private/loopback/link-local/metadata, редиректы/размер/время, удаление активного содержимого) + T6.2 закрыт (режимы Sealed=локальный индекс / Curated=SearXNG через прокси c upstream-логом и rate limits / Open Lab=закрытый список доменов, отдельный профиль) + T6.3 закрыт (provenance: original+normalized+hash, origin в sources/artifact_chunks, fenced-маркировка в контексте §11.2, research.fetch — единственный egress сессии) + T6.4 закрыт (injection/poisoning: capabilities неизменны, similarity→require_operator, poisoned artifact не самооценивается) | noezema-m6 (после gate) | см. раздел M6 ниже | 651 тест |
-| M7 полный веб + эксплуатация | ✅ Gate M7 пройден (T7.1 ✅ knowledge graph + provenance + diagnostics; T7.2 ✅ backup/PITR §15.3; T7.3 ✅ GC full root set; T7.4 ✅ security regression gate + §16 metrics; T7.5 ✅ evaluation run §22.2 mechanism; T7.6 ✅ ADR-0004) | noezema-m7 (на `2e1631c`) | см. раздел M7 ниже | |
+| M7 полный веб + эксплуатация | ✅ Gate M7 пройден (T7.1 ✅ knowledge graph + provenance + diagnostics; T7.2 ✅ backup/PITR §15.3; T7.3 ✅ GC full root set; T7.4 ✅ security regression gate + §16 metrics; T7.5 ✅ evaluation run §22.2 mechanism; T7.6 ✅ ADR-0004); после gate — дефекты EVAL-3b/EVAL-3: T7.7–T7.17 закрыты (T7.15 E2E-валидация, T7.16 assertion-окно, T7.17 хост-деривация scope, rules-v2, ADR-0007 — тесты test_scope.py / test_rules_engine.py / test_scope_coverage.py; детали в разделе M7) | noezema-m7 (на `2e1631c`) | см. раздел M7 ниже | 765 тест |
 
 ## Gate M2 (§19, этап 2) — пройден (noezema-m2)
 
@@ -74,7 +74,7 @@
 > профиле (computed_result), корпуса EVAL-1/EVAL-2 не содержали URL-вопросов.
 > MVP-приёмка (§22.2 `external_temporal_e3`) и gate M3 опираются на этот
 > путь; первая реальная попытка (EVAL-3b) показала дефекты самого пути —
-> `docs/eval/EVAL-3b-postmortem.md`, задачи T7.8–T7.15.
+> `docs/eval/EVAL-3b-postmortem.md`, задачи T7.8–T7.17.
 
 ## Матрица §22.2 (познавательная оценка)
 
@@ -2403,7 +2403,8 @@ fingerprint отражал новые промпты.
 
  Тест: `tests/unit/test_assertion_window.py` (12) — ОБЯЗАТЕЛЬНЫЙ тест на
  реальной сохранённой странице: en.wikipedia.org/wiki/European_Union
- (артефакт EVAL-3b, `eval3b-data/artifacts`, sha256 файла == имя файла) —
+ (фикстура репозитория `tests/fixtures/artifacts`, sha256 файла == имя
+  файла; см. пометку T7.17 ниже) —
  факт за 6000-м символом, фрагмент несёт «27 member(s)» и не стартует с
  ведущего префикса; + остальные 6 страниц корпуса (europa.eu 1996,
  cbr.ru 2511, consultant.ru 4588, un.org, python.org 1346,
@@ -2418,3 +2419,103 @@ fingerprint отражал новые промпты.
  un.org ~1009 ✓, python.org 1346 ✓, chocolatey 29 ✓). Корпус/конфиг/пороги
  §22.2 не тронуты (хэши прежние); EVAL-3 не запускался, перезапуск не
  планируется (до решения пользователя).
+
+### T7.17 — устойчивый scope: оценка по хост-деривации, rules-v2 (EVAL-3/T7.15, §3.7, §8.7, §11.2)
+
+ Дефект (T7.15, одна из двух причин нулевых external/temporal claims в
+ EVAL-3b): `requires_scope` проверялся key-by-key по free-form dict'ам,
+ которые модель придумывала РАЗДЕЛЬНО для claim и evidence — разные
+ ключи под один предмет и дату («регион» vs «область», «на дату» vs
+ «as_of») → `scope_not_covered` → E1. E3 в T7.15 получился только потому,
+ что вопрос диктовал scope-объект дословно — подсказка, которой нет в
+ замороженном корпусе v2 (и которую добавлять нельзя: гейт
+ `external_temporal_e3` выполнялся бы по построению). Суть против §3.7/
+ §11.2: входы, влияющие на grade, производила модель.
+
+ Решение (вариант 1 задачи — scope выводит доверенный хост; ADR-0007,
+ семантика покрытия изменилась → ADR обязателен):
+
+ - **claim scope** — из ВОПРОСА сессии + типизированного `as_of`
+   claim: опорная дата (детерминированный закрытый набор форм: русские/
+   английские месяцы, `д.м.гггг`, ISO; левейшее валидное совпадение;
+   «на текущую дату» → без даты) и registrable domains источников,
+   названных вопросом (гранулярность §11.3). Дата вопроса первична —
+   модельный `as_of` не может сдвинуть опорную дату (due/stale-механика
+   §22.2 не управляется моделью).
+ - **evidence scope** — из PROVENANCE: registrable domain
+   `sources.canonical_uri` + `sources.retrieved_at` (для не-source
+   evidence — commit time). При переиспользовании claim все строки
+   evidence (включая созданные rules-v1) ре-деривируются из provenance
+   в той же tx commit'а (идемпотентно; identity/dedupe не меняются —
+   scope не входит в identity_hash).
+ - **покрытие** (fail-closed): evidence должен быть НАБЛЮДЁН не раньше
+   опорной даты D (`T >= D`; источник, полученный раньше D, не говорит
+   о D — конвенция корпуса «по состоянию на D» по стабильным фактам) и
+   его домен обязан быть среди названных вопросом. Не объявленное
+   измерение не проверяется; отсутствие времени/домена при объявленном
+   измерении — НЕ покрывает.
+ - **legacy-scope** (без маркера `host-scope-v1`) — исходный key-by-key
+   предикат без изменений: апгрейд не переоценивает существующее знание
+   ни в одну сторону; канонический claim scope не покрывается legacy
+   evidence scope.
+ - **не входит в деривацию план сессии** (`sessions.plan`): это
+   предложение модели — его URLs расширили бы scope, который нужно
+   покрывать (модель влияла бы на grade-вход, §3.7/§11.2). Вопрос —
+   единственный scope-якорь.
+ - версия движка `rules-v1` → `rules-v2` (assessment фиксирует версию;
+   пороги §22.2, правила типов, `requires_scope`, правило E3 — два
+   независимых источника / минимум два source_assertion — не менялись);
+   модельный free-form scope остаётся в staging payload и audit
+   (`claim_created`: `scope` = модель, `assessed_scope` = хост).
+
+ Код: `packages/memory/scope.py` (чистый модуль: парсер даты вопроса,
+ извлечение URL, деривация claim/evidence scope, предикат покрытия с
+ диспетчеризацией canonical/legacy; AGENTS.md §4 — без заглушек и без
+ изменения публичного контракта rules engine: `evaluate`/
+ `AssessmentResult` прежние), `packages/memory/rules_engine.py` +
+ `packages/memory/evidence.py` (rules-v2), `packages/memory/service.py`
+ (claim scope из вопроса при commit, evidence scope из provenance,
+ ре-деривация всех строк claim'а, `_derive_evidence_scope`).
+
+ Тесты:
+ - `tests/unit/test_scope.py` (24) — формы парсера (корпусные,
+   «текущую дату», невалидные календарные, leftmost-wins), URL,
+   деривация (дата вопроса > модельный as_of; naive as_of; домены),
+   матрица покрытия: тот же предмет и дата → покрывает; другой домен /
+   retrieved раньше D / отсутствие времени-домена → НЕ покрывает
+   (fail-closed); legacy — исходный предикат (дефектный pair
+   «регион»/«область» не совпадал и не совпадает — без переоценки
+   legacy-знания); канонический claim + legacy evidence → НЕ покрывает.
+ - `tests/unit/test_rules_engine.py` (+4) — через `evaluate`: хост-
+   scope с тем же предметом и датой → E3 supported (требование 1);
+   источник не из вопроса → E1 hypothesis `scope_not_covered`;
+   retrieved раньше D → E1 `scope_not_covered` (требование 2,
+   fail-closed: grade не поднимается); модельные free-form ключи в
+   предикат не входят. Существенные legacy-тесты файла проходят без
+   изменений (диспетчеризация).
+ - `tests/scenario/test_scope_coverage.py` (4, полный путь
+   fetch → staging → commit → assessment на postgres): (1) вопрос с
+   датой и двумя источниками, кураторский scope free-form с
+   разнопрописанными ключами → E3 supported, head current,
+   assessed_scope/evidence.scope канонические, модельный dict в
+   audit; (2a) evidence из источника, НЕ названного вопросом (другой
+   subject; independence при этом выполняется — E1 только из-за
+   scope) → E1 `scope_not_covered`; (2b) оба источника названы, но
+   retrieved раньше опорной даты (другая дата) → E1
+   `scope_not_covered`; (3) ПОЛНАЯ сессия на fake LLM через
+   orchestrator (curated-профиль, research.fetch по двум
+   registrable-доменам, куратор вернул произвольный free-form scope) →
+   head current, supported, E3, два независимых source.
+
+ Задача 1 (фикстуры `tests/fixtures/artifacts`): тест
+   `test_assertion_window.py` больше не зашит на
+   `/home/denis/dsh1/eval3b-data/artifacts` — страницы в репозитории
+   (`tests/fixtures/artifacts/<sha2[:2]>/<sha256>`, sha256 файла == имя
+   файла), EU-фрагмент 20 000 символов (оффсеты факта 6682/8378
+   сохранены, «27» за 6000-м, в первых 2000 нет), 4 страницы корпуса
+   дословно; пропуск при отсутствии файла НЕ вводился (тест обязателен).
+   Источник (`noezema-eval3b`) не изменялся — только копия.
+
+ Корпус v2, конфиги v2/v3 и пороги §22.2 не тронуты (хэши прежние);
+ EVAL-3 не запускался и не планируется (решение за пользователем).
+ Прогон: 765 тестов (база 733 + 32 новых).

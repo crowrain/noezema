@@ -39,7 +39,9 @@ from packages.domain.models.memory import (
     ORMClaimDependency,
     ORMEnvironmentManifest,
     ORMEvidence,
+    ORMSource,
 )
+from packages.domain.models.questions import ORMQuestion
 from packages.domain.models.sessions import ORMSession
 from packages.domain.services.audit import AuditService
 from packages.memory.env_independence import (
@@ -56,6 +58,7 @@ from packages.memory.evidence import (
     session_environment_fields,
     source_assertion_identity,
 )
+from packages.memory.independence import registrable_domain
 from packages.memory.rules_engine import (
     ClaimTypeRule,
     EvaluatedEvidence,
@@ -63,6 +66,7 @@ from packages.memory.rules_engine import (
     evaluate,
     reverify_after,
 )
+from packages.memory.scope import derive_claim_scope, derive_evidence_scope
 from packages.memory.source_graph import build_source_independence_snapshot
 
 GLOBAL_SCOPE = "global"
@@ -279,6 +283,18 @@ class MemoryService:
         problems: list[str] = []
         counters = {"created": 0, "reused": 0, "added": 0, "deduped": 0, "assessments": 0}
 
+        # T7.17 (§3.7, §11.2): the question the session answers is the
+        # trusted scope anchor (host input). The model's free-form
+        # scope proposal is audited but can neither satisfy nor fail
+        # coverage: the claim scope is derived from the question and
+        # the claim's typed as_of, each evidence scope from its
+        # provenance (see packages.memory.scope)
+        question_text: str | None = None
+        if session.question_id is not None:
+            question_row = await db.get(ORMQuestion, session.question_id)
+            if question_row is not None:
+                question_text = question_row.text
+
         # §8.7.3 (T4.6): the FULL §14 environment manifest — content-
         # addressed over the field set. The protocol is the session's
         # prompt set (the effective config's prompts section); the seed
@@ -306,7 +322,9 @@ class MemoryService:
             if not statement or claim_type not in self._rules:
                 problems.append(f"claim staging rejected: bad statement/type ({row.id})")
                 continue
-            scope = dict(payload.get("scope") or {})
+            # T7.17: the model's free-form scope proposal (untrusted;
+            # audit/staging only) vs the host-derived assessed scope
+            model_scope = dict(payload.get("scope") or {})
             as_of_raw = payload.get("as_of")
             deps = payload.get("dependencies")
             deps_list: list[Any] = list(deps) if isinstance(deps, list) else []
@@ -345,7 +363,9 @@ class MemoryService:
             )
             if existing_claim is not None:
                 claims.append(existing_claim)
-                claim_scopes[existing_claim.id] = scope
+                claim_scopes[existing_claim.id] = derive_claim_scope(
+                    question=question_text, as_of=existing_claim.as_of
+                )
                 counters["reused"] += 1
                 claim_deps.append((existing_claim, deps_list))
             else:
@@ -361,7 +381,9 @@ class MemoryService:
                 db.add(claim)
                 await db.flush()
                 claims.append(claim)
-                claim_scopes[claim.id] = scope
+                claim_scopes[claim.id] = derive_claim_scope(
+                    question=question_text, as_of=claim.as_of
+                )
                 counters["created"] += 1
                 claim_deps.append((claim, deps_list))
                 await audit.record(
@@ -371,7 +393,11 @@ class MemoryService:
                         "claim_id": str(claim.id),
                         "claim_type": claim_type,
                         "statement": statement[:500],
-                        "scope": scope,
+                        # T7.17: "scope" is the model's free-form
+                        # proposal (untrusted); "assessed_scope" is the
+                        # host-derived scope the rules engine checks
+                        "scope": model_scope,
+                        "assessed_scope": claim_scopes[claim.id],
                     },
                     public_summary=f"claim: {statement[:120]}",
                 )
@@ -570,7 +596,12 @@ class MemoryService:
                     relation=relation,
                     evidence_kind=kind,
                     identity_hash=identity,
-                    scope=claim_scopes.get(claim.id, {}),
+                    # T7.17: the evidence scope is derived by the host
+                    # from the row's provenance, not copied from the
+                    # claim's (model) scope
+                    scope=await self._derive_evidence_scope(
+                        db, source_id=rec_source_id, fallback_at=now
+                    ),
                     source_id=rec_source_id,
                     chunk_id=getattr(record, "chunk_id", None),
                     observation_artifact_id=artifact_id,
@@ -593,6 +624,21 @@ class MemoryService:
                 .scalars()
                 .all()
             )
+            # T7.17: the scope of EVERY evidence row of the claim is a
+            # function of its durable provenance, recomputed by the
+            # trusted host (idempotent): rows created under the old
+            # engine (the model's free-form scope, copied from the
+            # then-claim) are re-scoped from the sources row in place —
+            # coverage must not depend on which keys the model once
+            # invented for the same subject and date
+            for ev_row in all_evidence:
+                expected = await self._derive_evidence_scope(
+                    db,
+                    source_id=ev_row.source_id,
+                    fallback_at=ev_row.created_at or now,
+                )
+                if dict(ev_row.scope or {}) != expected:
+                    ev_row.scope = expected
             try:
                 ok = await self._assess(
                     db, audit, session, claim, claim_scopes.get(claim.id, {}), all_evidence, now
@@ -713,6 +759,31 @@ class MemoryService:
         db.add(env)
         await db.flush()
         return env
+
+    async def _derive_evidence_scope(
+        self,
+        db: AsyncSession,
+        *,
+        source_id: uuid.UUID | None,
+        fallback_at: datetime,
+    ) -> JsonDict:
+        """T7.17 (§3.7, §11.2): the host-derived scope of one evidence
+        row from its durable provenance — the registrable domain and
+        the retrieval time of the ``sources`` row (source-based
+        evidence), or the observation time (fallback) for the rest.
+        The model never writes this dict: its free-form scope stays in
+        the staging payload and the audit."""
+        source_domain: str | None = None
+        observed_at: datetime | None = None
+        if source_id is not None:
+            src = await db.get(ORMSource, source_id)
+            if src is not None:
+                if src.canonical_uri:
+                    source_domain = registrable_domain(src.canonical_uri)
+                observed_at = src.retrieved_at
+        if observed_at is None:
+            observed_at = fallback_at
+        return derive_evidence_scope(source_domain=source_domain, observed_at=observed_at)
 
     async def _assess(
         self,

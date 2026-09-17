@@ -24,7 +24,11 @@ from typing import Any
 from packages.domain.canonical import canonical_sha256
 from packages.domain.models.base import JsonDict
 
-RULES_ENGINE_VERSION = "rules-v1"
+#: T7.17: the scope-coverage predicate became host-derived (see
+#: packages.memory.scope) — the assessment records the engine version
+#: so v1 (model-key coverage) and v2 (host-derived coverage) results
+#: stay distinguishable
+RULES_ENGINE_VERSION = "rules-v2"
 URI_NORMALIZER_VERSION = "uri-normalizer-v1"
 INDEPENDENCE_ALGORITHM_VERSION = "independence-v1"
 #: T4.7 (§11.3): the full source-graph algorithm (parent sources,

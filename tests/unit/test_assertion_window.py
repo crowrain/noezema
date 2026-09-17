@@ -12,6 +12,16 @@ uses (select_assertion_window over the stored artifact text) on a saved
 EVAL-3b page where the fact lies past char 6000 — en.wikipedia.org
 /wiki/European_Union (the "27" member-state fact is at offset 6682 of
 the normalized text).
+
+The page lives in the repository as a test fixture
+(``tests/fixtures/artifacts``, content-addressed: sha256 of the file ==
+the file name) so the required test runs on every machine (CI included)
+without the host's ``eval3b-data`` artifact store. The EU fixture is a
+20 000-char FRAGMENT (leading prefix) of the full EVAL-3b artifact
+``c98cc08e...``: the measured fact offsets (6682 infobox, 8378 lead)
+are preserved, the "27" figure stays beyond char 6000, and the leading
+2 000-char prefix (navigation + TOC) carries no "27" — the test's
+preconditions are identical to the full page's.
 """
 
 from __future__ import annotations
@@ -25,12 +35,15 @@ from apps.orchestrator.assertion_window import (
     select_assertion_window,
 )
 
-# the EVAL-3b corpus page where the fact lies past char 6000 (the test
+# the saved EVAL-3b page where the fact lies past char 6000 (the test
 # is REQUIRED to run on this real saved page, not a synthetic string):
 # en.wikipedia.org/wiki/European_Union, the "27" member-state fact at
-# offset 6682 of the normalized text
-EU_WIKIPEDIA_SHA = "c98cc08e42cf68dc8063a42306d5c45c317ca24e244b95091aaae398a9c6fd27"
-ARTIFACTS = Path("/home/denis/dsh1/eval3b-data/artifacts")
+# offset 6682 of the normalized text. Fixture = the 20 000-char leading
+# fragment of the full artifact c98cc08e42cf68dc8063a42306d5c45c317ca24
+# e244b95091aaae398a9c6fd27 (fact offsets preserved, see module
+# docstring); the fixture's own sha256 is its file name.
+EU_WIKIPEDIA_SHA = "190748699055e8e6cc6fc22c48558b10b2767f098d053e09149e80866cdf95d7"
+ARTIFACTS = Path(__file__).resolve().parent.parent / "fixtures" / "artifacts"
 BUDGET = 2_000  # == apps.orchestrator.evidence.SOURCE_ASSERTION_TEXT_BUDGET
 
 
@@ -245,7 +258,8 @@ def test_corpus_facts_are_reachable_from_their_pages() -> None:
 
 
 def test_artifact_integrity() -> None:
-    """The saved artifact is the EVAL-3b page itself (sha256 of the
-    file == the file name) — the test data is the corpus, not a copy."""
+    """The fixture is content-addressed (sha256 of the file == the file
+    name): the test data is the saved EVAL-3b page fragment itself, not
+    a re-encoding."""
     data = (ARTIFACTS / EU_WIKIPEDIA_SHA[:2] / EU_WIKIPEDIA_SHA).read_bytes()
     assert hashlib.sha256(data).hexdigest() == EU_WIKIPEDIA_SHA

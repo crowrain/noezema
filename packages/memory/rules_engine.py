@@ -1,12 +1,19 @@
-"""Rules engine v1 — the ONLY producer of grade and confidence (T3.3, T3.4,
-§3.7, §8.7).
+"""Rules engine v2 — the ONLY producer of grade and confidence (T3.3, T3.4,
+T7.17, §3.7, §8.7).
 
 A rule is an EXECUTABLE structure over the evidence set (not a text hint):
 allowed kinds, minimum support count, minimum independence groups, scope
 coverage, as_of requirement and volatility. The function is
-deterministic and versioned (``rules-v1``); the LLM never proposes a
+deterministic and versioned (``rules-v2``); the LLM never proposes a
 number, and an operator attestation is not an input — it cannot raise
 the grade.
+
+``rules-v2`` (T7.17): the scope-coverage predicate is host-derived
+(``packages.memory.scope``) — the scope checked is derived by the
+trusted host from the question and the evidence provenance, not the
+model's free-form dict; legacy (model-derived) scopes keep the original
+key-by-key predicate. Everything else (kinds, counts, independence,
+as_of, counterevidence, confidence) is unchanged from ``rules-v1``.
 """
 
 from __future__ import annotations
@@ -16,8 +23,9 @@ from datetime import datetime, timedelta
 
 from packages.domain.models.base import JsonDict
 from packages.domain.models.enums import EffectiveGrade, EpistemicStatus
+from packages.memory.scope import scope_covers
 
-RULES_ENGINE_VERSION = "rules-v1"
+RULES_ENGINE_VERSION = "rules-v2"
 
 VOLATILITY_REVERIFY_DAYS = {"static": 90, "configurable": 30, "temporal": 30}
 
@@ -134,18 +142,6 @@ class AssessmentResult:
     reasons: tuple[str, ...]
 
 
-def _scope_covers(evidence_scope: JsonDict, claim_scope: JsonDict) -> bool:
-    """The evidence scope must COVER the claim scope: every claim key is
-    present in the evidence scope with a compatible (equal-or-unset)
-    value."""
-    for key, value in claim_scope.items():
-        if key not in evidence_scope:
-            return False
-        if value is not None and evidence_scope[key] not in (None, value):
-            return False
-    return True
-
-
 def evaluate(
     claim_type: str,
     rule: ClaimTypeRule,
@@ -176,8 +172,12 @@ def evaluate(
             )
 
     groups = sorted({e.independence_group for e in support})
+    # T7.17: the coverage predicate is keyed on the claim scope's
+    # origin (host-derived canonical vs legacy model dict) — see
+    # packages.memory.scope; a scope that truly does not cover still
+    # fails closed (scope_not_covered, no grade lift)
     scope_ok = (not rule.requires_scope) or (bool(claim_scope) and all(
-        _scope_covers(e.scope, claim_scope) for e in support
+        scope_covers(e.scope, claim_scope) for e in support
     )) if support else (not rule.requires_scope or not claim_scope)
     as_of_ok = (not rule.requires_as_of) or has_as_of
 
