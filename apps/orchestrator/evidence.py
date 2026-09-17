@@ -23,10 +23,22 @@ The fragment is budgeted explicitly (``SOURCE_ASSERTION_TEXT_BUDGET``
 chars) and is NOT part of the identity: identity stays over the
 original content hash, so re-fetches of identical content dedupe
 exactly as before.
+
+T7.16 (EVAL-3b residual defect, §6.4): the fragment is no longer the
+LEADING prefix of the normalized text — on most full pages that is
+navigation, and the fact sits deeper (measured: up to ~6.7k chars in).
+The window is now QUESTION-DEPENDENT: ``assertion_window.
+select_assertion_window`` finds the region of the normalized text with
+the highest density of the question/plan's content terms and cuts the
+budgeted window around it (same budget — the fragment rides in the
+curator's claims_evidence section, 8192-token cap). The question and
+the plan ride in the observation data (the host adds them; the model
+never supplies them) and are NOT part of the identity either.
 """
 
 from __future__ import annotations
 
+from apps.orchestrator.assertion_window import select_assertion_window
 from apps.orchestrator.executor import Observation
 from packages.domain.canonical import canonical_sha256
 from packages.domain.models.base import JsonDict
@@ -110,8 +122,20 @@ def observation_to_evidence(observation: Observation, arguments: JsonDict) -> Ev
         # T7.8 (§6.4): the fragment of the normalized chunk text the
         # assertion is read from — bounded by SOURCE_ASSERTION_TEXT_BUDGET,
         # NOT part of the identity (identity stays over the original
-        # content hash, so dedupe semantics are unchanged)
-        assertion_text = str(data.get("normalized_text", ""))[:SOURCE_ASSERTION_TEXT_BUDGET]
+        # content hash, so dedupe semantics are unchanged).
+        #
+        # T7.16: the fragment is QUESTION-DEPENDENT (assertion_window
+        # module) — the budgeted window around the densest region of the
+        # question/plan's content terms, not the leading prefix. The
+        # host adds question/plan to the observation data; their absence
+        # (or no term match) falls back to the leading prefix — the T7.8
+        # behavior.
+        normalized_text = str(data.get("normalized_text", ""))
+        assertion_text = select_assertion_window(
+            normalized_text,
+            f"{data.get('question', '')}\n{data.get('plan', '')}",
+            SOURCE_ASSERTION_TEXT_BUDGET,
+        ).text
         return EvidenceRecord(
             kind=EvidenceKind.SOURCE_ASSERTION,
             identity_hash=identity,

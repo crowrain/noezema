@@ -800,7 +800,12 @@ class Orchestrator:
         )
 
     async def _research_fetch(
-        self, db: AsyncSession, audit: AuditService, session: ORMSession, args: JsonDict
+        self,
+        db: AsyncSession,
+        audit: AuditService,
+        session: ORMSession,
+        args: JsonDict,
+        ctx: SessionContext,
     ) -> Observation:
         """research.fetch (T6.3, §11.2): the ONLY egress path for the
         sandboxed session. The proxy (the only network exit) fetches,
@@ -908,8 +913,16 @@ class Orchestrator:
                 # context-budgeted above) — observation_to_evidence
                 # carries a bounded fragment of it as the payload
                 # assertion_text so the curator sees the text the
-                # assertion is grounded in
+                # assertion is grounded in.
+                #
+                # T7.16: the question/plan ride in the observation data
+                # (host-side, from the session context — the model never
+                # supplies them) so the fragment is selected WHERE the
+                # question's terms are densest, not from the leading
+                # prefix.
                 "normalized_text": text_body,
+                "question": ctx.question_text,
+                "plan": ctx.plan,
                 "source_id": str(envelope.get("source_id") or ""),
                 "original_sha256": str(envelope.get("original_sha256") or ""),
                 "normalized_sha256": nsha,
@@ -1357,7 +1370,12 @@ class Orchestrator:
                 # T6.3 (stage 5, §11.2): host-side egress through the
                 # research proxy — the explorer never sees raw content,
                 # only the fenced normalized text with provenance.
-                obs = await self._research_fetch(db, audit, session, args)
+                #
+                # T7.16: the session context (question + plan) rides in
+                # the observation data so observation_to_evidence selects
+                # the assertion fragment WHERE the question's terms are
+                # densest, not from the leading prefix.
+                obs = await self._research_fetch(db, audit, session, args, ctx)
             else:
                 obs = await self.executor.execute(tool_name, args, db=db)
             if tool_name == "research.fetch" and obs.ok:
