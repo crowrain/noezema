@@ -2305,3 +2305,66 @@ fingerprint отражал новые промпты.
 
 Тест: `tests/scenario/test_question_selector.py::test_real_prompts_are_versioned`
 (версии файлов промптов == pin в BOOTSTRAP_PAYLOAD; обе теперь v3).
+
+ ### T7.15 — E2E-валидация полного пути на черновой БД (условие перезапуска EVAL-3)
+
+ Задача: доказать на черновой БД (НЕ замороженный корпус) полный путь
+ `research.fetch → source_assertion с текстом → external_fact claim → head
+ current → grade E3 из 2 независимых источников` и показать выдержку из БД
+ (тип claim, statement, epistemic_status, grade, связанные evidence).
+ Реальный LLM (`qwen36-35b-a3b-q6-mtp`) + реальный research proxy (SearXNG +
+ прямой fetch). Fingerprint отражает промпты T7.14 (explorer-v3/curator-v3).
+
+ **Итог: путь подтверждён.** На черновой БД `noezema-eval-draft` созданы
+ external_fact claim'ы с head `current`, epistemic_status `supported`,
+ effective_grade **E3** (confidence 0.75, rules-v1), каждый со 2
+ source_assertion (relation `supports`) из 2 независимых групп источников.
+
+ Выдержка из БД (claim → head current → grade → evidence):
+
+     claim_type:  external_fact
+     statement:   Париж является столицей Франции
+     head assessment_state: current
+     epistemic_status: supported
+     effective_grade: E3    confidence: 0.75    rules_version: rules-v1
+     linked evidence (2):
+       - source_assertion / supports   en.wikipedia.org/api/rest_v1/page/summary/Paris  (группа: wikipedia.org)
+       - source_assertion / supports   home.adelphi.edu/~ca19535/page%204.html          (группа: adelphi.edu)
+
+ Два источника = два РАЗНЫХ registrable domain (wikipedia.org и adelphi.edu)
+ → две разные independence-группы (source_independence snapshot: g0/g1,
+ basis=single) → `min_independence_groups=2` выполнен → grade E3.
+
+ Найдено по ходу (ловушки, закреплено):
+ 1. **Независимость — по registrable domain** (PSL-style,
+    `packages/memory/independence.py::registrable_domain`). `en.wikipedia.org`
+    и `simple.wikipedia.org` — ОДИН домен (wikipedia.org) → одна группа → E3
+    с ними невозможен. Для E3 нужны 2 источника с РАЗНЫМИ registrable domain.
+ 2. **Текст утверждения должен попадать в `assertion_text`** (первые 2000
+    символов нормализованного текста, `SOURCE_ASSERTION_TEXT_BUDGET`, T7.8) —
+    именно его видит curator. Полные HTML-страницы Wikipedia прячут факт после
+    ~5000 символов навигации → curator видит только навигацию и формулирует
+    meta-claim о странице (или не формулирует). Для Wikipedia использован
+    REST summary endpoint (чистый текст, факт в пределах бюджета).
+ 3. **`external_fact` rule — `requires_scope=true`**: `_scope_covers`
+    требует, чтобы КЛЮЧИ scope claim присутствовали в scope каждого
+    supporting evidence с равным значением. curator-v3 не фиксирует схему
+    scope, поэтому свободный curator придумывает РАЗНЫЕ ключи для claim и
+    evidence (набл. claim `{domain,entity,target,property,...}` vs evidence
+    `{object,subject,relation}`) → `scope_not_covered` → E1. Промпт заморожен
+    (fingerprint T7.14), поэтому согласованность scope задаётся в ВОПРОСЕ
+    (один scope-объект, скопированный дословно в claim и в каждое evidence).
+
+ **Честная оговорка:** E3 получен при условии, что вопрос явно диктует
+ идентичный scope для claim и evidence. Без этой подсказки curator-v3 (без
+ фиксированной схемы scope) даёт E1 (`scope_not_covered`) — это реальное
+ ограничение свободной формы scope в curator-v3, а не дефект rules engine
+ (fail-closed сработал корректно: при несогласованном scope grade не
+ завышен). Путь сам по себе (fetch → source_assertion с текстом → claim →
+ head current → grade из независимых источников) доказан.
+
+ Условия перезапуска EVAL-3 (по gate) выполнены: выдержка из БД показана
+ (тип claim, statement, epistemic_status, grade, связанные evidence).
+ Корпус/конфиг/пороги §22.2 НЕ тронуты; прогон — только на черновой БД,
+ 2–3 авторских URL-вопроса (не замороженный корпус). One-off сценарий
+ (не тест репо) не коммитится; доказательство — в черновой БД.
