@@ -121,6 +121,33 @@ _DATE_FORMS: tuple[tuple[re.Pattern[str], str, dict[str, int]], ...] = (
 
 _URL_RE = re.compile(r"https?://[^\s\"'<>)\]]+", re.IGNORECASE)
 
+#: the closed deterministic set of RELATIVE reference-date forms
+#: (T7.18, ADR-0007). The question names its anchor as "now" rather
+#: than a fixed date. The corpus (question-set-v2.jsonl) actually uses
+#: «на текущую дату» and «сейчас»; the rest of the closed set is covered
+#: for completeness. For any of these the reference date is the
+#: SESSION's date on the host's clock — never the model's typed as_of.
+_RELATIVE_DATE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"на\s+текущую\s+дату", re.IGNORECASE),
+    re.compile(r"на\s+сегодня", re.IGNORECASE),
+    re.compile(r"\bсейчас\b", re.IGNORECASE),
+    re.compile(r"\bтекущ\w*", re.IGNORECASE),
+    re.compile(r"as\s+of\s+the\s+current\s+date", re.IGNORECASE),
+    re.compile(r"as\s+of\s+today", re.IGNORECASE),
+    re.compile(r"\bcurrently\b", re.IGNORECASE),
+)
+
+
+def question_uses_relative_date(text: str) -> bool:
+    """True when the question anchors the reference date RELATIVELY —
+    a closed deterministic set (T7.18, ADR-0007): «на текущую дату»,
+    «на сегодня», «сейчас», «текущий/текущая», «as of the current
+    date», «as of today», «currently». For these the reference date is
+    the session's date on the host's trusted clock, NOT the model's
+    typed as_of (which previously stood in and could shift the anchor
+    forward/backward, breaking coverage)."""
+    return any(p.search(text) for p in _RELATIVE_DATE_PATTERNS)
+
 
 def is_host_derived(scope: JsonDict) -> bool:
     """True when the scope dict was derived by the trusted host
@@ -174,12 +201,23 @@ def derive_claim_scope(
     *,
     question: str | None,
     as_of: datetime | None,
+    session_date: date | None = None,
 ) -> JsonDict:
     """The canonical scope of one claim (host-scope-v1).
 
-    - ``as_of``: the reference date the QUESTION names (the operator's
-      input, trusted) — otherwise the claim's typed ``as_of``
-      (host-validated, structured);
+    - ``as_of``: the reference date, host-derived, in priority order
+      (T7.17, refined by T7.18 — ADR-0007):
+      1. the date the QUESTION names explicitly (the operator's input,
+         trusted — leftmost valid match of the closed form set);
+      2. else, when the QUESTION anchors the date RELATIVELY (a closed
+         set: «на текущую дату», «сейчас», …) — the SESSION's date on
+         the host's trusted clock (``session_date``, UTC);
+      3. else (the question names no date at all, neither explicitly
+         nor relatively) — the claim's typed ``as_of`` (host-validated
+         structure, not free-form; see ADR-0007, уточнение T7.18);
+      The model's ``as_of`` can never shift the reference date of a
+      question that carries a date anchor (explicit or relative): it is
+      stored on the claim row and in the staging/audit only.
     - ``source_domains``: the registrable domains of the sources the
       question names (empty = the question names no sources — no source
       constraint).
@@ -187,6 +225,8 @@ def derive_claim_scope(
     day: date | None = None
     if question:
         day = parse_question_date(question)
+        if day is None and question_uses_relative_date(question) and session_date is not None:
+            day = session_date
     if day is None and as_of is not None:
         day = as_of.date() if as_of.tzinfo is None else as_of.astimezone(UTC).date()
     domains: list[str] = []

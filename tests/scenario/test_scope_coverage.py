@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import copy
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -89,6 +89,14 @@ QUESTION_APOLLO_DATED = (
 QUESTION_APOLLO_CURRENT = (
     "Подтверди первую пилотируемую посадку на Луну на текущую дату "
     "строго по этим двум источникам: "
+    "http://alpha.example/apollo и http://beta.example/landing"
+)
+
+#: T7.18: the corpus key-rate question (relative form «на текущую дату»,
+#: two named sources) — the found defect
+QUESTION_KEY_RATE_RELATIVE = (
+    "Какова ключевая ставка Банка России на текущую дату? Установи это "
+    "утверждение строго по этим двум источникам: "
     "http://alpha.example/apollo и http://beta.example/landing"
 )
 
@@ -425,6 +433,74 @@ async def test_source_retrieved_before_as_of_stays_E1(
     assert "insufficient_evidence" not in reasons[0]
 
 
+# ── T7.18: relative reference date is host-derived (session date) ──────
+
+
+@pytest.mark.asyncio
+async def test_relative_date_model_as_of_tomorrow_reaches_E3(
+    migrated_db: tuple[str, Any], tmp_path: Path, fake_fetch: None
+) -> None:
+    """T7.18 REGRESSION (full commit boundary, the found defect): the
+    question asks «на текущую дату», the model's typed as_of =
+    TOMORROW, the evidence was retrieved TODAY. Under T7.17 the model's
+    as_of became the reference date, so today's evidence was "before"
+    it → scope_not_covered → E1. Now the host-derived reference is the
+    SESSION's date (today) — the model's tomorrow does not shift it —
+    so the evidence covers and the claim reaches E3 supported, head
+    current."""
+    scratch_url, _engine = migrated_db
+    store = FilesystemArtifactStore(tmp_path / "artifacts")
+    await _set_section(scratch_url, _section())
+
+    records = await _fetch_records(
+        scratch_url, store, ("http://alpha.example/apollo", "http://beta.example/landing")
+    )
+    tomorrow = (datetime.now(UTC) + timedelta(days=1)).isoformat()
+    await _apply_claim(
+        scratch_url,
+        records,
+        statement="Ключевая ставка Банка России составляет 14,00%.",
+        question_text=QUESTION_KEY_RATE_RELATIVE,
+        # free-form model scope + an arbitrary (wrong) typed as_of — the
+        # T7.17 defect shape
+        scope={"объект": "ключевая ставка", "на дату": "2026-09-19"},
+        claim_type="temporal_fact",
+        as_of=tomorrow,
+    )
+
+    row = await _scalar(
+        scratch_url,
+        _assessment("Ключевая ставка Банка России%")
+        + " GROUP BY a.effective_grade, a.epistemic_status",
+    )
+    assert row is not None, "no assessment for the temporal claim"
+    assert row[0] == "E3", f"expected E3, got {row[0]}"
+    assert row[1] == "supported"
+
+    head = await _scalar(
+        scratch_url,
+        "SELECT h.assessment_state, h.epistemic_status "
+        "FROM claim_assessment_heads h JOIN claims c ON c.id = h.claim_id "
+        "WHERE c.statement LIKE 'Ключевая ставка Банка России%'",
+    )
+    assert head is not None
+    assert head[0] == "current" and head[1] == "supported"
+
+    # the assessed reference is HOST-DERIVED: the session's date
+    # (today), NOT the model's tomorrow
+    assessed = await _scalar(
+        scratch_url,
+        "SELECT a.assessed_scope FROM claim_assessments a "
+        "JOIN claims c ON c.id = a.claim_id "
+        "WHERE c.statement LIKE 'Ключевая ставка Банка России%'",
+    )
+    assert assessed is not None
+    scope = dict(assessed[0])
+    assert scope["scope_schema"] == "host-scope-v1"
+    assert scope["as_of"] == datetime.now(UTC).date().isoformat()
+    assert scope["source_domains"] == ["alpha.example", "beta.example"]
+
+
 async def _update(scratch_url: str, sql: str) -> None:
     """A one-shot committed DML on the scratch DB (test plumbing)."""
     engine = create_async_engine(scratch_url)
@@ -600,6 +676,141 @@ async def test_full_session_freeform_curator_scope_reaches_E3(
     scope = dict(assessed[0])
     assert scope["scope_schema"] == "host-scope-v1"
     assert scope["as_of"] is None
+    assert scope["source_domains"] == ["alpha.example", "beta.example"]
+
+
+@pytest.mark.asyncio
+async def test_full_session_relative_date_curator_as_of_reaches_E3(
+    migrated_db: tuple[str, Any],
+    fake_llm: FakeLLM,
+    fake_fetch: None,
+    tmp_path: Path,
+) -> None:
+    """T7.18 (full session on the fake LLM through the real
+    orchestrator): the question asks «на текущую дату»; the curator
+    returns a temporal claim with an ARBITRARY typed as_of (tomorrow)
+    and a free-form scope. The host-derived reference = the SESSION's
+    date (today) — the model's as_of does not shift it — so the
+    committed claim is head current / supported / E3 from two
+    independent sources, and the assessed_scope carries the session's
+    date, not the model's."""
+    scratch_url, engine = migrated_db
+    store = FilesystemArtifactStore(tmp_path / "artifacts")
+
+    payload = copy.deepcopy(BOOTSTRAP_PAYLOAD)
+    rp = payload["research_proxy"]
+    rp["mode"] = "curated"
+    rp["searxng_url"] = "http://127.0.0.1:8888"  # unused: the fetch is faked
+    rp["rate_limit_max"] = 10
+    pol = payload["policy"]
+    pol["access_profile"] = "curated"
+    pol["capabilities"]["tools"] = [*pol["capabilities"]["tools"], "research.fetch"]
+    result = await _run_online(engine, payload)
+    assert result.state == "active"
+
+    question_id = await _seed_question(scratch_url, QUESTION_KEY_RATE_RELATIVE)
+
+    gateway = LLMMiddleware(
+        LLMGatewayConfig(
+            base_url=fake_llm.base_url, model="fake-thinker", max_retries=2, retry_base_delay=0.01
+        )
+    )
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    service = ResearchProxyService(factory, store)
+    orch = Orchestrator(
+        session_factory=factory,
+        gateway=gateway,
+        profile=ModelProfile(model_alias="fake-thinker"),
+        executor=StubToolExecutor(tmp_path / "ws"),
+        research_service=service,
+    )
+
+    def fetch(url: str) -> dict[str, Any]:
+        return {
+            "content": {
+                "public_rationale": "Источники вопроса",
+                "expected_information": "Текст источника",
+                "decision": {"kind": "tool", "tool": "research.fetch", "arguments": {"url": url}},
+            }
+        }
+
+    tomorrow = (datetime.now(UTC) + timedelta(days=1)).isoformat()
+    CURATOR: dict[str, Any] = {
+        "summary": "Ключевая ставка Банка России",
+        "claims": [
+            {
+                "statement": "Ключевая ставка Банка России составляет 14,00%.",
+                "claim_type": "temporal_fact",
+                # arbitrary (wrong) model as_of + free-form scope — the
+                # T7.17 defect shape
+                "as_of": tomorrow,
+                "scope": {"объект": "ключевая ставка", "на дату": tomorrow[:10]},
+            }
+        ],
+        "evidence_links": [
+            {"evidence_index": 0, "claim_index": 0, "relation": "supports"},
+            {"evidence_index": 1, "claim_index": 0, "relation": "supports"},
+        ],
+        "new_questions": [],
+    }
+    fake_llm.script(
+        [
+            fetch("http://alpha.example/apollo"),
+            fetch("http://beta.example/landing"),
+            {
+                "content": {
+                    "public_rationale": "Данные собраны",
+                    "decision": {"kind": "complete", "reason": "goal_reached"},
+                }
+            },
+            {"content": CURATOR},
+        ]
+    )
+    try:
+        outcome = await orch.run_session(question_id)
+    finally:
+        await gateway.close()
+        await engine.dispose()
+
+    assert outcome.final_state.value == "succeeded"
+    assert outcome.evidence_count == 2
+
+    row = await _scalar(
+        scratch_url,
+        "SELECT a.effective_grade, a.epistemic_status, "
+        "       count(DISTINCT e.source_id) AS srcs "
+        "FROM claim_assessments a "
+        "JOIN claims c ON c.id = a.claim_id "
+        "LEFT JOIN evidence e ON e.claim_id = c.id "
+        "WHERE c.statement LIKE 'Ключевая ставка Банка России%' "
+        "GROUP BY a.effective_grade, a.epistemic_status",
+    )
+    assert row is not None, "no assessment for the temporal claim"
+    assert row[0] == "E3", f"expected E3, got {row[0]}"
+    assert row[1] == "supported"
+    assert row[2] == 2, "the two evidence rows must reference two distinct sources"
+
+    head = await _scalar(
+        scratch_url,
+        "SELECT h.assessment_state, h.epistemic_status "
+        "FROM claim_assessment_heads h JOIN claims c ON c.id = h.claim_id "
+        "WHERE c.statement LIKE 'Ключевая ставка Банка России%'",
+    )
+    assert head is not None
+    assert head[0] == "current" and head[1] == "supported"
+
+    # the assessed reference is the SESSION's date (today), NOT the
+    # model's arbitrary as_of (tomorrow)
+    assessed = await _scalar(
+        scratch_url,
+        "SELECT a.assessed_scope FROM claim_assessments a "
+        "JOIN claims c ON c.id = a.claim_id "
+        "WHERE c.statement LIKE 'Ключевая ставка Банка России%'",
+    )
+    assert assessed is not None
+    scope = dict(assessed[0])
+    assert scope["scope_schema"] == "host-scope-v1"
+    assert scope["as_of"] == datetime.now(UTC).date().isoformat()
     assert scope["source_domains"] == ["alpha.example", "beta.example"]
 
 

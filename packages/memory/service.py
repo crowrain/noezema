@@ -288,12 +288,26 @@ class MemoryService:
         # scope proposal is audited but can neither satisfy nor fail
         # coverage: the claim scope is derived from the question and
         # the claim's typed as_of, each evidence scope from its
-        # provenance (see packages.memory.scope)
+        # provenance (see packages.memory.scope).
+        # T7.18 (ADR-0007): when the question anchors the date
+        # RELATIVELY («на текущую дату», «сейчас», …) the reference
+        # date is the SESSION's date on the host's trusted clock, not
+        # the model's as_of. We anchor on the session START
+        # (session.created_at, the host/DB clock) rather than the
+        # commit time: every piece of in-session evidence is observed
+        # at or after the session start, so the relative-date claim is
+        # covered by same-session evidence, and a session that crosses
+        # midnight does not re-anchor the reference date behind the
+        # evidence it already fetched.
         question_text: str | None = None
         if session.question_id is not None:
             question_row = await db.get(ORMQuestion, session.question_id)
             if question_row is not None:
                 question_text = question_row.text
+        _created = session.created_at
+        if _created is not None and _created.tzinfo is None:
+            _created = _created.replace(tzinfo=UTC)
+        session_date = _created.astimezone(UTC).date() if _created is not None else None
 
         # §8.7.3 (T4.6): the FULL §14 environment manifest — content-
         # addressed over the field set. The protocol is the session's
@@ -364,7 +378,9 @@ class MemoryService:
             if existing_claim is not None:
                 claims.append(existing_claim)
                 claim_scopes[existing_claim.id] = derive_claim_scope(
-                    question=question_text, as_of=existing_claim.as_of
+                    question=question_text,
+                    as_of=existing_claim.as_of,
+                    session_date=session_date,
                 )
                 counters["reused"] += 1
                 claim_deps.append((existing_claim, deps_list))
@@ -382,7 +398,9 @@ class MemoryService:
                 await db.flush()
                 claims.append(claim)
                 claim_scopes[claim.id] = derive_claim_scope(
-                    question=question_text, as_of=claim.as_of
+                    question=question_text,
+                    as_of=claim.as_of,
+                    session_date=session_date,
                 )
                 counters["created"] += 1
                 claim_deps.append((claim, deps_list))
