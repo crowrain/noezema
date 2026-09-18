@@ -2519,3 +2519,16 @@ fingerprint отражал новые промпты.
  Корпус v2, конфиги v2/v3 и пороги §22.2 не тронуты (хэши прежние);
  EVAL-3 не запускался и не планируется (решение за пользователем).
  Прогон: 765 тестов (база 733 + 32 новых).
+
+### Merge T7.8–T7.17 в `main` (2026-09-18)
+
+Решение пользователя 2026-09-18: `impl/from-scratch` → `main` —
+выполнен (merge-commit `4b49f00` на `main`, `--no-ff`, pushed; дерево
+merge-коммита идентично `779d1fd`). Проверки на `779d1fd` перед merge:
+ruff ✓, mypy strict ✓ (124 файла), pytest 765 passed. До этого push
+`impl/from-scratch` `5c2be5d..779d1fd` (коммиты `1ca81a2`, `ccdc385`,
+`779d1fd`). Предыдущий merge — `d81919a` (T7.7, EVAL-2).
+
+Acceptance §22.2 по-прежнему не пройден: `significant_claim_reuse`
+failed (EVAL-1, EVAL-2), external/temporal E3 не измерен; перезапуск
+EVAL-3 — решение пользователя, не планируется.
