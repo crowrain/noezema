@@ -268,7 +268,9 @@ async def test_grade_produced_only_by_rules_engine(migrated_db: Any) -> None:
         )
         assert row is not None
         assert row["rules_hash"]  # the grade came from the rules engine
-        assert row["rules_version"] == "rules-v1"
+        # T7.17: the assessment is produced by the host-derived scope
+        # engine (rules-v2)
+        assert row["rules_version"] == "rules-v2"
         # computed_result's min_grade_for_supported is E2 -> the grade is E2
         assert row["effective_grade"] == "E2"
     await engine.dispose()

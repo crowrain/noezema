@@ -14,7 +14,7 @@
 | M4 зависимости + переоценка | ✅ T4.1 закрыт (claim_dependencies: DAG cycle check при commit, graph revision, kind `research` по §8.6); T4.2 закрыт (cascade invalidation: closure manifest, barrier с durable курсором, idempotent батчи, blocked-путь, retrieval ancestor check); T4.3 закрыт (worker `system:reassessment`: runnable-предикат §5.9.1, lease/retry/blocked, insufficient→invalid+question, crash-lease recovery); T4.4 закрыт (writer admission: table gate §14.1 NOWAIT + jitter, session intent rules 1/4/5, T_escalate/T_worker_admission в scheduler); T4.5 закрыт (online activation §8.7.2: fenced lease + takeover, shadow heads fast path/pending, seal + DB-триггер sealed-интервала, atomic flip, post-publish manifest с deterministic UUIDv5, repair runner + T_repair_admission); T4.6 закрыт (environment manifests §14 env-v2: content-addressed manifest_hash, versioned алгоритм env-independence-v1 — группы по (protocol, implementation, dataset lineage), отношения repeatability/reproducibility/independent_replication/variation/untracked, снапшот на оценке, `required_independence` в rules engine: E3 только через независимую репликацию); T4.7 закрыт (source graph §11.3: таблицы source_dependency_edges/source_graph_corrections, алгоритм independence-v2 — domain/content_hash/parent/edges/corrections, снапшот source_independence_* на оценке, каскад apply_source_graph_change: merge/split → invalidation + recompute, ревизия source_graph); T4.8 закрыт (counterevidence resolutions §8.7.4: таблица + XOR/partial-unique CHECK, межстрочные инварианты (counter-цель, scope-compat, нет транзитивной зависимости, valid correction), каскад create/invalidate → recompute, engine считает только unresolved counters); T4.9 закрыт (failpoints M4: crash после flip — pointer tuple recovery, crash между батчами post-publish — durable cursor, stale activator после takeover — fence-отказ, следующий flip закрывает blocked backlog, barrier crash после каждого батча, group merge + crash worker'а, worker без starvation после смерти intent-lease) — GATE M4 пройден (§19: invalid ancestor блокирует downstream; worker без starvation оба направления; group merge → корректный пересчёт) | — | пороги M4 из замеров серии 2026-09-14 зафиксированы в PLAN (батч 32, SLO P95 200 с); 501 тест |
 | M5 расширенный цикл | ✅ Gate M5 пройден (§19, этап 4): T5.1 закрыт (Curiosity ranking §5.3.1: score-формула, все входы [0,1] + similarity fingerprint, eligibility filter, ε-diversity (seed в audit), селектор config-driven) + T5.2 закрыт (planning §6.2: план как наблюдаемый артефакт, роль planner, закрытые assessment methods, метод ≠ перефраз, planning.mode config-driven) + T5.3 закрыт (роль verifier §3.7: организованные детерминированные проверки, **схема не несёт grade/confidence — assessment идентичен с verifier и без него (gate)**, verification.mode config-driven) + T5.4 закрыт (защита от повторов §9: перефраз + no-progress → цикл, закрытые стратегии §9, audit repeat_cycle_detected, repetition config-driven) + T5.5 закрыт (untrusted extraction §11.2: модель без инструментов, host-проверка дословности, raw-текст не покидает extractor, extraction config-driven) + T5.6 закрыт (long-run сценарии: накопление знания по FIFO-очереди, §9-цикл на накопленной истории, поздний контрпример → disputed E1 rules engine) | — | 651 тест |
 | M6 Research Proxy | ✅ Gate M6 пройден (§19, этап 5): T6.1 закрыт (research proxy: единственный egress, read-only, SSRF-guard private/loopback/link-local/metadata, редиректы/размер/время, удаление активного содержимого) + T6.2 закрыт (режимы Sealed=локальный индекс / Curated=SearXNG через прокси c upstream-логом и rate limits / Open Lab=закрытый список доменов, отдельный профиль) + T6.3 закрыт (provenance: original+normalized+hash, origin в sources/artifact_chunks, fenced-маркировка в контексте §11.2, research.fetch — единственный egress сессии) + T6.4 закрыт (injection/poisoning: capabilities неизменны, similarity→require_operator, poisoned artifact не самооценивается) | noezema-m6 (после gate) | см. раздел M6 ниже | 651 тест |
-| M7 полный веб + эксплуатация | ✅ Gate M7 пройден (T7.1 ✅ knowledge graph + provenance + diagnostics; T7.2 ✅ backup/PITR §15.3; T7.3 ✅ GC full root set; T7.4 ✅ security regression gate + §16 metrics; T7.5 ✅ evaluation run §22.2 mechanism; T7.6 ✅ ADR-0004) | noezema-m7 (на `2e1631c`) | см. раздел M7 ниже | |
+| M7 полный веб + эксплуатация | ✅ Gate M7 пройден (T7.1 ✅ knowledge graph + provenance + diagnostics; T7.2 ✅ backup/PITR §15.3; T7.3 ✅ GC full root set; T7.4 ✅ security regression gate + §16 metrics; T7.5 ✅ evaluation run §22.2 mechanism; T7.6 ✅ ADR-0004); после gate — дефекты EVAL-3b/EVAL-3: T7.7–T7.17 закрыты (T7.15 E2E-валидация, T7.16 assertion-окно, T7.17 хост-деривация scope, rules-v2, ADR-0007 — тесты test_scope.py / test_rules_engine.py / test_scope_coverage.py; детали в разделе M7) | noezema-m7 (на `2e1631c`) | см. раздел M7 ниже | 765 тест |
 
 ## Gate M2 (§19, этап 2) — пройден (noezema-m2)
 
@@ -63,6 +63,18 @@
 | 32 | host transition protocol | MVP | ✅ | test_host_journal.py (fsync-safe tmp→fsync→rename→fsync(dir), immutable events, head с immutable identity, boot reconcile 0/1/≥2, head на resolved → full replay + drop) |
 | 33 | recovery policy protocol | MVP | ✅ | test_host_policy.py (schema v1, jitter=0, диапазоны, JCS-хэш, symlink/missing reject) + test_policy_change_unit_state.py (install/resolve, head + event stream, terminal effective_hash, accept_current/install_replacement) |
 | 34 | web degraded observer | MVP | ✅ | test_web_mvp.py (Host Status Adapter: recovery_state none/retry_wait/degraded/blocked; fail-closed Command API 423 на unresolved transition; status.host; stale/missing unit-state; SSE + session detail + pages) |
+
+> **Оговорки к MVP-строкам (честные).** Строка 1 — задача добавлена в план
+> ретроспективно (пропуск плана, T3.29); строка 2 — ModelProfile частично
+> (секция `model` снапшота не подключена). Третья оговорка (2026-09-16,
+> post-mortem EVAL-3b): **curated-путь до прогона EVAL-3b не исполнялся
+> end-to-end ни разу** — research.search/fetch через SearXNG/fetch →
+> source_assertion → external/temporal claim: все тесты M6 — на фейках
+> (FakeFetchClient, fake SearXNG), реальные MVP-сессии работали в sealed-
+> профиле (computed_result), корпуса EVAL-1/EVAL-2 не содержали URL-вопросов.
+> MVP-приёмка (§22.2 `external_temporal_e3`) и gate M3 опираются на этот
+> путь; первая реальная попытка (EVAL-3b) показала дефекты самого пути —
+> `docs/eval/EVAL-3b-postmortem.md`, задачи T7.8–T7.17.
 
 ## Матрица §22.2 (познавательная оценка)
 
@@ -1835,3 +1847,675 @@ gates + blind sample + overall outcome). Tag: `noezema-m7`.
    reuse (путь закрытия — EVAL-3), insufficient — редкие типы
    (external/temporal E3, due/stale, reassessment SLO) — отложены
    решением пользователя.
+
+9. **Решения пользователя 2026-09-16 (после ADR-0006).** (1) Merge
+   `impl/from-scratch` → `main` — выполнен (`d81919a`, pushed,
+   проверки зелёные 688). (2) ADR-0006 уточнён: кросс-языковое
+   расхождение — ДЕФЕКТ МЕХАНИЗМА (не «артефакт корпуса»);
+   «показано end-to-end» снято — путь «поиск → находка → ссылка»
+   не отработал ни разу (0/16); расчёт потолка корпуса v1 расписан
+   явно (теор. максимум 7/28 = 25% при 100%-м соблюдении,
+   реалистично ~3.5%). (3) До заморозки EVAL-3: (а) кросс-язычный
+   поиск — двуязычный индекс `search_statements` + тест «запрос на
+   другом языке находит claim»; (б) lease `phase_deadline_seconds`
+   600 → 1800 в новом snapshot (потери ≤2–3%, срываются самые
+   длинные вызовы = выборка смещается); (в) корпус v2 = кластеры
+   reuse (10–15 пачек) + вопросы под редкие типы (external/temporal
+   E3, due/stale, reassessment — в один прогон; исключать типы
+   через ADR не будем). (4) EVAL-3 не запускать до починки поиска;
+   конфигурация замораживается отдельным шагом и показывается
+   пользователю ДО запуска. Выявленное предусловие редких типов:
+   в MVP нет пути research.fetch → source_assertion evidence
+   (observation_to_evidence → None), активный snapshot — sealed
+   (network=none), правила external/temporal требуют ≥2
+   source_assertion из ≥2 доменов + grade E3; в ходе серии нужен
+   цикл `hostctl reassessment-tick`.
+
+10. **Кросс-язычный поиск (ADR-0006 rev, T7.7) — реализован.**
+    Миграция `0021_search_statements`: `claims.search_statements`
+    (jsonb, [] — англоязычные отображения statement, ТОЛЬКО индекс
+    поиска; текст знания не меняется). `ClaimProposal.search_statements`
+    (1–2, ≤300 символов) + валидация; apply — host-trusted
+    (strip/trim/list-of-str); retrieval — `GREATEST(ts_rank(russian,
+    statement), ts_rank(english, search_statements))` — запрос на
+    любом из языков матчит тот же claim. Протокол: «ищи на языке
+    вопроса и/или языка claims; для каждого claim заполни
+    search_statements». Ловушка (зафиксирована в коде): `ts_rank`
+    возвращает ~1e-20, а не 0, для несовпавшего/частичного-AND
+    tsquery — SQL-фильтр `> 0` не фильтрует, реальный порог —
+    `MIN_RELEVANCE` в Python (частичный-AND = no match, семантика
+    не менялась). Тесты: unit — EN-запрос находит RU-claim через
+    search_statements, RU-запрос работает, без отображения
+    кросс-язык не матчит; scenario — end-to-end через оркестратор
+    (seed RU+EN → EN memory.search → [c:<id>] в контексте модели →
+    search_statements персистятся). 691 tests.
+
+11. **Путь research.fetch → source_assertion evidence (ADR-0006 rev,
+    T7.7) — реализован.** Было: `observation_to_evidence` для
+    research.fetch возвращала None — fetched-контент не мог стать
+    evidence (предрасположенное препятствие редких типов:
+    external/temporal E3 требует ≥2 source_assertion из ≥2
+    независимых source-групп). Стало: observation data несёт
+    `source_id/original_sha256/normalized_sha256/chunk_id`
+    (оркестратор `_research_fetch` — из envelope прокси; без них —
+    evidence не рождается, unprovenanced-контент в знание не
+    входит); адаптер строит `EvidenceRecord(kind=source_assertion,
+    identity_hash=source_assertion_identity(original_sha256,
+    chunk_id, kind), source_id, chunk_id)`; commit-граница
+    (`_identity_for`) пересчитывает тот же identity и требует
+    `source_id` (иначе problem + skip); ORMEvidence получает
+    `source_id`/`chunk_id` (колонки с миграции 0004) —
+    independence snapshot на оценке видит оба источника. Тесты:
+    scenario `tests/scenario/test_research_evidence.py` (2: полный
+    путь — два fetch из разных registrable domains (alpha.example /
+    beta.example) → staging → apply_claim_staging → claim E3
+    supported, 2 evidence rows с source provenance, 2 группы в
+    independence snapshot; отрицательный контроль — subdomain
+    (beta.alpha.example) = ОДНА registrable domain → одна группа →
+    НЕ E3 supported; сеть заменена FakeFetchClient c явным
+    URL→page map, остальное — реальный код: прокси-регистрация,
+    store, identity, independence, rules engine). Ловушка
+    (зафиксирована в тесте): `registrable_domain` = последние 2
+    label'а — 127.0.0.1:port и 127.0.0.1:port2 = ОДНА группа,
+    тестовые домены должны быть двухlabel'ными. 693 tests.
+
+12. **Заморозка конфигурации EVAL-3 (T7.7, 2026-09-16) — подготовка
+    завершена; первый запуск сорвался (дефект конфига, fail-fast до
+    первого вызова модели), пере-заморожено (§2.6 freeze-дока);
+    перезапуск — после решения пользователя.** Предусловия
+    закрыты: кросс-язычный поиск (п. 10), research.fetch →
+    source_assertion (п. 11), live-проверка v2→v3-активации
+    (old as_of → due, current → fresh, отдельная БД), SearXNG
+    (127.0.0.1:8888) + e2e search/fetch через прокси.
+    - **Wiring research proxy (зазор, найденный при подготовке):**
+      `build_orchestrator` (wake-tick И eval-run) собирал
+      оркестратор БЕЗ `research_service` → `research.fetch` был
+      fail-closed «not configured» на любом хост-входе. Стало:
+      `ResearchProxyService(session_factory,
+      FilesystemArtifactStore(workspace_root.parent/"artifacts"))`;
+      в sealed-профиле wiring инертен (tool profile-gated + proxy
+      fail-closed). Тест: `tests/unit/test_research_wiring.py`.
+    - **Приоритет в корпусе `eval-run`:** JSONL-строка
+      `{"text", "priority"?}` (int, default 0), fail-closed парсинг с
+      номером строки; seed записывает `questions.priority`. Причина:
+      seed = одна транзакция ⇒ `created_at = now()` = старт
+      транзакции у ВСЕХ строк (ловушка §7 AGENTS.md) ⇒ тайбрейк по
+      случайному uuid ⇒ порядок потребления случаен; priority даёт
+      детерминированный FIFO-порядок (§5.3.2: priority DESC).
+      Тест: `tests/unit/test_corpus_parse.py` (+ закреплена форма
+      замороженного корпуса: 50 / 100×3 / 90×11 / 80×22 / 0×14,
+      уникальность текстов).
+    - **Замороженные артефакты** (`docs/eval/`, детали + план запуска
+      + арифметика 11 гейтов + риски — `docs/eval/EVAL-3-freeze.md`):
+      `config-v2-payload.json` (canonical sha256 `ffc98c9e…`,
+      пере-заморозка §2.6; curated profile, research proxy searxng 8888 +
+      allowlist 127.0.0.1:8888, phase_deadline **1800** (решение по
+      LeaseLost), fifo) и `config-v3-payload.json` (canonical sha256
+      `2e93889c…`, пере-заморозка §2.6; diff =
+      ровно 2 строки: volatility external_fact/temporal_fact →
+      `temporal` — поведенчески нейтрально (30d), но активация v3
+      запускает re-evaluation всех external/temporal head-ов →
+      old-as_of claim'ы становятся `due`); `question-set-v2.jsonl`
+      (sha256 `93c1a93a…`): 50 вопросов — 24 URL-факта (20 temporal +
+      4 external), у каждого 2 источника на 2 registrable domains
+      (lift ⇒ ровно E3; все 24 пары факт-проверены в ≤40 KiB
+      нормализованного текста), 11 паков ×3 (7 URL + 4
+      workspace-файла; follow-up'ы «перепроверь ранее установленное»
+      — путь reuse: dedup или dependency-edge на якорный claim),
+      3 old-as_of (as_of 15.04.2026 / 01.01.2026, priority 100 →
+      сессии 1–3). План запуска: чистая `noezema-eval3`,
+      `activate-online` v2, фоновый цикл `reassessment-tick`,
+      `eval-run --count 50 --slo-seconds 3600 --seed 20260915
+      --blind-size 50`, watchdog → `activate-online` v3 при ≥20
+      external/temporal claim'ов (driver сам мостит
+      activation_slot_busy), гейты после серии (SLO-знаменатель ≥20 —
+      только через activation jobs).
+    - **Допуски к запуску (решение пользователя 2026-09-16) — 3 правки БЕЗ
+      замёрзших артефактов** (хэши v2/v3 payload и корпуса пересчитаны до
+      и после — без изменений, §8 freeze-дока):
+      (a) **отчётность**: 95% доверительный интервал (Wilson) `ci95` во
+      ВСЕХ ratio-гейтах (`packages/evaluation/gates.py: wilson_ci95`;
+      печать в `eval-run`) — пороги/знаменатели/исходы не меняются;
+      (b) **`hostctl blind-sample --run <id|label> [--out file]
+      [--fragment-chars N]`** — выгрузка слепой выборки для РУЧНОЙ
+      проверки §22.2: тот же seeded/стратифицированный отбор, что
+      меряют blind-гейты (общий код `packages/evaluation/blind.py:
+      blind_sample_claim_ids` у гейтов и у выгрузки); по claim — id/тип/
+      statement/status/grade/assessed_scope, по evidence — kind/relation/
+      scope, URL источника или id артефакта, процитированный фрагмент
+      (нормализованный текст источника / observation-артефакт из
+      content-addressed хранилища);
+      (c) **freeze-документ**: раздел «Ограничение метода» — blind-гейты
+      = СТРУКТУРНАЯ проверка, а не пройденные гейты §22.2 (слепая
+      выборка по §22.2/ARCHITECTURE v0.3 — ручная + публикация 95% ДИ);
+      в отчёте рана blind-гейты выводятся отдельным блоком; честный
+      пересчёт reuse: проходит ТОЛЬКО при ≥9 якорях из 11 через dedup-
+      путь (k/(50−2k) ≥ 0.25 ⇔ k ≥ 9; чистый dependency-путь
+      математически невозможен: max 11/50 = 0.22 < 0.25) — исход
+      практически бимодальный. Тесты: `tests/unit/test_wilson_ci.py`,
+      `tests/scenario/test_blind_sample_dump.py` (совпадение выгруженной
+      выборки с измеренной гейтами + поля + фрагмент из хранилища),
+      ci95-закрепление в `tests/scenario/test_evaluation_gates.py`.
+    - **Первый запуск сорвался (2026-09-16) + пере-заморозка (§2.6
+      freeze-дока).** Все 50 сессий упали мгновенно (0 steps / 0 с / 0
+      model-calls): `token budgets invalid: section limits sum 26624 >
+      input_budget 22528`. Причина: при заморозке max_output 4096→8192
+      поднят без пересчёта секций — в EVAL-2 бюджет сходился впритык
+      (32768−4096−2048 = 26624 = Σ секций); payload был live-проверен
+      только на активацию, а `activate-online` бюджеты не валидировал.
+      Правка (решение пользователя): ровно 2 строки model-секции каждого
+      payload — `context_window 32768→40960` + `backend_context_limit
+      262144` (фактический предел слота бэкенда: llama-swap
+      `-c 524288 --parallel 2`) → input_budget 30720, секции — байт в
+      байт как в EVAL-2/bootstrap (Σ 26624, A/B-сопоставимость). Новые
+      канонические хэши: v2 `ffc98c9e…`, v3 `2e93889c…`; хэш
+      `question-set-v2.jsonl` (`93c1a93a…`) НЕ изменился; пороги §22.2,
+      rules engine, корпус — не тронуты; diff v2→v3 = те же 2 строки
+      volatility. Доказательства срыва СОХРАНЕНЫ: БД `noezema-eval3`
+      (run `83366765-e795-44d6-a5d0-b2027270fa54`, outcome=
+      insufficient_sample, 0 сессий/claims/model_runs) + логи
+      `/home/denis/dsh1/eval3-logs/` — не переиспользуются; перезапуск —
+      в чистой `noezema-eval3b`. Регрессия-защита: `activate-online`
+      fail-closed на нестартующихся payload'ах (`packages/memory/
+      activation.py: _validate_payload_budgets` — проверка ДО записи
+      candidate, зеркалирует ContextBuilder) — тест
+      `tests/scenario/test_online_activation.py::test_online_rejects_unstartable_token_budgets`;
+      замороженные payload'ы закреплены `tests/unit/test_freeze_payloads.py`
+      (validate() == [], секции = EVAL-2-значения, model/token_budgets
+      идентичны в v2 и v3).
+    - 710 tests (706 + 4 новых). Первый запуск сорвался по технической
+      причине (до первого вызова модели); перезапуск — после слова
+      пользователя: чистая `noezema-eval3b`, тот же план (§3
+      freeze-дока, обновлён: env с `NOEZEMA_LLM_BASE_URL`/
+      `NOEZEMA_LLM_MODEL`, прогрев модели), запуск через setsid nohup
+      (worker-цикл / eval-run / watchdog — отсоединённые процессы с
+      логами в `/home/denis/dsh1/eval3-logs/`).
+
+13. **EVAL-3b: прогон прерван (решение пользователя) + post-mortem
+    (2026-09-16).** Run `34e06d35…` (`noezema-eval3b`, started
+    2026-09-16 13:10:30 UTC): 7 сессий завершено + 8-я остановлена
+    mid-exploration (её phase-1-транзакция откатилась; следы proxy —
+    cbr.ru/consultant.ru — источники её собственного вопроса «ключевая
+    ставка», priority 90). et=0 на всём протяжении: 0
+    external/temporal claims. Остановка — решением пользователя после
+    4-й сессии (watchdog: et=0). **Строка прогона в `evaluation_runs`
+    оставлена незакрытой** (`outcome='running'`, `finished_at=NULL`):
+    штатного способа закрыть «как прерванный» нет — closed-set
+    `running/passed/failed/insufficient_sample` (миграция 0020), а
+    единственная функция закрытия `finish_evaluation_run` вычисляет итог
+    по гейтам и поставила бы убитому рану постфактумное состояние;
+    `running`+NULL — точная запись об остановке. БД `noezema-eval3b` и
+    логи `/home/denis/dsh1/eval3-logs/` сохранены без изменений.
+    **Post-mortem** (закоммичен как доказательная база до правок) —
+    `docs/eval/EVAL-3b-postmortem.md`: P.1 — payload `source_assertion`
+    не несёт текст утверждения (куратор мог лишь мета-claim, §6.4);
+    P.2 — commit применяется при отклонённом assessment rules engine
+    (claim без head — невидим, яд для dedup, §14.1); P.3 — 24k-обрезка
+    explorer-промпта отбрасывает самое свежее наблюдение + неидемпотентный
+    refetch (500 UniqueViolation на `artifact_chunks`); P.4 —
+    `message.reply` предложен при пустом inbox (3 потерянных шага из 10
+    в двух сессиях); P.5 — корпус чист (37 уникальных URL — 200, все 24
+    пары фактов присутствуют; повторная проверка методом заморозки), 404
+    по ООН — опечатка модели (самоисправилась), не дефект корпуса.
+    Две предпосылки разбора опровергнуты данными: chocolatey —
+    собственный источник Python-вопроса (сессия 2), cbr.ru/consultant.ru
+    — вопросы сессии 8, а не «чужой дрейф» сессии 7.
+    **Зарегистрированы задачи T7.8–T7.15** (PLAN, M7): T7.8 текст
+    утверждения в source_assertion; T7.9 claim без head не коммитится;
+    T7.10 newest-first обрезка explorer-контекста; T7.11 идемпотентный
+    refetch; T7.12 intra-session repeat guard; T7.13 message.reply
+    inbox-gating; T7.14 правила в промптах; T7.15 E2E-валидация на
+    черновой БД (условие перезапуска EVAL-3). Честная оговорка
+    «curated-путь не исполнялся end-to-end до этого прогона» — под
+    матрицей §22.1 (вместе с оговорками строк 1–2). Новый прогон не
+    планируется, корпус не перезамораживается, хэши конфигов v2/v3 и
+    корпуса не меняются — решение за пользователем.
+
+**T7.8 закрыт: текст утверждения в `source_assertion` (EVAL-3b post-mortem P.1, §6.4).**
+
+Payload evidence `source_assertion` теперь несёт `assertion_text` —
+фрагмент нормализованного текста chunk, из которого читается
+утверждение (явный бюджет `SOURCE_ASSERTION_TEXT_BUDGET = 2_000`
+символов, `apps/orchestrator/evidence.py`). Хост (`_research_fetch`)
+кладёт чистый нормализованный текст (уже обрезанный
+RESEARCH_CONTEXT_BUDGET) в данные наблюдения (`normalized_text`),
+адаптер берёт его бюджетированный фрагмент. Куратор (и верификатор)
+теперь видят текст в evidence-строках роли-промпта
+(`_evidence_lines` в `apps/orchestrator/orchestrator.py`: метаданные —
+URL/хэши/chunk — по-прежнему `_cap_args`, фрагмент — отдельным блоком
+`[текст фрагмента]`), а не только URL и хэши, как в EVAL-3b.
+
+Identity не меняется (§14.3): `source_assertion_identity(original_sha,
+chunk_id, kind)` — фрагмент не участвует в identity; тест
+`test_assertion_text_budget_is_explicit_and_identity_ignores_text`
+фиксирует: другое содержимое текста при том же хэше исходного
+содержимого → тот же identity (семантика дедупликации не поменялась),
+и что фрагмент обрезается ровно до явного бюджета.
+
+Тесты: `tests/scenario/test_research_evidence.py` (E3-тест теперь
+ассертит payload-текст и инвариант identity по тексту; новый тест
+явного бюджета + identity, не зависящий от текста),
+`tests/scenario/test_research_provenance.py` (полная curated-сессия:
+промпт куратора — свежего chat-вызова, не видевшего fenced-контент
+explorer'а — содержит предложение страницы end-to-end).
+
+**T7.9 закрыт: claim без head не коммитится (EVAL-3b post-mortem P.2, §14.1).**
+
+Два дефекта, зафиксированных в EVAL-3b (headless claim'ы
+`e098b6d3…`/`c005b58a…` сессии `46849cec…` — audit seq=69:
+`problems=["assessment rejected for …: support evidence kind
+'source_assertion' not allowed for local_observation", …]`,
+assessments=0, claims_created=2, commit продолжился), закрыты двумя
+уровнями:
+
+1. **Pre-commit отбой предложения** (`validate_claim_proposal` в
+   `packages/memory/service.py` + проверка в `_curator`
+   `apps/orchestrator/orchestrator.py`): до записи каких-либо
+   staging-опов хост прогоняет предложение куратора через rules engine
+   (единственный производитель оценок, §3.7) — ровно тот путь
+   `RuleValidationError` из `evaluate()` (support-вид, не входящий в
+   `allowed_kinds` claim-типа; он не зависит от групп независимости,
+   поэтому pre-check тождествен проверке на границе commit). Отбитое
+   предложение аудируется (`session_state_changed` с
+   `curator_rejected_by_rules`) и не попадает в staging: commit-граница
+   применяет ничего, problems-записи при продолжении commit нет.
+   Session завершается (SUCCEEDED — исследование удалось), но
+   отравленный claim не коммитится.
+2. **Fail-closed на самой границе** (`apply_claim_staging`, шаг 3):
+   `RuleValidationError` больше НЕ превращается в `problems.append +
+   continue` — apply прерывается, fenced-транзакция откатывается;
+   reconciler атомарно разрешает prepared-attempt (aborted + failed +
+   staging discarded, T2.20). Инвариант «закоммиченный claim всегда
+   имеет head в активном снапшоте» теперь держится границей, а не
+   только оркестратором.
+3. **Dedup не переиспользует headless** (`apply_claim_staging`, шаг 1):
+   запрос дедупликации требует `EXISTS` head claim'а в
+   `config_snapshot_id` сессии — legacy headless claim'ы (невидимые для
+   retrieval, `claim_view` = None) больше не могут быть переиспользованы:
+   вместо reuse создаётся новый claim и оценивается как положено.
+
+Тесты: `tests/unit/test_memory_service.py` —
+`test_rules_rejected_claim_aborts_apply_no_headless_claim` (инвариант:
+apply с rejected-оценкой бросает `RuleValidationError`, после отката в
+БД нет ни claim, ни evidence, ни head),
+`test_headless_claim_is_never_reused_by_dedup` (legacy headless claim с
+тем же statement/type НЕ переиспользуется: claims_created=1,
+claims_reused=0, новый claim имеет current head; legacy остаётся без
+head; контроль — повторный apply из новой сессии переиспользует новый
+claim с head), `test_validate_claim_proposal_bounces_rules_rejected_claim`
+(pre-check: кейс EVAL-3b отбит, допустимое предложение
+external_fact+source_assertion проходит, неизвестный claim_type отбит);
+`tests/scenario/test_research_provenance.py` —
+`test_rules_rejected_proposal_is_bounced_before_commit` (полная
+curated-сессия end-to-end: curator предлагает local_observation,
+поддержанную source_assertion — ровно кейс EVAL-3b → proposal отбит до
+commit: audit с точной причиной, 0 claim/0 head/0 evidence/0
+staging-опов в БД, session SUCCEEDED).
+
+**T7.10 закрыт: newest-first обрезка explorer-контекста (EVAL-3b post-mortem P.3, §5.4).**
+
+Дефект EVAL-3b: builder explorer-контекста (`_explorer_context`) собирал
+pack + инструменты + наблюдения + evidence + сообщение и обрезал хвост
+жёстким `[:24_000]` — сохраняя НАЧАЛО (старейшие наблюдения) и вырезая
+КОНЕЦ, где лежал последний `research.fetch` (fenced, до 40k). Модель не
+видела результат последнего fetch и переиспускала тот же fetch: в EVAL-3b
+`input_tokens` был константным (sess2 9895×6, sess3 8521×9),
+`CONTEXT_PACKED` 317–330 токенов.
+
+Фикс (`apps/orchestrator/orchestrator.py`):
+1. Новый бюджет `EXPLORER_CONTEXT_BUDGET = RESEARCH_CONTEXT_BUDGET + 8_000`
+   (48k) — помещает целый fetch (до `RESEARCH_CONTEXT_BUDGET`) плюс
+   overhead (инструкция, инструменты, evidence, pack, сообщения).
+2. Обрезка newest-first: отбрасываются САМЫЕ СТАРЫЕ наблюдения одно за
+   другим, пока промпт не влезает в бюджет; последнее наблюдение (самый
+   свежий `research.fetch`) и финальная инструкция никогда не
+   отбрасываются. Старая `[:24_000]` (keep-head) удалена.
+
+Тесты: `tests/unit/test_explorer_context.py` —
+`test_latest_fetch_present_and_oldest_dropped_under_budget` (15
+full-budget наблюдений: результат ПОСЛЕДНЕГО `research.fetch`
+присутствует в промпте шага, fence цел, инструкция на месте, старейшие
+отброшены, промпт ≤ бюджета), `test_no_truncation_when_prompt_fits`
+(малые наблюдения — ничего не отбрасывается),
+`test_empty_observations_still_offers_instruction` (пусто — инструкция и
+список инструментов всё равно есть). End-to-end подтверждение, что
+fetch-результат попадает в промпт, — существующий
+`tests/scenario/test_research_provenance.py::test_research_content_enters_context_fenced`.
+
+**T7.11 закрыт: идемпотентный refetch — существующий source+chunk, не 500 (EVAL-3b P.4, §6.4).**
+
+Дефект EVAL-3b: повторный `research.fetch` уже виденного контента (тот же
+content-hash → тот же artifact) завершался 500: `sources` на каждый fetch
+писалась новая строка, а `artifact_chunks` вставлялся слепым
+`INSERT … 'chunk-0'` → `UNIQUE (artifact_id, chunk_id)` (ключ
+`61a8f927-…/chunk-0`): sess3 ×8 europa.eu, sess7 ×3, sess2 python.org,
+chocolatey ×7 дублей.
+
+Фикс (`apps/research_proxy/service.py`):
+1. **Source по content-hash идемпотентен**: перед вставкой source ищется
+   существующий `sources WHERE content_hash = original_sha AND
+   source_type='external_url'`; при наличии переиспользуется его `id`
+   (новая строка не создаётся), иначе — создаётся как раньше.
+2. **Chunk идемпотентен**: `INSERT INTO artifact_chunks … ON CONFLICT
+   (artifact_id, chunk_id) DO NOTHING` — повторный chunk-0 для того же
+   artifact молча пропускается (500 больше невозможен; race на
+   одновременный первый fetch тоже закрыт).
+3. Аудит `research_fetch_completed` получает флаг `idempotent` (true на
+   refetch) — наблюдаемо, что контент был переиспользован.
+
+Тест: `tests/scenario/test_research_proxy.py::test_refetch_is_idempotent_reuses_source_and_chunk`
+(два fetch одной страницы: второй НЕ 500, возвращает тот же
+`source_id`; ровно 1 source + 1 chunk по content-hash; ровно 1 аудит с
+`idempotent=true`).
+
+**T7.12 закрыт: N одинаковых (tool, args_hash) — deny с наблюдением (EVAL-3b P.5, §5.4).**
+
+Дефект EVAL-3b: idempotency-key действия скопирован на `turn_id`, который
+генерируется заново на каждом шаге — поэтому `check_idempotency` (replay)
+никогда не совпадал между шагами, и модель могла переиспускать ОДИН И ТОТ
+ЖЕ вызов (инструмент + аргументы) бесконечно: в EVAL-3b один
+`research.fetch` повторялся 6–9× при константных `input_tokens`
+(sess2 9895×6, sess3 8521×9).
+
+Фикс (`apps/orchestrator/orchestrator.py`):
+1. Константа `TOOL_REPEAT_DENY_LIMIT = 2` — сколько раз один и тот же
+   (tool, args_hash) может быть исполнен в сессии до deny следующего
+   повтора.
+2. Счётчик `tool_call_counts` (per-сессия) в explorer-цикле: после
+   каждого исполнения (после `ACTION_STARTED`) увеличивается.
+3. Перед созданием действия: если счётчик ≥ лимита — действие НЕ
+   исполняется, пишется аудит `action_failed`
+   (`reason="tool_call_repeated"`, `executed_count`) и наблюдение модели:
+   «этот же вызов уже выполнялся N раз; результат уже в наблюдениях —
+   смени стратегию (другой инструмент / аргументы / завершение)».
+
+Тест: `tests/scenario/test_research_provenance.py::test_repeated_tool_call_is_denied_after_limit`
+(модель переиспускает один `research.fetch` на `TOOL_REPEAT_DENY_LIMIT+1`
+раз: первые N исполнены, последний ОТКЛОНЁН; ровно 1 аудит
+`tool_call_repeated` с `executed_count=N`; в промпте последующего шага —
+наблюдение «ОТКЛОНЕНО»).
+
+### T7.13 — `message.reply` не предлагать при пустом inbox + самоочевидная схема (EVAL-3b P.6)
+
+Задача: «message.reply не предлагать модели при пустом inbox, либо сделать
+схему самоочевидной». Сделано И то, И другое.
+
+Корневая причина: `message.reply` отвечает на конкретное сообщение оператора
+по `message_id`; при пустом inbox отвечать не на что — вызов бесполезен.
+В EVAL-3b модель продолжала его вызывать в пустоту (получала deny или
+no-op). Инструмент оставался в списке доступных на каждом шаге.
+
+Фикс:
+1. **Не предлагать** (`apps/orchestrator/orchestrator.py`): новый чистый
+   хелпер `filter_offered_tools(base_tools, *, has_message)` — при пустом
+   inbox `message.reply` убирается из per-step списка инструментов, который
+   видит модель; при наличии сообщения возвращается в список (порядок
+   остальных сохраняется). Вызывается на каждом шаге explorer-цикла (inbox
+   может меняться в течение сессии, поэтому фильтр per-step, а не на
+   сборке pack). Per-step `tool_schema_hash` отражает реально
+   предложенный список.
+2. **Самоочевидная схема** (`packages/policy/tools.py`): описание
+   `message.reply` теперь гласит, что инструмент доступен ТОЛЬКО когда в
+   inbox есть такое сообщение (иначе вызов бесполезен и отклоняется).
+3. Текст протокола (`_protocol_text`) больше не дублирует список
+   инструментов — канонический список инструментов только в per-step
+   `tools_str` (иначе дублирующий список противоречил per-step фильтру).
+4. Порядок секций step-промпта: `tools_str` теперь ПЕРЕД context pack
+   (модель сначала видит авторитетный per-step список инструментов).
+
+Тест: `tests/unit/test_explorer_context.py::test_filter_offered_tools_drops_message_reply_without_message`
+(пустой inbox → `message.reply` убран, остальные на месте; непустой inbox →
+`message.reply` предложен; базовый список без `message.reply` не меняется).
+
+Примечание: stray-вызов `message.reply` при пустом inbox остаётся
+безопасным no-op на исполнение (message=None) — фильтр только убирает его
+из предложения модели.
+
+### T7.14 — правила в промптах (EVAL-3b P.2/P.4)
+
+Задача: «explorer — не более двух повторов после ошибки инструмента, затем
+смена стратегии; curator — если в evidence нет текста утверждения,
+создавать вопрос, а не claim».
+
+Корневые причины (EVAL-3b):
+- P.2: после ошибки инструмента модель переиспускала тот же вызов (см.
+  также T7.12 — жёсткий лимит на исполнение). Промпт не запрещал повтор
+  после ошибки явно.
+- P.4: куратор формулировал claim по evidence, в тексте которого НЕ было
+  самого утверждения (statement) — claim без подтверждения в evidence.
+
+Фикс (только промпты, без изменения логики; жёсткий лимит T7.12 остаётся):
+1. `prompts/explorer.md` (version `explorer-v2` → `explorer-v3`), rule 4:
+   «Если инструмент вернул ошибку — не повторяй один и тот же вызов
+   (те же tool и аргументы) больше двух раз: после второй ошибки с теми же
+   аргументами результат не изменится — смени стратегию (другие аргументы,
+   другой инструмент) или заверши».
+2. `prompts/curator.md` (version `curator-v2` → `curator-v3`), rule 5:
+   «Если в тексте evidence нет самого утверждения (statement), которое ты
+   хочешь предложить, — не формулируй claim по этому evidence; создай
+   вопрос о том, что именно нужно проверить или уточнить».
+3. Pin в `BOOTSTRAP_PAYLOAD` (`packages/domain/config.py`) поднят до
+   `explorer-v3`/`curator-v3` (версия промпта идёт в fingerprint вызова).
+   Замороженные eval-конфиги (`docs/eval/config-v{2,3}-payload.json`)
+   НЕ тронуты (это артефакты EVAL-3).
+
+Важно: смена версии промпта меняет fingerprint модели (prompt_version) —
+поэтому T7.15 (E2E-проверка) должен выполняться ПОСЛЕ T7.14, чтобы
+fingerprint отражал новые промпты.
+
+Тест: `tests/scenario/test_question_selector.py::test_real_prompts_are_versioned`
+(версии файлов промптов == pin в BOOTSTRAP_PAYLOAD; обе теперь v3).
+
+ ### T7.15 — E2E-валидация полного пути на черновой БД (условие перезапуска EVAL-3)
+
+ Задача: доказать на черновой БД (НЕ замороженный корпус) полный путь
+ `research.fetch → source_assertion с текстом → external_fact claim → head
+ current → grade E3 из 2 независимых источников` и показать выдержку из БД
+ (тип claim, statement, epistemic_status, grade, связанные evidence).
+ Реальный LLM (`qwen36-35b-a3b-q6-mtp`) + реальный research proxy (SearXNG +
+ прямой fetch). Fingerprint отражает промпты T7.14 (explorer-v3/curator-v3).
+
+ **Итог: путь подтверждён.** На черновой БД `noezema-eval-draft` созданы
+ external_fact claim'ы с head `current`, epistemic_status `supported`,
+ effective_grade **E3** (confidence 0.75, rules-v1), каждый со 2
+ source_assertion (relation `supports`) из 2 независимых групп источников.
+
+ Выдержка из БД (claim → head current → grade → evidence):
+
+     claim_type:  external_fact
+     statement:   Париж является столицей Франции
+     head assessment_state: current
+     epistemic_status: supported
+     effective_grade: E3    confidence: 0.75    rules_version: rules-v1
+     linked evidence (2):
+       - source_assertion / supports   en.wikipedia.org/api/rest_v1/page/summary/Paris  (группа: wikipedia.org)
+       - source_assertion / supports   home.adelphi.edu/~ca19535/page%204.html          (группа: adelphi.edu)
+
+ Два источника = два РАЗНЫХ registrable domain (wikipedia.org и adelphi.edu)
+ → две разные independence-группы (source_independence snapshot: g0/g1,
+ basis=single) → `min_independence_groups=2` выполнен → grade E3.
+
+ Найдено по ходу (ловушки, закреплено):
+ 1. **Независимость — по registrable domain** (PSL-style,
+    `packages/memory/independence.py::registrable_domain`). `en.wikipedia.org`
+    и `simple.wikipedia.org` — ОДИН домен (wikipedia.org) → одна группа → E3
+    с ними невозможен. Для E3 нужны 2 источника с РАЗНЫМИ registrable domain.
+ 2. **Текст утверждения должен попадать в `assertion_text`** (первые 2000
+    символов нормализованного текста, `SOURCE_ASSERTION_TEXT_BUDGET`, T7.8) —
+    именно его видит curator. Полные HTML-страницы Wikipedia прячут факт после
+    ~5000 символов навигации → curator видит только навигацию и формулирует
+    meta-claim о странице (или не формулирует). Для Wikipedia использован
+    REST summary endpoint (чистый текст, факт в пределах бюджета).
+ 3. **`external_fact` rule — `requires_scope=true`**: `_scope_covers`
+    требует, чтобы КЛЮЧИ scope claim присутствовали в scope каждого
+    supporting evidence с равным значением. curator-v3 не фиксирует схему
+    scope, поэтому свободный curator придумывает РАЗНЫЕ ключи для claim и
+    evidence (набл. claim `{domain,entity,target,property,...}` vs evidence
+    `{object,subject,relation}`) → `scope_not_covered` → E1. Промпт заморожен
+    (fingerprint T7.14), поэтому согласованность scope задаётся в ВОПРОСЕ
+    (один scope-объект, скопированный дословно в claim и в каждое evidence).
+
+ **Честная оговорка:** E3 получен при условии, что вопрос явно диктует
+ идентичный scope для claim и evidence. Без этой подсказки curator-v3 (без
+ фиксированной схемы scope) даёт E1 (`scope_not_covered`) — это реальное
+ ограничение свободной формы scope в curator-v3, а не дефект rules engine
+ (fail-closed сработал корректно: при несогласованном scope grade не
+ завышен). Путь сам по себе (fetch → source_assertion с текстом → claim →
+ head current → grade из независимых источников) доказан.
+
+ Условия перезапуска EVAL-3 (по gate) выполнены: выдержка из БД показана
+ (тип claim, statement, epistemic_status, grade, связанные evidence).
+ Корпус/конфиг/пороги §22.2 НЕ тронуты; прогон — только на черновой БД,
+ 2–3 авторских URL-вопроса (не замороженный корпус). One-off сценарий
+ (не тест репо) не коммитится; доказательство — в черновой БД.
+
+ ### T7.16 — вопрос-зависимый выбор фрагмента assertion_text (EVAL-3b, §6.4)
+
+ Дефект (остаточный после T7.8): `assertion_text` в payload
+ `source_assertion` — первые `SOURCE_ASSERTION_TEXT_BUDGET` (2000)
+ символов нормализованного текста страницы, отсчитанные ОТ НАЧАЛА. У
+ половины страниц корпуса факт лежит дальше: на en.wikipedia.org/wiki/
+ European_Union «27» на 6682-м символе, consultant.ru/legalnews/32063 —
+ на 4588-м, cbr.ru — на 2511-м (замеры — `docs/eval/EVAL-3b-postmortem.md`
+  ираздел). Куратор видит навигацию вместо факта → external_fact
+ не формулируется.
+
+ Решение (без роста бюджета): фрагмент вырезается окном вокруг места с
+ наибольшей плотностью терминов вопроса/плана. Чистая логика — новый
+ модуль `apps/orchestrator/assertion_window.py`
+ (`select_assertion_window`): термины вопроса (стоп-фильтр + URL-сегменты
+ + prefix-stem), фильтр page-wide-сигналов (термин, дающий >½ всех
+ совпадений вопроса по странице, и chrome-стемы — «view history»,
+ «python», «wikipedia» — факт не локализируют), двухстрелочное скользящее
+ окно по позициям совпадений, score = число разных стемов + бонус числа
+ в расширенном контексте (факт — это ЗНАЧЕНИЕ: «27 members», «3.14.7»,
+ «14,00%») + затухающий бонус близости к началу (infobox/lead). Окно
+ стартует за `_LEAD` (300) символов до лучшей позиции; бюджет 2000
+ символов не поднят (секция claims_evidence куратора — 8192 токена, при
+ двух evidence на claim большие фрагменты вытеснили бы остальные секции).
+ Fallback (пустой вопрос / нет терминов / нет совпадений / текст короче
+ бюджета) — ведущий префикс, поведение T7.8. Фрагмент НЕ входит в
+ identity §14.3 (identity — по original hash + chunk + kind;
+ dedupe-семантика без изменений). Вопрос/план попадают в observation
+ data host-сторонами (`_research_fetch` получает `SessionContext`), модель
+ их не передаёт; публичный контракт `observation_to_evidence` не менялся
+ (AGENTS.md §4: чистая логика в отдельном модуле, без заглушек импортов).
+
+ Тест: `tests/unit/test_assertion_window.py` (12) — ОБЯЗАТЕЛЬНЫЙ тест на
+ реальной сохранённой странице: en.wikipedia.org/wiki/European_Union
+ (фикстура репозитория `tests/fixtures/artifacts`, sha256 файла == имя
+  файла; см. пометку T7.17 ниже) —
+ факт за 6000-м символом, фрагмент несёт «27 member(s)» и не стартует с
+ ведущего префикса; + остальные 6 страниц корпуса (europa.eu 1996,
+ cbr.ru 2511, consultant.ru 4588, un.org, python.org 1346,
+ chocolatey 29) — факт в окне для вопроса; + чистые свойства (fallback,
+ бюджет, tie-break, start-bias — только как тай-брейк). Сценарный путь
+ (fetch → evidence → commit) покрыт `tests/scenario/test_research_evidence.py`
+ (без изменений, зелёный: на коротких страницах текст < бюджета → весь
+ текст, поведение T7.8).
+
+ Замер на корпусе (7 реальных страниц, budget=2000): факт в окне на всех
+ 7 (eu.wiki 6682 ✓, europa.eu 1996 ✓, cbr.ru 2511 ✓, consultant.ru 4588 ✓,
+ un.org ~1009 ✓, python.org 1346 ✓, chocolatey 29 ✓). Корпус/конфиг/пороги
+ §22.2 не тронуты (хэши прежние); EVAL-3 не запускался, перезапуск не
+ планируется (до решения пользователя).
+
+### T7.17 — устойчивый scope: оценка по хост-деривации, rules-v2 (EVAL-3/T7.15, §3.7, §8.7, §11.2)
+
+ Дефект (T7.15, одна из двух причин нулевых external/temporal claims в
+ EVAL-3b): `requires_scope` проверялся key-by-key по free-form dict'ам,
+ которые модель придумывала РАЗДЕЛЬНО для claim и evidence — разные
+ ключи под один предмет и дату («регион» vs «область», «на дату» vs
+ «as_of») → `scope_not_covered` → E1. E3 в T7.15 получился только потому,
+ что вопрос диктовал scope-объект дословно — подсказка, которой нет в
+ замороженном корпусе v2 (и которую добавлять нельзя: гейт
+ `external_temporal_e3` выполнялся бы по построению). Суть против §3.7/
+ §11.2: входы, влияющие на grade, производила модель.
+
+ Решение (вариант 1 задачи — scope выводит доверенный хост; ADR-0007,
+ семантика покрытия изменилась → ADR обязателен):
+
+ - **claim scope** — из ВОПРОСА сессии + типизированного `as_of`
+   claim: опорная дата (детерминированный закрытый набор форм: русские/
+   английские месяцы, `д.м.гггг`, ISO; левейшее валидное совпадение;
+   «на текущую дату» → без даты) и registrable domains источников,
+   названных вопросом (гранулярность §11.3). Дата вопроса первична —
+   модельный `as_of` не может сдвинуть опорную дату (due/stale-механика
+   §22.2 не управляется моделью).
+ - **evidence scope** — из PROVENANCE: registrable domain
+   `sources.canonical_uri` + `sources.retrieved_at` (для не-source
+   evidence — commit time). При переиспользовании claim все строки
+   evidence (включая созданные rules-v1) ре-деривируются из provenance
+   в той же tx commit'а (идемпотентно; identity/dedupe не меняются —
+   scope не входит в identity_hash).
+ - **покрытие** (fail-closed): evidence должен быть НАБЛЮДЁН не раньше
+   опорной даты D (`T >= D`; источник, полученный раньше D, не говорит
+   о D — конвенция корпуса «по состоянию на D» по стабильным фактам) и
+   его домен обязан быть среди названных вопросом. Не объявленное
+   измерение не проверяется; отсутствие времени/домена при объявленном
+   измерении — НЕ покрывает.
+ - **legacy-scope** (без маркера `host-scope-v1`) — исходный key-by-key
+   предикат без изменений: апгрейд не переоценивает существующее знание
+   ни в одну сторону; канонический claim scope не покрывается legacy
+   evidence scope.
+ - **не входит в деривацию план сессии** (`sessions.plan`): это
+   предложение модели — его URLs расширили бы scope, который нужно
+   покрывать (модель влияла бы на grade-вход, §3.7/§11.2). Вопрос —
+   единственный scope-якорь.
+ - версия движка `rules-v1` → `rules-v2` (assessment фиксирует версию;
+   пороги §22.2, правила типов, `requires_scope`, правило E3 — два
+   независимых источника / минимум два source_assertion — не менялись);
+   модельный free-form scope остаётся в staging payload и audit
+   (`claim_created`: `scope` = модель, `assessed_scope` = хост).
+
+ Код: `packages/memory/scope.py` (чистый модуль: парсер даты вопроса,
+ извлечение URL, деривация claim/evidence scope, предикат покрытия с
+ диспетчеризацией canonical/legacy; AGENTS.md §4 — без заглушек и без
+ изменения публичного контракта rules engine: `evaluate`/
+ `AssessmentResult` прежние), `packages/memory/rules_engine.py` +
+ `packages/memory/evidence.py` (rules-v2), `packages/memory/service.py`
+ (claim scope из вопроса при commit, evidence scope из provenance,
+ ре-деривация всех строк claim'а, `_derive_evidence_scope`).
+
+ Тесты:
+ - `tests/unit/test_scope.py` (24) — формы парсера (корпусные,
+   «текущую дату», невалидные календарные, leftmost-wins), URL,
+   деривация (дата вопроса > модельный as_of; naive as_of; домены),
+   матрица покрытия: тот же предмет и дата → покрывает; другой домен /
+   retrieved раньше D / отсутствие времени-домена → НЕ покрывает
+   (fail-closed); legacy — исходный предикат (дефектный pair
+   «регион»/«область» не совпадал и не совпадает — без переоценки
+   legacy-знания); канонический claim + legacy evidence → НЕ покрывает.
+ - `tests/unit/test_rules_engine.py` (+4) — через `evaluate`: хост-
+   scope с тем же предметом и датой → E3 supported (требование 1);
+   источник не из вопроса → E1 hypothesis `scope_not_covered`;
+   retrieved раньше D → E1 `scope_not_covered` (требование 2,
+   fail-closed: grade не поднимается); модельные free-form ключи в
+   предикат не входят. Существенные legacy-тесты файла проходят без
+   изменений (диспетчеризация).
+ - `tests/scenario/test_scope_coverage.py` (4, полный путь
+   fetch → staging → commit → assessment на postgres): (1) вопрос с
+   датой и двумя источниками, кураторский scope free-form с
+   разнопрописанными ключами → E3 supported, head current,
+   assessed_scope/evidence.scope канонические, модельный dict в
+   audit; (2a) evidence из источника, НЕ названного вопросом (другой
+   subject; independence при этом выполняется — E1 только из-за
+   scope) → E1 `scope_not_covered`; (2b) оба источника названы, но
+   retrieved раньше опорной даты (другая дата) → E1
+   `scope_not_covered`; (3) ПОЛНАЯ сессия на fake LLM через
+   orchestrator (curated-профиль, research.fetch по двум
+   registrable-доменам, куратор вернул произвольный free-form scope) →
+   head current, supported, E3, два независимых source.
+
+ Задача 1 (фикстуры `tests/fixtures/artifacts`): тест
+   `test_assertion_window.py` больше не зашит на
+   `/home/denis/dsh1/eval3b-data/artifacts` — страницы в репозитории
+   (`tests/fixtures/artifacts/<sha2[:2]>/<sha256>`, sha256 файла == имя
+   файла), EU-фрагмент 20 000 символов (оффсеты факта 6682/8378
+   сохранены, «27» за 6000-м, в первых 2000 нет), 4 страницы корпуса
+   дословно; пропуск при отсутствии файла НЕ вводился (тест обязателен).
+   Источник (`noezema-eval3b`) не изменялся — только копия.
+
+ Корпус v2, конфиги v2/v3 и пороги §22.2 не тронуты (хэши прежние);
+ EVAL-3 не запускался и не планируется (решение за пользователем).
+ Прогон: 765 тестов (база 733 + 32 новых).

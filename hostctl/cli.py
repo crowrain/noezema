@@ -7,6 +7,7 @@ policy_change, unit_state); all invariants live in those modules, not here.
 
 from __future__ import annotations
 
+import json
 import sys
 import uuid
 from pathlib import Path
@@ -709,6 +710,130 @@ def security_gate(python_bin: str | None, metrics_url: str | None) -> None:
     sys.exit(proc.returncode)
 
 
+def parse_corpus_questions(raw: str) -> list[tuple[str, int]]:
+    """Parse the eval-run JSONL question corpus (T7.7, EVAL-3).
+
+    One object per line: ``{"text": ...}`` plus an optional integer
+    ``priority`` (default 0). Blank lines and lines starting with ``#``
+    are skipped. The seed preserves the priority: the FIFO selector
+    consumes (priority DESC, created_at ASC, id), so the corpus
+    controls the consumption order through priorities (§5.3.2).
+    Raises ValueError (with the line number) on a malformed line.
+    """
+    out: list[tuple[str, int]] = []
+    for line_no, line in enumerate(raw.splitlines(), start=1):
+        if not line.strip() or line.startswith("#"):
+            continue
+        try:
+            obj = json.loads(line)
+            text_value = str(obj["text"])
+            priority = obj.get("priority", 0)
+        except (ValueError, KeyError, TypeError) as exc:
+            raise ValueError(f"corpus line {line_no}: {exc}") from exc
+        if isinstance(priority, bool) or not isinstance(priority, int):
+            raise ValueError(f"corpus line {line_no}: 'priority' must be an integer")
+        if not text_value:
+            raise ValueError(f"corpus line {line_no}: empty 'text'")
+        out.append((text_value, priority))
+    return out
+
+
+@main.command("blind-sample")
+@click.option(
+    "--run",
+    "run_ref",
+    required=True,
+    help="Evaluation run id (uuid) or label.",
+)
+@click.option(
+    "--out",
+    "out_file",
+    type=click.Path(dir_okay=False),
+    default=None,
+    help="Write the report to this file (default: stdout).",
+)
+@click.option(
+    "--fragment-chars",
+    default=2000,
+    show_default=True,
+    help="Max characters of the cited fragment per evidence.",
+)
+def blind_sample(run_ref: str, out_file: str | None, fragment_chars: int) -> None:
+    """T7.7 (EVAL-3): dump the blind sample for the MANUAL §22.2 review.
+
+    §22.2 defines the blind sample as a manual procedure: a person
+    judges whether each sampled claim follows from its evidence. This
+    renders the SAME seeded/stratified selection the blind gates
+    measure — per claim: id/type/statement/status/grade/assessed scope;
+    per linked evidence: kind/relation/scope, source URL or artifact
+    id, and the cited fragment (from the content-addressed artifact
+    store, ``NOEZEMA_ARTIFACTS_ROOT`` or data_root/artifacts).
+    docs/eval/EVAL-3-freeze.md «Ограничение метода».
+    """
+    import asyncio
+    import os
+
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from apps.orchestrator.scheduler import data_root_from_env
+    from packages.artifacts.store import ArtifactStore, FilesystemArtifactStore
+    from packages.evaluation.blind import blind_sample_details, render_blind_sample
+    from packages.evaluation.service import get_evaluation_run
+
+    url = os.environ.get("NOEZEMA_DATABASE_URL", "")
+    if not url:
+        click.echo("NOEZEMA_DATABASE_URL is not set", err=True)
+        sys.exit(EXIT_USAGE_ERROR)
+    engine = create_async_engine(url)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    store_root = Path(
+        os.environ.get("NOEZEMA_ARTIFACTS_ROOT") or str(data_root_from_env() / "artifacts")
+    )
+    store: ArtifactStore | None
+    try:
+        store = FilesystemArtifactStore(store_root)
+    except OSError as exc:
+        click.echo(
+            f"artifact store unavailable ({exc}); fragments will be empty", err=True
+        )
+        store = None
+
+    async def _run() -> int:
+        async with factory() as db:
+            run = None
+            try:
+                run = await get_evaluation_run(db, uuid.UUID(run_ref))
+            except ValueError:
+                row = (
+                    await db.execute(
+                        text("SELECT id FROM evaluation_runs WHERE label = :l"),
+                        {"l": run_ref},
+                    )
+                ).first()
+                if row is not None:
+                    run = await get_evaluation_run(db, row[0])
+            if run is None:
+                click.echo(f"evaluation run not found: {run_ref}", err=True)
+                return 1
+            entries = await blind_sample_details(
+                db, run, store=store, fragment_chars=fragment_chars
+            )
+        report = render_blind_sample(run, entries)
+        if out_file:
+            Path(out_file).write_text(report, encoding="utf-8")
+            click.echo(f"blind sample: {len(entries)} claims -> {out_file}")
+        else:
+            click.echo(report)
+        return 0
+
+    try:
+        code = asyncio.run(_run())
+    finally:
+        asyncio.run(engine.dispose())
+    sys.exit(code)
+
+
 @main.command("eval-run")
 @click.option("--label", required=True, help="Run label (e.g. EVAL-1).")
 @click.option(
@@ -716,7 +841,8 @@ def security_gate(python_bin: str | None, metrics_url: str | None) -> None:
     "questions_file",
     required=True,
     type=click.Path(exists=True, dir_okay=False),
-    help="JSONL question corpus (one {'text': ...} per line); seeded as origin='seeded'.",
+    help="JSONL question corpus (one {'text': ..., 'priority': N?} per line); "
+    "seeded as origin='seeded' with the given priority (default 0).",
 )
 @click.option("--count", default=50, show_default=True, help="Number of sessions to run.")
 @click.option(
@@ -752,7 +878,6 @@ def eval_run(
     """
     import asyncio
     import hashlib
-    import json
     import os
 
     from sqlalchemy import text
@@ -786,11 +911,11 @@ def eval_run(
     llm = LLMGatewayConfig()
 
     raw = Path(questions_file).read_text(encoding="utf-8")
-    questions = [
-        json.loads(line)
-        for line in raw.splitlines()
-        if line.strip() and not line.startswith("#")
-    ]
+    try:
+        questions = parse_corpus_questions(raw)
+    except ValueError as exc:
+        click.echo(f"corpus: {exc}", err=True)
+        sys.exit(EXIT_USAGE_ERROR)
     corpus_sha = hashlib.sha256(raw.encode("utf-8")).hexdigest()
     click.echo(f"corpus: {len(questions)} questions, sha256={corpus_sha[:16]}…")
 
@@ -827,8 +952,7 @@ def eval_run(
     async def _seed_questions() -> None:
         async with factory() as db, db.begin():
             n = 0
-            for q in questions:
-                t = str(q["text"])
+            for t, priority in questions:
                 exists = (
                     await db.execute(
                         text("SELECT 1 FROM questions WHERE text = :t"), {"t": t}
@@ -838,10 +962,10 @@ def eval_run(
                     continue
                 await db.execute(
                     text(
-                        "INSERT INTO questions (id, text, origin, state) "
-                        "VALUES (:id, :t, 'seeded', 'candidate')"
+                        "INSERT INTO questions (id, text, origin, state, priority) "
+                        "VALUES (:id, :t, 'seeded', 'candidate', :p)"
                     ),
-                    {"id": uuid.uuid4(), "t": t},
+                    {"id": uuid.uuid4(), "t": t, "p": priority},
                 )
                 n += 1
             click.echo(f"seeded {n} new questions (corpus frozen)")
@@ -1003,8 +1127,41 @@ def eval_run(
                 now=datetime.now(UTC),
             )
             click.echo(f"run finished: outcome={finished.outcome}")
+            click.echo("gates (§22.2; ratio gates carry the 95% Wilson ci95):")
+            blind_names = ("blind_provenance_path", "blind_scope")
             for name, g in gates.items():
-                click.echo(f"  {name}: {g.get('outcome')} {g}")
+                if name in blind_names:
+                    continue
+                ci = g.get("ci95")
+                ci_s = (
+                    f" ci95=[{ci['low']}, {ci['high']}]" if isinstance(ci, dict) else ""
+                )
+                click.echo(
+                    f"  {name}: {g.get('outcome')} "
+                    f"{g.get('numerator')}/{g.get('denominator')}{ci_s} "
+                    f"(threshold={g.get('threshold')})"
+                )
+            click.echo(
+                "blind gates — STRUCTURAL CHECK ONLY (§22.2 defines the blind "
+                "sample as MANUAL review; full acceptance requires the manual "
+                "check of the rendered sample — docs/eval/EVAL-3-freeze.md "
+                "«Ограничение метода»):"
+            )
+            for name in blind_names:
+                g = gates[name]
+                ci = g.get("ci95")
+                ci_s = (
+                    f" ci95=[{ci['low']}, {ci['high']}]" if isinstance(ci, dict) else ""
+                )
+                click.echo(
+                    f"  {name}: {g.get('outcome')} "
+                    f"{g.get('numerator')}/{g.get('denominator')}{ci_s} "
+                    f"(threshold={g.get('threshold')})"
+                )
+            click.echo(
+                "manual blind review: noezemactl blind-sample --run "
+                f"{finished.id} --out <file>"
+            )
 
     async def _main() -> int:
         run_id = await _freeze()

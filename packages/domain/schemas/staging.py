@@ -42,6 +42,15 @@ class ClaimProposal(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     statement: str = Field(min_length=1, max_length=2000)
+    # ADR-0006 rev (cross-lingual search): the model renders the
+    # statement in the other corpus language (MVP: English) so that
+    # retrieval matches queries in either language. Search index only —
+    # the knowledge text is always ``statement``.
+    search_statements: list[str] = Field(
+        default_factory=list,
+        max_length=2,
+        description="Англоязычные варианты формулировки (1–2), ТОЛЬКО для поиска",
+    )
     claim_type: ClaimType
     scope: JsonDict = Field(default_factory=dict)
     as_of: datetime | None = None
@@ -87,6 +96,11 @@ class CuratorProposal(BaseModel):
         for i, claim in enumerate(self.claims):
             if claim.claim_type is ClaimType.TEMPORAL_FACT and claim.as_of is None:
                 problems.append(f"claim[{i}]: temporal_fact requires as_of")
+            for k, alt in enumerate(claim.search_statements):
+                if not alt.strip():
+                    problems.append(f"claim[{i}].search_statements[{k}]: empty")
+                elif len(alt) > 300:
+                    problems.append(f"claim[{i}].search_statements[{k}]: > 300 chars")
             seen: set[tuple[str, str]] = set()
             for j, dep in enumerate(claim.dependencies):
                 key = (str(dep.claim_id), dep.kind.value)

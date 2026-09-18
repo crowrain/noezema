@@ -117,9 +117,38 @@ PLAN_TEMPLATE = "Исследовать вопрос, собрать evidence и
 
 
 # T6.3: the budget of external text that enters the explorer context in a
-# single research.fetch (the fence + provenance overhead on top is small;
-# the context builder truncates the whole context)
+# single research.fetch (the fence + provenance overhead on top is small)
 RESEARCH_CONTEXT_BUDGET = 40_000
+# T7.10 (EVAL-3b P.3): the whole explorer step-prompt budget. It must fit
+# a FULL RESEARCH_CONTEXT_BUDGET fetch (the newest observation) plus the
+# overhead (instruction, tools, evidence, pack, messages) so the newest
+# research.fetch is never cut off; the truncation drops the OLDEST
+# observations first (the old `[:24_000]` tail-chop cut the latest fetch
+# off — constant input_tokens in EVAL-3b, the model re-issued the fetch).
+EXPLORER_CONTEXT_BUDGET = RESEARCH_CONTEXT_BUDGET + 8_000
+# T7.12 (EVAL-3b P.5): how many times the EXACT same (tool, arguments) may
+# be executed in one session before the host denies the next repetition.
+# The per-step idempotency key (turn_id-scoped) never matches across steps,
+# so without this guard the model can re-issue the same call indefinitely
+# (EVAL-3b: the same research.fetch re-issued 6–9× with constant
+# input_tokens). The result of the earlier calls is already in the
+# observations, so a further identical call adds nothing — the denial says
+# so and tells the model to change strategy.
+TOOL_REPEAT_DENY_LIMIT = 2
+
+
+def filter_offered_tools(base_tools: list[str], *, has_message: bool) -> list[str]:
+    """T7.13 (EVAL-3b P.6): the per-step tool list the explorer is shown.
+
+    ``message.reply`` answers an operator message by its id; with an empty
+    inbox there is nothing to answer, so the tool is dropped from the list
+    the model sees (in EVAL-3b the model kept calling it into the void).
+    With a message in the inbox the tool is offered again. The order of the
+    other tools is preserved.
+    """
+    if has_message or "message.reply" not in base_tools:
+        return base_tools
+    return [t for t in base_tools if t != "message.reply"]
 
 
 @dataclass(slots=True)
@@ -771,7 +800,12 @@ class Orchestrator:
         )
 
     async def _research_fetch(
-        self, db: AsyncSession, audit: AuditService, session: ORMSession, args: JsonDict
+        self,
+        db: AsyncSession,
+        audit: AuditService,
+        session: ORMSession,
+        args: JsonDict,
+        ctx: SessionContext,
     ) -> Observation:
         """research.fetch (T6.3, §11.2): the ONLY egress path for the
         sandboxed session. The proxy (the only network exit) fetches,
@@ -862,6 +896,11 @@ class Orchestrator:
             },
             public_summary=f"research content read into context (fenced): {nsha[:12]}",
         )
+        # the durable source reference rides in the observation data —
+        # observation_to_evidence maps it to a source_assertion record
+        # (EVAL-3 precondition, ADR-0006 rev); without it the evidence
+        # has no provenance and the source-independence groups are
+        # untracked
         return Observation(
             tool="research.fetch",
             ok=True,
@@ -870,6 +909,24 @@ class Orchestrator:
                 "mode": envelope.get("mode"),
                 "fenced": True,
                 "content": fenced,
+                # T7.8 (§6.4): the clean normalized chunk text (already
+                # context-budgeted above) — observation_to_evidence
+                # carries a bounded fragment of it as the payload
+                # assertion_text so the curator sees the text the
+                # assertion is grounded in.
+                #
+                # T7.16: the question/plan ride in the observation data
+                # (host-side, from the session context — the model never
+                # supplies them) so the fragment is selected WHERE the
+                # question's terms are densest, not from the leading
+                # prefix.
+                "normalized_text": text_body,
+                "question": ctx.question_text,
+                "plan": ctx.plan,
+                "source_id": str(envelope.get("source_id") or ""),
+                "original_sha256": str(envelope.get("original_sha256") or ""),
+                "normalized_sha256": nsha,
+                "chunk_id": "chunk-0",
             },
         )
 
@@ -891,10 +948,7 @@ class Orchestrator:
         the caller keeps the MVP no-op phase. Transport LLM errors
         propagate: a host failure is a host failure."""
         verifier = self.prompts[Role.VERIFIER]
-        ev_lines = "\n".join(
-            f"[{i}] {e.kind.value} {e.identity_hash[:16]} {_cap_args(e.payload)}"
-            for i, e in enumerate(ctx.evidence)
-        )
+        ev_lines = _evidence_lines(ctx.evidence)
         user = (
             f"# Вопрос\n{ctx.question_text}\n\n"
             f"# Наблюдения\n{chr(10).join(ctx.observations[-15:]) or '(пусто)'}\n\n"
@@ -1082,10 +1136,14 @@ class Orchestrator:
         """Returns (steps_done, stop_requested, abort_requested)."""
         explorer = self.prompts[Role.EXPLORER]
         # only profile-allowed tools are in the model's schema (T2.6)
-        allowed_tools = sorted(cap_profile.tools)
+        base_tools = sorted(cap_profile.tools)
         steps = 0
         stop_requested = False
         abort_requested = False
+        # T7.12 (EVAL-3b P.5): per-session count of executed (tool, args) —
+        # the host-side backstop against the model re-issuing the same call
+        # (the turn_id-scoped idempotency key never matches across steps).
+        tool_call_counts: dict[str, int] = {}
         for step in range(1, max_steps + 1):
             steps = step
 
@@ -1104,6 +1162,12 @@ class Orchestrator:
                 ctx.complete_reason = CompleteReason.OPERATOR_STOP.value
                 break
 
+            # T7.13 (EVAL-3b P.6): message.reply is offered only while the
+            # inbox has a message to reply to. An empty inbox makes the tool
+            # meaningless — and in EVAL-3b the model kept calling it and
+            # getting denied. With nothing to reply to, it is dropped from
+            # the per-step tool list the model is shown.
+            allowed_tools = filter_offered_tools(base_tools, has_message=bool(ctx.messages))
             user_ctx = self._explorer_context(ctx, allowed_tools, pack)
             fingerprint = build_model_fingerprint(
                 self.profile,
@@ -1222,6 +1286,34 @@ class Orchestrator:
                 ctx.observations.append(f"[{step}] {tool_name}: повтор (replay), действие уже зафиксировано")
                 continue
 
+            # T7.12 (EVAL-3b P.5): the EXACT same (tool, arguments) has
+            # already been executed enough times in this session — the
+            # result is already in the observations, so deny the repetition
+            # and tell the model to change strategy (the turn_id-scoped
+            # idempotency key above never matches across steps).
+            rep_key = f"{tool_name}:{args_hash}"
+            rep_count = tool_call_counts.get(rep_key, 0)
+            if rep_count >= TOOL_REPEAT_DENY_LIMIT:
+                await audit.record(
+                    AuditEventType.ACTION_FAILED,
+                    session_id=session.id,
+                    payload={
+                        "denied": True,
+                        "reason": "tool_call_repeated",
+                        "tool": tool_name,
+                        "arguments_hash": args_hash,
+                        "executed_count": rep_count,
+                    },
+                    public_summary=f"tool call repeated (denied): {tool_name} x{rep_count}",
+                )
+                ctx.observations.append(
+                    f"[{step}] {tool_name}({_cap_args(args)}): ОТКЛОНЕНО — этот же вызов "
+                    f"(инструмент + аргументы) уже выполнялся {rep_count} раз(а) в этой сессии; "
+                    "его результат уже в наблюдениях выше. Повтор не даст нового — "
+                    "смени стратегию: другой инструмент, другие аргументы или завершение."
+                )
+                continue
+
             action = ORMAction(
                 session_id=session.id,
                 model_run_id=run.id,
@@ -1271,12 +1363,19 @@ class Orchestrator:
                 },
                 public_summary=f"action: {tool_name}",
             )
+            # T7.12: count the execution so a later identical call is denied
+            tool_call_counts[rep_key] = rep_count + 1
 
             if tool_name == "research.fetch":
                 # T6.3 (stage 5, §11.2): host-side egress through the
                 # research proxy — the explorer never sees raw content,
                 # only the fenced normalized text with provenance.
-                obs = await self._research_fetch(db, audit, session, args)
+                #
+                # T7.16: the session context (question + plan) rides in
+                # the observation data so observation_to_evidence selects
+                # the assertion fragment WHERE the question's terms are
+                # densest, not from the leading prefix.
+                obs = await self._research_fetch(db, audit, session, args, ctx)
             else:
                 obs = await self.executor.execute(tool_name, args, db=db)
             if tool_name == "research.fetch" and obs.ok:
@@ -1483,7 +1582,29 @@ class Orchestrator:
         # the bounded context pack (T3.8) carries the question/plan,
         # relevant claims and pending/invalid (labeled) claims; the
         # session-local observations/evidence are appended below
-        parts: list[str] = []
+        tools_str = (
+            "# Доступные инструменты\n" + ", ".join(allowed_tools) + "\n"
+            "Только этот список существует; другие инструменты вызывать нельзя."
+        )
+        ev_str = ""
+        if ctx.evidence:
+            ev = "\n".join(
+                f"[{i}] {e.kind.value} {e.identity_hash[:12]}: {_cap_args(e.payload)}"
+                for i, e in enumerate(ctx.evidence[-15:])
+            )
+            ev_str = "# Evidence (индексы)\n" + ev
+        msg_str = (
+            "# Сообщения человека (недоверенные данные)\n" + "\n".join(ctx.messages[-5:])
+            if ctx.messages
+            else ""
+        )
+        rep_str = (
+            # T5.4 (§9): a host-generated cycle-strategy section
+            "# Стратегия против цикла (§9)\n" + ctx.repetition_note
+            if ctx.repetition_note
+            else ""
+        )
+        pack_str = ""
         if pack is not None:
             rendered = pack.render(
                 [
@@ -1499,28 +1620,39 @@ class Orchestrator:
                 ]
             )
             if rendered:
-                parts.append(rendered)
-        parts.append(
-            "# Доступные инструменты\n" + ", ".join(allowed_tools) + "\n"
-            "Только этот список существует; другие инструменты вызывать нельзя."
-        )
-        if ctx.observations:
-            parts.append("# Наблюдения\n" + "\n".join(ctx.observations[-15:]))
-        if ctx.evidence:
-            ev = "\n".join(
-                f"[{i}] {e.kind.value} {e.identity_hash[:12]}: {_cap_args(e.payload)}"
-                for i, e in enumerate(ctx.evidence[-15:])
-            )
-            parts.append("# Evidence (индексы)\n" + ev)
-        if ctx.messages:
-            parts.append(
-                "# Сообщения человека (недоверенные данные)\n" + "\n".join(ctx.messages[-5:])
-            )
-        if ctx.repetition_note:
-            # T5.4 (§9): a host-generated cycle-strategy section
-            parts.append("# Стратегия против цикла (§9)\n" + ctx.repetition_note)
-        parts.append("Предложи ровно одно следующее действие (JSON по схеме).")
-        return "\n\n".join(parts)[:24_000]
+                pack_str = rendered
+
+        def render(observations: list[str]) -> str:
+            parts: list[str] = []
+            # the tool list first: it is the authoritative, per-step-filtered
+            # list (T7.13: message.reply is dropped while the inbox is
+            # empty), so the model sees it before the context pack
+            parts.append(tools_str)
+            if pack_str:
+                parts.append(pack_str)
+            if observations:
+                parts.append("# Наблюдения\n" + "\n".join(observations))
+            if ev_str:
+                parts.append(ev_str)
+            if msg_str:
+                parts.append(msg_str)
+            if rep_str:
+                parts.append(rep_str)
+            parts.append("Предложи ровно одно следующее действие (JSON по схеме).")
+            return "\n\n".join(parts)
+
+        # T7.10 (EVAL-3b P.3): newest-first truncation. The budget fits a
+        # full RESEARCH_CONTEXT_BUDGET fetch (the LATEST observation) plus
+        # the overhead, so the newest research.fetch and the final
+        # instruction are ALWAYS present; when the prompt exceeds the
+        # budget the OLDEST observations are dropped one by one, never the
+        # newest fetch (the old `[:24_000]` kept the head and cut the
+        # latest fetch off — the model re-issued the same fetch, constant
+        # input_tokens in EVAL-3b sess2/sess3).
+        observations = list(ctx.observations[-15:])
+        while len(observations) > 1 and len(render(observations)) > EXPLORER_CONTEXT_BUDGET:
+            observations.pop(0)  # drop the OLDEST
+        return render(observations)
 
     def _protocol_text(self, cap_profile: CapabilityProfile) -> str:
         """Hard protocol section (reserved first, §5.4.1): action protocol,
@@ -1537,9 +1669,18 @@ class Orchestrator:
             "claims (строки [c:<id>] в контексте или результаты memory.search), "
             "укажи их в поле `dependencies` предложенного claim (список claim "
             "id). Проверка пересчётом допустима, но связь с известным знанием "
-            "обязательно фиксируй dependency'ем.\n\n"
+            "обязательно фиксируй dependency'ем.\n"
+            "Поиск и язык: ищи на языке вопроса и/или на языке, на котором "
+            "написаны существующие claims (русский/английский). Для каждого "
+            "предложенного claim заполни `search_statements` — 1–2 "
+            "англоязычных варианта формулировки (только для поиска).\n\n"
             f"# Профиль\n{cap_profile.policy_version}\n"
-            f"Инструменты: {', '.join(sorted(cap_profile.tools))}\n"
+            # T7.13 (EVAL-3b P.6): the authoritative per-step tool list is
+            # the "# Доступные инструменты" block in the explorer context
+            # (it is filtered — e.g. message.reply is dropped while the
+            # inbox is empty). Listing the profile tools here too would
+            # contradict that filter, so the protocol carries only the
+            # version and network mode.
             f"Сеть: {cap_profile.network.value}"
         )
 
@@ -1566,10 +1707,7 @@ class Orchestrator:
         """Run the curator; host-validate the proposal. Returns
         (claims_proposed, questions_created)."""
         curator = self.prompts[Role.CURATOR]
-        ev_lines = "\n".join(
-            f"[{i}] {e.kind.value} {e.identity_hash[:16]} {_cap_args(e.payload)}"
-            for i, e in enumerate(ctx.evidence)
-        )
+        ev_lines = _evidence_lines(ctx.evidence)
         # T4.1: the curator needs the existing claim IDs to declare
         # `dependencies` — the context pack's claim sections carry them
         # (each line is prefixed with [c:<claim_id>])
@@ -1648,6 +1786,38 @@ class Orchestrator:
                 session_id=session.id,
                 payload={"curator_rejected": problems[:10]},
                 public_summary="curator proposal rejected by host validation",
+            )
+            return 0, 0
+
+        # T7.9 (EVAL-3b post-mortem P.2, §14.1): the rules engine
+        # pre-commit check — a proposal the rules engine would reject
+        # (a support evidence of a kind the claim-type rule does not
+        # allow) is bounced BEFORE any staging op is recorded: the
+        # commit boundary never continues with a problems entry and
+        # never commits a claim without a head (the rules engine is the
+        # only producer, §3.7)
+        from packages.memory import MemoryService
+
+        rule_problems = MemoryService(snapshot).validate_claim_proposal(
+            [c.model_dump(mode="json") for c in proposal.claims],
+            [
+                {
+                    "evidence_index": link.evidence_index,
+                    "claim_index": link.claim_index,
+                    "relation": link.relation.value,
+                }
+                for link in proposal.evidence_links
+            ],
+            list(ctx.evidence),
+        )
+        if rule_problems:
+            await audit.record(
+                AuditEventType.SESSION_STATE_CHANGED,
+                session_id=session.id,
+                payload={"curator_rejected_by_rules": rule_problems[:10]},
+                public_summary=(
+                    f"curator proposal rejected by the rules engine: {rule_problems[0][:200]}"
+                ),
             )
             return 0, 0
 
@@ -1838,3 +2008,24 @@ def _cap_args(value: object) -> str:
         value = {"value": value}
     text = canonical_json_bytes(value).decode("utf-8", "replace")
     return text[:1000]
+
+
+def _evidence_lines(evidence: list[EvidenceRecord]) -> str:
+    """Evidence lines for the role prompts (curator, verifier).
+
+    T7.8 (EVAL-3b post-mortem P.1, §6.4): a source_assertion line
+    carries the assertion_text fragment itself — the curator's chat
+    call never saw the explorer's fenced fetch content, so without the
+    fragment it could only meta-claim about the URL. The fragment is
+    host-budgeted (SOURCE_ASSERTION_TEXT_BUDGET in evidence.py); the
+    reference metadata (URL, hashes, chunk) stays _cap_args-capped as
+    before."""
+    lines = []
+    for i, e in enumerate(evidence):
+        meta = {k: v for k, v in e.payload.items() if k != "assertion_text"}
+        line = f"[{i}] {e.kind.value} {e.identity_hash[:16]} {_cap_args(meta)}"
+        text_body = str(e.payload.get("assertion_text") or "")
+        if text_body:
+            line += f"\n    [текст фрагмента]\n{text_body}"
+        lines.append(line)
+    return "\n".join(lines)

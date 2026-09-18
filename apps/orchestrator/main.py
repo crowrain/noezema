@@ -12,6 +12,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from apps.orchestrator.executor import StubToolExecutor
 from apps.orchestrator.orchestrator import Orchestrator
+from apps.research_proxy.service import ResearchProxyService
+from packages.artifacts.store import FilesystemArtifactStore
 from packages.domain.db.engine import DatabaseSettings
 from packages.llm_gateway.client import LLMMiddleware
 from packages.llm_gateway.config import LLMGatewayConfig, ModelProfile
@@ -24,15 +26,24 @@ def build_orchestrator(
 
     Shared by the manual entry point and the wake tick so both run the
     exact same session pipeline. The caller closes the gateway.
+
+    T7.7 (EVAL-3): the research proxy is wired at every host entry point
+    (wake tick, eval run). The ``research.fetch`` tool is profile-gated
+    (curated/open_lab only) and the proxy fails closed in sealed mode,
+    so the wiring is inert where the profile has no egress.
     """
     llm_config = LLMGatewayConfig()
     profile = ModelProfile(model_alias=llm_config.model, backend_name="local")
     gateway = LLMMiddleware(llm_config)
+    research_service = ResearchProxyService(
+        session_factory, FilesystemArtifactStore(workspace_root.parent / "artifacts")
+    )
     orchestrator = Orchestrator(
         session_factory=session_factory,
         gateway=gateway,
         profile=profile,
         executor=StubToolExecutor(workspace_root),
+        research_service=research_service,
     )
     return orchestrator, gateway
 

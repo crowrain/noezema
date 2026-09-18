@@ -62,8 +62,10 @@ def test_real_prompts_are_versioned() -> None:
 
     explorer = load_prompt(Role.EXPLORER)
     curator = load_prompt(Role.CURATOR)
-    assert explorer.version == "explorer-v2"
-    assert curator.version == "curator-v2"  # T4.1: the dependencies section
+    # T7.14: prompts bumped to v3 (explorer: ≤2 repeats after a tool error;
+    # curator: no assertion text in evidence → question, not claim)
+    assert explorer.version == "explorer-v3"
+    assert curator.version == "curator-v3"
     assert len(explorer.sha256) == 64
     assert len(curator.sha256) == 64
     # config snapshot references these exact paths/versions

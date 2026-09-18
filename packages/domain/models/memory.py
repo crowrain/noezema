@@ -22,6 +22,10 @@ class ORMClaim(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
     statement: Mapped[str] = mapped_column(Text, nullable=False)
+    # cross-lingual search index (ADR-0006 rev): alternative-language
+    # renderings of the statement (MVP: English), search-only — the
+    # knowledge text is always ``statement``
+    search_statements: Mapped[JsonDict] = mapped_column(JSONB, nullable=False, default=list)
     claim_type: Mapped[str] = mapped_column(Text, nullable=False)
     freshness_status: Mapped[str] = mapped_column(Text, nullable=False, default="unknown")
     valid_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

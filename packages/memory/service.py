@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import select, text
+from sqlalchemy import exists, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.domain.canonical import canonical_sha256
@@ -39,7 +39,9 @@ from packages.domain.models.memory import (
     ORMClaimDependency,
     ORMEnvironmentManifest,
     ORMEvidence,
+    ORMSource,
 )
+from packages.domain.models.questions import ORMQuestion
 from packages.domain.models.sessions import ORMSession
 from packages.domain.services.audit import AuditService
 from packages.memory.env_independence import (
@@ -54,7 +56,9 @@ from packages.memory.evidence import (
     observation_artifact_hash,
     rules_hash,
     session_environment_fields,
+    source_assertion_identity,
 )
+from packages.memory.independence import registrable_domain
 from packages.memory.rules_engine import (
     ClaimTypeRule,
     EvaluatedEvidence,
@@ -62,6 +66,7 @@ from packages.memory.rules_engine import (
     evaluate,
     reverify_after,
 )
+from packages.memory.scope import derive_claim_scope, derive_evidence_scope
 from packages.memory.source_graph import build_source_independence_snapshot
 
 GLOBAL_SCOPE = "global"
@@ -180,6 +185,63 @@ class MemoryService:
             return FreshnessStatus.FRESH
         return FreshnessStatus.DUE
 
+    # ── T7.9: pre-commit proposal validation (EVAL-3b post-mortem P.2) ───
+
+    def validate_claim_proposal(
+        self,
+        claims: list[JsonDict],
+        evidence_links: list[JsonDict],
+        evidence_records: list[Any],
+    ) -> list[str]:
+        """T7.9 (EVAL-3b post-mortem P.2, §14.1): the pre-commit check of
+        the curator's proposal — the rules engine's role/kind validation
+        runs BEFORE any staging op is recorded, so a proposal the rules
+        engine would reject is bounced before commit, never turned into a
+        problems entry while the commit continues (which left a claim
+        without a head — invisible, and poison for dedup).
+
+        The check is exact for the ``RuleValidationError`` path of
+        ``evaluate()`` (a support evidence of a kind the claim-type rule
+        does not allow): that check depends only on the claim type and
+        the (kind, relation) pairs of the linked evidence — the same
+        inputs the commit-boundary assessment uses — and runs before any
+        group-dependent logic. Returns the rejection reasons (empty =
+        the proposal is admissible)."""
+        problems: list[str] = []
+        for i, payload in enumerate(claims):
+            claim_type = str(payload.get("claim_type", ""))
+            if claim_type not in self._rules:
+                problems.append(f"claim {i}: unknown claim_type {claim_type!r}")
+                continue
+            scope = dict(payload.get("scope") or {})
+            evs: list[EvaluatedEvidence] = []
+            for link in evidence_links:
+                if int(link.get("claim_index", -1)) != i:
+                    continue
+                index = int(link.get("evidence_index", -1))
+                if index < 0 or index >= len(evidence_records):
+                    continue  # host validation already rejects it
+                record = evidence_records[index]
+                evs.append(
+                    EvaluatedEvidence(
+                        identity_hash=str(record.identity_hash),
+                        kind=str(record.kind.value),
+                        relation=str(link.get("relation", "supports")),
+                        scope=scope,
+                    )
+                )
+            try:
+                evaluate(
+                    claim_type,
+                    self._rules[claim_type],
+                    claim_scope=scope,
+                    evidences=evs,
+                    has_as_of=payload.get("as_of") is not None,
+                )
+            except RuleValidationError as exc:
+                problems.append(f"claim {i} ({claim_type}): {exc}")
+        return problems
+
     # ── commit-boundary apply ─────────────────────────────────────────────
 
     async def apply_claim_staging(
@@ -221,6 +283,18 @@ class MemoryService:
         problems: list[str] = []
         counters = {"created": 0, "reused": 0, "added": 0, "deduped": 0, "assessments": 0}
 
+        # T7.17 (§3.7, §11.2): the question the session answers is the
+        # trusted scope anchor (host input). The model's free-form
+        # scope proposal is audited but can neither satisfy nor fail
+        # coverage: the claim scope is derived from the question and
+        # the claim's typed as_of, each evidence scope from its
+        # provenance (see packages.memory.scope)
+        question_text: str | None = None
+        if session.question_id is not None:
+            question_row = await db.get(ORMQuestion, session.question_id)
+            if question_row is not None:
+                question_text = question_row.text
+
         # §8.7.3 (T4.6): the FULL §14 environment manifest — content-
         # addressed over the field set. The protocol is the session's
         # prompt set (the effective config's prompts section); the seed
@@ -248,15 +322,39 @@ class MemoryService:
             if not statement or claim_type not in self._rules:
                 problems.append(f"claim staging rejected: bad statement/type ({row.id})")
                 continue
-            scope = dict(payload.get("scope") or {})
+            # T7.17: the model's free-form scope proposal (untrusted;
+            # audit/staging only) vs the host-derived assessed scope
+            model_scope = dict(payload.get("scope") or {})
             as_of_raw = payload.get("as_of")
             deps = payload.get("dependencies")
             deps_list: list[Any] = list(deps) if isinstance(deps, list) else []
+            # cross-lingual search index (ADR-0006 rev): host-trusted —
+            # stripped, truncated, list-of-str only
+            raw_search = payload.get("search_statements")
+            search_statements: list[str] = []
+            if isinstance(raw_search, list):
+                search_statements = [
+                    str(s).strip()[:300] for s in raw_search if str(s).strip()
+                ][:2]
+            # T7.9 (EVAL-3b post-mortem P.2, §14.1): dedup reuses only
+            # claims that have a head in this session's snapshot. A
+            # headless claim (created but never assessed — the legacy
+            # poison of the old problems-and-continue path) is invisible
+            # to retrieval and must never be reused: the new apply
+            # creates a fresh claim and assesses it properly.
             existing_claim = (
                 (
                     await db.execute(
                         select(ORMClaim).where(
-                            ORMClaim.statement == statement, ORMClaim.claim_type == claim_type
+                            ORMClaim.statement == statement,
+                            ORMClaim.claim_type == claim_type,
+                            exists(
+                                select(ORMClaimAssessmentHead.claim_id).where(
+                                    ORMClaimAssessmentHead.claim_id == ORMClaim.id,
+                                    ORMClaimAssessmentHead.config_snapshot_id
+                                    == session.config_snapshot_id,
+                                )
+                            ),
                         )
                     )
                 )
@@ -265,13 +363,16 @@ class MemoryService:
             )
             if existing_claim is not None:
                 claims.append(existing_claim)
-                claim_scopes[existing_claim.id] = scope
+                claim_scopes[existing_claim.id] = derive_claim_scope(
+                    question=question_text, as_of=existing_claim.as_of
+                )
                 counters["reused"] += 1
                 claim_deps.append((existing_claim, deps_list))
             else:
                 claim = ORMClaim(
                     id=uuid.uuid4(),
                     statement=statement,
+                    search_statements=search_statements,
                     claim_type=claim_type,
                     as_of=datetime.fromisoformat(as_of_raw) if as_of_raw else None,
                     observed_at=now,
@@ -280,7 +381,9 @@ class MemoryService:
                 db.add(claim)
                 await db.flush()
                 claims.append(claim)
-                claim_scopes[claim.id] = scope
+                claim_scopes[claim.id] = derive_claim_scope(
+                    question=question_text, as_of=claim.as_of
+                )
                 counters["created"] += 1
                 claim_deps.append((claim, deps_list))
                 await audit.record(
@@ -290,7 +393,11 @@ class MemoryService:
                         "claim_id": str(claim.id),
                         "claim_type": claim_type,
                         "statement": statement[:500],
-                        "scope": scope,
+                        # T7.17: "scope" is the model's free-form
+                        # proposal (untrusted); "assessed_scope" is the
+                        # host-derived scope the rules engine checks
+                        "scope": model_scope,
+                        "assessed_scope": claim_scopes[claim.id],
                     },
                     public_summary=f"claim: {statement[:120]}",
                 )
@@ -387,7 +494,7 @@ class MemoryService:
                     proposed = [e for e in proposed if e[:2] not in drop]
 
             for f, t, k in proposed:
-                exists = (
+                existing_edge = (
                     (
                         await db.execute(
                             select(ORMClaimDependency).where(
@@ -400,7 +507,7 @@ class MemoryService:
                     .scalars()
                     .first()
                 )
-                if exists is not None:
+                if existing_edge is not None:
                     continue  # idempotent: the edge already exists
                 db.add(
                     ORMClaimDependency(
@@ -467,13 +574,36 @@ class MemoryService:
                 ev: ORMEvidence = existing_ev
                 counters["deduped"] += 1
             else:
+                # source provenance (source_assertion / quote_integrity):
+                # the host-verified sources row the assertion was read
+                # from — drives the source-independence groups (§11.3)
+                rec_source_id: uuid.UUID | None = None
+                if kind in ("source_assertion", "quote_integrity"):
+                    raw_sid = getattr(record, "source_id", None)
+                    if raw_sid:
+                        try:
+                            rec_source_id = uuid.UUID(str(raw_sid))
+                        except ValueError:
+                            rec_source_id = None
+                    if rec_source_id is None:
+                        problems.append(
+                            f"evidence staging rejected: no source provenance for {kind} ({row.id})"
+                        )
+                        continue
                 ev = ORMEvidence(
                     id=uuid.uuid4(),
                     claim_id=claim.id,
                     relation=relation,
                     evidence_kind=kind,
                     identity_hash=identity,
-                    scope=claim_scopes.get(claim.id, {}),
+                    # T7.17: the evidence scope is derived by the host
+                    # from the row's provenance, not copied from the
+                    # claim's (model) scope
+                    scope=await self._derive_evidence_scope(
+                        db, source_id=rec_source_id, fallback_at=now
+                    ),
+                    source_id=rec_source_id,
+                    chunk_id=getattr(record, "chunk_id", None),
                     observation_artifact_id=artifact_id,
                     environment_manifest_id=env.id
                     if kind in ("experiment_run", "local_observation")
@@ -494,13 +624,37 @@ class MemoryService:
                 .scalars()
                 .all()
             )
+            # T7.17: the scope of EVERY evidence row of the claim is a
+            # function of its durable provenance, recomputed by the
+            # trusted host (idempotent): rows created under the old
+            # engine (the model's free-form scope, copied from the
+            # then-claim) are re-scoped from the sources row in place —
+            # coverage must not depend on which keys the model once
+            # invented for the same subject and date
+            for ev_row in all_evidence:
+                expected = await self._derive_evidence_scope(
+                    db,
+                    source_id=ev_row.source_id,
+                    fallback_at=ev_row.created_at or now,
+                )
+                if dict(ev_row.scope or {}) != expected:
+                    ev_row.scope = expected
             try:
                 ok = await self._assess(
                     db, audit, session, claim, claim_scopes.get(claim.id, {}), all_evidence, now
                 )
-            except RuleValidationError as exc:
-                problems.append(f"assessment rejected for {claim.id}: {exc}")
-                continue
+            except RuleValidationError:
+                # T7.9 (EVAL-3b post-mortem P.2, §14.1): a rules engine
+                # rejection is NOT a problems entry — the commit must not
+                # continue with a claim that has no head (invisible to
+                # retrieval, poison for dedup). The orchestrator's
+                # pre-commit validation (validate_claim_proposal) makes
+                # this unreachable through the session path; at the
+                # boundary itself the fail-closed action is to abort the
+                # whole apply — the fenced transaction rolls back, and
+                # the reconciler resolves the attempt (never a mixed
+                # state, T2.20).
+                raise
             if ok:
                 counters["assessments"] += 1
 
@@ -532,7 +686,16 @@ class MemoryService:
         elif kind in ("local_observation", "experiment_run"):
             content = str(payload.get("content", payload.get("entries", "")))
             identity = local_observation_identity(content, env_hash)
-        else:  # source kinds are not produced by session tools in M3
+        elif kind in ("source_assertion", "quote_integrity"):
+            # §14.3: provenance identity over the ORIGINAL source content
+            # hash + chunk + kind — stable across re-fetches, independent
+            # of the (budget-truncated) context copy in the payload
+            identity = source_assertion_identity(
+                str(payload.get("original_sha256", "")),
+                str(payload.get("chunk_id", "chunk-0")),
+                kind,
+            )
+        else:
             identity = observation_artifact_hash(payload)
         return identity, artifact.id
 
@@ -596,6 +759,31 @@ class MemoryService:
         db.add(env)
         await db.flush()
         return env
+
+    async def _derive_evidence_scope(
+        self,
+        db: AsyncSession,
+        *,
+        source_id: uuid.UUID | None,
+        fallback_at: datetime,
+    ) -> JsonDict:
+        """T7.17 (§3.7, §11.2): the host-derived scope of one evidence
+        row from its durable provenance — the registrable domain and
+        the retrieval time of the ``sources`` row (source-based
+        evidence), or the observation time (fallback) for the rest.
+        The model never writes this dict: its free-form scope stays in
+        the staging payload and the audit."""
+        source_domain: str | None = None
+        observed_at: datetime | None = None
+        if source_id is not None:
+            src = await db.get(ORMSource, source_id)
+            if src is not None:
+                if src.canonical_uri:
+                    source_domain = registrable_domain(src.canonical_uri)
+                observed_at = src.retrieved_at
+        if observed_at is None:
+            observed_at = fallback_at
+        return derive_evidence_scope(source_domain=source_domain, observed_at=observed_at)
 
     async def _assess(
         self,

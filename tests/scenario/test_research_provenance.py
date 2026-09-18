@@ -224,6 +224,17 @@ async def test_research_content_enters_context_fenced(
     assert "transform: fetch" in ctx2 and "parser: noezema-normalize-v1" in ctx2
     assert f"{origin.base}/page" in ctx2
 
+    # 1b) T7.8 (§6.4): the curator — a fresh chat call that never saw
+    #     the explorer's fenced content — must see the assertion text
+    #     fragment itself in the evidence lines, not only URL and hashes
+    curator_reqs = [r["last_user"] for r in fake_llm.requests() if "Предложи изменения памяти" in r["last_user"]]
+    assert curator_reqs, "no curator request"
+    curator_ctx = max(curator_reqs, key=len)
+    assert "source_assertion" in curator_ctx
+    assert "Энергопотребление процессора растёт квадратично с частотой." in curator_ctx, (
+        "the curator must see the source text the assertion is grounded in"
+    )
+
     # 2) the read is journaled with the source link
     read_rows = (
         await _row(
@@ -273,6 +284,208 @@ async def test_research_content_enters_context_fenced(
         scratch_url, "SELECT sha256 FROM artifacts WHERE sha256 = :s", {"s": nsha}
     )
     assert norm is not None  # the normalized text is stored too
+
+
+async def test_rules_rejected_proposal_is_bounced_before_commit(
+    migrated_db: tuple[str, Any],
+    origin: FakeOrigin,
+    fake_llm: FakeLLM,
+    tmp_path: Path,
+) -> None:
+    """T7.9 (EVAL-3b post-mortem P.2, §14.1): a curator proposal the
+    rules engine rejects — the exact EVAL-3b case, a local_observation
+    claim supported by source_assertion evidence — is bounced BEFORE
+    commit: no staging ops for it are recorded, the commit boundary
+    applies nothing, and the DB contains no claim (headless or
+    otherwise). The session completes, but without the poisoned claim."""
+    scratch_url, engine = migrated_db
+    store = FilesystemArtifactStore(tmp_path / "artifacts")
+
+    payload = copy.deepcopy(BOOTSTRAP_PAYLOAD)
+    rp = payload["research_proxy"]
+    rp["mode"] = "curated"
+    rp["searxng_url"] = origin.base
+    rp["private_allowlist"] = origin.allowlist
+    rp["rate_limit_max"] = 10
+    pol = payload["policy"]
+    pol["access_profile"] = "curated"
+    pol["capabilities"]["tools"] = [*pol["capabilities"]["tools"], "research.fetch"]
+    result = await _run_online(engine, payload)
+    assert result.state == "active"
+
+    question_id = await _seed_question(scratch_url, "Каково энергопотребление процессора?")
+
+    gateway = LLMMiddleware(
+        LLMGatewayConfig(
+            base_url=fake_llm.base_url, model="fake-thinker", max_retries=2, retry_base_delay=0.01
+        )
+    )
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    service = ResearchProxyService(factory, store)
+    orch = Orchestrator(
+        session_factory=factory,
+        gateway=gateway,
+        profile=ModelProfile(model_alias="fake-thinker"),
+        executor=StubToolExecutor(tmp_path / "ws"),
+        research_service=service,
+    )
+    fake_llm.script(
+        [
+            {
+                "content": {
+                    "public_rationale": "Найти источник",
+                    "decision": {
+                        "kind": "tool",
+                        "tool": "research.fetch",
+                        "arguments": {"url": f"{origin.base}/page"},
+                    },
+                }
+            },
+            {
+                "content": {
+                    "public_rationale": "Данные собраны",
+                    "decision": {"kind": "complete", "reason": "goal_reached"},
+                }
+            },
+            {
+                "content": {
+                    "summary": "Утверждение о процессоре",
+                    "claims": [
+                        {
+                            "statement": "Страница утверждает квадратичный рост энергопотребления",
+                            # the EVAL-3b mistake: the claim type does not
+                            # allow source_assertion support evidence
+                            "claim_type": "local_observation",
+                            "scope": {"url": f"{origin.base}/page"},
+                        }
+                    ],
+                    "evidence_links": [
+                        {"evidence_index": 0, "claim_index": 0, "relation": "supports"}
+                    ],
+                    "new_questions": [],
+                }
+            },
+        ]
+    )
+    try:
+        outcome = await orch.run_session(question_id)
+    finally:
+        await gateway.close()
+
+    # the session completes (exploration succeeded) — but without the claim
+    assert outcome.final_state is SessionState.SUCCEEDED
+
+    # 1) the proposal was rejected by the rules engine — audited with the
+    #    exact reason, before any staging op for it
+    audit_row = await _row(
+        scratch_url,
+        "SELECT payload->'curator_rejected_by_rules' FROM audit_events "
+        "WHERE type = :t AND payload->'curator_rejected_by_rules' IS NOT NULL "
+        "AND session_id = (SELECT id FROM sessions ORDER BY created_at DESC LIMIT 1)",
+        {"t": AuditEventType.SESSION_STATE_CHANGED.value},
+    )
+    assert audit_row is not None, "the rules rejection must be audited"
+    reasons = audit_row[0]
+    assert isinstance(reasons, list) and len(reasons) == 1
+    assert "local_observation" in reasons[0] and "source_assertion" in reasons[0]
+
+    # 2) the commit boundary applied nothing: no claim, no head, no
+    #    evidence — never a headless claim (the EVAL-3b poison)
+    assert await _count(scratch_url, "SELECT count(*) FROM claims") == 0
+    assert await _count(scratch_url, "SELECT count(*) FROM claim_assessment_heads") == 0
+    assert await _count(scratch_url, "SELECT count(*) FROM evidence") == 0
+    # no staging ops for the rejected proposal survived
+    assert await _count(scratch_url, "SELECT count(*) FROM session_staging") == 0
+
+
+async def test_repeated_tool_call_is_denied_after_limit(
+    migrated_db: tuple[str, Any],
+    origin: FakeOrigin,
+    fake_llm: FakeLLM,
+    tmp_path: Path,
+) -> None:
+    """T7.12 (EVAL-3b P.5): the model re-issuing the EXACT same (tool,
+    arguments) is denied once it has already been executed
+    TOOL_REPEAT_DENY_LIMIT times — the result is already in the
+    observations, so the host tells the model to change strategy instead
+    of re-executing. The turn_id-scoped idempotency key never matches
+    across steps, so without this guard the same research.fetch was
+    re-issued 6–9× with constant input_tokens in EVAL-3b."""
+    from apps.orchestrator.orchestrator import TOOL_REPEAT_DENY_LIMIT
+
+    scratch_url, engine = migrated_db
+    store = FilesystemArtifactStore(tmp_path / "artifacts")
+    payload = copy.deepcopy(BOOTSTRAP_PAYLOAD)
+    rp = payload["research_proxy"]
+    rp["mode"] = "curated"
+    rp["searxng_url"] = origin.base
+    rp["private_allowlist"] = origin.allowlist
+    rp["rate_limit_max"] = 10
+    pol = payload["policy"]
+    pol["access_profile"] = "curated"
+    pol["capabilities"]["tools"] = [*pol["capabilities"]["tools"], "research.fetch"]
+    result = await _run_online(engine, payload)
+    assert result.state == "active"
+
+    question_id = await _seed_question(scratch_url, "Что написано на странице?")
+
+    gateway = LLMMiddleware(
+        LLMGatewayConfig(
+            base_url=fake_llm.base_url, model="fake-thinker", max_retries=2, retry_base_delay=0.01
+        )
+    )
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    service = ResearchProxyService(factory, store)
+    orch = Orchestrator(
+        session_factory=factory,
+        gateway=gateway,
+        profile=ModelProfile(model_alias="fake-thinker"),
+        executor=StubToolExecutor(tmp_path / "ws"),
+        research_service=service,
+    )
+    url = f"{origin.base}/page"
+    fetch_call = {
+        "content": {
+            "public_rationale": "ещё раз та же страница",
+            "decision": {"kind": "tool", "tool": "research.fetch", "arguments": {"url": url}},
+        }
+    }
+    # the model re-issues the EXACT same fetch (limit + 1 times), then
+    # completes — the last repetition must be denied, not executed
+    calls = [copy.deepcopy(fetch_call) for _ in range(TOOL_REPEAT_DENY_LIMIT + 1)]
+    calls.append(
+        {"content": {"public_rationale": "готово", "decision": {"kind": "complete", "reason": "goal_reached"}}}
+    )
+    calls.append(
+        {
+            "content": {
+                "summary": "Смотрел страницу",
+                "claims": [],
+                "evidence_links": [],
+                "new_questions": [],
+            }
+        }
+    )
+    fake_llm.script(calls)
+    try:
+        outcome = await orch.run_session(question_id)
+    finally:
+        await gateway.close()
+    assert outcome.final_state is SessionState.SUCCEEDED
+
+    # the repeated call is denied (exactly once) and audited with the
+    # executed count
+    denied = await _row(
+        scratch_url,
+        "SELECT payload->>'executed_count' FROM audit_events "
+        "WHERE type = :t AND payload->>'reason' = 'tool_call_repeated'",
+        {"t": AuditEventType.ACTION_FAILED.value},
+    )
+    assert denied is not None, "the repeated tool call must be denied and audited"
+    assert int(denied[0]) == TOOL_REPEAT_DENY_LIMIT
+
+    # the model got an observation explaining the result already exists
+    assert any("ОТКЛОНЕНО" in r["last_user"] for r in fake_llm.requests())
 
 
 async def _seed_question(scratch_url: str, text_: str) -> Any:

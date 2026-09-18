@@ -806,3 +806,35 @@ async def test_sealed_interval_freezes_shadow_heads(
             assert h is not None
     finally:
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_online_rejects_unstartable_token_budgets(
+    migrated_db: tuple[str, AsyncEngine]
+) -> None:
+    """Fail-closed before publishing (§5.4.1): a payload whose section
+    limits sum past the input budget is rejected BEFORE the candidate
+    row exists — publishing a config on which no session can start must
+    be refused. Regression: first EVAL-3 launch (2026-09-16) — the v2
+    payload was published with Σ 26624 > input_budget 22528 and all 50
+    sessions failed at start (run 83366765-e795-44d6-a5d0-b2027270fa54).
+    """
+    _, engine = migrated_db
+    try:
+        payload = _rules_payload()
+        payload["token_budgets"] = dict(payload["token_budgets"])
+        payload["token_budgets"]["claims_evidence"] = 100_000  # Σ ≫ budget
+        with pytest.raises(act.ActivationError, match="invalid token budgets"):
+            await _run_online(engine, payload)
+        # nothing was written: no online candidate, the head untouched
+        assert (
+            await _scalar(
+                engine,
+                "SELECT count(*) FROM config_snapshots "
+                "WHERE activation_mode = 'online'",
+            )
+            == (0,)
+        )
+        assert await _pointer(engine) == await _bootstrap(engine)
+    finally:
+        await engine.dispose()

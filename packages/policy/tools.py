@@ -106,7 +106,10 @@ _TOOLS: dict[str, ToolSpec] = {
         IdempotencyClass.IDEMPOTENT, QuestionCreateArgs,
     ),
     "message.reply": ToolSpec(
-        "message.reply", "Ответить на сообщение оператора (staging)",
+        "message.reply",
+        "Ответить на конкретное сообщение оператора по его message_id; "
+        "доступно ТОЛЬКО когда в inbox есть такое сообщение (иначе вызов "
+        "бесполезен и отклоняется)",
         IdempotencyClass.IDEMPOTENT, MessageReplyArgs,
     ),
 }
