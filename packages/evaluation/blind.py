@@ -16,6 +16,17 @@ within each (claim_type, epistemic_status) stratum of the current
 head, proportional allocation of ``run.blind_sample_size``, remainder
 top-up from the global seeded shuffle. Deterministic for the same run
 row, so the rendered sample IS the measured sample.
+
+HEAD SELECTION (T7.19, EVAL-3d post-mortem; §14.1, §8.7.2): after a
+mid-run online activation a claim has one head per config snapshot
+(shadow heads, ``UNIQUE(claim_id, config_snapshot_id)``). The current
+knowledge of a claim is resolved through the runtime pointer —
+``runtime_config_heads.active_config_snapshot_id`` (pointer equality,
+NOT ``config_snapshots.activation_state``; §14.1) — and ONLY that head
+is counted. A claim without a head on the active snapshot has no
+current lifecycle under the effective config (the query path,
+``MemoryService.claim_view``, returns None for it) and is not part of
+the sample.
 """
 
 from __future__ import annotations
@@ -30,11 +41,26 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from packages.artifacts.store import ArtifactStore, ArtifactStoreError
 from packages.evaluation.service import EvaluationRun
 
+#: The effective config snapshot, resolved through the runtime pointer
+#: (§14.1: «current lifecycle разрешается только через
+#: runtime_config_heads.active_config_snapshot_id. Pointer equality, а
+#: не config_snapshots.activation_state='active', определяет effective
+#: config»). After a mid-run activation (§8.7.2) a claim has one head
+#: per config snapshot; the gates and the blind sample count EXACTLY
+#: ONE head per claim — the head of this snapshot (T7.19, EVAL-3d).
+#: A claim without a head here has no current knowledge under the
+#: effective config and is not counted.
+EFFECTIVE_SNAPSHOT_SQL = (
+    "(SELECT active_config_snapshot_id FROM runtime_config_heads "
+    "WHERE scope = 'global')"
+)
+
 
 async def blind_sample_claim_ids(db: AsyncSession, run: EvaluationRun) -> list[Any]:
     """The seeded, stratified blind sample (claim ids).
 
-    Stratification: (claim_type, epistemic_status) of the current head.
+    Stratification: (claim_type, epistemic_status) of the current head
+    of the EFFECTIVE snapshot (T7.19: exactly one head per claim).
     Seeded shuffle within each stratum; proportional allocation of
     ``run.blind_sample_size``; the remainder (rounding) is drawn from
     the global seeded shuffle. Deterministic for the same run row.
@@ -46,6 +72,7 @@ async def blind_sample_claim_ids(db: AsyncSession, run: EvaluationRun) -> list[A
                 "FROM claims c "
                 "JOIN claim_assessment_heads h "
                 "  ON h.claim_id = c.id AND h.assessment_state = 'current' "
+                f"  AND h.config_snapshot_id = {EFFECTIVE_SNAPSHOT_SQL} "
                 "ORDER BY c.created_at, c.id"
             )
         )
@@ -117,6 +144,7 @@ async def blind_sample_details(
                     "FROM claims c "
                     "JOIN claim_assessment_heads h "
                     "  ON h.claim_id = c.id AND h.assessment_state = 'current' "
+                    f"  AND h.config_snapshot_id = {EFFECTIVE_SNAPSHOT_SQL} "
                     "JOIN claim_assessments a ON a.id = h.current_assessment_id "
                     "WHERE c.id = :c"
                 ),

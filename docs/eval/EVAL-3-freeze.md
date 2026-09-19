@@ -1,6 +1,6 @@
 # EVAL-3 — замороженная конфигурация (готово, НЕ запущено)
 
-Статус: **подготовка завершена; первый запуск (2026-09-16) сорвался — дефект конфига, пойманный fail-fast до первого вызова модели; пере-заморожено (§2.6); перезапуск — только после явного решения пользователя.**
+Статус: **подготовка завершена; первый запуск (2026-09-16) сорвался — дефект конфига, пойманный fail-fast до первого вызова модели; пере-заморожено (§2.6); перезапуск — только после явного решения пользователя. 2026-09-19: EVAL-3c сорван технически (§10.1), перезапуск EVAL-3d доведён до конца 50 сессий, но гейты упали на дефекте учёта head-ов после mid-run активации — T7.19 (§10.2–10.4); досчёт EVAL-3d — после проверки T7.19.**
 Все пороги §22.2 неизменны; исключение типов через ADR не делается (решение от 16.09.2026).
 
 ## 1. Что изменилось относительно EVAL-1 / EVAL-2
@@ -329,3 +329,189 @@ temporal claim'ы могут опуститься до E1 по неизменё�
 отчёте о запуске. Если прогон всё же пересечёт полночь — это **отмечается
 в отчёте по прогону, но прогон НЕ останавливается и НЕ переигрывается**:
 провал гейта — результат.
+
+## 10. EVAL-3c сорван → EVAL-3d; дефект гейтов T7.19 (2026-09-19)
+
+### 10.1 Хронология
+
+**EVAL-3c** — прогон `bd21973c-164a-44e0-94de-4cbfe4ce8ed0`, БД
+`noezema-eval3c` (оставлена как улика, данные НЕ трогать), логи
+`/home/denis/dsh1/eval3c-logs/`:
+
+| Время (UTC) | Событие |
+|---|---|
+| 08:25:25 | старт: `eval-run` заморожен (snapshot `6f0f711e` = canonical v2 `ffc98c9e…`, rules-v2, rules_hash `a0b78e2d…`, SLO 3600 c, seed 20260915, blind 50), 50 вопросов засиданы |
+| 08:25:26–08:33 | 2 сессии из 50 завершены (succeeded, succeeded_partial) |
+| 08:36:26 | последняя запись watchdog (`et=2 < 20`) |
+| ~08:36:51 | **сорван по технической причине**: `eval-run`, worker и watchdog были запущены через `setsid nohup` из headless-сессии dsh и убиты при завершении хода сессии. Утверждение в отчёте о запуске, что процессы «переживут завершение хода», было непроверенным |
+
+**EVAL-3d** — прогон `faa3cded-2eec-4087-bc1e-60c242728b90`, БД
+`noezema-eval3d` (данные НЕ трогать), логи `/home/denis/dsh1/eval3d-logs/`;
+та же замороженная конфигурация (§2, §9) и тот же код (`83d0ea9`),
+изменён только документ заморозки (§9):
+
+| Время (UTC) | Событие |
+|---|---|
+| 13:05:54 | старт через `systemd-run --user` (переживает завершение хода сессии) |
+| 13:05:55–16:33:26 | **все 50 сессий завершены**: 24 succeeded, 26 succeeded_partial, 0 failed, 0 LeaseLost (40 сессий под v2, 10 под v3) |
+| 15:47:32 | watchdog (et=20) активировал v3: `activate-online` fence 2, audit `activation_published` 15:47:32.977Z, snapshot `db622010` = canonical v3 `2e93889c…`; v2 → superseded, указатель `runtime_config_heads` → v3 |
+| 15:47:33–16:33 | 20 reassessment-задач активации выполнены (completed=20, очередь пуста, pending heads = 0) |
+| 16:33:26 | session 50/50 завершена; **eval-run упал** в `_finish → compute_gates → _provenance_complete` (`packages/evaluation/gates.py:500`): `sqlalchemy.exc.MultipleResultsFound`. Строка прогона осталась `outcome=running`. Worker и watchdog остановлены пользователем |
+
+### 10.2 Дефект гейтов (T7.19)
+
+После mid-run активации у claim'а есть head на **каждый** config
+snapshot (shadow heads, `UNIQUE(claim_id, config_snapshot_id)`, §8.7.2)
+— в `noezema-eval3d`: **25 current head на v2 (superseded) + 34 на v3
+(active); у 24 claim'ов current head на обоих** (10 claim'ов — только
+v3, созданы после флипа; 1 — только v2, см. §10.4), 35 claim'ов всего.
+Ни один SQL гейтов (`packages/evaluation/gates.py`, строки ~217/247/324/
+371/440/504/590) и blind-выгрузка (`packages/evaluation/blind.py`) не
+фильтровал head по snapshot:
+
+- гейты считали **строки head'ов**, а не claim'ы — знаменатели
+  раздуты (59 «current head» при 35 claim'ах), доли искажены;
+- per-claim запросы blind-гейтов (`scalar_one_or_none` / `.first()`
+  по мульти-результату) падают `MultipleResultsFound` — именно это
+  убило EVAL-3d в `_finish`;
+- watchdog тоже считал с дублями (et=51 к концу — сумма current-строк
+  external/temporal по обоим snapshot'ам).
+
+Дефект латентный с T7.5 (механизм оценки §22.2): ни один прошлый прогон
+не доходил до mid-run активации (EVAL-1/2 — активаций нет, EVAL-3b —
+остановлен ранее, первый запуск EVAL-3 — сорвался до сессий, шаги на
+черновых БД — 3 сессии без флипа).
+
+### 10.3 Правило выбора head (T7.19)
+
+**Текущее знание claim'а = head `(claim_id, active_config_snapshot_id)`**,
+где `active_config_snapshot_id` — указатель
+`runtime_config_heads(scope='global')` (равенство указателя, НЕ
+`config_snapshots.activation_state='active'`):
+
+- §14.1: «current lifecycle разрешается только через
+  `runtime_config_heads.active_config_snapshot_id`. Pointer equality, а
+  не `config_snapshots.activation_state='active'`, определяет effective
+  config»;
+- §8.7.2: «Query/Memory Service сначала разрешает effective snapshot
+  через runtime pointer и только затем читает соответствующий head»;
+- то же разрешение делает query path: `MemoryService.claim_view`
+  возвращает `None` для claim'а без head на активном snapshot — такой
+  claim не является текущим знанием и не подаётся в контекст.
+
+Следствия, закреплённые тестами (`tests/scenario/
+test_evaluation_gates_activation.py`):
+
+1. каждый claim учитывается гейтами **ровно один раз** — по head'у
+   активного snapshot (на нём и grade, и epistemic_status, и
+   provenance/scope для blind-гейтов);
+2. claim **без head на активном snapshot** не имеет current lifecycle
+   по effective config (§14.1) и не входит ни в знаменатели, ни в
+   числители head-гейтов, ни в слепую выборку. Это не
+   «неправомерное выбрасывание»: протокол активации (§8.7.2)
+   гарантирует shadow head на новом snapshot для **каждого** claim'а,
+   существовавшего на момент флипа (cohort = все claims; publish
+   запрещён без полного seal), — head'а на новом snapshot может не
+   быть только у claim'а, созданного в окне race (см. §10.4);
+3. claim, чей head на активном snapshot `pending | invalid`, — не
+   «current» (lifecycle §14.1) и выпадает по фильтру
+   `assessment_state = 'current'` — семантика гейта, не дефект;
+4. указатель разрешается в момент `compute_gates` (гейты меряют
+   финальное состояние знания по effective config — ради этого в
+   эксперименте и mid-run-флип), а **не** snapshot из строки рана
+   (строка заморожена на v2; гейты от неё не зависят).
+
+### 10.4 Почему это не меняет метод
+
+- **Пороги §22.2** — неизменны (immutable; зафиксированы до серии в
+  строке рана).
+- **Определения гейтов по смыслу** — неизменны: «current head
+  claim'а» теперь разрешается по §14.1; знаменатели по смыслу — как и
+  задумано, по **одному** head на claim (до любой активации так и
+  было; прогон без mid-run активации даёт те же числители/знаменатели —
+  зафиксировано тестом).
+- **Замороженные артефакты** — не трогались. Явная сверка (2026-09-19,
+  T7.19) — хэши **не изменились** и совпадают с §2.1/§2.6/§9.4:
+
+  | Файл | sha256 (файл) |
+  |---|---|
+  | `docs/eval/config-v2-payload.json` | `2b22b417f2422b693854e3338505e9ba1540d2ddda89a1bcf49342de0668f8c3` |
+  | `docs/eval/config-v3-payload.json` | `87278c77e2919ed0a0019c5c3f2b2e7de937b940869967b016978b8978be5525` |
+  | `docs/eval/question-set-v2.jsonl` | `93c1a93a4d6cbb4b29d31a30dedecb8488e5cf2135345a42d04bedbee11d31f4` |
+
+  Канонические (canonical JSON): v2 `ffc98c9e54b5ba0b3621d5f3fb37616fabbb6b159a4a9d5d46710adee75a6e2d`,
+  v3 `2e93889ce4b4f943f3c4e03d9a87ce9740c2012f2781a65637cd0ce831501d92`.
+  Сверка по `noezema-eval3d`: `payload_sha256` активного snapshot'а
+  (`db622010`) = `2e93889c…` = canonical v3; `rules_hash` строки рана =
+  `a0b78e2d…` (v2, §9.1) — всё как при заморозке.
+
+- Изменён **только учёт** head'ов после активации (`packages/evaluation/
+  gates.py`: 7 запросов; `packages/evaluation/blind.py`: 2 запроса;
+  общее правило — константа `EFFECTIVE_SNAPSHOT_SQL` в blind.py).
+  Это правка учёта дублей, а не метода.
+
+### 10.5 Данные EVAL-3d и оценка гейтов при досчёте (read-only)
+
+Состояние `noezema-eval3d` (SELECT, 2026-09-19): 35 claims; v2 — 25
+current (hypothesis/E1 ×11, supported/E2 ×4, supported/E3 ×10); v3 — 34
+current (hypothesis/E1 ×16, supported/E2 ×4, supported/E3 ×14);
+pending/invalid — 0; reassessment_jobs completed=20; sessions: 50
+terminal (40 под v2, 10 под v3).
+
+**Claim только на superseded v2** — `8bbbb06a` (temporal_fact,
+current/hypothesis/E1, `prepared_by=session`, сессия `6f45deea`,
+committed 15:50:59Z). Источник — **quiesce-race активации**: сессия
+`6f45deea` (40-я, под v2) открыла длинную phase-1-транзакцию в
+15:47:21.8Z — **до** флипа (15:47:32.9Z); её строка сессии и создаваемый
+claim были незакоммичены (невидимы) на момент cohort freeze
+(15:47:32.88Z), поэтому проверка «нет активных сессий»
+(`packages/memory/activation.py:463–483` считает только
+закоммиченные `ACTIVE_SESSION_STATES`) увидела 0 активных, а cohort
+(`SELECT id FROM claims`) не включила in-flight claim; коммит в
+15:50:59.8Z — после флипа — записал head под замороженным v2 snapshot
+сессии (`plan.config_snapshot_id`, `apps/orchestrator/orchestrator.
+py:296`). **Отдельный латентный дефект активации** (quiesce не закрывает
+окно невидимой in-flight сессии) — вне T7.19; гейты обязаны
+детерминированно обрабатывать получившееся состояние данных (правило
+§10.3, п.2 — зафиксировано регрессионным тестом).
+
+Гейты EVAL-3d **после** T7.19 (выполнено read-only `compute_gates` на
+`noezema-eval3d`, запись НЕ делалась; строка рана остаётся
+`outcome=running` до проверки T7.19):
+
+| Гейт | num/den | Исход |
+|---|---|---|
+| new_supported_refuted_e2 | 18/18 | insufficient_sample (N<20) |
+| external_temporal_e3 | 14/14 | insufficient_sample (N<20) |
+| eligible_sessions_with_outcome | 50/50 | passed |
+| near_duplicate_questions | 0/50 | passed |
+| significant_claim_reuse | 5/18 (0.278) | insufficient_sample (N<20) |
+| due_stale_time_sensitive | 8/17 (0.471) | insufficient_sample (N<20) |
+| reassessment_slo | 20/20 (SLO 3600 c) | passed |
+| current_pending_invalid_ancestor | 0/34 | passed |
+| high_severity_incidents | 0 | passed |
+| blind_provenance_path | 34/34 | passed — **структурная проверка, §5** |
+| blind_scope | 34/34 | passed — **структурная проверка, §5** |
+
+overall (правило finish: нет failed, есть insufficient_sample) →
+**insufficient_sample**. Для сравнения — что посчитал бы **старый**
+код, не упади он: g1 32/32, g2 24/24, g5 10/32, g6 16/30, g8 0/59
+(знаменатели раздуты дублями), blind-гейты — падение
+`MultipleResultsFound`. Слепая выборка после T7.19: 34 claim'а
+(уникальных), seed 20260915, size 50.
+
+### 10.6 Судьба строк прогонов
+
+- **EVAL-3d `faa3cded…`**: НЕ досчитана и НЕ закрыта (решение
+  пользователя после проверки T7.19). Данные БД не менялись. Варианты
+  досчёта: штатный `compute_gates + finish_evaluation_run` по строке
+  (аналог `close-draft2-runs.py`) либо повторный расчёт через
+  `eval-run --skip-sessions` (новая строка; гейты от snapshot'а строки
+  не зависят — §10.3, п.4).
+- **EVAL-3c `bd21973c…`**: закрыта штатно как прерванная
+  (`compute_gates + finish_evaluation_run`, аналог draft2) **после**
+  правки T7.19 — в `noezema-eval3c` только один snapshot с head'ами
+  (v2), дублей нет, расчёт корректен; 2 сессии из 50, гейты по малым
+  N → insufficient_sample, overall insufficient_sample. БД
+  `noezema-eval3c` остаётся уликой, данные прогона не менялись
+  (кроме штатного закрытия строки рана).

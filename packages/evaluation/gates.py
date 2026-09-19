@@ -77,6 +77,22 @@ declared); the run report marks them as a structural check, not as
 passed §22.2 gates. The sample rendered for human review
 (``noezemactl blind-sample``) uses exactly this selection
 (``packages.evaluation.blind``).
+
+HEAD SELECTION (T7.19, EVAL-3d post-mortem; §14.1, §8.7.2): a
+mid-run online activation leaves a claim with one head per config
+snapshot (``UNIQUE(claim_id, config_snapshot_id)`` shadow heads).
+Every head-based gate counts EXACTLY ONE head per claim — the head
+of the EFFECTIVE snapshot, resolved through the runtime pointer
+(``runtime_config_heads.active_config_snapshot_id``; pointer
+equality, NOT ``config_snapshots.activation_state``) — the same
+resolution the query path uses (``MemoryService.claim_view``).
+Claims without a head on the active snapshot have no current
+lifecycle under the effective config and are not counted; claims
+whose active head is pending/invalid are not "current" and fall out
+of the ``assessment_state = 'current'`` filters. Without this filter
+a mid-run activation double-counts claims (denominators inflated,
+ratios distorted) and the blind-gate per-claim queries raise
+``MultipleResultsFound``.
 """
 
 from __future__ import annotations
@@ -87,7 +103,7 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from packages.evaluation.blind import blind_sample_claim_ids
+from packages.evaluation.blind import EFFECTIVE_SNAPSHOT_SQL, blind_sample_claim_ids
 from packages.evaluation.service import EvaluationRun
 
 #: «при N<20 gate получает insufficient_sample» (§22.2)
@@ -217,6 +233,7 @@ async def _gate_new_e2(db: AsyncSession, run: EvaluationRun) -> dict[str, Any]:
           WHERE h.assessment_state = 'current'
             AND h.epistemic_status IN ('supported', 'refuted')
             AND h.claim_id IN (SELECT id FROM new_claims)
+            AND h.config_snapshot_id = {EFFECTIVE_SNAPSHOT_SQL}
         )
         SELECT count(*),
                count(*) FILTER (WHERE {_grade_at_least("COALESCE(cur.effective_grade, 'E0')", 'E2')})
@@ -247,6 +264,7 @@ async def _gate_external_e3(db: AsyncSession, run: EvaluationRun) -> dict[str, A
           WHERE h.assessment_state = 'current'
             AND h.epistemic_status IN ('supported', 'refuted')
             AND h.claim_id IN (SELECT id FROM new_claims)
+            AND h.config_snapshot_id = {EFFECTIVE_SNAPSHOT_SQL}
         )
         SELECT count(*), count(*) FILTER (WHERE cur.effective_grade = 'E3')
         FROM cur
@@ -323,6 +341,7 @@ async def _gate_reuse(db: AsyncSession, run: EvaluationRun) -> dict[str, Any]:
           JOIN claim_assessments a ON a.id = h.current_assessment_id
           WHERE h.assessment_state = 'current'
             AND h.epistemic_status IN ('supported', 'disputed', 'refuted')
+            AND h.config_snapshot_id = {EFFECTIVE_SNAPSHOT_SQL}
         ),
         significant AS (
           SELECT claim_id FROM cur
@@ -363,12 +382,13 @@ async def _gate_reuse(db: AsyncSession, run: EvaluationRun) -> dict[str, Any]:
 
 
 async def _gate_due_stale(db: AsyncSession, run: EvaluationRun) -> dict[str, Any]:
-    sql = """
+    sql = f"""
         SELECT count(*),
                count(*) FILTER (WHERE c.freshness_status IN ('due', 'stale'))
         FROM claims c
         JOIN claim_assessment_heads h
           ON h.claim_id = c.id AND h.assessment_state = 'current'
+             AND h.config_snapshot_id = {EFFECTIVE_SNAPSHOT_SQL}
         WHERE c.claim_type = 'temporal_fact'
     """
     total, due_stale = await _two(db, sql, {})
@@ -416,11 +436,15 @@ async def _gate_slo(db: AsyncSession, run: EvaluationRun) -> dict[str, Any]:
 
 
 async def _gate_pending_ancestor(db: AsyncSession) -> dict[str, Any]:
-    sql = """
+    # T7.19: both the "bad" (pending/invalid) set and the current-head
+    # denominator are the heads of the effective snapshot — the
+    # lifecycle of a claim under the effective config (§14.1).
+    sql = f"""
         WITH RECURSIVE
         bad AS (
           SELECT claim_id FROM claim_assessment_heads
           WHERE assessment_state IN ('pending', 'invalid')
+            AND config_snapshot_id = {EFFECTIVE_SNAPSHOT_SQL}
         ),
         -- claims that (transitively) depend on a bad claim via
         -- evidential edges (from = depender, to = dependee)
@@ -438,9 +462,11 @@ async def _gate_pending_ancestor(db: AsyncSession) -> dict[str, Any]:
         SELECT
           (SELECT count(*) FROM claim_assessment_heads h
            WHERE h.assessment_state = 'current'
+             AND h.config_snapshot_id = {EFFECTIVE_SNAPSHOT_SQL}
              AND h.claim_id IN (SELECT from_claim_id FROM deps)),
-          (SELECT count(*) FROM claim_assessment_heads
-           WHERE assessment_state = 'current')
+          (SELECT count(*) FROM claim_assessment_heads h
+           WHERE h.assessment_state = 'current'
+             AND h.config_snapshot_id = {EFFECTIVE_SNAPSHOT_SQL})
     """
     violations, total_current = await _two(db, sql, {})
     base = {"numerator": violations, "denominator": total_current, "threshold": 0}
@@ -496,12 +522,14 @@ async def _gate_blind_provenance(
 
 
 async def _provenance_complete(db: AsyncSession, claim_id: Any) -> bool:
-    """claim → current assessment → linked evidence → source / artifact."""
+    """claim → current assessment (of the EFFECTIVE snapshot, T7.19)
+    → linked evidence → source / artifact."""
     head = (
         await db.execute(
             text(
                 "SELECT h.current_assessment_id FROM claim_assessment_heads h "
-                "WHERE h.claim_id = :c AND h.assessment_state = 'current'"
+                "WHERE h.claim_id = :c AND h.assessment_state = 'current' "
+                f"AND h.config_snapshot_id = {EFFECTIVE_SNAPSHOT_SQL}"
             ),
             {"c": claim_id},
         )
@@ -587,7 +615,8 @@ async def _in_scope(db: AsyncSession, claim_id: Any) -> bool:
                 "     AND e.scope = '{}'::jsonb) AS n_empty_scope "
                 "FROM claim_assessment_heads h "
                 "JOIN claim_assessments a ON a.id = h.current_assessment_id "
-                "WHERE h.claim_id = :c AND h.assessment_state = 'current'"
+                "WHERE h.claim_id = :c AND h.assessment_state = 'current' "
+                f"  AND h.config_snapshot_id = {EFFECTIVE_SNAPSHOT_SQL}"
             ),
             {"c": claim_id},
         )
