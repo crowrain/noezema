@@ -21,6 +21,7 @@ reconciler, not a guessed rollback, decides the outcome).
 
 from __future__ import annotations
 
+import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC
@@ -32,7 +33,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.domain.models.artifacts import ORMWorkspaceManifest
 from packages.domain.models.commit import ORMCommitAttempt
-from packages.domain.models.enums import AuditEventType, SessionState
+from packages.domain.models.enums import (
+    AuditEventType,
+    ReassessmentJobStatus,
+    SessionState,
+)
+from packages.domain.models.memory import ORMReassessmentJob
 from packages.domain.models.sessions import ORMSession
 from packages.domain.services.audit import AuditService
 from packages.domain.services.locks import lock_commit_set
@@ -260,6 +266,99 @@ async def finalize(
     memory_payload: dict[str, Any] = {}
     if apply_memory is not None:
         memory_payload = await apply_memory(db, audit, session)
+
+    # 3a'. (T7.20, §8.7.2, ADR-0009) pointer-drift backstop: the session
+    # was admitted under an old snapshot and the runtime pointer moved
+    # while it was in flight (a quiesce violation — the admission record
+    # expired on a crash/stall or was lost). Fail-closed invariant: a
+    # claim must never be left with a head only on a superseded snapshot.
+    # Every claim this commit created is carried over to the active
+    # snapshot: a PENDING head + a durable reassessment job — the cohort
+    # mechanism of §8.7.2 applied to the claims that missed the cohort.
+    # The pointer is read WITHOUT locking the head row: this transaction
+    # already holds the session row lock, and a head->session lock order
+    # here would deadlock against the activation's acquire, which locks
+    # head -> sessions. The next flip cannot start before this
+    # transaction commits (the session's live admission record blocks its
+    # quiesce check), so its cohort covers the carried-over claims.
+    if apply_memory is not None:
+        active_ptr_raw = (
+            await db.execute(
+                text(
+                    "SELECT active_config_snapshot_id FROM runtime_config_heads "
+                    "WHERE scope = 'global'"
+                )
+            )
+        ).scalar_one()
+        active_ptr = uuid.UUID(str(active_ptr_raw))
+        if session.config_snapshot_id != active_ptr:
+            new_claims = [
+                uuid.UUID(str(r[0]))
+                for r in (
+                    await db.execute(
+                        text(
+                            "SELECT id FROM claims WHERE created_in_session = :sid "
+                            "ORDER BY id"
+                        ),
+                        {"sid": session.id},
+                    )
+                ).all()
+            ]
+            for claim_id in new_claims:
+                # lifecycle: pending ⇒ current_assessment_id and
+                # epistemic_status are NULL — the claim has no current
+                # knowledge under the active config until the worker
+                # reassesses it
+                await db.execute(
+                    text(
+                        """
+                        INSERT INTO claim_assessment_heads
+                            (claim_id, config_snapshot_id, assessment_state,
+                             current_assessment_id, epistemic_status, prepared_by)
+                        VALUES (:c, :s, 'pending', NULL, NULL, 'commit_carryover')
+                        ON CONFLICT (claim_id, config_snapshot_id) DO NOTHING
+                        """
+                    ),
+                    {"c": claim_id, "s": active_ptr},
+                )
+                # the durable job (the partial unique index keeps one
+                # active job per (claim, target))
+                job_exists = (
+                    await db.execute(
+                        text(
+                            "SELECT 1 FROM reassessment_jobs "
+                            "WHERE claim_id = :c AND target_config_snapshot_id = :s "
+                            "AND status IN ('queued', 'leased', 'retry')"
+                        ),
+                        {"c": claim_id, "s": active_ptr},
+                    )
+                ).scalar_one_or_none()
+                if job_exists is None:
+                    db.add(
+                        ORMReassessmentJob(
+                            id=uuid.uuid4(),
+                            claim_id=claim_id,
+                            target_config_snapshot_id=active_ptr,
+                            status=ReassessmentJobStatus.QUEUED.value,
+                            reason="commit_carryover",
+                            priority=0,
+                        )
+                    )
+            if new_claims:
+                await audit.record(
+                    AuditEventType.COMMIT_SNAPSHOT_DRIFT,
+                    session_id=session.id,
+                    payload={
+                        "attempt_id": str(attempt.id),
+                        "session_snapshot": str(session.config_snapshot_id),
+                        "active_snapshot": str(active_ptr),
+                        "carried_claims": [str(c) for c in new_claims],
+                    },
+                    public_summary=(
+                        f"{len(new_claims)} claims carried over to the active snapshot "
+                        f"(commit under superseded {session.config_snapshot_id})"
+                    ),
+                )
 
     # 3b. apply staging (recorded -> applied) inside the same transaction
     applied_claims, applied_questions = await staging.apply_recorded(db, audit, session)

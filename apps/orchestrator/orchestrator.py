@@ -20,6 +20,7 @@ M2 state (after this PR):
 
 from __future__ import annotations
 
+import contextlib
 import os
 import uuid
 from collections.abc import Mapping
@@ -109,6 +110,7 @@ from packages.llm_gateway.client import LLMError, LLMMiddleware, LLMSchemaError
 from packages.llm_gateway.config import ModelProfile
 from packages.llm_gateway.fingerprint import build_model_fingerprint
 from packages.llm_gateway.roles import Role, load_prompt, tool_schema_hash
+from packages.memory.session_admission import register_session_admission
 from packages.policy.engine import PolicyEngine
 from packages.policy.profiles import CapabilityProfile, ProfileError, effective_profile
 from packages.policy.tools import get_tool
@@ -252,9 +254,46 @@ class Orchestrator:
         4. a failed fencing/lease outcome is resolved by the reconciler,
            never by a guessed rollback.
         """
-        # ── phase 1: lifecycle up to COMMITTING ───────────────────────────
+        # ── T7.20 (§8.7.2, ADR-0009): the committed admission record ────
+        # Phase 1 keeps the session row uncommitted until COMMITTING, so
+        # the activation's quiesce check ("no active sessions") cannot see
+        # an in-flight session — the EVAL-3d quiesce race (freeze §10.5).
+        # The admission record is committed up front (short tx) and lives
+        # until the session's terminal transaction (a DB trigger on
+        # sessions releases it on every terminal state) or its lease
+        # expires (a crashed session cannot commit knowledge — its own
+        # shorter lease is dead; the activation sweeps expired rows).
+        session_id = uuid.uuid4()
         async with self.session_factory() as db, transaction(db):
-            result = await self._run_to_committing(db, question_id)
+            active = await SessionRepository.list_nonterminal(db)
+            if active:
+                raise RuntimeError(
+                    f"session {active[0].id} is still nonterminal; single session at a time (M1)"
+                )
+            probe_snapshot = await ConfigService.get_effective(db)
+            await register_session_admission(
+                db,
+                session_id,
+                node_owner=self.node_owner,
+                config_snapshot_id=probe_snapshot.id,
+                phase_deadline_seconds=int(
+                    probe_snapshot.session_limits.get("phase_deadline_seconds", 600)
+                ),
+            )
+
+        # ── phase 1: lifecycle up to COMMITTING ───────────────────────────
+        try:
+            async with self.session_factory() as db, transaction(db):
+                result = await self._run_to_committing(db, question_id, session_id)
+        except Exception:
+            # phase 1 crashed: the session row rolled back — release the
+            # admission record right away (a terminal state written inside
+            # phase 1 already released it via the trigger; idempotent).
+            # If the release itself fails (the DB is down), the lease
+            # expires and the activation sweeps the row.
+            with contextlib.suppress(Exception):
+                await self._release_session_admission(session_id)
+            raise
         if isinstance(result, SessionOutcome):
             # early finish (no question, operator abort) — already terminal
             return result
@@ -388,7 +427,10 @@ class Orchestrator:
     # ── main flow (phase 1) ───────────────────────────────────────────────
 
     async def _run_to_committing(
-        self, db: AsyncSession, question_id: uuid.UUID | None
+        self,
+        db: AsyncSession,
+        question_id: uuid.UUID | None,
+        session_id: uuid.UUID | None = None,
     ) -> SessionOutcome | CommitPlan:
         audit = AuditService(db)
 
@@ -399,6 +441,8 @@ class Orchestrator:
                 f"session {active[0].id} is still nonterminal; single session at a time (M1)"
             )
 
+        # T7.20: the host-generated id is bound to the committed admission
+        # record written before this transaction opened (ADR-0009)
         snapshot = await ConfigService.get_effective(db)
         limits = snapshot.session_limits
 
@@ -416,6 +460,7 @@ class Orchestrator:
         # T7.7: started_at is the evaluation window anchor (§22.2);
         # recorded at creation — before any real work
         session = ORMSession(
+            id=session_id if session_id is not None else uuid.uuid4(),
             state=SessionState.CREATED.value,
             config_snapshot_id=snapshot.id,
             started_at=datetime.now(UTC),
@@ -1970,6 +2015,19 @@ class Orchestrator:
             questions_created=questions_created,
             termination_reason=termination_reason,
         )
+
+    async def _release_session_admission(self, session_id: uuid.UUID) -> None:
+        """T7.20 (ADR-0009): drop the admission record when phase 1 ends
+        without a committed session row (crash/rollback — the record would
+        otherwise hold the flip until its lease expires). Idempotent: the
+        terminal-state trigger releases the record on every normal path."""
+        from sqlalchemy import text
+
+        async with self.session_factory() as db, transaction(db):
+            await db.execute(
+                text("DELETE FROM session_admissions WHERE session_id = :id"),
+                {"id": session_id},
+            )
 
     async def _abort_session(self, plan: CommitPlan, reason: str) -> None:
         """A prepare/finalize crash: resolve via the fenced reconciler in a

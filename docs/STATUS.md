@@ -14,7 +14,7 @@
 | M4 зависимости + переоценка | ✅ T4.1 закрыт (claim_dependencies: DAG cycle check при commit, graph revision, kind `research` по §8.6); T4.2 закрыт (cascade invalidation: closure manifest, barrier с durable курсором, idempotent батчи, blocked-путь, retrieval ancestor check); T4.3 закрыт (worker `system:reassessment`: runnable-предикат §5.9.1, lease/retry/blocked, insufficient→invalid+question, crash-lease recovery); T4.4 закрыт (writer admission: table gate §14.1 NOWAIT + jitter, session intent rules 1/4/5, T_escalate/T_worker_admission в scheduler); T4.5 закрыт (online activation §8.7.2: fenced lease + takeover, shadow heads fast path/pending, seal + DB-триггер sealed-интервала, atomic flip, post-publish manifest с deterministic UUIDv5, repair runner + T_repair_admission); T4.6 закрыт (environment manifests §14 env-v2: content-addressed manifest_hash, versioned алгоритм env-independence-v1 — группы по (protocol, implementation, dataset lineage), отношения repeatability/reproducibility/independent_replication/variation/untracked, снапшот на оценке, `required_independence` в rules engine: E3 только через независимую репликацию); T4.7 закрыт (source graph §11.3: таблицы source_dependency_edges/source_graph_corrections, алгоритм independence-v2 — domain/content_hash/parent/edges/corrections, снапшот source_independence_* на оценке, каскад apply_source_graph_change: merge/split → invalidation + recompute, ревизия source_graph); T4.8 закрыт (counterevidence resolutions §8.7.4: таблица + XOR/partial-unique CHECK, межстрочные инварианты (counter-цель, scope-compat, нет транзитивной зависимости, valid correction), каскад create/invalidate → recompute, engine считает только unresolved counters); T4.9 закрыт (failpoints M4: crash после flip — pointer tuple recovery, crash между батчами post-publish — durable cursor, stale activator после takeover — fence-отказ, следующий flip закрывает blocked backlog, barrier crash после каждого батча, group merge + crash worker'а, worker без starvation после смерти intent-lease) — GATE M4 пройден (§19: invalid ancestor блокирует downstream; worker без starvation оба направления; group merge → корректный пересчёт) | — | пороги M4 из замеров серии 2026-09-14 зафиксированы в PLAN (батч 32, SLO P95 200 с); 501 тест |
 | M5 расширенный цикл | ✅ Gate M5 пройден (§19, этап 4): T5.1 закрыт (Curiosity ranking §5.3.1: score-формула, все входы [0,1] + similarity fingerprint, eligibility filter, ε-diversity (seed в audit), селектор config-driven) + T5.2 закрыт (planning §6.2: план как наблюдаемый артефакт, роль planner, закрытые assessment methods, метод ≠ перефраз, planning.mode config-driven) + T5.3 закрыт (роль verifier §3.7: организованные детерминированные проверки, **схема не несёт grade/confidence — assessment идентичен с verifier и без него (gate)**, verification.mode config-driven) + T5.4 закрыт (защита от повторов §9: перефраз + no-progress → цикл, закрытые стратегии §9, audit repeat_cycle_detected, repetition config-driven) + T5.5 закрыт (untrusted extraction §11.2: модель без инструментов, host-проверка дословности, raw-текст не покидает extractor, extraction config-driven) + T5.6 закрыт (long-run сценарии: накопление знания по FIFO-очереди, §9-цикл на накопленной истории, поздний контрпример → disputed E1 rules engine) | — | 651 тест |
 | M6 Research Proxy | ✅ Gate M6 пройден (§19, этап 5): T6.1 закрыт (research proxy: единственный egress, read-only, SSRF-guard private/loopback/link-local/metadata, редиректы/размер/время, удаление активного содержимого) + T6.2 закрыт (режимы Sealed=локальный индекс / Curated=SearXNG через прокси c upstream-логом и rate limits / Open Lab=закрытый список доменов, отдельный профиль) + T6.3 закрыт (provenance: original+normalized+hash, origin в sources/artifact_chunks, fenced-маркировка в контексте §11.2, research.fetch — единственный egress сессии) + T6.4 закрыт (injection/poisoning: capabilities неизменны, similarity→require_operator, poisoned artifact не самооценивается) | noezema-m6 (после gate) | см. раздел M6 ниже | 651 тест |
-| M7 полный веб + эксплуатация | ✅ Gate M7 пройден (T7.1 ✅ knowledge graph + provenance + diagnostics; T7.2 ✅ backup/PITR §15.3; T7.3 ✅ GC full root set; T7.4 ✅ security regression gate + §16 metrics; T7.5 ✅ evaluation run §22.2 mechanism; T7.6 ✅ ADR-0004); после gate — дефекты EVAL-3b/EVAL-3: T7.7–T7.19 закрыты (T7.15 E2E-валидация, T7.16 assertion-окно, T7.17 хост-деривация scope, rules-v2, ADR-0007; T7.18 относительная опорная дата «на текущую дату» = дата сессии по часам хоста, уточнение ADR-0007 — тесты test_scope.py / test_rules_engine.py / test_scope_coverage.py; T7.19 гейты считают ровно один head на claim — head активного snapshot по указателю runtime_config_heads (§14.1), дефект учёта дублей после mid-run активации EVAL-3d — тесты test_evaluation_gates_activation.py; детали в разделе M7; досчёт EVAL-3d 2026-09-19 (eligible=50, completed=50, overall insufficient_sample — приёмка §22.2 не пройдена) + слепая выборка для ручной проверки — ADR-0008) | noezema-m7 (на `2e1631c`) | см. раздел M7 ниже | 777 тест |
+| M7 полный веб + эксплуатация | ✅ Gate M7 пройден (T7.1 ✅ knowledge graph + provenance + diagnostics; T7.2 ✅ backup/PITR §15.3; T7.3 ✅ GC full root set; T7.4 ✅ security regression gate + §16 metrics; T7.5 ✅ evaluation run §22.2 mechanism; T7.6 ✅ ADR-0004); после gate — дефекты EVAL-3b/EVAL-3: T7.7–T7.20 закрыты (T7.15 E2E-валидация, T7.16 assertion-окно, T7.17 хост-деривация scope, rules-v2, ADR-0007; T7.18 относительная опорная дата «на текущую дату» = дата сессии по часам хоста, уточнение ADR-0007 — тесты test_scope.py / test_rules_engine.py / test_scope_coverage.py; T7.19 гейты считают ровно один head на claim — head активного snapshot по указателю runtime_config_heads (§14.1), дефект учёта дублей после mid-run активации EVAL-3d — тесты test_evaluation_gates_activation.py; детали в разделе M7; досчёт EVAL-3d 2026-09-19 (eligible=50, completed=50, overall insufficient_sample — приёмка §22.2 не пройдена) + слепая выборка для ручной проверки — ADR-0008; T7.20 quiesce-барьер online-активации (гонка EVAL-3d §10.5): committed admission-запись сессии (миграция 0022 + trigger на sessions) блокирует flip при in-flight сессии + carry-over на fenced commit (pending head + durable job на активном snapshot) — инвариант «нет claim'а с head только на superseded» при любом переплетении — тест test_quiesce_race.py, ADR-0009) | noezema-m7 (на `2e1631c`) | см. раздел M7 ниже | 782 тест |
 
 ## Gate M2 (§19, этап 2) — пройден (noezema-m2)
 
@@ -54,7 +54,7 @@
 | 23 | session limits + host reserve | MVP | ✅ | test_orchestrator.py (max_explorer_steps из config → partial success на safe boundary) + test_staging_reserve.py (host reserve: staging_budget_exceeded ДО записи) |
 | 24 | online activation | v1 | ✅ T4.5 | test_online_activation.py (12: fenced lease/takeover, quiesce, shadow heads, deterministic UUIDv5 вопросы, atomic flip, crash resume, exhaustion → post_publish_blocked) + test_failpoints_m4.py (crash после flip / между батчами) — строка 14, T4.5/T4.9 |
 | 25 | activating slot / terminal-cleanup | v1 | ✅ T4.5 | test_online_activation.py (slot held при transient, terminal cleanup при exhaustion, superseded-закрытие без reactivation) + test_failpoints_m4.py::test_next_flip_closes_blocked_backlog — строка 14, T4.5/T4.9 |
-| 26 | quiesce через writer gate | v1 | ✅ T4.4+T4.5 | test_writer_admission.py (gate CAS NOWAIT §14.1, session intent, worker deferral) + test_online_activation.py (activation берёт gate до pointer; quiesce — gate wait timeout, active session) — строка 14, T4.4/T4.5 |
+| 26 | quiesce через writer gate | v1 | ✅ T4.4+T4.5+T7.20 | test_writer_admission.py (gate CAS NOWAIT §14.1, session intent, worker deferral) + test_online_activation.py (activation берёт gate до pointer; quiesce — gate wait timeout, active session) + test_quiesce_race.py (T7.20, ADR-0009: quiesce-барьер in-flight сессии — committed admission-запись + trigger на terminal, sweep истёкших, backstop carry-over на commit при drift указателя) — строка 14, T4.4/T4.5; M7, T7.20 |
 | 27 | recovery по pointer tuple | v1 | ✅ T4.5+T4.9 | test_online_activation.py (crash resume: fence не меняется, один publish) + test_failpoints_m4.py::test_crash_after_flip_recovers_pointer_tuple (pointer tuple durable, idempotent resume) — строка 14, T4.5/T4.9 |
 | 28 | offline rules change | MVP | ✅ | test_offline_rules.py (idempotent upsert по (base,payload), cohort+seal, atomic publish: pointer + UUIDv5 invalid-вопросы одной tx; уже-активный payload → success; active session → reject) |
 | 29 | repair runner CAS | v1 | ✅ T4.5 | test_online_activation.py (repair runner: repair CAS, phase=repair, T_repair_admission — skip repair_backlog) + test_failpoints_m4.py::test_next_flip_closes_blocked_backlog (find_repair_backlog → None) — строка 14, T4.5/T4.9 |
@@ -2717,3 +2717,93 @@ EVAL-3 — решение пользователя, не планируется.
  finish_evaluation_run`, аналог `close-draft2-runs.py`): в
  `noezema-eval3c` один snapshot с head'ами (v2), дублей нет; 2
  сессии из 50, overall insufficient_sample.
+
+  ### T7.20 — quiesce-барьер online-активации: admission-запись сессии + carry-over на commit (EVAL-3d race, §8.7.2, §14.1, ADR-0009)
+
+  Дефект (зафиксирован в EVAL-3d, `EVAL-3-freeze.md` §10.5; разбор и
+  обоснование выбора варианта — `docs/adr/0009-quiesce-admission-barrier.md`):
+  quiesce-проверка §8.7.2 («нет активных сессий») в
+  `acquire_activation` считает строки `sessions` в
+  `ACTIVE_SESSION_STATES` — но сессия живёт в одной долгой
+  phase-1-транзакции (`run_session`): строка сессии (и её lease)
+  некоммичена до COMMITTING и невидима проверяющему. Прогон EVAL-3d:
+  сессия `6f45deea` открыла phase-1 tx 15:47:21.8Z ДО флипа v2→v3
+  (15:47:32.9Z); flip прошёл quiesce («активных сессий нет»), cohort
+  зафиксирован без будущего claim'а; коммит 15:50:59.8Z (prepare
+  прочитал ревизию ПОСЛЕ флипа — revision-fence §5.2.2 не сработал)
+  создал claim `8bbbb06a` с head только на superseded v2. После T7.19
+  такой claim тихо выпадает из текущего знания и из гейтов.
+  Существующие механизмы не ловили: writer gate сессия не держит по
+  дизайну, `commit_intent_at` пишется только в `committing` (поздно),
+  fenced финальная tx не сравнивает `plan.config_snapshot_id` с
+  указателем.
+
+  Решение (ADR-0009, два слоя):
+  1. **Committed admission-запись (барьер)** — миграция
+     `0022_session_admissions`: таблица `session_admissions`
+     (host-generated `session_id` PK, lease) + **DB-trigger на
+     `sessions`**: любой переход в терминальное состояние
+     (`succeeded/succeeded_partial/failed/cancelled`) в той же tx
+     удаляет запись — ни один терминальный код (finalize/abort/
+     reconciler) не может её пропустить; прецедент — sealed-interval
+     trigger (T4.5). Оркестратор (`run_session`) ПЕРЕД phase-1 tx в
+     короткой tx: single-session проверка (M1) + `get_effective` +
+     INSERT записи; session UUID генерируется хостом до tx и phase 1
+     использует его. Lease = `created_at + phase_deadline + 600s`
+     (heartbeat'ом не обновляется: сессия не может жить дольше phase
+     deadline — watchdog отказывает в renew). `acquire_activation`:
+     в quiesce-tx sweep истёкших записей (погибшая сессия не может
+     коммитить — её собственный lease мёртв) + count живых; живые
+     считаются активными сессиями (`active sessions present: N`),
+     число swept — в audit `activation_acquired/takeover`.
+  2. **Carry-over на fenced commit (fail-closed backstop)** —
+     `finalize` (packages/domain/services/commit.py, шаг 3a'): после
+     apply_memory tx читает указатель `runtime_config_heads` БЕЗ
+     блокировки head-строки (lock head→session дал бы deadlock с
+     acquire; корректность по индукции: следующий flip ждёт
+     commit'а этой tx по живой admission-записи и его cohort закрывает
+     перенесённые claims). Если `sessions.config_snapshot_id ≠
+     указатель` — каждый claim, созданный коммитом
+     (`created_in_session = session.id`), переносится на активный
+     snapshot: pending head (NULL/NULL, `prepared_by='commit_carryover'`
+     — новое значение CHECK-ограничения, миграция 0022) + durable
+     reassessment job (`reason='commit_carryover'`) — механизм
+     cohort'а §8.7.2 для claim'ов, его пропустивших. Audit
+     `commit_snapshot_drift` (session_snapshot, active_snapshot,
+     carried_claims) в той же tx. Выбран carry-over, а не отказ от
+     commit'а (fencing_conflict): отказ выбрасывал бы валидное знание
+     из-за смены конфига, а протокол §8.7.2 отвечает на «claim под
+     старым конфигом» именно pending head + durable job.
+
+  Тесты: `tests/scenario/test_quiesce_race.py` (5 scenario-тестов,
+  postgres):
+  - детерминированное воспроизведение переплетения EVAL-3d: сессия
+    допущена (запись коммичена) + phase-1 tx открыта (строка
+    невидима) → flip БЛОКИРОВАН (`active sessions present`), указатель
+    не тронут; после commit'а phase-1 (`committing`) — всё ещё
+    заблокирован (видимая строка); терминальное состояние — trigger
+    снял запись, активация проходит штатно;
+  - crash-вариант: истёкшая admission-запись без строки сессии —
+    активация её свипает (`swept_admissions=1` в audit) и проходит,
+    не упираясь в мёртвую сессию;
+  - backstop (окно, которое барьер закрывает только при живом lease —
+    запись потеряна/истекла, сессия ещё может коммитнуть): тот же
+    переплёт EVAL-3d (flip при невидимой сессии, prepare после флипа)
+    → старый код оставил бы claim с head только на superseded
+    (состояние зафиксировано в тесте как документация), НОВЫЙ
+    `finalize` переносит созданный claim на активный snapshot (pending
+    head + queued job `commit_carryover` + audit
+    `commit_snapshot_drift`); инвариант «нет claim'а с head только на
+    superseded при активном указателе на новом» проверен SELECT'ом;
+  - trigger: каждое из 4 терминальных состояний снимает запись в той
+    же tx, non-terminal переход (`exploring→committing`) — не снимает;
+  - регрессия: активация без сессий/записей (sweep=0) — поведение
+    штатного пути не изменилось.
+
+  На старом коде (worktree на `705c04d`, проверено запуском) та же
+  последовательность (flip при невидимой in-flight сессии, commit
+  после) оставляет claim с head только на superseded snapshot —
+  воспроизведение гонки EVAL-3d; на новом коде барьер блокирует flip,
+  а в деградированном окне backstop гарантирует carry-over. Данные
+  прогонов (`noezema-eval*`) не тронуты (SELECT only); `8bbbb06a`
+  остаётся как улика (ADR-0008). Прогон: полная проверка зелёная.

@@ -78,6 +78,10 @@ from packages.domain.models.enums import (
 from packages.domain.models.memory import ORMClaim, ORMClaimAssessmentHead, ORMReassessmentJob
 from packages.domain.models.questions import ORMQuestion
 from packages.domain.services.audit import AuditService
+from packages.memory.session_admission import (
+    count_live_admissions,
+    sweep_expired_admissions,
+)
 from packages.memory.writer_gate import (
     GATE_PRIORITY_ACTIVATION,
     OWNER_ACTIVATION,
@@ -479,8 +483,18 @@ async def acquire_activation(
                     )
                 )
             ).scalar_one()
-            if int(active_sessions) > 0:
-                raise ActivationError(f"active sessions present: {int(active_sessions)}")
+            # T7.20 (§8.7.2, ADR-0009): the phase-1 visibility gap — a
+            # session admitted before the flip keeps its ``sessions`` row
+            # uncommitted until COMMITTING, so the count above misses it.
+            # The committed admission record is the barrier: sweep the
+            # expired ones (crashed sessions — they cannot commit
+            # knowledge, their own lease is dead) and count the live.
+            swept = await sweep_expired_admissions(db)
+            live_admissions = await count_live_admissions(db)
+            if int(active_sessions) + live_admissions > 0:
+                raise ActivationError(
+                    f"active sessions present: {int(active_sessions) + live_admissions}"
+                )
             if int(unresolved) > 0:
                 raise ActivationError(f"unresolved commit attempts: {int(unresolved)}")
 
@@ -525,6 +539,7 @@ async def acquire_activation(
                         "base_snapshot_id": str(candidate.base_snapshot_id),
                         "fence": fence,
                         "scope": SCOPE,
+                        "swept_admissions": swept,
                     },
                     public_summary=(
                         "online activation lease "
