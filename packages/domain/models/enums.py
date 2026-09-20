@@ -486,6 +486,11 @@ class AuditEventType(StrEnum):
     # T5.5 (stage 4): the untrusted extraction profile (§11.2)
     EXTRACTION_COMPLETED = "extraction_completed"
     EXTRACTION_FALLBACK = "extraction_fallback"
+    # T7.20 (stage 7, §8.7.2, ADR-0009): the commit-time backstop —
+    # the session's pinned snapshot is superseded at commit; the claims
+    # it created are carried over to the active snapshot (pending head +
+    # durable reassessment job)
+    COMMIT_SNAPSHOT_DRIFT = "commit_snapshot_drift"
     # T6.1 (stage 5, §5.12): the research proxy egress journal
     RESEARCH_FETCH_COMPLETED = "research_fetch_completed"
     RESEARCH_FETCH_REJECTED = "research_fetch_rejected"

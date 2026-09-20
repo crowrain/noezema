@@ -8,7 +8,7 @@ scopes keep the original key-by-key predicate."""
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 import pytest
 
@@ -46,6 +46,29 @@ QUESTION_TWO_SOURCES = (
     "входило в ООН? Ответь строго по этим двум источникам: "
     "https://un.org/en/about-us и "
     "https://ru.wikipedia.org/wiki/Список_государств_—_членов_ООН"
+)
+
+#: T7.18: the SAME shape but with a RELATIVE date anchor («на текущую
+#: дату») — the reference date is the session's date on the host's clock
+QUESTION_TWO_SOURCES_RELATIVE = (
+    "Какова ключевая ставка Банка России на текущую дату? Установи это "
+    "утверждение строго по этим двум источникам: "
+    "https://cbr.ru/ и https://www.consultant.ru/legalnews/32063"
+)
+
+#: the frozen temporal_fact rule (§8.7): E3 from >=2 source_assertion in
+#: >=2 independent groups, requires_scope + requires_as_of
+TEMPORAL_FACT_RULE = ClaimTypeRule.from_payload(
+    "temporal_fact",
+    {
+        "min_grade_for_supported": "E3",
+        "allowed_kinds": ["source_assertion", "quote_integrity"],
+        "min_support_evidence": 2,
+        "min_independence_groups": 2,
+        "requires_scope": True,
+        "requires_as_of": True,
+        "volatility": "temporal",
+    },
 )
 
 
@@ -280,6 +303,86 @@ def test_canonical_scope_model_freeform_keys_do_not_block():
     r = evaluate("external_fact", EXTERNAL_FACT_RULE, claim_scope, evs, has_as_of=True)
     assert r.epistemic_status is EpistemicStatus.SUPPORTED
     assert r.grade is EffectiveGrade.E3
+
+
+# ── T7.18: relative reference date is host-derived (session date) ──────
+
+
+def test_relative_date_session_reference_reaches_E3():
+    """T7.18 REGRESSION (the found defect): the question asks «на
+    текущую дату», the model's typed as_of = TOMORROW, the evidence was
+    retrieved TODAY. The host-derived reference date is the SESSION's
+    date (today) — NOT the model's as_of — so the evidence (retrieved
+    at/after the reference) covers, and the claim reaches E3 from two
+    independent sources."""
+    session_date = date(2026, 9, 18)
+    claim_scope = derive_claim_scope(
+        question=QUESTION_TWO_SOURCES_RELATIVE,
+        as_of=datetime(2026, 9, 19, 0, 0, tzinfo=UTC),  # model says TOMORROW
+        session_date=session_date,
+    )
+    assert claim_scope["as_of"] == "2026-09-18"  # host-derived, not tomorrow
+    evs = [
+        _canonical_evidence(
+            "g0", source_domain="cbr.ru", observed_at=datetime(2026, 9, 18, 18, 36, tzinfo=UTC)
+        ),
+        _canonical_evidence(
+            "g1", source_domain="consultant.ru", observed_at=datetime(2026, 9, 18, 18, 40, tzinfo=UTC)
+        ),
+    ]
+    r = evaluate("temporal_fact", TEMPORAL_FACT_RULE, claim_scope, evs, has_as_of=True)
+    assert r.epistemic_status is EpistemicStatus.SUPPORTED
+    assert r.grade is EffectiveGrade.E3
+    assert "requirements_met" in r.reasons
+
+
+def test_relative_date_past_model_as_of_cannot_shift_reference():
+    """T7.18: a PAST model as_of also cannot pull the reference date
+    backward — it stays the session date, so today's evidence still
+    covers (the model cannot engineer a scope_not_covered either way)."""
+    session_date = date(2026, 9, 18)
+    claim_scope = derive_claim_scope(
+        question=QUESTION_TWO_SOURCES_RELATIVE,
+        as_of=datetime(2026, 4, 15, 0, 0, tzinfo=UTC),  # model says the past
+        session_date=session_date,
+    )
+    assert claim_scope["as_of"] == "2026-09-18"
+    evs = [
+        _canonical_evidence(
+            "g0", source_domain="cbr.ru", observed_at=datetime(2026, 9, 18, 18, 36, tzinfo=UTC)
+        ),
+        _canonical_evidence(
+            "g1", source_domain="consultant.ru", observed_at=datetime(2026, 9, 18, 18, 40, tzinfo=UTC)
+        ),
+    ]
+    r = evaluate("temporal_fact", TEMPORAL_FACT_RULE, claim_scope, evs, has_as_of=True)
+    assert r.epistemic_status is EpistemicStatus.SUPPORTED
+    assert r.grade is EffectiveGrade.E3
+
+
+def test_relative_date_evidence_before_session_date_stays_E1():
+    """T7.18 fail-closed (relative form): the reference is the session
+    date; evidence retrieved BEFORE it does not cover — E1,
+    scope_not_covered, no grade lift."""
+    session_date = date(2026, 9, 18)
+    claim_scope = derive_claim_scope(
+        question=QUESTION_TWO_SOURCES_RELATIVE,
+        as_of=datetime(2026, 9, 18, tzinfo=UTC),
+        session_date=session_date,
+    )
+    assert claim_scope["as_of"] == "2026-09-18"
+    evs = [
+        _canonical_evidence(
+            "g0", source_domain="cbr.ru", observed_at=datetime(2026, 9, 17, 18, 36, tzinfo=UTC)
+        ),
+        _canonical_evidence(
+            "g1", source_domain="consultant.ru", observed_at=datetime(2026, 9, 17, 18, 40, tzinfo=UTC)
+        ),
+    ]
+    r = evaluate("temporal_fact", TEMPORAL_FACT_RULE, claim_scope, evs, has_as_of=True)
+    assert r.epistemic_status is EpistemicStatus.HYPOTHESIS
+    assert r.grade is EffectiveGrade.E1
+    assert "scope_not_covered" in r.reasons
 
 
 def test_requires_as_of_missing_is_deferred():

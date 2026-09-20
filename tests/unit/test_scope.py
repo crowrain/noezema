@@ -19,6 +19,7 @@ from packages.memory.scope import (
     is_host_derived,
     legacy_scope_covers,
     parse_question_date,
+    question_uses_relative_date,
     scope_covers,
 )
 
@@ -28,8 +29,18 @@ QUESTION_UN = (
     "https://un.org/en/about-us и "
     "https://ru.wikipedia.org/wiki/Список_государств_—_членов_ООН"
 )
-QUESTION_EU_NO_DATE = (
+#: relative-form question (T7.18): «на текущую дату» — the reference
+#: date is the SESSION's date on the host's clock, never the model's as_of
+QUESTION_EU_RELATIVE = (
     "Сколько стран-членов в Европейском союзе на текущую дату? "
+    "Источники: https://en.wikipedia.org/wiki/European_Union и "
+    "https://european-union.europa.eu/principles-countries-history/"
+    "facts-and-figures-european-union_en"
+)
+#: no date anchor at all (neither explicit nor relative) — the claim's
+#: typed as_of stands (ADR-0007, уточнение T7.18)
+QUESTION_EU_TRUE_NO_DATE = (
+    "Сколько стран-членов в Европейском союзе? "
     "Источники: https://en.wikipedia.org/wiki/European_Union и "
     "https://european-union.europa.eu/principles-countries-history/"
     "facts-and-figures-european-union_en"
@@ -55,9 +66,42 @@ def test_parse_question_date_other_forms() -> None:
 
 
 def test_parse_question_date_no_date() -> None:
-    assert parse_question_date(QUESTION_EU_NO_DATE) is None
+    # the EXPLICIT parser does not see relative forms («на текущую дату»
+    # is not a fixed date) — that is a T7.18 relative anchor, handled in
+    # question_uses_relative_date / derive_claim_scope
+    assert parse_question_date(QUESTION_EU_RELATIVE) is None
     assert parse_question_date("Сколько стран в ЕС на текущую дату?") is None
+    assert parse_question_date(QUESTION_EU_TRUE_NO_DATE) is None
     assert parse_question_date("") is None
+
+
+def test_question_uses_relative_date_closed_set() -> None:
+    """T7.18: the closed deterministic set of relative reference-date
+    forms. The corpus (question-set-v2.jsonl) actually uses «на текущую
+    дату» and «сейчас»; the rest of the closed set is covered too."""
+    relative = [
+        "Какова ключевая ставка Банка России на текущую дату?",
+        "Сколько стран-членов в Европейском союзе на текущую дату?",
+        "Сколько стран в ЕС на сегодня?",
+        "Сколько стран в ЕС сейчас?",
+        "Верно ли, что сейчас в Европейском союзе 27 стран-членов?",
+        "Какая версия Python сейчас последняя стабильная?",
+        "На текущий момент сколько стран в ЕС?",
+        "Какая текущая версия Python?",
+        "How many EU members as of the current date?",
+        "How many EU members as of today?",
+        "How many members are currently in the EU?",
+    ]
+    for q in relative:
+        assert question_uses_relative_date(q), q
+    # an EXPLICIT date (no relative form) is not a relative anchor
+    assert not question_uses_relative_date(
+        "По состоянию на 15 апреля 2026 года: сколько стран в ЕС?"
+    )
+    # no date at all is not a relative anchor
+    assert not question_uses_relative_date("Сколько планет в Солнечной системе?")
+    assert not question_uses_relative_date(QUESTION_EU_TRUE_NO_DATE)
+    assert not question_uses_relative_date("")
 
 
 def test_parse_question_date_invalid_calendar_and_leftmost() -> None:
@@ -105,12 +149,49 @@ def test_derive_claim_scope_question_date_wins_over_model_as_of() -> None:
 
 
 def test_derive_claim_scope_model_as_of_without_question_date() -> None:
+    # ADR-0007 уточнение (T7.18): a question with NO date anchor at all
+    # (neither explicit nor relative) keeps the claim's typed as_of — a
+    # host-validated structure, not free-form
     scope = derive_claim_scope(
-        question=QUESTION_EU_NO_DATE,
+        question=QUESTION_EU_TRUE_NO_DATE,
         as_of=datetime(2026, 9, 17, 13, 0, tzinfo=UTC),
     )
     assert scope["as_of"] == "2026-09-17"
     assert scope["source_domains"] == ["wikipedia.org", "europa.eu"]
+
+
+def test_derive_claim_scope_relative_date_uses_session_date() -> None:
+    """T7.18 (the defect fix): a relative-form question («на текущую
+    дату») anchors the reference date to the SESSION's date on the
+    host's clock. The model's typed as_of — in the FUTURE or in the
+    PAST — cannot shift the reference date either way."""
+    # model says TOMORROW → the reference stays the session date
+    scope = derive_claim_scope(
+        question=QUESTION_EU_RELATIVE,
+        as_of=datetime(2026, 9, 19, 12, 0, tzinfo=UTC),
+        session_date=date(2026, 9, 18),
+    )
+    assert scope["as_of"] == "2026-09-18"
+    assert scope["source_domains"] == ["wikipedia.org", "europa.eu"]
+    # model says the PAST → the reference still stays the session date
+    scope_past = derive_claim_scope(
+        question=QUESTION_EU_RELATIVE,
+        as_of=datetime(2026, 9, 1, 12, 0, tzinfo=UTC),
+        session_date=date(2026, 9, 18),
+    )
+    assert scope_past["as_of"] == "2026-09-18"
+
+
+def test_derive_claim_scope_explicit_date_wins_over_relative_and_session() -> None:
+    # an EXPLICIT date in the question is primary: it beats both the
+    # relative form and the session date
+    q = "По состоянию на 15 апреля 2026, сейчас сколько стран в ЕС?"
+    scope = derive_claim_scope(
+        question=q,
+        as_of=datetime(2026, 9, 19, tzinfo=UTC),
+        session_date=date(2026, 9, 18),
+    )
+    assert scope["as_of"] == "2026-04-15"
 
 
 def test_derive_claim_scope_no_question_no_as_of() -> None:

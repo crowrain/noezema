@@ -14,7 +14,7 @@
 | M4 зависимости + переоценка | ✅ T4.1 закрыт (claim_dependencies: DAG cycle check при commit, graph revision, kind `research` по §8.6); T4.2 закрыт (cascade invalidation: closure manifest, barrier с durable курсором, idempotent батчи, blocked-путь, retrieval ancestor check); T4.3 закрыт (worker `system:reassessment`: runnable-предикат §5.9.1, lease/retry/blocked, insufficient→invalid+question, crash-lease recovery); T4.4 закрыт (writer admission: table gate §14.1 NOWAIT + jitter, session intent rules 1/4/5, T_escalate/T_worker_admission в scheduler); T4.5 закрыт (online activation §8.7.2: fenced lease + takeover, shadow heads fast path/pending, seal + DB-триггер sealed-интервала, atomic flip, post-publish manifest с deterministic UUIDv5, repair runner + T_repair_admission); T4.6 закрыт (environment manifests §14 env-v2: content-addressed manifest_hash, versioned алгоритм env-independence-v1 — группы по (protocol, implementation, dataset lineage), отношения repeatability/reproducibility/independent_replication/variation/untracked, снапшот на оценке, `required_independence` в rules engine: E3 только через независимую репликацию); T4.7 закрыт (source graph §11.3: таблицы source_dependency_edges/source_graph_corrections, алгоритм independence-v2 — domain/content_hash/parent/edges/corrections, снапшот source_independence_* на оценке, каскад apply_source_graph_change: merge/split → invalidation + recompute, ревизия source_graph); T4.8 закрыт (counterevidence resolutions §8.7.4: таблица + XOR/partial-unique CHECK, межстрочные инварианты (counter-цель, scope-compat, нет транзитивной зависимости, valid correction), каскад create/invalidate → recompute, engine считает только unresolved counters); T4.9 закрыт (failpoints M4: crash после flip — pointer tuple recovery, crash между батчами post-publish — durable cursor, stale activator после takeover — fence-отказ, следующий flip закрывает blocked backlog, barrier crash после каждого батча, group merge + crash worker'а, worker без starvation после смерти intent-lease) — GATE M4 пройден (§19: invalid ancestor блокирует downstream; worker без starvation оба направления; group merge → корректный пересчёт) | — | пороги M4 из замеров серии 2026-09-14 зафиксированы в PLAN (батч 32, SLO P95 200 с); 501 тест |
 | M5 расширенный цикл | ✅ Gate M5 пройден (§19, этап 4): T5.1 закрыт (Curiosity ranking §5.3.1: score-формула, все входы [0,1] + similarity fingerprint, eligibility filter, ε-diversity (seed в audit), селектор config-driven) + T5.2 закрыт (planning §6.2: план как наблюдаемый артефакт, роль planner, закрытые assessment methods, метод ≠ перефраз, planning.mode config-driven) + T5.3 закрыт (роль verifier §3.7: организованные детерминированные проверки, **схема не несёт grade/confidence — assessment идентичен с verifier и без него (gate)**, verification.mode config-driven) + T5.4 закрыт (защита от повторов §9: перефраз + no-progress → цикл, закрытые стратегии §9, audit repeat_cycle_detected, repetition config-driven) + T5.5 закрыт (untrusted extraction §11.2: модель без инструментов, host-проверка дословности, raw-текст не покидает extractor, extraction config-driven) + T5.6 закрыт (long-run сценарии: накопление знания по FIFO-очереди, §9-цикл на накопленной истории, поздний контрпример → disputed E1 rules engine) | — | 651 тест |
 | M6 Research Proxy | ✅ Gate M6 пройден (§19, этап 5): T6.1 закрыт (research proxy: единственный egress, read-only, SSRF-guard private/loopback/link-local/metadata, редиректы/размер/время, удаление активного содержимого) + T6.2 закрыт (режимы Sealed=локальный индекс / Curated=SearXNG через прокси c upstream-логом и rate limits / Open Lab=закрытый список доменов, отдельный профиль) + T6.3 закрыт (provenance: original+normalized+hash, origin в sources/artifact_chunks, fenced-маркировка в контексте §11.2, research.fetch — единственный egress сессии) + T6.4 закрыт (injection/poisoning: capabilities неизменны, similarity→require_operator, poisoned artifact не самооценивается) | noezema-m6 (после gate) | см. раздел M6 ниже | 651 тест |
-| M7 полный веб + эксплуатация | ✅ Gate M7 пройден (T7.1 ✅ knowledge graph + provenance + diagnostics; T7.2 ✅ backup/PITR §15.3; T7.3 ✅ GC full root set; T7.4 ✅ security regression gate + §16 metrics; T7.5 ✅ evaluation run §22.2 mechanism; T7.6 ✅ ADR-0004); после gate — дефекты EVAL-3b/EVAL-3: T7.7–T7.17 закрыты (T7.15 E2E-валидация, T7.16 assertion-окно, T7.17 хост-деривация scope, rules-v2, ADR-0007 — тесты test_scope.py / test_rules_engine.py / test_scope_coverage.py; детали в разделе M7) | noezema-m7 (на `2e1631c`) | см. раздел M7 ниже | 765 тест |
+| M7 полный веб + эксплуатация | ✅ Gate M7 пройден (T7.1 ✅ knowledge graph + provenance + diagnostics; T7.2 ✅ backup/PITR §15.3; T7.3 ✅ GC full root set; T7.4 ✅ security regression gate + §16 metrics; T7.5 ✅ evaluation run §22.2 mechanism; T7.6 ✅ ADR-0004); после gate — дефекты EVAL-3b/EVAL-3: T7.7–T7.20 закрыты (T7.15 E2E-валидация, T7.16 assertion-окно, T7.17 хост-деривация scope, rules-v2, ADR-0007; T7.18 относительная опорная дата «на текущую дату» = дата сессии по часам хоста, уточнение ADR-0007 — тесты test_scope.py / test_rules_engine.py / test_scope_coverage.py; T7.19 гейты считают ровно один head на claim — head активного snapshot по указателю runtime_config_heads (§14.1), дефект учёта дублей после mid-run активации EVAL-3d — тесты test_evaluation_gates_activation.py; детали в разделе M7; досчёт EVAL-3d 2026-09-19 (eligible=50, completed=50, overall insufficient_sample — приёмка §22.2 не пройдена) + слепая выборка для ручной проверки — ADR-0008; T7.20 quiesce-барьер online-активации (гонка EVAL-3d §10.5): committed admission-запись сессии (миграция 0022 + trigger на sessions) блокирует flip при in-flight сессии + carry-over на fenced commit (pending head + durable job на активном snapshot) — инвариант «нет claim'а с head только на superseded» при любом переплетении — тест test_quiesce_race.py, ADR-0009) | noezema-m7 (на `2e1631c`) | см. раздел M7 ниже | 782 тест |
 
 ## Gate M2 (§19, этап 2) — пройден (noezema-m2)
 
@@ -54,7 +54,7 @@
 | 23 | session limits + host reserve | MVP | ✅ | test_orchestrator.py (max_explorer_steps из config → partial success на safe boundary) + test_staging_reserve.py (host reserve: staging_budget_exceeded ДО записи) |
 | 24 | online activation | v1 | ✅ T4.5 | test_online_activation.py (12: fenced lease/takeover, quiesce, shadow heads, deterministic UUIDv5 вопросы, atomic flip, crash resume, exhaustion → post_publish_blocked) + test_failpoints_m4.py (crash после flip / между батчами) — строка 14, T4.5/T4.9 |
 | 25 | activating slot / terminal-cleanup | v1 | ✅ T4.5 | test_online_activation.py (slot held при transient, terminal cleanup при exhaustion, superseded-закрытие без reactivation) + test_failpoints_m4.py::test_next_flip_closes_blocked_backlog — строка 14, T4.5/T4.9 |
-| 26 | quiesce через writer gate | v1 | ✅ T4.4+T4.5 | test_writer_admission.py (gate CAS NOWAIT §14.1, session intent, worker deferral) + test_online_activation.py (activation берёт gate до pointer; quiesce — gate wait timeout, active session) — строка 14, T4.4/T4.5 |
+| 26 | quiesce через writer gate | v1 | ✅ T4.4+T4.5+T7.20 | test_writer_admission.py (gate CAS NOWAIT §14.1, session intent, worker deferral) + test_online_activation.py (activation берёт gate до pointer; quiesce — gate wait timeout, active session) + test_quiesce_race.py (T7.20, ADR-0009: quiesce-барьер in-flight сессии — committed admission-запись + trigger на terminal, sweep истёкших, backstop carry-over на commit при drift указателя) — строка 14, T4.4/T4.5; M7, T7.20 |
 | 27 | recovery по pointer tuple | v1 | ✅ T4.5+T4.9 | test_online_activation.py (crash resume: fence не меняется, один publish) + test_failpoints_m4.py::test_crash_after_flip_recovers_pointer_tuple (pointer tuple durable, idempotent resume) — строка 14, T4.5/T4.9 |
 | 28 | offline rules change | MVP | ✅ | test_offline_rules.py (idempotent upsert по (base,payload), cohort+seal, atomic publish: pointer + UUIDv5 invalid-вопросы одной tx; уже-активный payload → success; active session → reject) |
 | 29 | repair runner CAS | v1 | ✅ T4.5 | test_online_activation.py (repair runner: repair CAS, phase=repair, T_repair_admission — skip repair_backlog) + test_failpoints_m4.py::test_next_flip_closes_blocked_backlog (find_repair_backlog → None) — строка 14, T4.5/T4.9 |
@@ -87,19 +87,27 @@ test_evaluation.py` (4) + `tests/scenario/test_web_evaluation.py` (2).
 Пороги фиксируются до серии (§16.3); SLO и пороги меняются только до
 нового evaluation run с новой config version (§22.2).
 
+Фактические серии: EVAL-1/EVAL-2 (корпус v1, sealed — ADR-0005/0006,
+overall failed по `significant_claim_reuse`) → **EVAL-3d** (2026-09-19,
+корпус v2, curated-профиль, mid-run-активация v2→v3; 50/50 сессий,
+0 failed, 0 LeaseLost): исходы 11 гейтов, overall **insufficient_sample**
+(приёмка §22.2 не пройдена), разбор, варианты выбора выборки следующего
+прогона и слепая выборка для ручной проверки — **ADR-0008**
+(`docs/eval/EVAL-3d-blind-sample.md`).
+
 | Gate | Порог | Итог (passed/failed/insufficient_sample) |
 |---|---|---|
-| E2+ у новых supported/refuted | ≥80% | mechanism: ADR-0004 + test_evaluation.py (gates jsonb); расчёт: gates.py + test_evaluation_gates.py; actual run — T7.7 (50 сессий, frozen config) |
-| external/temporal facts E3 | 100% в выборке ≥20 | mechanism: ADR-0004 + test_evaluation.py (insufficient_sample при N<20); расчёт: gates.py + test_evaluation_gates.py; actual run — T7.7 |
-| eligible sessions с результатом | ≥60% | mechanism: ADR-0004 + test_evaluation.py (eligible/completed sessions); расчёт: gates.py + test_evaluation_gates.py; actual run — T7.7 |
-| near-duplicate вопросы | ≤15% | mechanism: ADR-0004 + test_evaluation.py (thresholds jsonb); расчёт: gates.py + test_evaluation_gates.py; actual run — T7.7 |
-| переиспользование значимых claims | ≥25% / 20 сессий | mechanism: ADR-0004 + test_evaluation.py (thresholds jsonb); расчёт: gates.py + test_evaluation_gates.py; actual run — T7.7 |
-| due/stale time-sensitive | <20% | mechanism: ADR-0004 + test_evaluation.py (thresholds jsonb); расчёт: gates.py + test_evaluation_gates.py; actual run — T7.7 |
-| reassessment SLO | зафиксировано до run | mechanism: ADR-0004 + test_evaluation.py (reassessment_slo_seconds в thresholds, фиксация до run); расчёт: gates.py + test_evaluation_gates.py; actual run — T7.7 (SLO 3600 с, зафиксировано) |
-| current assessments с pending/invalid ancestor | 0 | mechanism: ADR-0004 + test_evaluation.py (thresholds jsonb); расчёт: gates.py + test_evaluation_gates.py; actual run — T7.7 |
-| high-severity incidents | 0 | mechanism: ADR-0004 + test_evaluation.py (thresholds jsonb); расчёт: gates.py + test_evaluation_gates.py; actual run — T7.7 |
-| blind-выборка: provenance path | ≥90% | mechanism: ADR-0004 + test_evaluation.py (blind_sample_seed + size, стратификация); расчёт: gates.py + test_evaluation_gates.py (seeded, детерминизм); actual run — T7.7 |
-| blind-выборка: не выходит за scope | ≥80% | mechanism: ADR-0004 + test_evaluation.py (blind_sample_seed + size, стратификация); расчёт: gates.py + test_evaluation_gates.py (seeded, детерминизм); actual run — T7.7 |
+| E2+ у новых supported/refuted | ≥80% | mechanism: ADR-0004 + test_evaluation.py (gates jsonb); расчёт: gates.py + test_evaluation_gates.py; actual run — T7.7 (EVAL-1/2); EVAL-3d (2026-09-19, mid-run v2→v3) — ADR-0008 |
+| external/temporal facts E3 | 100% в выборке ≥20 | mechanism: ADR-0004 + test_evaluation.py (insufficient_sample при N<20); расчёт: gates.py + test_evaluation_gates.py; actual run — T7.7 (EVAL-1/2); EVAL-3d (2026-09-19, mid-run v2→v3) — ADR-0008 |
+| eligible sessions с результатом | ≥60% | mechanism: ADR-0004 + test_evaluation.py (eligible/completed sessions); расчёт: gates.py + test_evaluation_gates.py; actual run — T7.7 (EVAL-1/2); EVAL-3d (2026-09-19, mid-run v2→v3) — ADR-0008 |
+| near-duplicate вопросы | ≤15% | mechanism: ADR-0004 + test_evaluation.py (thresholds jsonb); расчёт: gates.py + test_evaluation_gates.py; actual run — T7.7 (EVAL-1/2); EVAL-3d (2026-09-19, mid-run v2→v3) — ADR-0008 |
+| переиспользование значимых claims | ≥25% / 20 сессий | mechanism: ADR-0004 + test_evaluation.py (thresholds jsonb); расчёт: gates.py + test_evaluation_gates.py; actual run — T7.7 (EVAL-1/2); EVAL-3d (2026-09-19, mid-run v2→v3) — ADR-0008 |
+| due/stale time-sensitive | <20% | mechanism: ADR-0004 + test_evaluation.py (thresholds jsonb); расчёт: gates.py + test_evaluation_gates.py; actual run — T7.7 (EVAL-1/2); EVAL-3d (2026-09-19, mid-run v2→v3) — ADR-0008 |
+| reassessment SLO | зафиксировано до run | mechanism: ADR-0004 + test_evaluation.py (reassessment_slo_seconds в thresholds, фиксация до run); расчёт: gates.py + test_evaluation_gates.py; actual run — T7.7 (SLO 3600 с, зафиксировано); EVAL-3d — ADR-0008 |
+| current assessments с pending/invalid ancestor | 0 | mechanism: ADR-0004 + test_evaluation.py (thresholds jsonb); расчёт: gates.py + test_evaluation_gates.py; actual run — T7.7 (EVAL-1/2); EVAL-3d (2026-09-19, mid-run v2→v3) — ADR-0008 |
+| high-severity incidents | 0 | mechanism: ADR-0004 + test_evaluation.py (thresholds jsonb); расчёт: gates.py + test_evaluation_gates.py; actual run — T7.7 (EVAL-1/2); EVAL-3d (2026-09-19, mid-run v2→v3) — ADR-0008 |
+| blind-выборка: provenance path | ≥90% | mechanism: ADR-0004 + test_evaluation.py (blind_sample_seed + size, стратификация); расчёт: gates.py + test_evaluation_gates.py (seeded, детерминизм); actual run — T7.7 (EVAL-1/2); EVAL-3d (2026-09-19, mid-run v2→v3) — ADR-0008 |
+| blind-выборка: не выходит за scope | ≥80% | mechanism: ADR-0004 + test_evaluation.py (blind_sample_seed + size, стратификация); расчёт: gates.py + test_evaluation_gates.py (seeded, детерминизм); actual run — T7.7 (EVAL-1/2); EVAL-3d (2026-09-19, mid-run v2→v3) — ADR-0008 |
 
 ## Gate M3 (этап 3a + MVP-критерии §22.1)
 
@@ -2519,3 +2527,283 @@ fingerprint отражал новые промпты.
  Корпус v2, конфиги v2/v3 и пороги §22.2 не тронуты (хэши прежние);
  EVAL-3 не запускался и не планируется (решение за пользователем).
  Прогон: 765 тестов (база 733 + 32 новых).
+
+### Merge T7.8–T7.17 в `main` (2026-09-18)
+
+Решение пользователя 2026-09-18: `impl/from-scratch` → `main` —
+выполнен (merge-commit `4b49f00` на `main`, `--no-ff`, pushed; дерево
+merge-коммита идентично `779d1fd`). Проверки на `779d1fd` перед merge:
+ruff ✓, mypy strict ✓ (124 файла), pytest 765 passed. До этого push
+`impl/from-scratch` `5c2be5d..779d1fd` (коммиты `1ca81a2`, `ccdc385`,
+`779d1fd`). Предыдущий merge — `d81919a` (T7.7, EVAL-2).
+
+Acceptance §22.2 по-прежнему не пройден: `significant_claim_reuse`
+failed (EVAL-1, EVAL-2), external/temporal E3 не измерен; перезапуск
+EVAL-3 — решение пользователя, не планируется.
+
+### T7.18 — относительная опорная дата выводится хостом (шаг 1 перезапуска EVAL-3c, ADR-0007, §3.7, §8.7)
+
+ Дефект (прогон 91c1be43, БД `noezema-eval-draft2`, оставлена как
+ улика, НЕ удалять): вопрос корпуса «…на текущую дату…» (cbr.ru +
+ consultant.ru) дал `temporal_fact` «Ключевая ставка Банка России
+ составляет 14,00%» → hypothesis/E1 `scope_not_covered`. Причина:
+ `parse_question_date` видит только ЯВНЫЕ даты; «на текущую дату» →
+ `None` → `derive_claim_scope` брал типизированный `as_of` модели
+ (= завтра, 2026-09-19), evidence получен 2026-09-18 → раньше опорной
+ даты → E1. Для вопросов «на текущую дату» вход, влияющий на grade,
+ по-прежнему производила модель — вопреки ADR-0007. **Поправка к
+ отчёту T7.17:** утверждение «на текущую дату поддерживается» было
+ неточно — тест `test_parse_question_date_no_date` закреплял лишь, что
+ парсер явных дат эту фразу НЕ видит (→ `None`), то есть закрывал путь,
+ уводящий опорную дату в модельный `as_of`.
+
+ Решение (уточнение ADR-0007, см. раздел «Уточнение T7.18»):
+
+ - **Хост распознаёт относительные формы** — закрытый
+   детерминированный набор `question_uses_relative_date`
+   (`packages/memory/scope.py`): «на текущую дату», «на сегодня»,
+   «сейчас», «текущий/текущая» (все падежные формы), «as of the
+   current date», «as of today», «currently». По корпусу
+   `question-set-v2.jsonl` реально встречаются ровно «на текущую дату»
+   (20 вопросов) и «сейчас» (3 вопроса); закрытый набор покрыт
+   полностью.
+ - **Для относительных форм опорная дата = дата сессии по доверенным
+   часам хоста (UTC)** — `sessions.created_at` (начало сессии), а не
+   момент commit: вопрос задаётся в начале сессии; весь evidence
+   сессии наблюдается не раньше её начала (одни часы) → относительный
+   claim покрывается evidence той же сессии; commit-time для сессии,
+   перешагнувшей полночь, сдвигал бы якорь назад относительно уже
+   полученного evidence (ложный `scope_not_covered`).
+ - **Модельный `as_of` не сдвигает опорную дату** (ни вперёд, ни назад),
+   когда вопрос несёт дату-якорь (явную или относительную); сохраняется
+   только в строке claim + staging/audit.
+ - **Вопрос без даты (ни явной, ни относительной)** — текущее поведение
+   сохранено: опорная дата = типизированный `as_of` claim
+   (валидированная структура). Решение по корпусу: все «текущие»
+   temporal-вопросы несут относительную форму, все факты с прошлой
+   датой — явную; бездатовые — timeless external/historical факты
+   (`as_of` обычно `None` → ограничения по дате нет, стабилен между
+   днями) и follow-up переиспользования. Привязка их к дате сессии
+   навязала бы freshness-проверку timeless-фактам и деградировала бы
+   переиспользование между днями.
+ - **Fail-closed сохранён**: evidence раньше явной даты вопроса (и
+   раньше даты сессии для относительных форм) не покрывает; предикат
+   `_canonical_covers` не менялся.
+ - **Версии/заморозка:** `rules_version` не меняется (`rules-v2` — не
+   менялись rules engine, предикат покрытия, пороги §22.2,
+   `claim_type_rules`, `requires_scope`, правило E3); `rules_hash` не
+   меняется (хэш payload'а `claim_type_rules`, замороженный конфиг);
+   due/stale-базовая дата (`reverify_after = as_of + 30d`) не меняется;
+   `config-v2/v3-payload.json` и `question-set-v2.jsonl` (хэши) не
+   тронуты.
+ - Известное следствие (записано в ADR): при переиспользовании
+   относительного claim между ДНЯМИ якорь задаётся датой новой сессии,
+   и evidence более раннего дня не покрывает по неизменённому
+   `all(...)`; взаимодействие существует и в T7.17 (якорь «ехал» через
+   модельный as_of), в однодневных прогонах не срабатывает.
+
+ Код: `packages/memory/scope.py` (`_RELATIVE_DATE_PATTERNS`,
+ `question_uses_relative_date`, `derive_claim_scope(..., session_date)`),
+ `packages/memory/service.py` (session_date из `session.created_at`,
+ оба вызова `derive_claim_scope`). rules engine / предикат покрытия /
+ `evidence.py` не тронуты.
+
+ Тесты:
+ - `tests/unit/test_scope.py` (+3, итого 27): закрытый набор форм →
+   `question_uses_relative_date` (корпусные + остальные; явная дата и
+   бездата → False); относительная форма + `session_date` → дата
+   сессии, модельный `as_of` в будущем (завтра) и в прошлом НЕ
+   сдвигает; явная дата первична (бьёт и относительную, и сессию);
+   бездата → типизированный `as_of` (уточнение ADR).
+ - `tests/unit/test_rules_engine.py` (+3, итого 37): РЕГРЕССИЯ — вопрос
+   «на текущую дату», модельный `as_of` = завтра, evidence получен
+   сегодня → E3 supported (при прочих условиях E3); модельный `as_of` в
+   прошлом → E3 (не сдвигает назад); fail-closed — evidence раньше даты
+   сессии → E1 `scope_not_covered`.
+ - `tests/scenario/test_scope_coverage.py` (+2, итого 6, полный путь
+   fetch → staging → commit → assessment на postgres): регрессия на
+   commit boundary (temporal_fact, модельный `as_of` = завтра, evidence
+   сегодня → E3, head current, `assessed_scope.as_of` = дата сессии, а
+   не завтра); ПОЛНАЯ сессия на fake LLM через orchestrator (вопрос
+   «на текущую дату», куратор с произвольным `as_of` + free-form scope)
+   → head current / supported / E3, два независимых source,
+   `assessed_scope.as_of` = дата сессии. Существенные тесты T7.17
+   проходят без изменений (явная дата первична; fail-closed даты и
+   subject — прежние).
+
+ Корпус v2, конфиги v2/v3 и пороги §22.2 не тронуты (хэши прежние);
+ EVAL-3c НЕ запускался, дозаморозка не делалась (решение пользователя).
+ Прогон: 773 тестов (база 765 + 8 новых).
+
+ ### T7.19 — гейты считают ровно один head на claim (EVAL-3d, §14.1, §8.7.2)
+
+ Дефект (прогон `faa3cded…`, БД `noezema-eval3d`, оставлена как улика,
+ НЕ трогать; полный разбор — `docs/eval/EVAL-3-freeze.md` §10): после
+ mid-run активации v2→v3 (15:47:32Z, fence 2) у claim'а есть head на
+ КАЖДЫЙ config snapshot (shadow heads, `UNIQUE(claim_id,
+ config_snapshot_id)`): 25 current на v2 (superseded) + 34 на v3
+ (active), у 24 claim'ов current head на обоих. SQL гейтов
+ (`packages/evaluation/gates.py`) и blind-выгрузка
+ (`packages/evaluation/blind.py`) не фильтровали head по snapshot:
+ знаменатели считались по СТРОКАМ head'ов (59 при 35 claim'ах), а
+ per-claim запросы blind-гейтов (`scalar_one_or_none` по мульти-
+ результату) упали `sqlalchemy.exc.MultipleResultsFound` в
+ `_finish → compute_gates` (16:33:26Z) — строка прогона осталась
+ `outcome=running`. Дефект латентный с T7.5: ни один прошлый прогон не
+ доходил до mid-run активации.
+
+ Решение (правило выбора head, обоснование — `EVAL-3-freeze.md` §10.3):
+ текущее знание claim'а = head `(claim_id, active_config_snapshot_id)`
+ по указателю `runtime_config_heads(scope='global')` — pointer
+ equality, НЕ `config_snapshots.activation_state` (§14.1: «current
+ lifecycle разрешается только через
+ runtime_config_heads.active_config_snapshot_id»; §8.7.2: «Query/Memory
+ Service сначала разрешает effective snapshot через runtime pointer и
+ только затем читает соответствующий head»). То же разрешение делает
+ query path (`MemoryService.claim_view` → `None` без head на активном
+ snapshot). Claim без head на активном snapshot не имеет current
+ lifecycle по effective config и не учитывается ни в каких гейтах и в
+ слепой выборке — не «неправомерное выбрасывание»: протокол активации
+ (§8.7.2) гарантирует shadow head каждому claim'у, существовавшему на
+ момент флипа (cohort = все claims, publish запрещён без полного
+ seal); в `noezema-eval3d` единственный такой claim (`8bbbb06a`,
+ сессия `6f45deea`) — следствие quiesce-race (сессия открыла длинную
+ phase-1-транзакцию ДО флипа, её строка и claim были невидимы на
+ момент cohort freeze; коммит после флипа записал head под v2 —
+ `plan.config_snapshot_id`), hypothesis/E1 — выпал бы из
+ supported/refuted-знаменателей в любом случае. **Отдельный латентный
+ дефект активации** (quiesce не закрывает окно невидимой in-flight
+ сессии) — зарегистрирован, вне T7.19. Указатель разрешается в момент
+ `compute_gates` (гейты меряют финальное состояние по effective
+ config), НЕ snapshot из строки рана (строка заморожена на v2).
+
+ Код: `packages/evaluation/blind.py` — константа
+ `EFFECTIVE_SNAPSHOT_SQL` (указатель активного snapshot) + фильтр в
+ 2 запросах (`blind_sample_claim_ids`, `blind_sample_details`);
+ `packages/evaluation/gates.py` — фильтр в 7 запросах (new_e2,
+ external_e3, reuse, due_stale, pending_ancestor ×2,
+ `_provenance_complete`, `_in_scope`). Никаких `scalar_one_or_none`
+ на потенциально множественных строках без явного фильтра. Пороги
+ §22.2, определения гейтов по смыслу, знаменатели по смыслу,
+ замороженные `config-v2/v3-payload.json` и `question-set-v2.jsonl`
+ (хэши — сверка в `EVAL-3-freeze.md` §10.4) не меняются.
+
+ Тесты: `tests/scenario/test_evaluation_gates_activation.py` (4
+ scenario-теста, postgres):
+ - сценарий mid-run активации: два snapshot (bootstrap + online
+   candidate, указатель переведён на candidate), claim'ы с current
+   head на обоих (в т.ч. с РАЗНЫМИ статусами/grade на сторонах —
+   supported/E3 на v2 → hypothesis/E1 на v3, как реассессированные) +
+   claim только на новом → `compute_gates` не падает, каждый claim
+   один раз; тот же набор БЕЗ активации (head'ы только на активном
+   snapshot, те же значения) → идентичные числители/знаменатели;
+ - регрессия: claim с current head только на SUPERSEDED snapshot
+   (quiesce-race-состояние EVAL-3d) → не учитывается ни в каких
+   гейтах, не входит в слепую выборку, `compute_gates` не падает;
+ - blind-гейты при дублях: dual-head claim «цел на v2, сломан на v3»
+   → считается сломанным (читается head активного snapshot),
+   «сломан на v2, цел на v3» → целым; выборка без дублей claim'ов.
+
+ На старом коде эти тесты падают `MultipleResultsFound` (проверено
+ stash'ом) — воспроизводят сбой EVAL-3d. Прогон: 777 тестов (база
+ 773 + 4 новых).
+
+ Операционные последствия (решения пользователя — после проверки
+ T7.19): EVAL-3d `faa3cded…` НЕ досчитан и НЕ закрыт (строка
+ `outcome=running`; read-only `compute_gates` на `noezema-eval3d`
+ уже выполнен — `EVAL-3-freeze.md` §10.5: g1 18/18, g2 14/14, g5
+ 5/18, g6 8/17, g8 0/34, overall insufficient_sample). EVAL-3c
+ `bd21973c…` закрыт штатно как прерванный (`compute_gates +
+ finish_evaluation_run`, аналог `close-draft2-runs.py`): в
+ `noezema-eval3c` один snapshot с head'ами (v2), дублей нет; 2
+ сессии из 50, overall insufficient_sample.
+
+  ### T7.20 — quiesce-барьер online-активации: admission-запись сессии + carry-over на commit (EVAL-3d race, §8.7.2, §14.1, ADR-0009)
+
+  Дефект (зафиксирован в EVAL-3d, `EVAL-3-freeze.md` §10.5; разбор и
+  обоснование выбора варианта — `docs/adr/0009-quiesce-admission-barrier.md`):
+  quiesce-проверка §8.7.2 («нет активных сессий») в
+  `acquire_activation` считает строки `sessions` в
+  `ACTIVE_SESSION_STATES` — но сессия живёт в одной долгой
+  phase-1-транзакции (`run_session`): строка сессии (и её lease)
+  некоммичена до COMMITTING и невидима проверяющему. Прогон EVAL-3d:
+  сессия `6f45deea` открыла phase-1 tx 15:47:21.8Z ДО флипа v2→v3
+  (15:47:32.9Z); flip прошёл quiesce («активных сессий нет»), cohort
+  зафиксирован без будущего claim'а; коммит 15:50:59.8Z (prepare
+  прочитал ревизию ПОСЛЕ флипа — revision-fence §5.2.2 не сработал)
+  создал claim `8bbbb06a` с head только на superseded v2. После T7.19
+  такой claim тихо выпадает из текущего знания и из гейтов.
+  Существующие механизмы не ловили: writer gate сессия не держит по
+  дизайну, `commit_intent_at` пишется только в `committing` (поздно),
+  fenced финальная tx не сравнивает `plan.config_snapshot_id` с
+  указателем.
+
+  Решение (ADR-0009, два слоя):
+  1. **Committed admission-запись (барьер)** — миграция
+     `0022_session_admissions`: таблица `session_admissions`
+     (host-generated `session_id` PK, lease) + **DB-trigger на
+     `sessions`**: любой переход в терминальное состояние
+     (`succeeded/succeeded_partial/failed/cancelled`) в той же tx
+     удаляет запись — ни один терминальный код (finalize/abort/
+     reconciler) не может её пропустить; прецедент — sealed-interval
+     trigger (T4.5). Оркестратор (`run_session`) ПЕРЕД phase-1 tx в
+     короткой tx: single-session проверка (M1) + `get_effective` +
+     INSERT записи; session UUID генерируется хостом до tx и phase 1
+     использует его. Lease = `created_at + phase_deadline + 600s`
+     (heartbeat'ом не обновляется: сессия не может жить дольше phase
+     deadline — watchdog отказывает в renew). `acquire_activation`:
+     в quiesce-tx sweep истёкших записей (погибшая сессия не может
+     коммитить — её собственный lease мёртв) + count живых; живые
+     считаются активными сессиями (`active sessions present: N`),
+     число swept — в audit `activation_acquired/takeover`.
+  2. **Carry-over на fenced commit (fail-closed backstop)** —
+     `finalize` (packages/domain/services/commit.py, шаг 3a'): после
+     apply_memory tx читает указатель `runtime_config_heads` БЕЗ
+     блокировки head-строки (lock head→session дал бы deadlock с
+     acquire; корректность по индукции: следующий flip ждёт
+     commit'а этой tx по живой admission-записи и его cohort закрывает
+     перенесённые claims). Если `sessions.config_snapshot_id ≠
+     указатель` — каждый claim, созданный коммитом
+     (`created_in_session = session.id`), переносится на активный
+     snapshot: pending head (NULL/NULL, `prepared_by='commit_carryover'`
+     — новое значение CHECK-ограничения, миграция 0022) + durable
+     reassessment job (`reason='commit_carryover'`) — механизм
+     cohort'а §8.7.2 для claim'ов, его пропустивших. Audit
+     `commit_snapshot_drift` (session_snapshot, active_snapshot,
+     carried_claims) в той же tx. Выбран carry-over, а не отказ от
+     commit'а (fencing_conflict): отказ выбрасывал бы валидное знание
+     из-за смены конфига, а протокол §8.7.2 отвечает на «claim под
+     старым конфигом» именно pending head + durable job.
+
+  Тесты: `tests/scenario/test_quiesce_race.py` (5 scenario-тестов,
+  postgres):
+  - детерминированное воспроизведение переплетения EVAL-3d: сессия
+    допущена (запись коммичена) + phase-1 tx открыта (строка
+    невидима) → flip БЛОКИРОВАН (`active sessions present`), указатель
+    не тронут; после commit'а phase-1 (`committing`) — всё ещё
+    заблокирован (видимая строка); терминальное состояние — trigger
+    снял запись, активация проходит штатно;
+  - crash-вариант: истёкшая admission-запись без строки сессии —
+    активация её свипает (`swept_admissions=1` в audit) и проходит,
+    не упираясь в мёртвую сессию;
+  - backstop (окно, которое барьер закрывает только при живом lease —
+    запись потеряна/истекла, сессия ещё может коммитнуть): тот же
+    переплёт EVAL-3d (flip при невидимой сессии, prepare после флипа)
+    → старый код оставил бы claim с head только на superseded
+    (состояние зафиксировано в тесте как документация), НОВЫЙ
+    `finalize` переносит созданный claim на активный snapshot (pending
+    head + queued job `commit_carryover` + audit
+    `commit_snapshot_drift`); инвариант «нет claim'а с head только на
+    superseded при активном указателе на новом» проверен SELECT'ом;
+  - trigger: каждое из 4 терминальных состояний снимает запись в той
+    же tx, non-terminal переход (`exploring→committing`) — не снимает;
+  - регрессия: активация без сессий/записей (sweep=0) — поведение
+    штатного пути не изменилось.
+
+  На старом коде (worktree на `705c04d`, проверено запуском) та же
+  последовательность (flip при невидимой in-flight сессии, commit
+  после) оставляет claim с head только на superseded snapshot —
+  воспроизведение гонки EVAL-3d; на новом коде барьер блокирует flip,
+  а в деградированном окне backstop гарантирует carry-over. Данные
+  прогонов (`noezema-eval*`) не тронуты (SELECT only); `8bbbb06a`
+  остаётся как улика (ADR-0008). Прогон: полная проверка зелёная.
