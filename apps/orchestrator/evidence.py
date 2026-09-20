@@ -34,11 +34,22 @@ budgeted window around it (same budget — the fragment rides in the
 curator's claims_evidence section, 8192-token cap). The question and
 the plan ride in the observation data (the host adds them; the model
 never supplies them) and are NOT part of the identity either.
+
+T7.22 (EVAL-3d group A, ADR-0011, §6.4): the fragment can carry up to
+TWO non-overlapping budget windows joined by a " […]" separator — the
+T7.16 term-density window plus a value window (the fact-zone region
+where a data value co-occurs with the question's terms). The single
+term window missed the assertion in 7 of the 12 measured group-A cases
+(lead/infobox, first paragraph, data widget); the total fragment is
+bounded by ``SOURCE_ASSERTION_TEXT_BUDGET * SOURCE_ASSERTION_MAX_WINDOWS
++ separator`` and still fits the curator's claims_evidence budget with
+margin (ADR-0011 §4 — two evidence of one claim ≈ 2.6–2.9k tokens of
+the 8192-token section).
 """
 
 from __future__ import annotations
 
-from apps.orchestrator.assertion_window import select_assertion_window
+from apps.orchestrator.assertion_window import select_assertion_windows
 from apps.orchestrator.executor import Observation
 from packages.domain.canonical import canonical_sha256
 from packages.domain.models.base import JsonDict
@@ -53,6 +64,21 @@ from packages.memory.evidence import source_assertion_identity
 #: the fragment is bounded so the role prompts and the DB payload stay
 #: predictable. It is NOT part of the identity (see the module docstring).
 SOURCE_ASSERTION_TEXT_BUDGET = 2_000
+
+#: T7.22 (ADR-0011): the fragment carries up to this many NON-OVERLAPPING
+#: budget windows (the T7.16 term-density window + the value window),
+#: joined by a separator. Two windows keep the total fragment at
+#: ≤ 2*SOURCE_ASSERTION_TEXT_BUDGET + separator chars, which still fits
+#: the curator's claims_evidence section (8192 tokens) with margin —
+#: the worst case of TWO source_assertion evidence on ONE claim is
+#: measured in tests/unit/test_assertion_window.py::
+#: test_two_evidence_fragments_fit_the_claims_evidence_budget.
+SOURCE_ASSERTION_MAX_WINDOWS = 2
+
+#: T7.22: separator between the two fragment windows (the curator sees
+#: a continuous fragment with a visible gap marker, not two disjoint
+#: slices). 5 chars.
+_FRAGMENT_SEPARATOR = "\n[…]\n"
 
 
 def observation_to_evidence(observation: Observation, arguments: JsonDict) -> EvidenceRecord | None:
@@ -130,12 +156,21 @@ def observation_to_evidence(observation: Observation, arguments: JsonDict) -> Ev
         # host adds question/plan to the observation data; their absence
         # (or no term match) falls back to the leading prefix — the T7.8
         # behavior.
+        #
+        # T7.22 (ADR-0011): up to SOURCE_ASSERTION_MAX_WINDOWS
+        # non-overlapping budget windows (the term-density window + the
+        # value window) joined by _FRAGMENT_SEPARATOR — EVAL-3d group A
+        # showed the single term window misses the assertion in 7 of 12
+        # cases (lead/infobox, first paragraph, data widget). The joined
+        # text is NOT part of the identity (as the single window was).
         normalized_text = str(data.get("normalized_text", ""))
-        assertion_text = select_assertion_window(
+        windows = select_assertion_windows(
             normalized_text,
             f"{data.get('question', '')}\n{data.get('plan', '')}",
             SOURCE_ASSERTION_TEXT_BUDGET,
-        ).text
+            max_windows=SOURCE_ASSERTION_MAX_WINDOWS,
+        )
+        assertion_text = _FRAGMENT_SEPARATOR.join(w.text for w in windows)
         return EvidenceRecord(
             kind=EvidenceKind.SOURCE_ASSERTION,
             identity_hash=identity,

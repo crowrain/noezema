@@ -17,6 +17,19 @@ page is reachable inside a 2000-char window).
 Pure, host-side, deterministic. The selected fragment is NOT part of
 the §14.3 identity (identity stays over the original content hash, so
 dedupe semantics are unchanged).
+
+T7.22 (ADR-0011, §6.4): the single term-density window misses the
+assertion in a measured 7 of 12 EVAL-3d group-A cases — the fact lives
+in the lead/infobox (Wikipedia), the first paragraph (a news page), or
+a data widget (cbr.ru), a region the term density skips (or lands 200–300
+chars short of) while the term-densest region is the TOC (which repeats
+the question's words) or an unrelated body section. ``select_assertion_windows``
+adds a SECOND, non-overlapping "value" window: the budget window around
+the number-position where a significant number (a data value, not a
+date/year/TOC index) co-occurs with the question's terms inside the
+fact zone (the first ``_FACT_ZONE_DECAY`` chars — beyond that, the deep
+number-dense regions on long pages are data tables, not assertions).
+The primary window and its selection are unchanged.
 """
 
 from __future__ import annotations
@@ -312,3 +325,217 @@ def select_assertion_window(
 
     start = max(0, best_pos - lead)
     return AssertionWindow(text=text[start : start + budget], start=start)
+
+
+# ── T7.22 (ADR-0011): the second, value-anchored window ─────────────────
+
+
+#: T7.22: fact-zone decay for the value window's score. The fact the
+#: question is about is stated FIRST on the page (lead/infobox); on the
+#: measured EVAL-3d corpus all seven recoverable group-A facts sit at
+#: offsets ≤ 10k, while the deep number-dense regions past ~12k on the
+#: long pages (Wikipedia country stats tables, historical population
+#: tables, UN accession lists) are data tables, not assertions. The
+#: candidate score decays linearly to zero at this offset, so a deep
+#: table can never outrank a lead fact. Derived from the EVAL-3d
+#: measurements (ADR-0011 §2).
+_FACT_ZONE_DECAY = 16_000
+
+#: T7.22: weight of one significant number in the value-window score
+#: (relative to one distinct question term). A fact is a VALUE ("193
+#: государства", "8.3 billion", "14,00%") — the number is its anchor —
+#: so a region with two values beats a region with one more term and
+#: no values; but a single value without any term co-occurrence is not
+#: enough to override the term signal (the 2:1 ratio keeps the terms
+#: dominant, the same tie-break discipline as _NUMBER_BONUS_MAX).
+_VALUE_WEIGHT = 2.0
+
+#: digit runs (lowercased text)
+_NUMBER_RE = re.compile(r"\d+")
+
+#: maximal dot-joined groups ("27.07.2026" is ONE match, "8.3" is one,
+#: "8,000,000,000" is nine separate digit runs — the comma is not a dot)
+_DOTTED_RE = re.compile(r"\d+(?:\.\d+)*")
+
+#: a dot-separated Russian date ("27.07.2026") — a date, not a value
+_ISO_DATE_RE = re.compile(r"^\d{1,2}\.\d{1,2}\.\d{4}$")
+
+#: a MediaWiki TOC section index ("1.1 Background") is a decimal whose
+#: digit groups are all single-digit and which is immediately followed
+#: by the section title (a capitalized word). A data value with the
+#: same shape ("8.3 billion", "66.2% Christianity") is followed by a
+#: lowercase word or a punctuation mark — the one reliable
+#: deterministic separator between the two.
+_TOC_INDEX_AFTER = re.compile(r"\s+[A-ZА-ЯЁ]")
+
+#: T7.22: TOC chrome markers (in the lowercased normalized text). A
+#: span containing one of these is a table-of-contents / navigation
+#: block, never an assertion region: the TOC repeats the page's section
+#: titles (which echo the question's words) and its section indexes
+#: (which look like data values). Measured on the EVAL-3d corpus:
+#: en.wikipedia carries "move to sidebar" / "toggle ... subsection",
+#: ru.wikipedia carries «переместить в боковую панель» /
+#: «Отобразить/Скрыть подраздел».
+_TOC_MARKERS = (
+    "move to sidebar",
+    "переместить в боковую панель",
+    "отобразить",
+    "подраздел",
+)
+
+
+def _is_table_of_contents(span: str) -> bool:
+    """True when the span is a TOC / navigation block (see
+    _TOC_MARKERS). ``span`` is lowercased normalized text."""
+    if any(marker in span for marker in _TOC_MARKERS):
+        return True
+    return "toggle" in span and "subsection" in span
+
+
+def _significant_numbers(span: str) -> int:
+    """Count the DATA VALUES in the span (T7.22, ADR-0011).
+
+    A significant number is what an assertion actually states:
+    - 3+ digits, unless a plausible year (1900–2099): "193", "370",
+      "8,000,000,000" (each comma-separated digit run counts);
+    - a decimal value ("8.3", "66.2", "18.6") — except a dot-separated
+      date ("27.07.2026") and a TOC section index ("1.1 Background");
+    - any length immediately before "%": "4,0%" → the "0" before "%".
+
+    Excluded on purpose: 4-digit years (the question is almost always
+    about a value, and a page of dates — a Wikipedia TOC's
+    "(1948–1957)" entries, an accession list — must not look dense),
+    1–2 digit integers without a value context (TOC indexes, list
+    numbers, "27" in "27 member states" carries no weight of its own —
+    the co-occurring question term localizes it), and ISO dates.
+    """
+    n = 0
+    for m in _DOTTED_RE.finditer(span):
+        s = m.group()
+        parts = s.split(".")
+        if len(parts) > 1:
+            if _ISO_DATE_RE.match(s):
+                continue
+            if all(len(p) == 1 for p in parts) and _TOC_INDEX_AFTER.match(
+                span[m.end() : m.end() + 8]
+            ):
+                continue
+            n += 1
+        else:
+            v = int(s)
+            if (len(s) >= 3 and not (len(s) == 4 and 1900 <= v <= 2099)) or (
+                span[m.end() : m.end() + 1] == "%"
+            ):
+                n += 1
+    return n
+
+
+def _fact_region_candidates(
+    text: str, question: str, match_span: int
+) -> list[tuple[int, float, int, int]]:
+    """Value-window candidates (T7.22): ``(pos, score, terms, values)``
+    for every number-position anchor ``pos`` in the fact zone
+    (``pos < _FACT_ZONE_DECAY``).
+
+    score = (distinct question terms in the ``2*match_span`` span
+            + _VALUE_WEIGHT * significant numbers in the span)
+            * (1 - pos / _FACT_ZONE_DECAY)
+
+    The terms are the RAW ``extract_terms`` output — WITHOUT the
+    page-wide dominant-term cap and WITHOUT the _CHROME filter that
+    protect the primary window: the value window is a secondary anchor,
+    and the cap would erase the only signal on cross-language pages
+    (where every question term is "dominant" or absent), while the
+    decay keeps a deep number-dense table from outranking the lead.
+    ``score`` is 0.0 for anchors with neither signal (they are filtered
+    out by the caller, along with TOC spans).
+    """
+    tl = text.lower()
+    terms = extract_terms(question) if question else []
+    anchors = [m.start() for m in _NUMBER_RE.finditer(tl) if m.start() < _FACT_ZONE_DECAY]
+    out: list[tuple[int, float, int, int]] = []
+    for pos in anchors:
+        span = tl[pos : pos + 2 * match_span]
+        t = sum(1 for s in terms if s in span)
+        sig = _significant_numbers(span)
+        if t == 0 and sig == 0:
+            continue
+        score = (t + _VALUE_WEIGHT * sig) * (1.0 - pos / _FACT_ZONE_DECAY)
+        out.append((pos, score, t, sig))
+    return out
+
+
+def select_assertion_windows(
+    text: str,
+    question: str,
+    budget: int,
+    *,
+    max_windows: int = 2,
+    match_span: int = _MATCH_SPAN,
+    lead: int = _LEAD,
+) -> list[AssertionWindow]:
+    """Pick up to ``max_windows`` NON-OVERLAPPING ``budget``-char
+    fragments for the ``source_assertion`` payload (T7.22, ADR-0011).
+
+    Window 1 — the T7.16 term-density window
+    (``select_assertion_window``, unchanged): where the question's
+    content terms are densest.
+    Window 2 — the value window: the budget window around the best
+    fact-zone candidate of ``_fact_region_candidates``. EVAL-3d group A
+    (ADR-0010 §2 / ADR-0011 §2) — 12 claims where the second source was
+    fetched but the curator attached one — showed the term window misses
+    the assertion in 7 of 12: the fact sits in the lead/infobox, the
+    first paragraph, or a data widget, and the term-densest region is
+    the TOC or an unrelated body section.
+
+    Fallbacks (each degrades to the T7.16 behavior):
+    - text shorter than the budget → the whole text, one window;
+    - no value candidate (no numbers at all, or every candidate is a
+      TOC span or scores 0) → the primary window alone;
+    - the primary window is the leading-prefix fallback (``start=-1``,
+      no term matched — a cross-language page) and a value window
+      exists → the value window REPLACES the prefix: the prefix is
+      navigation chrome and the value window is the only content
+      signal.
+
+    Deterministic: ties go to the EARLIEST candidate; the value window
+    never overlaps the primary window (the next-best non-overlapping
+    candidate is chosen instead).
+    """
+    if budget <= 0:
+        raise ValueError(f"budget must be positive, got {budget}")
+    if max_windows < 1:
+        raise ValueError(f"max_windows must be >= 1, got {max_windows}")
+    if len(text) <= budget:
+        return [AssertionWindow(text=text, start=0)]
+    primary = select_assertion_window(
+        text, question, budget, match_span=match_span, lead=lead
+    )
+    if max_windows == 1:
+        return [primary]
+
+    best_start = -1
+    best_score = 0.0
+    tl = text.lower()
+    for pos, score, _t, _sig in _fact_region_candidates(text, question, match_span):
+        if score <= 0.0:
+            continue
+        if _is_table_of_contents(tl[pos : pos + 2 * match_span]):
+            continue
+        start = max(0, pos - lead)
+        end = min(len(text), start + budget)
+        if primary.start >= 0 and start < primary.start + budget and end > primary.start:
+            continue  # overlaps the primary window → next-best candidate
+        if score > best_score:
+            best_start = start
+            best_score = score
+    if best_start < 0:
+        return [primary]
+    if primary.start < 0:
+        # cross-language fallback: the prefix is chrome, keep only the
+        # value window (it is the only content signal on the page)
+        return [AssertionWindow(text=text[best_start : best_start + budget], start=best_start)]
+    return [
+        primary,
+        AssertionWindow(text=text[best_start : best_start + budget], start=best_start),
+    ]
