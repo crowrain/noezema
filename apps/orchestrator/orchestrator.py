@@ -34,6 +34,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from apps.orchestrator.evidence import observation_to_evidence
 from apps.orchestrator.executor import arguments_hash
+from apps.orchestrator.source_coverage import SourceCoverageTracker, named_source_urls
 from apps.orchestrator.state_machine import transition
 from apps.research_proxy.normalization import PARSER_FINGERPRINT
 from packages.artifacts import freeze_workspace
@@ -167,6 +168,12 @@ class SessionContext:
     # T5.4 (stage 4): the repetition-guard strategy note (a
     # host-generated context section; empty = no cycle detected)
     repetition_note: str = ""
+    # T7.21 (EVAL-3d, ADR-0010): the sources NAMED IN THE QUESTION
+    # (host-derived from the trusted operator input) and the host-tracked
+    # fetch coverage (fetched/errored); the host withholds the release to
+    # consolidation until the coverage is complete (§3.7, §5.4, §11.2)
+    named_sources: tuple[str, ...] = ()
+    source_coverage: SourceCoverageTracker | None = None
 
 
 @dataclass(frozen=True)
@@ -521,6 +528,25 @@ class Orchestrator:
         )
         ctx.question_text = question.text
 
+        # T7.21 (EVAL-3d, ADR-0010): the host tracks the fetch coverage
+        # of the sources the QUESTION names (§3.7, §5.4, §11.2 — the
+        # grade-relevant input is produced by the trusted host, not the
+        # model): the release to consolidation is withheld until every
+        # named source has been fetched or errored.
+        named = named_source_urls(question.text)
+        ctx.named_sources = named
+        ctx.source_coverage = SourceCoverageTracker(named) if named else None
+        if ctx.source_coverage is not None:
+            await audit.record(
+                AuditEventType.SESSION_STATE_CHANGED,
+                session_id=session.id,
+                payload={"named_sources": list(named)},
+                public_summary=(
+                    f"question names {len(named)} source(s); the host withholds "
+                    "consolidation until each is fetched or errored"
+                ),
+            )
+
         # planning: MVP fixed template, or the multi-step LLM plan
         # (T5.2, stage 4) when the config snapshot says so
         await self._transition(db, audit, session, SessionState.PLANNING)
@@ -579,6 +605,12 @@ class Orchestrator:
         if hasattr(self.executor, "snapshot_id"):
             self.executor.snapshot_id = snapshot.id
         max_steps = int(limits.get("max_explorer_steps", 10))
+        # T7.21: the step budget accounts for the named sources: at
+        # least one step per named source plus three (a fetch each, the
+        # probe, the final complete) — a host-side floor; the configured
+        # value wins when it is larger.
+        if ctx.source_coverage is not None:
+            max_steps = max(max_steps, len(named) + 3)
         steps, stopped, aborted = await self._explorer_loop(
             db, audit, session, ctx, max_steps, cap_profile, policy_engine, staging, lease, pack, snapshot
         )
@@ -650,15 +682,22 @@ class Orchestrator:
 
         # reporting
         await self._transition(db, audit, session, SessionState.REPORTING)
+        report_payload: dict[str, Any] = {
+            "steps": steps,
+            "evidence": [e.model_dump() for e in ctx.evidence[:20]],
+            "observations": ctx.observations[:20],
+        }
+        # T7.21: the coverage state of the question's named sources rides
+        # in the report — a budget-exhausted session that never fetched a
+        # named source is EXPLAINABLE from the audit (fail-closed), not
+        # a silent gap
+        if ctx.source_coverage is not None:
+            report_payload["source_coverage"] = ctx.source_coverage.report()
         await audit.record(
             AuditEventType.SESSION_STATE_CHANGED,
             session_id=session.id,
             public_summary=f"report: {ctx.complete_reason or 'budget_exhausted'} after {steps} steps",
-            payload={
-                "steps": steps,
-                "evidence": [e.model_dump() for e in ctx.evidence[:20]],
-                "observations": ctx.observations[:20],
-            },
+            payload=report_payload,
         )
 
         # committing: freeze the overlay, then return the CommitPlan — the
@@ -1262,6 +1301,37 @@ class Orchestrator:
 
             decision = response.decision
             if decision.kind is DecisionKind.COMPLETE:
+                # T7.21 (EVAL-3d, ADR-0010): the host withholds the
+                # release to consolidation until every source the
+                # question names has been fetched or errored (§3.7,
+                # §5.4, §11.2 — the grade-relevant input is produced by
+                # the trusted host, not the model). The rejected
+                # completion costs a step; the step budget bounds the
+                # loop (fail-closed: the session ends budget-exhausted
+                # with the uncovered sources recorded in the report
+                # audit, never a silent partial release).
+                if ctx.source_coverage is not None and not ctx.source_coverage.is_complete:
+                    uncovered = ctx.source_coverage.uncovered()
+                    await audit.record(
+                        AuditEventType.SESSION_STATE_CHANGED,
+                        session_id=session.id,
+                        payload={
+                            "complete_rejected": True,
+                            "reason": "source_coverage_incomplete",
+                            "coverage": ctx.source_coverage.report(),
+                        },
+                        public_summary=(
+                            f"completion rejected: {len(uncovered)} of "
+                            f"{len(ctx.named_sources)} named sources not yet fetched or errored"
+                        ),
+                    )
+                    ctx.observations.append(
+                        f"[{step}] COMPLETE отклонён хостом: вопрос называет источники, "
+                        f"которые ещё не скачаны: {', '.join(uncovered)}. Скачайте каждый "
+                        "названный источник (fetch с ошибкой засчитывается как покрытый), "
+                        "затем завершите сессию."
+                    )
+                    continue
                 ctx.complete_reason = decision.reason
                 await audit.record(
                     AuditEventType.SESSION_STATE_CHANGED,
@@ -1439,6 +1509,12 @@ class Orchestrator:
                 obs = await self._apply_extraction_profile(
                     db, audit, session, obs, snapshot, cap_profile
                 )
+            if tool_name == "research.fetch" and ctx.source_coverage is not None and not obs.result_unknown:
+                # T7.21: every EXECUTED fetch (success or error)
+                # advances the coverage of the named sources it matches;
+                # a call refused before execution (policy deny, repeat
+                # guard) never reaches here — it requested no source
+                ctx.source_coverage.mark(str(args.get("url", "")), ok=obs.ok)
             if obs.result_unknown:
                 # the execution process was lost: the outcome genuinely
                 # cannot be known (T2.22). Never retried, never reported

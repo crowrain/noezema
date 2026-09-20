@@ -47,7 +47,9 @@ BOOTSTRAP_PAYLOAD: dict[str, Any] = {
     },
     "embeddings": {"enabled": False, "dimensions": None},
     "prompts": {
-        "explorer": {"version": "explorer-v3", "path": "prompts/explorer.md"},
+        # T7.21 (ADR-0010): v4 — rule 7 (fetch every question-named
+        # source before completing; backstop for the host coverage gate)
+        "explorer": {"version": "explorer-v4", "path": "prompts/explorer.md"},
         "curator": {"version": "curator-v3", "path": "prompts/curator.md"},
         # T5.2 (stage 4): the planner role (multi-step planning)
         "planner": {"version": "planner-v1", "path": "prompts/planner.md"},

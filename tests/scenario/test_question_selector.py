@@ -64,7 +64,9 @@ def test_real_prompts_are_versioned() -> None:
     curator = load_prompt(Role.CURATOR)
     # T7.14: prompts bumped to v3 (explorer: ≤2 repeats after a tool error;
     # curator: no assertion text in evidence → question, not claim)
-    assert explorer.version == "explorer-v3"
+    # T7.21: explorer bumped to v4 (fetch every question-named source
+    # before completing — backstop for the host coverage gate, ADR-0010)
+    assert explorer.version == "explorer-v4"
     assert curator.version == "curator-v3"
     assert len(explorer.sha256) == 64
     assert len(curator.sha256) == 64

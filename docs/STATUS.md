@@ -14,7 +14,7 @@
 | M4 зависимости + переоценка | ✅ T4.1 закрыт (claim_dependencies: DAG cycle check при commit, graph revision, kind `research` по §8.6); T4.2 закрыт (cascade invalidation: closure manifest, barrier с durable курсором, idempotent батчи, blocked-путь, retrieval ancestor check); T4.3 закрыт (worker `system:reassessment`: runnable-предикат §5.9.1, lease/retry/blocked, insufficient→invalid+question, crash-lease recovery); T4.4 закрыт (writer admission: table gate §14.1 NOWAIT + jitter, session intent rules 1/4/5, T_escalate/T_worker_admission в scheduler); T4.5 закрыт (online activation §8.7.2: fenced lease + takeover, shadow heads fast path/pending, seal + DB-триггер sealed-интервала, atomic flip, post-publish manifest с deterministic UUIDv5, repair runner + T_repair_admission); T4.6 закрыт (environment manifests §14 env-v2: content-addressed manifest_hash, versioned алгоритм env-independence-v1 — группы по (protocol, implementation, dataset lineage), отношения repeatability/reproducibility/independent_replication/variation/untracked, снапшот на оценке, `required_independence` в rules engine: E3 только через независимую репликацию); T4.7 закрыт (source graph §11.3: таблицы source_dependency_edges/source_graph_corrections, алгоритм independence-v2 — domain/content_hash/parent/edges/corrections, снапшот source_independence_* на оценке, каскад apply_source_graph_change: merge/split → invalidation + recompute, ревизия source_graph); T4.8 закрыт (counterevidence resolutions §8.7.4: таблица + XOR/partial-unique CHECK, межстрочные инварианты (counter-цель, scope-compat, нет транзитивной зависимости, valid correction), каскад create/invalidate → recompute, engine считает только unresolved counters); T4.9 закрыт (failpoints M4: crash после flip — pointer tuple recovery, crash между батчами post-publish — durable cursor, stale activator после takeover — fence-отказ, следующий flip закрывает blocked backlog, barrier crash после каждого батча, group merge + crash worker'а, worker без starvation после смерти intent-lease) — GATE M4 пройден (§19: invalid ancestor блокирует downstream; worker без starvation оба направления; group merge → корректный пересчёт) | — | пороги M4 из замеров серии 2026-09-14 зафиксированы в PLAN (батч 32, SLO P95 200 с); 501 тест |
 | M5 расширенный цикл | ✅ Gate M5 пройден (§19, этап 4): T5.1 закрыт (Curiosity ranking §5.3.1: score-формула, все входы [0,1] + similarity fingerprint, eligibility filter, ε-diversity (seed в audit), селектор config-driven) + T5.2 закрыт (planning §6.2: план как наблюдаемый артефакт, роль planner, закрытые assessment methods, метод ≠ перефраз, planning.mode config-driven) + T5.3 закрыт (роль verifier §3.7: организованные детерминированные проверки, **схема не несёт grade/confidence — assessment идентичен с verifier и без него (gate)**, verification.mode config-driven) + T5.4 закрыт (защита от повторов §9: перефраз + no-progress → цикл, закрытые стратегии §9, audit repeat_cycle_detected, repetition config-driven) + T5.5 закрыт (untrusted extraction §11.2: модель без инструментов, host-проверка дословности, raw-текст не покидает extractor, extraction config-driven) + T5.6 закрыт (long-run сценарии: накопление знания по FIFO-очереди, §9-цикл на накопленной истории, поздний контрпример → disputed E1 rules engine) | — | 651 тест |
 | M6 Research Proxy | ✅ Gate M6 пройден (§19, этап 5): T6.1 закрыт (research proxy: единственный egress, read-only, SSRF-guard private/loopback/link-local/metadata, редиректы/размер/время, удаление активного содержимого) + T6.2 закрыт (режимы Sealed=локальный индекс / Curated=SearXNG через прокси c upstream-логом и rate limits / Open Lab=закрытый список доменов, отдельный профиль) + T6.3 закрыт (provenance: original+normalized+hash, origin в sources/artifact_chunks, fenced-маркировка в контексте §11.2, research.fetch — единственный egress сессии) + T6.4 закрыт (injection/poisoning: capabilities неизменны, similarity→require_operator, poisoned artifact не самооценивается) | noezema-m6 (после gate) | см. раздел M6 ниже | 651 тест |
-| M7 полный веб + эксплуатация | ✅ Gate M7 пройден (T7.1 ✅ knowledge graph + provenance + diagnostics; T7.2 ✅ backup/PITR §15.3; T7.3 ✅ GC full root set; T7.4 ✅ security regression gate + §16 metrics; T7.5 ✅ evaluation run §22.2 mechanism; T7.6 ✅ ADR-0004); после gate — дефекты EVAL-3b/EVAL-3: T7.7–T7.20 закрыты (T7.15 E2E-валидация, T7.16 assertion-окно, T7.17 хост-деривация scope, rules-v2, ADR-0007; T7.18 относительная опорная дата «на текущую дату» = дата сессии по часам хоста, уточнение ADR-0007 — тесты test_scope.py / test_rules_engine.py / test_scope_coverage.py; T7.19 гейты считают ровно один head на claim — head активного snapshot по указателю runtime_config_heads (§14.1), дефект учёта дублей после mid-run активации EVAL-3d — тесты test_evaluation_gates_activation.py; детали в разделе M7; досчёт EVAL-3d 2026-09-19 (eligible=50, completed=50, overall insufficient_sample — приёмка §22.2 не пройдена) + слепая выборка для ручной проверки — ADR-0008; T7.20 quiesce-барьер online-активации (гонка EVAL-3d §10.5): committed admission-запись сессии (миграция 0022 + trigger на sessions) блокирует flip при in-flight сессии + carry-over на fenced commit (pending head + durable job на активном snapshot) — инвариант «нет claim'а с head только на superseded» при любом переплетении — тест test_quiesce_race.py, ADR-0009) | noezema-m7 (на `2e1631c`) | см. раздел M7 ниже | 782 тест |
+| M7 полный веб + эксплуатация | ✅ Gate M7 пройден (T7.1 ✅ knowledge graph + provenance + diagnostics; T7.2 ✅ backup/PITR §15.3; T7.3 ✅ GC full root set; T7.4 ✅ security regression gate + §16 metrics; T7.5 ✅ evaluation run §22.2 mechanism; T7.6 ✅ ADR-0004); после gate — дефекты EVAL-3b/EVAL-3: T7.7–T7.20 закрыты (T7.15 E2E-валидация, T7.16 assertion-окно, T7.17 хост-деривация scope, rules-v2, ADR-0007; T7.18 относительная опорная дата «на текущую дату» = дата сессии по часам хоста, уточнение ADR-0007 — тесты test_scope.py / test_rules_engine.py / test_scope_coverage.py; T7.19 гейты считают ровно один head на claim — head активного snapshot по указателю runtime_config_heads (§14.1), дефект учёта дублей после mid-run активации EVAL-3d — тесты test_evaluation_gates_activation.py; детали в разделе M7; досчёт EVAL-3d 2026-09-19 (eligible=50, completed=50, overall insufficient_sample — приёмка §22.2 не пройдена) + слепая выборка для ручной проверки — ADR-0008; T7.20 quiesce-барьер online-активации (гонка EVAL-3d §10.5): committed admission-запись сессии (миграция 0022 + trigger на sessions) блокирует flip при in-flight сессии + carry-over на fenced commit (pending head + durable job на активном snapshot) — инвариант «нет claim'а с head только на superseded» при любом переплетении — тест test_quiesce_race.py, ADR-0009; T7.21 разбор E1 по EVAL-3d: корень 75% — окно фрагмента T7.16 (оба источника скачаны, куратор привязал один), 25% — неполное скачивание (группы B/C) → host-гейт покрытия названных вопросом источников (complete отклоняется до fetched/errored каждого, хост-пол бюджета, fail-closed + explainable report-audit; prompt explorer-v4 — подстраховка) — тесты test_source_coverage.py (9 unit + 5 scenario), ADR-0010; дробление куратором не чинится (1 случай, обоснование ADR-0010 §5); следующий прогон — новая заморозка, EVAL-3-freeze §11) | noezema-m7 (на `2e1631c`) | см. раздел M7 ниже | 796 тест |
 
 ## Gate M2 (§19, этап 2) — пройден (noezema-m2)
 
@@ -2808,6 +2808,59 @@ EVAL-3 — решение пользователя, не планируется.
   прогонов (`noezema-eval*`) не тронуты (SELECT only); `8bbbb06a`
   остаётся как улика (ADR-0008). Прогон: полная проверка зелёная.
 
+  ### T7.21 — почему на E3 не хватает evidence: разбор по EVAL-3d + host-гейт покрытия названных вопросом источников (§3.7, §5.4, §11.2, ADR-0010)
+
+  Разбор по данным (SELECT по `noezema-eval3d`): гипотеза «explorer
+  скачивает один из двух названных источников» ОПРОВЕРГНУТА — из 16
+  external/temporal claim'ов с одним source_assertion (15 E1 + 1 без
+  active head) в 12 (75%) сессия скачала ОБА источника, но куратор
+  привязал один: окно фрагмента T7.16 (2000 символов) не накрыло
+  утверждение (навигация/оглавление), куратор по правилу 5 промпта не
+  привязал источник, правила дают E1. Группы: A — «оба скачаны,
+  привязан один» — 12; B — «модель завершила после одного fetch» — 3
+  (856ab8ef, c9e7e876 — goal_reached на 2-м шаге; 5f1f3fcd —
+  самообъявленный budget_exhausted на 2-м шаге из 10); C — «второй URL
+  упал таймаутом» — 1 (6497c97d: stroi.mos.ru, 5 попыток, бюджет
+  10 шагов). «Дробление куратором» (гипотеза ADR-0008) — 1 intra-
+  session сессия (9c0b7bfd: составный вопрос → 3 claim), её E1 — тоже
+  группа A; не чиним (обоснование — ADR-0010 §5).
+
+  Механизм (ADR-0010, чистый модуль `apps/orchestrator/
+  source_coverage.py` + оркестратор): хост извлекает названные
+  вопросом URL (`extract_question_urls`, T7.17), трекает покрытие
+  (исполненный fetch: успех → fetched, ошибка → errored; matching по
+  registrable domain + decoded path — та же нормализация §11.3, что
+  www.un.org = un.org), и **не выпускает сессию в консолидацию**:
+  `complete` при неполном покрытии отклонён хостом (audit
+  `complete_rejected: source_coverage_incomplete` + host-наблюдение),
+  цикл продолжается. Бюджет: хост-пол `max_steps = max(configured,
+  len(named)+3)`. Fail-closed по бюджету: сессия
+  `budget_exhausted` → `succeeded_partial`, report-audit несёт
+  `source_coverage.uncovered` (объяснимо по журналу). Промпт
+  `explorer.md` v3→v4 (правило 7) — только подстраховка. Не тронуто:
+  пороги §22.2, claim_type_rules, requires_scope, правило E3,
+  замороженные config v2/v3 и корпус v2.
+
+  Оценка (ADR-0010 §6): только T7.21 → 14 → **15–17** supported по
+  гейту 2 (insufficient_sample остаётся); +исправление окна (T7.22) →
+  **20–25** (проходимость N≥20). Следующий прогон требует НОВОЙ
+  заморозки (прямпт v4 + поведение сессии) — `EVAL-3-freeze.md` §11;
+  решение о прогоне — за пользователем.
+
+  Тесты: `tests/unit/test_source_coverage.py` (9 unit: coverage_key —
+  scheme/www/trailing-slash/percent-decode/query/PSL/не-URL; tracker —
+  pending→fetched/errored, once-covered stays covered, дубли,
+  untrackable→untracked) + `tests/scenario/test_source_coverage.py`
+  (5 scenario, postgres + fake LLM, реальный оркестратор/прокси/rules
+  engine; сеть — FakeFetchClient): обязательный (2 URL → complete
+  после первого fetch отклонён ровно один раз → второй скачан → claim
+  E3 supported с 2 distinct source); регрессия 1 URL (не блокируется,
+  claim E1 — независимость не выдумывается); регрессия вопрос без URL
+  (гейта нет); бюджетный (configured 2 шага < 2 источника → хост-пол
+  5; модель не скачивает → succeeded_partial + uncovered в report-
+  audit); errored-покрытие (fetch второго URL упал → covered, complete
+  прошёл, claim E1 честно). Прогон: полная проверка зелёная.
+
 ### Merge T7.18–T7.20 в `main` (2026-09-20)
 
 Решение пользователя 2026-09-20: `impl/from-scratch` → `main` —
@@ -2822,5 +2875,8 @@ merge-коммита идентично `51f759a`). Вошли шесть ком
 Acceptance §22.2 по-прежнему НЕ пройден: EVAL-3d (ADR-0008) —
 `outcome=insufficient_sample`, ни одного failed-гейта, четыре гейта
 без выборки (N<20). Открыто: ручная проверка слепой выборки (34
-claim), выбор варианта следующего прогона (ADR-0008 §5), дробление
-факта куратором на claim по одному источнику.
+claim), выбор варианта следующего прогона (ADR-0008 §5; T7.21 — новая
+заморозка, `EVAL-3-freeze.md` §11), T7.22 — окно assertion-фрагмента
+(T7.16): корень 75% E1 external/temporal (ADR-0010 §2/§6). Дробление
+факта куратором закрыто как НЕ дефект (1 intra-session случай из 50,
+обоснование ADR-0010 §5).
