@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from packages.domain.models.base import JsonDict
+from packages.llm_gateway.schema_compat import SCHEMA_PROFILES
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,3 +53,19 @@ class LLMGatewayConfig(BaseSettings):
     max_retries: int = 3
     retry_base_delay: float = 1.0
     retry_multiplier: float = 2.0
+    # T7.23 (ADR-0012): engine JSON Schema compatibility profile.
+    # "none" (the default) sends the pydantic schema byte-for-byte
+    # unchanged — the current behavior, so frozen config-v2/v3 runs and
+    # the qwen36-35b-a3b-q6-mtp / EVAL-3d comparability are untouched.
+    # "halogen" strips exactly the keywords that engine refuses
+    # (format, pattern) from the schema SENT to the engine only; the
+    # host still validates the model's answer against the full model.
+    schema_profile: str = "none"
+
+    @field_validator("schema_profile")
+    @classmethod
+    def _check_schema_profile(cls, value: str) -> str:
+        if value not in SCHEMA_PROFILES:
+            known = ", ".join(sorted(SCHEMA_PROFILES))
+            raise ValueError(f"unknown schema_profile {value!r}; known profiles: {known}")
+        return value

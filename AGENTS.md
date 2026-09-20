@@ -105,6 +105,11 @@ cd /home/denis/dsh1/noezema-src && export UV_CACHE_DIR="$PWD/.uv-cache" \
 - Локальные reasoning-модели: `reasoning_content` расходует `max_output_tokens`; длина
   reasoning дрейфует между запусками — бюджет держать ≥ P99 (для qwen36-35b-a3b-q6-mtp
   минимум 8192; при 4096 сессии падали `finish_reason=length` с пустым content).
+- Движок halogen-flash-next (192.168.1.48:8080): отклоняет JSON Schema-ключевые слова
+  `format` и `pattern` (HTTP 400 «unsupported keyword»), и сообщает только ПЕРВОЕ такое
+  слово — остальные прятаться могут (замер T7.23, ADR-0012). Для него —
+  `NOEZEMA_LLM_SCHEMA_PROFILE=halogen`; ответ движка без format валидирует хост полной
+  pydantic-моделью (модель может выдать не-UUID — хост отклонит).
 - PostgreSQL FTS: конфиг `russian` (не `simple` — падежи не матчатся); `plainto_tsquery`
   (не `to_tsquery` — `*` ломает разбор); `ts_rank(to_tsvector(...), tsquery)` — вектор первым.
 - ORM: атрибут `metadata` занят `DeclarativeBase` → `meta = mapped_column("metadata", ...)`.

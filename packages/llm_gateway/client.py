@@ -24,6 +24,7 @@ from pydantic import BaseModel, ValidationError
 
 from packages.domain.models.base import JsonDict
 from packages.llm_gateway.config import LLMGatewayConfig
+from packages.llm_gateway.schema_compat import SCHEMA_PROFILES, strip_schema_keywords
 
 TModel = TypeVar("TModel", bound=BaseModel)
 
@@ -38,6 +39,18 @@ class LLMTransientError(LLMError):
 
 class LLMSchemaError(LLMError):
     """The model produced output that fails response-schema validation."""
+
+
+class LLMRequestRejectedError(LLMError):
+    """The engine REFUSED THE REQUEST ITSELF (HTTP 4xx, T7.23).
+
+    The endpoint is reachable, but it will refuse the same request
+    again (schema keyword/parameter the engine does not support, unknown
+    model, bad auth): NOT transient, never retried, and — unlike
+    LLMTransientError — the model is up. The host records a distinct
+    audit marker so an engine-side refusal is distinguishable from
+    "model unavailable" in the journal (ADR-0012).
+    """
 
 
 @dataclass(slots=True)
@@ -95,10 +108,21 @@ class LLMMiddleware:
         """One structured chat call. Returns (validated model, record).
 
         Raises LLMSchemaError (bad schema, not retried further once the
-        model has had its retries) or LLMTransientError (network/5xx after
-        exhausting retries).
+        model has had its retries), LLMTransientError (network/5xx after
+        exhausting retries) or LLMRequestRejectedError (the engine refused
+        the request itself — HTTP 4xx, e.g. a schema keyword it does not
+        support; not retried, distinct from "model unavailable").
+
+        T7.23 (ADR-0012): when config.schema_profile strips keywords, only
+        the schema SENT TO THE ENGINE is reduced (the engine refuses the
+        full strict schema). The model's ANSWER is still parsed and
+        validated against the FULL ``response_schema`` (uuid, date-time,
+        every constraint) — host-side validation is never weakened.
         """
         schema = response_schema.model_json_schema()
+        stripped = SCHEMA_PROFILES[self.config.schema_profile]
+        if stripped:
+            schema = strip_schema_keywords(schema, stripped)
         body: dict[str, Any] = {
             "model": self.config.model,
             "max_tokens": self.config.max_output_tokens,
@@ -139,6 +163,13 @@ class LLMMiddleware:
                         continue
                     raise LLMTransientError(f"transient HTTP {response.status_code} after {attempt} attempts") from (
                         last_error
+                    )
+                if 400 <= response.status_code < 500:
+                    # T7.23: the engine is up but refuses THIS request
+                    # (schema/params/model/auth) — distinct from "model
+                    # unavailable" (transient) in the audit trail.
+                    raise LLMRequestRejectedError(
+                        f"engine refused the request, HTTP {response.status_code}: {response.text[:500]}"
                     )
                 raise LLMError(f"HTTP {response.status_code}: {response.text[:500]}")
 

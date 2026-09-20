@@ -107,7 +107,7 @@ from packages.domain.services.lease import DEFAULT_LEASE_TTL, LeaseHeartbeatGuar
 from packages.domain.services.reconciler import reconcile_commit
 from packages.domain.services.reserve import HostReserveService, ReserveLimits
 from packages.domain.services.staging import StagingService
-from packages.llm_gateway.client import LLMError, LLMMiddleware, LLMSchemaError
+from packages.llm_gateway.client import LLMError, LLMMiddleware, LLMRequestRejectedError, LLMSchemaError
 from packages.llm_gateway.config import ModelProfile
 from packages.llm_gateway.fingerprint import build_model_fingerprint
 from packages.llm_gateway.roles import Role, load_prompt, tool_schema_hash
@@ -1866,12 +1866,36 @@ class Orchestrator:
                     response_schema=CuratorProposal,
                     fingerprint=fingerprint,
                 )
+        except LLMRequestRejectedError as exc:
+            # T7.23 (ADR-0012): the engine REFUSED THE REQUEST itself
+            # (HTTP 4xx — a schema keyword/param it does not support, an
+            # unknown model, bad auth). The model is UP; this is a
+            # host/deployment mismatch, not "model unavailable". Soft
+            # refusal (no claims, the research work is kept) but with a
+            # DISTINCT audit marker so the journal shows an engine-side
+            # refusal, not an unavailable model.
+            await audit.record(
+                AuditEventType.SESSION_STATE_CHANGED,
+                session_id=session.id,
+                payload={
+                    "curator_error": str(exc)[:300],
+                    "curator_error_kind": "request_rejected",
+                },
+                public_summary=(
+                    "curator request refused by engine (schema/params); "
+                    "no claims proposed — check schema_profile for this engine"
+                ),
+            )
+            return 0, 0
         except LLMError as exc:
             # host-generated failure report (§6.5): curator unavailable
             await audit.record(
                 AuditEventType.SESSION_STATE_CHANGED,
                 session_id=session.id,
-                payload={"curator_error": str(exc)[:300]},
+                payload={
+                    "curator_error": str(exc)[:300],
+                    "curator_error_kind": "unavailable",
+                },
                 public_summary="curator unavailable; host failure report, no claims proposed",
             )
             return 0, 0
