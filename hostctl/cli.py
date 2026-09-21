@@ -353,6 +353,85 @@ def reassessment_tick(batch_size: int, lease_seconds: int) -> None:
     sys.exit(code)
 
 
+@main.command("reconcile-tick")
+@click.option(
+    "--max-probes", default=5, show_default=True, help="Probes per stuck session (fresh connection each)."
+)
+@click.option(
+    "--lock-timeout-ms", default=2000, show_default=True, help="Row-lock timeout per probe."
+)
+def reconcile_tick(max_probes: int, lock_timeout_ms: int) -> None:
+    """Run one reconciliation tick (T2.20, T7.24, §5.2.2).
+
+    Finds sessions stuck at the commit boundary (committing /
+    reconciling_commit — a nonterminal session blocks admission,
+    fail-closed) and drives the fenced probe loop over each: fresh
+    connection per probe, live finalizer ≠ rollback, transient outcomes
+    (finalizer_in_progress / database_unavailable) retried with
+    exponential backoff + jitter.
+
+    exit 0  -> nothing to do, or every stuck session resolved
+               (committed_accepted / aborted / no_attempt)
+    exit 1  -> still transient after all probes (the next tick retries)
+               or the database was unreachable at the find probe
+    exit 78 -> records_inconsistent — an invariant was broken; a human
+               is required (critical alert recorded by the protocol)
+    """
+    import asyncio
+    import os
+
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    url = os.environ.get("NOEZEMA_DATABASE_URL", "")
+    if not url:
+        click.echo("NOEZEMA_DATABASE_URL is not set", err=True)
+        sys.exit(EXIT_USAGE_ERROR)
+
+    from packages.domain.services.audit import AuditService
+    from packages.domain.services.reconciler import reconcile_tick as run_reconcile_tick
+
+    engine = create_async_engine(url)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    async def _run() -> int:
+        try:
+            result = await run_reconcile_tick(
+                factory,
+                lambda db: AuditService(db),
+                max_probes=max_probes,
+                lock_timeout_ms=lock_timeout_ms,
+            )
+        except Exception as exc:
+            click.echo(
+                f"reconcile-tick: database_unavailable ({type(exc).__name__}: {str(exc)[:200]})",
+                err=True,
+            )
+            return 1
+        for outcome in (*result.resolved, *result.transient, *result.inconsistent):
+            line = f"reconcile-tick: {str(outcome.session_id)[:8]} {outcome.outcome}"
+            if outcome.detail:
+                line += f" ({outcome.detail[:200]})"
+            click.echo(line)
+        if not (result.resolved or result.transient or result.inconsistent):
+            click.echo("reconcile-tick: nothing to do (no stuck sessions)")
+            return 0
+        click.echo(
+            f"reconcile-tick: resolved={len(result.resolved)} "
+            f"transient={len(result.transient)} inconsistent={len(result.inconsistent)}"
+        )
+        if result.inconsistent:
+            return 78
+        if result.transient:
+            return 1
+        return 0
+
+    try:
+        code = asyncio.run(_run())
+    finally:
+        asyncio.run(engine.dispose())
+    sys.exit(code)
+
+
 @main.command("activate-online")
 @click.option("--payload", "payload_file", required=True, type=click.Path(exists=True))
 @click.option("--reason", required=True)

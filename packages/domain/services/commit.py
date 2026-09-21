@@ -65,7 +65,9 @@ async def _staging_hash(db: AsyncSession, session_id: UUID) -> str:
             await db.execute(
                 text(
                     "SELECT op, payload_hash, schema_version FROM session_staging "
-                    "WHERE session_id = :s AND state = 'recorded' ORDER BY created_at, id"
+                    # T7.24: recording (proposal) order — created_at is
+                    # constant within the long phase-1 transaction
+                    "WHERE session_id = :s AND state = 'recorded' ORDER BY seq"
                 ),
                 {"s": session_id},
             )

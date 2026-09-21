@@ -268,7 +268,16 @@ class MemoryService:
                         ORMStagingOp.op.in_(("claim", "evidence")),
                         ORMStagingOp.state == "recorded",
                     )
-                    .order_by(ORMStagingOp.created_at, ORMStagingOp.id)
+                    # T7.24 (EVAL-4 abort 2026-09-21): RECORDING order —
+                    # the claim_index of the evidence links is a position
+                    # in the curator proposal. created_at is the constant
+                    # start of the long phase-1 transaction (now()), so
+                    # (created_at, id) is random UUID order and silently
+                    # scrambled the claim→evidence mapping (a claim
+                    # received support evidence of a disallowed kind →
+                    # RuleValidationError in the fenced final tx, session
+                    # left committing with a prepared attempt).
+                    .order_by(ORMStagingOp.seq)
                 )
             )
             .scalars()

@@ -14,7 +14,7 @@
 | M4 зависимости + переоценка | ✅ T4.1 закрыт (claim_dependencies: DAG cycle check при commit, graph revision, kind `research` по §8.6); T4.2 закрыт (cascade invalidation: closure manifest, barrier с durable курсором, idempotent батчи, blocked-путь, retrieval ancestor check); T4.3 закрыт (worker `system:reassessment`: runnable-предикат §5.9.1, lease/retry/blocked, insufficient→invalid+question, crash-lease recovery); T4.4 закрыт (writer admission: table gate §14.1 NOWAIT + jitter, session intent rules 1/4/5, T_escalate/T_worker_admission в scheduler); T4.5 закрыт (online activation §8.7.2: fenced lease + takeover, shadow heads fast path/pending, seal + DB-триггер sealed-интервала, atomic flip, post-publish manifest с deterministic UUIDv5, repair runner + T_repair_admission); T4.6 закрыт (environment manifests §14 env-v2: content-addressed manifest_hash, versioned алгоритм env-independence-v1 — группы по (protocol, implementation, dataset lineage), отношения repeatability/reproducibility/independent_replication/variation/untracked, снапшот на оценке, `required_independence` в rules engine: E3 только через независимую репликацию); T4.7 закрыт (source graph §11.3: таблицы source_dependency_edges/source_graph_corrections, алгоритм independence-v2 — domain/content_hash/parent/edges/corrections, снапшот source_independence_* на оценке, каскад apply_source_graph_change: merge/split → invalidation + recompute, ревизия source_graph); T4.8 закрыт (counterevidence resolutions §8.7.4: таблица + XOR/partial-unique CHECK, межстрочные инварианты (counter-цель, scope-compat, нет транзитивной зависимости, valid correction), каскад create/invalidate → recompute, engine считает только unresolved counters); T4.9 закрыт (failpoints M4: crash после flip — pointer tuple recovery, crash между батчами post-publish — durable cursor, stale activator после takeover — fence-отказ, следующий flip закрывает blocked backlog, barrier crash после каждого батча, group merge + crash worker'а, worker без starvation после смерти intent-lease) — GATE M4 пройден (§19: invalid ancestor блокирует downstream; worker без starvation оба направления; group merge → корректный пересчёт) | — | пороги M4 из замеров серии 2026-09-14 зафиксированы в PLAN (батч 32, SLO P95 200 с); 501 тест |
 | M5 расширенный цикл | ✅ Gate M5 пройден (§19, этап 4): T5.1 закрыт (Curiosity ranking §5.3.1: score-формула, все входы [0,1] + similarity fingerprint, eligibility filter, ε-diversity (seed в audit), селектор config-driven) + T5.2 закрыт (planning §6.2: план как наблюдаемый артефакт, роль planner, закрытые assessment methods, метод ≠ перефраз, planning.mode config-driven) + T5.3 закрыт (роль verifier §3.7: организованные детерминированные проверки, **схема не несёт grade/confidence — assessment идентичен с verifier и без него (gate)**, verification.mode config-driven) + T5.4 закрыт (защита от повторов §9: перефраз + no-progress → цикл, закрытые стратегии §9, audit repeat_cycle_detected, repetition config-driven) + T5.5 закрыт (untrusted extraction §11.2: модель без инструментов, host-проверка дословности, raw-текст не покидает extractor, extraction config-driven) + T5.6 закрыт (long-run сценарии: накопление знания по FIFO-очереди, §9-цикл на накопленной истории, поздний контрпример → disputed E1 rules engine) | — | 651 тест |
 | M6 Research Proxy | ✅ Gate M6 пройден (§19, этап 5): T6.1 закрыт (research proxy: единственный egress, read-only, SSRF-guard private/loopback/link-local/metadata, редиректы/размер/время, удаление активного содержимого) + T6.2 закрыт (режимы Sealed=локальный индекс / Curated=SearXNG через прокси c upstream-логом и rate limits / Open Lab=закрытый список доменов, отдельный профиль) + T6.3 закрыт (provenance: original+normalized+hash, origin в sources/artifact_chunks, fenced-маркировка в контексте §11.2, research.fetch — единственный egress сессии) + T6.4 закрыт (injection/poisoning: capabilities неизменны, similarity→require_operator, poisoned artifact не самооценивается) | noezema-m6 (после gate) | см. раздел M6 ниже | 651 тест |
-| M7 полный веб + эксплуатация | ✅ Gate M7 пройден (T7.1 ✅ knowledge graph + provenance + diagnostics; T7.2 ✅ backup/PITR §15.3; T7.3 ✅ GC full root set; T7.4 ✅ security regression gate + §16 metrics; T7.5 ✅ evaluation run §22.2 mechanism; T7.6 ✅ ADR-0004); после gate — дефекты EVAL-3b/EVAL-3: T7.7–T7.20 закрыты (T7.15 E2E-валидация, T7.16 assertion-окно, T7.17 хост-деривация scope, rules-v2, ADR-0007; T7.18 относительная опорная дата «на текущую дату» = дата сессии по часам хоста, уточнение ADR-0007 — тесты test_scope.py / test_rules_engine.py / test_scope_coverage.py; T7.19 гейты считают ровно один head на claim — head активного snapshot по указателю runtime_config_heads (§14.1), дефект учёта дублей после mid-run активации EVAL-3d — тесты test_evaluation_gates_activation.py; детали в разделе M7; досчёт EVAL-3d 2026-09-19 (eligible=50, completed=50, overall insufficient_sample — приёмка §22.2 не пройдена) + слепая выборка для ручной проверки — ADR-0008; T7.20 quiesce-барьер online-активации (гонка EVAL-3d §10.5): committed admission-запись сессии (миграция 0022 + trigger на sessions) блокирует flip при in-flight сессии + carry-over на fenced commit (pending head + durable job на активном snapshot) — инвариант «нет claim'а с head только на superseded» при любом переплетении — тест test_quiesce_race.py, ADR-0009; T7.21 разбор E1 по EVAL-3d: корень 75% — окно фрагмента T7.16 (оба источника скачаны, куратор привязал один), 25% — неполное скачивание (группы B/C) → host-гейт покрытия названных вопросом источников (complete отклоняется до fetched/errored каждого, хост-пол бюджета, fail-closed + explainable report-audit; prompt explorer-v4 — подстраховка) — тесты test_source_coverage.py (9 unit + 5 scenario), ADR-0010; дробление куратором не чинится (1 случай, обоснование ADR-0010 §5); следующий прогон — новая заморозка, EVAL-3-freeze §11; T7.22 окно assertion-фрагмента (группа A, §6.4): замер 12 промахов (7 чинимы окном, 5 — точное значение отсутствует в источнике и честно не вернутся) → второе НЕПЕРЕСЕКАЮЩЕЕСЯ value-окно (позиция значения + термины вопроса, факт-зона 16k с затуханием, TOC-фильтр; терминальное окно T7.16 без изменений; фрагмент до 2×2000+5 символов, худшая пара evidence = 1287 токенов из 8192 — без вытеснения) — тесты test_assertion_window.py (+14, реальные страницы-фикстуры, по тесту на класс промаха), ADR-0011; оценка гейта 2 уточнена: T7.21+T7.22 → 22–24 supported (проходимость N≥20); следующий прогон — новая заморозка, EVAL-3-freeze §12; T7.23 совместимость структурированного вывода с движками, не принимающими часть ключевых слов JSON Schema (halogen): замер прямыми HTTP — движок halogen-flash-next отвергает ровно {format, pattern}, всё остальное (anyOf/$defs/$ref/enum/budgets/strict) принимает → профиль возможностей `LLMGatewayConfig.schema_profile` (env NOEZEMA_LLM_SCHEMA_PROFILE): "none" (default, байт в байт = текущее поведение, qwen36/EVAL-3d не тронут) / "halogen" (снимает {format, pattern} из схемы, уходящей движку; валидация ответа хостом — полной pydantic-моделью — НЕ ослаблена); fail-closed: HTTP 4xx → LLMRequestRejectedError (не ретраится, ≠ «модель недоступна»), audit `curator_error_kind = request_rejected` (мягкий отказ, сессия без знания); живая проверка реальной схемы CuratorProposal — движок принял (HTTP 200), model_validate OK; смена модели (halogen вместо qwen36) ломает сопоставимость с EVAL-3d сама по себе — решение о модели/прогоне за пользователем (EVAL-3-freeze §13) — тесты test_schema_compat.py (+8), test_llm_gateway.py (+6), test_schema_rejection_audit.py (2 scenario), ADR-0012); 2026-09-20 — решение пользователя: модель halogen-flash-next (Qwen3.8 Flash Next, `.hgn`) + профиль схемы halogen (env noezema-llm.env); подготовлена заморозка EVAL-4 (НЕ запущено): новый код HEAD ff59dbf (T7.19–T7.23), новые payload'ы config-v4/v5-payload.json (diff ровно 1 строка — context_window 262144 = измеренный предел движка, validate()==[], rules_hash как у v2/v3), корпус v2 без изменений, замеренные пределы движка (контекст 262144, max_tokens без потолка до 32768) и оценка N под halogen (n=3, планировочный диапазон) — docs/eval/EVAL-4-freeze.md; решение о запуске и объёме серии — за пользователем) | noezema-m7 (на `2e1631c`) | см. раздел M7 ниже | 826 тест |
+| M7 полный веб + эксплуатация | ✅ Gate M7 пройден (T7.1 ✅ knowledge graph + provenance + diagnostics; T7.2 ✅ backup/PITR §15.3; T7.3 ✅ GC full root set; T7.4 ✅ security regression gate + §16 metrics; T7.5 ✅ evaluation run §22.2 mechanism; T7.6 ✅ ADR-0004); после gate — дефекты EVAL-3b/EVAL-3: T7.7–T7.20 закрыты (T7.15 E2E-валидация, T7.16 assertion-окно, T7.17 хост-деривация scope, rules-v2, ADR-0007; T7.18 относительная опорная дата «на текущую дату» = дата сессии по часам хоста, уточнение ADR-0007 — тесты test_scope.py / test_rules_engine.py / test_scope_coverage.py; T7.19 гейты считают ровно один head на claim — head активного snapshot по указателю runtime_config_heads (§14.1), дефект учёта дублей после mid-run активации EVAL-3d — тесты test_evaluation_gates_activation.py; детали в разделе M7; досчёт EVAL-3d 2026-09-19 (eligible=50, completed=50, overall insufficient_sample — приёмка §22.2 не пройдена) + слепая выборка для ручной проверки — ADR-0008; T7.20 quiesce-барьер online-активации (гонка EVAL-3d §10.5): committed admission-запись сессии (миграция 0022 + trigger на sessions) блокирует flip при in-flight сессии + carry-over на fenced commit (pending head + durable job на активном snapshot) — инвариант «нет claim'а с head только на superseded» при любом переплетении — тест test_quiesce_race.py, ADR-0009; T7.21 разбор E1 по EVAL-3d: корень 75% — окно фрагмента T7.16 (оба источника скачаны, куратор привязал один), 25% — неполное скачивание (группы B/C) → host-гейт покрытия названных вопросом источников (complete отклоняется до fetched/errored каждого, хост-пол бюджета, fail-closed + explainable report-audit; prompt explorer-v4 — подстраховка) — тесты test_source_coverage.py (9 unit + 5 scenario), ADR-0010; дробление куратором не чинится (1 случай, обоснование ADR-0010 §5); следующий прогон — новая заморозка, EVAL-3-freeze §11; T7.22 окно assertion-фрагмента (группа A, §6.4): замер 12 промахов (7 чинимы окном, 5 — точное значение отсутствует в источнике и честно не вернутся) → второе НЕПЕРЕСЕКАЮЩЕЕСЯ value-окно (позиция значения + термины вопроса, факт-зона 16k с затуханием, TOC-фильтр; терминальное окно T7.16 без изменений; фрагмент до 2×2000+5 символов, худшая пара evidence = 1287 токенов из 8192 — без вытеснения) — тесты test_assertion_window.py (+14, реальные страницы-фикстуры, по тесту на класс промаха), ADR-0011; оценка гейта 2 уточнена: T7.21+T7.22 → 22–24 supported (проходимость N≥20); следующий прогон — новая заморозка, EVAL-3-freeze §12; T7.23 совместимость структурированного вывода с движками, не принимающими часть ключевых слов JSON Schema (halogen): замер прямыми HTTP — движок halogen-flash-next отвергает ровно {format, pattern}, всё остальное (anyOf/$defs/$ref/enum/budgets/strict) принимает → профиль возможностей `LLMGatewayConfig.schema_profile` (env NOEZEMA_LLM_SCHEMA_PROFILE): "none" (default, байт в байт = текущее поведение, qwen36/EVAL-3d не тронут) / "halogen" (снимает {format, pattern} из схемы, уходящей движку; валидация ответа хостом — полной pydantic-моделью — НЕ ослаблена); fail-closed: HTTP 4xx → LLMRequestRejectedError (не ретраится, ≠ «модель недоступна»), audit `curator_error_kind = request_rejected` (мягкий отказ, сессия без знания); живая проверка реальной схемы CuratorProposal — движок принял (HTTP 200), model_validate OK; смена модели (halogen вместо qwen36) ломает сопоставимость с EVAL-3d сама по себе — решение о модели/прогоне за пользователем (EVAL-3-freeze §13) — тесты test_schema_compat.py (+8), test_llm_gateway.py (+6), test_schema_rejection_audit.py (2 scenario), ADR-0012); 2026-09-20 — решение пользователя: модель halogen-flash-next (Qwen3.8 Flash Next, `.hgn`) + профиль схемы halogen (env noezema-llm.env); подготовлена заморозка EVAL-4 (НЕ запущено): новый код HEAD ff59dbf (T7.19–T7.23), новые payload'ы config-v4/v5-payload.json (diff ровно 1 строка — context_window 262144 = измеренный предел движка, validate()==[], rules_hash как у v2/v3), корпус v2 без изменений, замеренные пределы движка (контекст 262144, max_tokens без потолка до 32768) и оценка N под halogen (n=3, планировочный диапазон) — docs/eval/EVAL-4-freeze.md; решение о запуске и объёме серии — за пользователем); T7.24 обрыв EVAL-4 (2026-09-21, 15 сессий + обрыв на 16-й): commit-boundary dead end — `hostctl reconcile-tick` (точка входа примирителя M2: fenced row-lock, живой finalizer ≠ rollback, transient → retry с backoff; worker-цикл теперь reassessment-tick + reconcile-tick), staging-последовательность (миграция 0023 — корень обрыва: claim→evidence-пара перепутывалась UUID-порядком при константной created_at phase-1-транзакции) и known rollback из final-транзакции → детерминированное terminal `failed (commit_boundary_error)` (§6.5/§6.7), не зависание сессии — тесты test_reconciler.py (+1), test_commit_boundary.py (2), test_memory_service.py (+1), детали в разделе M7) | noezema-m7 (на `2e1631c`) | см. раздел M7 ниже | 831 тест |
 
 ## Gate M2 (§19, этап 2) — пройден (noezema-m2)
 
@@ -47,7 +47,7 @@
 | 16 | worker: priority, retry, no starvation | v1 | ✅ T4.3+T4.4+T4.9 | test_reassessment.py (priority, retry/backoff, blocked) + test_writer_admission.py (worker уступает session intent на входе и mid-batch, release после батча; deferral с jitter) + test_failpoints_m4.py::test_worker_not_starved_after_intent_lease_expiry (worker завершает после смерти intent-lease) — строка 14, T4.3/T4.4/T4.9 |
 | 17 | repeatability/reproducibility/replication | v1 | ✅ T4.6 | test_env_independence.py (unit 17 + scenario 6: группы по (protocol, implementation, dataset lineage); repeatability/reproducibility/independent_replication/variation/untracked; E3 только через independent_replication) — строка 14, T4.6 |
 | 18 | counterevidence resolutions | v1 | ✅ T4.8 | test_counter_resolutions.py (unit 9 + scenario 5: XOR/partial-unique, инварианты basis, каскад create/invalidate → recompute, engine считает только unresolved) + test_rules_engine.py (+3) — строка 14, T4.8 |
-| 19 | unresolved attempt блокирует wake/GC | MVP | ✅ | test_reconciler.py (unresolved prepared → aborted/finalizer_in_progress; reconciling_commit = non-terminal ⇒ FIFO не стартует новую сессию, GC не трогает, critical alert, §14.2) |
+| 19 | unresolved attempt блокирует wake/GC | MVP | ✅ | test_reconciler.py (unresolved prepared → aborted/finalizer_in_progress; reconciling_commit = non-terminal ⇒ FIFO не стартует новую сессию, GC не трогает, critical alert, §14.2); T7.24: точка входа примирителя — `hostctl reconcile-tick` (fenced row-lock, живой finalizer ≠ rollback, transient → retry c backoff; stuck committing + prepared + истёкшая аренда → разрешено, сессия терминальна, следующая допускается — test_reconciler.py::test_reconcile_tick_resolves_stuck_committing_session) |
 | 20 | FIFO полный минимальный путь | MVP | ✅ | test_web_api.py::test_wake_now_runs_full_session + test_orchestrator.py::test_full_sealed_session + test_question_selector.py (durable knowledge — M3) |
 | 21 | sync head update + offline flip | MVP | ✅ | test_orchestrator.py + test_memory_service.py (sync head update в fenced tx: новый assessment + head→current, old superseded) + test_offline_rules.py (offline flip: atomic publish pointer + UUIDv5 invalid-вопросы одной tx; deferred→pending, removed-type→invalid) |
 | 22 | barrier crash-resume | v1 | ✅ T4.2+T4.9 | test_cascade.py (barrier lifecycle + crash-resume с durable курсором, idempotent replay, tamper → blocked) + test_failpoints_m4.py::test_barrier_crash_after_every_batch (crash после КАЖДОГО батча — 3 batch audits + 1 resolved) — строка 14, T4.2/T4.9 |
@@ -3040,6 +3040,108 @@ rules_hash как у v2/v3; sampling — фиксируем seed 42, остал�
 сессий в SMOKE-HALOGEN2, не чинится) и оценка N под halogen (n=3 —
 планировочный диапазон). Решение о запуске и объёме серии — за
 пользователем. Корпус — v3 (ниже).
+
+### T7.24 — обрыв EVAL-4 (2026-09-21): commit-boundary dead end — reconcile-tick + staging-последовательность + known rollback → terminal (§5.2.2, §6.5, §6.7)
+
+**Факт обрыва** (улики: БД `noezema-eval4` и логи `/home/denis/dsh1/
+eval4-logs/` — только SELECT, не изменялись): прогон 2026-09-21 (код
+`45515c1`, 1 ч 58 мин), 15 сессий завершено (13 succeeded + 2
+succeeded_partial), 16-я (`44bf319e-b81b-4c46-9ae0-f9737ef27fe3`) обрвала
+серии:
+
+1. Куратор предложил ДВА ВЕРНЫХ claim'а: `local_observation` ←
+   evidence[0] (workspace.read, kind local_observation) и
+   `computed_result` ← evidence[1] (python.execute, kind computation).
+   Пре-чек T7.9 (consolidating) предложение пропустил — парная связь
+   была допустимой.
+2. **Корень**: commit boundary читал recorded staging-опы в порядке
+   `(created_at, id)`. `created_at` ВСЕХ строк сессии — константа
+   (старт phase-1-транзакции, `now()` — ловушка AGENTS.md §7), поэтому
+   эффективный порядок — случайный UUID-порядок. В сессии UUID claim'а
+   `computed_result` (позиция 1 в предложении) был МЕНЬШЕ UUID claim'а
+   `local_observation` (позиция 0) → `claim_index` links молча
+   перепутались → `computed_result` получил support-evidence вида
+   `local_observation` → `RuleValidationError` ВНУТРИ fenced
+   final-транзакции, ПОСЛЕ устойчивой `prepared`-строки.
+3. Исключение вылетело в драйвер; сессия осталась `committing` с
+   attempt `prepared` (аренда истекла 07:23 UTC). Fail-closed admission
+   (nonterminal-сессия блокирует старт) отдал 16 `nonterminal_session`
+   → «admission never granted; aborting series».
+4. Разрешить попытку было НЕМЧЕМ: примиритель существовал
+   (`reconciler.py`, M2), но команды hostctl для него не было, а
+   фоновый цикл крутил только `reassessment-tick`.
+
+Правки (инварианты M2 сохранены: fenced row-lock, живой finalizer ≠
+rollback, `database_unavailable`/`finalizer_in_progress` → retry c
+экспоненциальным backoff + jitter):
+
+- **`hostctl reconcile-tick`** — точка входа примирителя:
+  `reconcile_tick`/`find_unresolved_sessions`
+  (`packages/domain/services/reconciler.py`) находят нетерминальные
+  сессии, застрявшие на границе коммита (`committing` /
+  `reconciling_commit`), и гоняют по каждой M2 probe-loop: свежее
+  соединение на пробо (мёртвое соединение не решает исход), fenced
+  row-lock, `records_inconsistent` → exit 78 (нужен человек, critical
+  alert уже в audit). exit 0 — нечего делать / всё разрешено; exit 1 —
+  ещё transient (следующий tick повторит). Worker-цикл
+  (`eval4-worker.sh`, EVAL-4-freeze §5.10) теперь: `reassessment-tick`
+  + `reconcile-tick`.
+- **Staging-последовательность** (миграция `0023_staging_seq`):
+  `session_staging.seq` — per-session порядок ЗАПИСИ (присваивает
+  `StagingService.record` — единственный writer, MAX+1 в собственной
+  phase-1-транзакции сессии; unique (session_id, seq) — backstop).
+  `apply_claim_staging`/`apply_recorded`/`_staging_hash` читают ops в
+  `seq`-порядке: commit boundary оценивает ровно ту парную связь
+  (claim ↔ evidence), которую предложил куратор, а не UUID-порядок.
+  Бэкфилл нумерует существующие строки в legacy-порядке (created_at,
+  id) — применённые сессии уже этот порядок потратили, recorded-строки
+  застрявшей сессии применены не будут (примиритель abort'ит attempt).
+- **Known rollback → terminal** (§6.5/§6.7): в phase 3 `run_session`
+  исключение из ТЕЛА final-транзакции (до COMMIT — сервер ОДНОЗНАЧНО
+  откатил: ничего не применено, prepared-попытка unresolved) больше не
+  вылетает в драйвер: детерминированное терминальное разрешение новой
+  короткой транзакцией (fenced-записи как у abort-ветви примирителя, но
+  БЕЗ проб — исход ИЗВЕСТЕН, а не угадан: `commit_attempts → aborted`,
+  `sessions → failed (commit_boundary_error: <Exc>)`, audit
+  `session_failed` + `commit_attempt_aborted` с причиной и
+  diagnostics — host failure report §6.5) → сессия завершается штатным
+  терминальным состоянием, следующая допускается. Исключение из самого
+  COMMIT (потерянный ответ — UNKNOWN) по-прежнему идёт примирителю
+  (`reconcile-tick`), никогда — в guessed rollback (T2.20).
+- Пре-чек T7.9 (сочетание «вид evidence не разрешён правилом типа
+  claim» отклоняется на стадии предложения, до записи staging и
+  prepared-строки) и инвариант EVAL-3b (claim без head не
+  коммитится; отклонённый assessment → apply abortится fenced
+  rollback'ом, сессия не зависает) — не тронуты.
+
+Тесты:
+- `tests/scenario/test_reconciler.py::test_reconcile_tick_resolves_stuck_committing_session` —
+  точная форма инцидента (committing + prepared + истёкшая owned-аренда)
+  → после tick: attempt aborted, сессия failed (`reconciled_abort`),
+  admission открыт — следующая полная сессия (fake LLM) стартует и
+  завершается succeeded.
+- `tests/scenario/test_commit_boundary.py::test_disallowed_evidence_kind_rejected_at_consolidating` —
+  ровно это сочетание (computed_result + local_observation support):
+  отклонено на consolidating (audit `curator_rejected_by_rules` с
+  точным текстом ошибки, 0 staging, 0 claim'ов), сессия succeeded с
+  0 claim'ов, неразрешённых попыток нет, следующая сессия допускается.
+- `tests/scenario/test_commit_boundary.py::test_commit_boundary_error_ends_session_terminal` —
+  `RuleValidationError` ВНУТРИ final-транзакции не вылетает наружу:
+  сессия failed (`commit_boundary_error: RuleValidationError`), attempt
+  aborted, ничего не применено, следующая сессия допускается.
+- `tests/unit/test_memory_service.py::test_apply_claim_staging_uses_recording_order_not_uuid_order` —
+  регрессия корня: строки с ОДНОЙ created_at и UUID-порядком, обратным
+  порядку записи; на legacy-порядке воспроизводит точную ошибку EVAL-4
+  (`support evidence kind 'local_observation' not allowed for
+  computed_result`), на `seq` — оба claim'а коммичатся с head'ами и с
+  тем evidence, который предложил куратор.
+
+Не тронуто: замороженные `config-v4/v5-payload.json`, корпус v3, пороги
+§22.2, `ARCHITECTURE.md`, M2-семантика примирителя. БД `noezema-eval4`
+и логи — улики (SELECT only), не мигрированы и не изменены;
+запущенный worker-инстанс не перезапущен (было бы трогание
+уликовой БД) — обновлённый `eval4-worker.sh` действует с следующего
+прогона. Перезапуск EVAL-4 — отдельное решение пользователя.
 
 ### Корпус v3 (EVAL-4) — 2026-09-20
 

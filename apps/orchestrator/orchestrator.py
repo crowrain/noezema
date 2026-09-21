@@ -373,6 +373,13 @@ class Orchestrator:
             }
 
         finalize_result: FinalizeResult | None = None
+        # T7.24 (EVAL-4 abort 2026-09-21): distinguishes the two failure
+        # kinds the transaction helper otherwise conflates — an exception
+        # from the body (the fenced tx raised BEFORE COMMIT: the server
+        # has definitely rolled it back, the outcome is KNOWN) vs an
+        # exception from the COMMIT itself (a lost answer: UNKNOWN — the
+        # reconciler decides, never a guessed rollback, T2.20).
+        body_completed = False
         async with self.session_factory() as db:
             try:
                 async with transaction(db):
@@ -391,8 +398,29 @@ class Orchestrator:
                         question_terminal=plan.question_terminal.value,
                         apply_memory=apply_memory,
                     )
-            except Exception:
+                    body_completed = True
+            except Exception as exc:
                 await db.rollback()
+                if not body_completed:
+                    # Known rollback: nothing was applied, the prepared
+                    # attempt is unresolved. Resolve it DETERMINISTICALLY
+                    # (the fenced abort writes, no probe) so the session
+                    # ends in a normal terminal state (§6.5/§6.7) instead
+                    # of being left committing — the EVAL-4 dead end that
+                    # blocked admission for the whole series. A
+                    # RuleValidationError from the commit boundary no
+                    # longer escapes to the driver.
+                    await self._resolve_failed_finalize(plan, attempt_id, exc)
+                    return SessionOutcome(
+                        session_id=plan.session_id,
+                        final_state=SessionState.FAILED,
+                        question_id=plan.question_id,
+                        steps=plan.steps,
+                        evidence_count=plan.evidence_count,
+                        claims_proposed=0,
+                        questions_created=0,
+                        termination_reason="commit_boundary_error",
+                    )
                 raise
         assert finalize_result is not None
 
@@ -2127,6 +2155,69 @@ class Orchestrator:
             await db.execute(
                 text("DELETE FROM session_admissions WHERE session_id = :id"),
                 {"id": session_id},
+            )
+
+    async def _resolve_failed_finalize(
+        self, plan: CommitPlan, attempt_id: uuid.UUID, exc: Exception
+    ) -> None:
+        """T7.24 (EVAL-4 abort 2026-09-21, §6.5, §6.7): the fenced final
+        transaction raised BEFORE COMMIT — the server has definitely
+        rolled it back (nothing applied, the prepared attempt is
+        unresolved). Deterministic terminal resolution in a fresh short
+        transaction: the same fenced writes as the reconciler's abort
+        branch, but without a probe — the outcome is KNOWN here (our own
+        transaction rolled back), not guessed. A guessed rollback is
+        forbidden only for UNKNOWN outcomes (a lost COMMIT answer, T2.20);
+        those still go to the reconciler (hostctl reconcile-tick).
+
+        If the resolution itself cannot be written (DB down), it raises:
+        the session stays non-terminal and the reconcile tick resolves it
+        once the database is back (fail-closed, no silent loss)."""
+        from sqlalchemy import text
+
+        reason = f"commit_boundary_error: {type(exc).__name__}"
+        async with self.session_factory() as db, transaction(db):
+            audit = AuditService(db)
+            await db.execute(
+                text(
+                    "UPDATE commit_attempts SET status = 'aborted', finished_at = now() "
+                    "WHERE session_id = :s AND id = :a "
+                    "AND status IN ('prepared','reconciling')"
+                ),
+                {"s": plan.session_id, "a": attempt_id},
+            )
+            await db.execute(
+                text(
+                    "UPDATE sessions SET state = 'failed', finished_at = now(), "
+                    "lease_owner = NULL, lease_expires_at = NULL, termination_reason = :r, "
+                    "commit_intent_at = NULL "
+                    "WHERE id = :s AND state NOT IN "
+                    "('succeeded','succeeded_partial','failed','cancelled')"
+                ),
+                {"s": plan.session_id, "r": reason},
+            )
+            # host failure report (§6.5): the reason, the last completed
+            # operation and the diagnostics
+            await audit.record(
+                AuditEventType.SESSION_FAILED,
+                session_id=plan.session_id,
+                payload={
+                    "attempt_id": str(attempt_id),
+                    "reason": reason,
+                    "error": str(exc)[:500],
+                    "steps": plan.steps,
+                    "evidence": plan.evidence_count,
+                },
+                public_summary=f"session failed at the commit boundary ({reason})",
+            )
+            await audit.record(
+                AuditEventType.COMMIT_ATTEMPT_ABORTED,
+                session_id=plan.session_id,
+                payload={
+                    "attempt_id": str(attempt_id),
+                    "reason": reason,
+                    "error": str(exc)[:500],
+                },
             )
 
     async def _abort_session(self, plan: CommitPlan, reason: str) -> None:

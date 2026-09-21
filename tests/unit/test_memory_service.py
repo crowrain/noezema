@@ -440,3 +440,143 @@ async def test_env_manifest_hash_is_content_addressed(migrated_db: Any) -> None:
     )
     assert a == b
     assert a != c
+
+
+@pytest.mark.asyncio
+async def test_apply_claim_staging_uses_recording_order_not_uuid_order(migrated_db: Any) -> None:
+    """T7.24 (EVAL-4 abort 2026-09-21 — the root cause).
+
+    The commit boundary must read the recorded staging ops in RECORDING
+    (proposal) order. The EVAL-4 shape: two claim ops recorded in the
+    order [local_observation, computed_result] (the evidence links refer
+    to that order via ``claim_index``), but with the UUID ``id`` of the
+    SECOND claim SMALLER than the first — and, as always inside the long
+    phase-1 transaction, one shared ``created_at``. The legacy ordering
+    ``(created_at, id)`` then puts the computed_result claim FIRST, so
+    ``claim_index=0`` (the local_observation evidence) is linked to the
+    computed_result claim → ``RuleValidationError`` in the fenced final
+    transaction → session left committing with a prepared attempt.
+    With the durable ``seq`` the apply pairs each claim with the
+    evidence the curator proposed: both claims commit with a head."""
+    import json
+    from datetime import UTC, datetime
+
+    from packages.domain.canonical import canonical_sha256
+    from packages.domain.models.enums import EvidenceKind
+    from packages.domain.schemas.evidence import EvidenceRecord
+
+    _url, engine = migrated_db
+    factory, sid = await _seed_session(engine)
+    snap = await _snapshot(engine)
+
+    big_id = uuid.UUID("f0000000-0000-4000-8000-000000000001")
+    small_id = uuid.UUID("00000000-0000-4000-8000-000000000002")
+    rows = [
+        # seq = the proposal order; id = the scrambled UUID order
+        (
+            big_id,
+            0,
+            "claim",
+            {
+                "statement": "Файл notes/reading.md содержит три непустые строки.",
+                "claim_type": "local_observation",
+                "scope": {},
+            },
+        ),
+        (
+            small_id,
+            1,
+            "claim",
+            {
+                "statement": "Количество непустых строк в файле notes/reading.md равно 3.",
+                "claim_type": "computed_result",
+                "scope": {},
+            },
+        ),
+        (uuid.uuid4(), 2, "evidence", {"evidence_index": 0, "claim_index": 0, "relation": "supports"}),
+        (uuid.uuid4(), 3, "evidence", {"evidence_index": 1, "claim_index": 1, "relation": "supports"}),
+    ]
+    phase1_start = datetime.now(UTC)
+    async with factory() as db, db.begin():
+        for row_id, seq, op, payload in rows:
+            await db.execute(
+                text(
+                    "INSERT INTO session_staging "
+                    "(id, session_id, op, payload, payload_hash, schema_version, seq, created_at) "
+                    "VALUES (:id, :s, :op, CAST(:p AS jsonb), :h, 1, :seq, :ts)"
+                ),
+                {
+                    "id": row_id,
+                    "s": sid,
+                    "op": op,
+                    "p": json.dumps(payload, ensure_ascii=False),
+                    "h": canonical_sha256(payload),
+                    "seq": seq,
+                    "ts": phase1_start,  # constant now() of the phase-1 txn
+                },
+            )
+
+    records = [
+        # index 0: the workspace.read observation (local_observation)
+        EvidenceRecord(
+            kind=EvidenceKind.LOCAL_OBSERVATION,
+            identity_hash="l" * 32,
+            payload={"path": "notes/reading.md", "content": "The Little Prince\nDune\nThe Master and Margarita\n"},
+        ),
+        # index 1: the python.execute observation (computation)
+        _comp_record({"code": "print(3)", "stdout": "3", "exit_code": 0}),
+    ]
+
+    memory = MemoryService(snap)
+    async with factory() as db, transaction(db):
+        session = await db.get(ORMSession, sid)
+        assert session is not None
+        result = await memory.apply_claim_staging(db, AuditService(db), session, records)
+
+    assert result.claims_created == 2
+    assert result.assessments == 2
+    assert result.problems == ()
+
+    async with factory() as db:
+        by_statement = {
+            r.statement: r for r in (await db.execute(select(ORMClaim))).scalars().all()
+        }
+        obs_claim = by_statement["Файл notes/reading.md содержит три непустые строки."]
+        comp_claim = by_statement["Количество непустых строк в файле notes/reading.md равно 3."]
+        # each claim got exactly the evidence the curator PROPOSED
+        obs_kinds = set(
+            (
+                await db.execute(
+                    text("SELECT evidence_kind FROM evidence WHERE claim_id = :c"),
+                    {"c": str(obs_claim.id)},
+                )
+            )
+            .scalars()
+            .all()
+        )
+        comp_kinds = set(
+            (
+                await db.execute(
+                    text("SELECT evidence_kind FROM evidence WHERE claim_id = :c"),
+                    {"c": str(comp_claim.id)},
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert obs_kinds == {"local_observation"}
+        assert comp_kinds == {"computation"}
+        # both claims have a head under this session's snapshot
+        heads = (
+            (
+                await db.execute(
+                    select(ORMClaimAssessmentHead).where(
+                        ORMClaimAssessmentHead.config_snapshot_id == snap.id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert {h.claim_id for h in heads} == {obs_claim.id, comp_claim.id}
+        assert all(h.current_assessment_id is not None for h in heads)

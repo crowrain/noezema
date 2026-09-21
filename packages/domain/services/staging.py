@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import uuid
 
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.domain.canonical import canonical_sha256
@@ -60,12 +61,32 @@ class StagingService:
             proposed_evidence=proposed_evidence,
             proposed_questions=proposed_questions,
         )
+        # T7.24 (EVAL-4 abort 2026-09-21): the per-session recording
+        # order. Staging is written by the session's own phase-1
+        # transaction (single connection, statements sequential), so
+        # MAX+1 in the same transaction is race-free; the unique
+        # (session_id, seq) constraint is the backstop. The commit
+        # boundary reads the ops in THIS order — the proposal order the
+        # claim_index/evidence_index links refer to.
+        seq = (
+            (
+                await db.execute(
+                    text(
+                        "SELECT COALESCE(MAX(seq), -1) + 1 FROM session_staging "
+                        "WHERE session_id = :s"
+                    ),
+                    {"s": session.id},
+                )
+            )
+            .scalar_one()
+        )
         row = ORMStagingOp(
             session_id=session.id,
             op=op,
             payload=payload,
             payload_hash=canonical_sha256(payload),
             schema_version=STAGING_SCHEMA_VERSION,
+            seq=int(seq),
         )
         db.add(row)
         await db.flush()
@@ -120,7 +141,9 @@ class StagingService:
                 await db.execute(
                     select(ORMStagingOp)
                     .where(ORMStagingOp.session_id == session.id, ORMStagingOp.state == "recorded")
-                    .order_by(ORMStagingOp.created_at)
+                    # T7.24: recording (proposal) order — created_at is the
+                    # constant start of the phase-1 transaction
+                    .order_by(ORMStagingOp.seq)
                 )
             )
             .scalars()

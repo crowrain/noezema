@@ -469,6 +469,34 @@ invariant'а head'ов).
 9. **Prefill-задержка движка** на огромных промптах (~3 мин на 253k токенов,
    §2.4) — на реалистичных контекстах сессии (max 15659 в smoke) не
    влияет; зафиксировано как факт.
+10. **Commit-boundary dead end — обрыв прогона 2026-09-21 (T7.24, в коде
+   исправлено)** — прогон 2026-09-21 (код `45515c1`) прошёл 15 сессий
+   (13 succeeded + 2 succeeded_partial) и оборвался на 16-й
+   (`44bf319e-b81b-4c46-9ae0-f9737ef27fe3`): сессия осталась
+   `committing` с `prepared`-попыткой и истёкшей арендой, fail-closed
+   admission заблокировал старт следующих (16 `nonterminal_session`),
+   разрешить попытку было нечем (команды hostctl для примирителя не
+   было). **Корень — НЕ предложение куратора** (оно было валидным:
+   `local_observation`←local_observation, `computed_result`←computation;
+   пре-чек T7.9 пропустил его правильно): commit boundary читал
+   staging-опы в порядке `(created_at, id)`, а `created_at` всех строк —
+   константа (старт phase-1-транзакции), т.е. случайный UUID-порядок →
+   claim↔evidence-пара перепуталась → `RuleValidationError` в fenced
+   final-транзакции ПОСЛЕ устойчивой prepared-строки. Правки T7.24
+   (HEAD после этого документа, детали — docs/STATUS.md, раздел T7.24):
+   (a) `hostctl reconcile-tick` — точка входа примирителя M2 (fenced
+   row-lock, живой finalizer ≠ rollback, transient → backoff), worker-
+   цикл теперь `reassessment-tick` + `reconcile-tick`; (b)
+   `session_staging.seq` (миграция 0023) — commit boundary читает опсы
+   в порядке ЗАПИСИ (корень); (c) исключение из тела final-транзакции
+   (known rollback, до COMMIT) → детерминированное terminal
+   `failed (commit_boundary_error)` + attempt aborted (§6.5/§6.7) —
+   сессия не висит; lost COMMIT answer по-прежнему — примирителю.
+   **Последствия для рана**: `noezema-eval4` + `/home/denis/dsh1/
+   eval4-logs/` — улики (SELECT only), не мигрированы, не чистились;
+   перезапуск — с ЧИСТОЙ БД (чек-лист п.1) по отдельному решению
+   пользователя; запущенный worker-инстанс не перезапущен (не трогать
+   улик).
 
 ## 6. Предстартовый чек-лист (до eval-run)
 
@@ -489,8 +517,9 @@ invariant'а head'ов).
    `/home/denis/dsh1/eval4-logs/`.
 6. **SearXNG запущен** (`docker start noezema-searxng`, если остановлен).
 7. **Запуск через `systemd-run --user`** — eval-run, worker-цикл
-   (reassessment-tick) и watchdog (freeze §3, §10.1: setsid/nohup из dsh
-   headless не переживает завершение хода).
+   (T7.24: `reassessment-tick` + `reconcile-tick`, §5 п.10) и watchdog
+   (freeze §3, §10.1: setsid/nohup из dsh headless не переживает
+   завершение хода).
 8. **Старт утром UTC** (риск опорной даты, freeze §9.6); время старта
    фиксировать в отчёте о запуске.
 9. **Перепроверка хэшей замороженных артефактов** до seed'а (§7) и хэша
