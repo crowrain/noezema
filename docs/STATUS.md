@@ -14,7 +14,7 @@
 | M4 зависимости + переоценка | ✅ T4.1 закрыт (claim_dependencies: DAG cycle check при commit, graph revision, kind `research` по §8.6); T4.2 закрыт (cascade invalidation: closure manifest, barrier с durable курсором, idempotent батчи, blocked-путь, retrieval ancestor check); T4.3 закрыт (worker `system:reassessment`: runnable-предикат §5.9.1, lease/retry/blocked, insufficient→invalid+question, crash-lease recovery); T4.4 закрыт (writer admission: table gate §14.1 NOWAIT + jitter, session intent rules 1/4/5, T_escalate/T_worker_admission в scheduler); T4.5 закрыт (online activation §8.7.2: fenced lease + takeover, shadow heads fast path/pending, seal + DB-триггер sealed-интервала, atomic flip, post-publish manifest с deterministic UUIDv5, repair runner + T_repair_admission); T4.6 закрыт (environment manifests §14 env-v2: content-addressed manifest_hash, versioned алгоритм env-independence-v1 — группы по (protocol, implementation, dataset lineage), отношения repeatability/reproducibility/independent_replication/variation/untracked, снапшот на оценке, `required_independence` в rules engine: E3 только через независимую репликацию); T4.7 закрыт (source graph §11.3: таблицы source_dependency_edges/source_graph_corrections, алгоритм independence-v2 — domain/content_hash/parent/edges/corrections, снапшот source_independence_* на оценке, каскад apply_source_graph_change: merge/split → invalidation + recompute, ревизия source_graph); T4.8 закрыт (counterevidence resolutions §8.7.4: таблица + XOR/partial-unique CHECK, межстрочные инварианты (counter-цель, scope-compat, нет транзитивной зависимости, valid correction), каскад create/invalidate → recompute, engine считает только unresolved counters); T4.9 закрыт (failpoints M4: crash после flip — pointer tuple recovery, crash между батчами post-publish — durable cursor, stale activator после takeover — fence-отказ, следующий flip закрывает blocked backlog, barrier crash после каждого батча, group merge + crash worker'а, worker без starvation после смерти intent-lease) — GATE M4 пройден (§19: invalid ancestor блокирует downstream; worker без starvation оба направления; group merge → корректный пересчёт) | — | пороги M4 из замеров серии 2026-09-14 зафиксированы в PLAN (батч 32, SLO P95 200 с); 501 тест |
 | M5 расширенный цикл | ✅ Gate M5 пройден (§19, этап 4): T5.1 закрыт (Curiosity ranking §5.3.1: score-формула, все входы [0,1] + similarity fingerprint, eligibility filter, ε-diversity (seed в audit), селектор config-driven) + T5.2 закрыт (planning §6.2: план как наблюдаемый артефакт, роль planner, закрытые assessment methods, метод ≠ перефраз, planning.mode config-driven) + T5.3 закрыт (роль verifier §3.7: организованные детерминированные проверки, **схема не несёт grade/confidence — assessment идентичен с verifier и без него (gate)**, verification.mode config-driven) + T5.4 закрыт (защита от повторов §9: перефраз + no-progress → цикл, закрытые стратегии §9, audit repeat_cycle_detected, repetition config-driven) + T5.5 закрыт (untrusted extraction §11.2: модель без инструментов, host-проверка дословности, raw-текст не покидает extractor, extraction config-driven) + T5.6 закрыт (long-run сценарии: накопление знания по FIFO-очереди, §9-цикл на накопленной истории, поздний контрпример → disputed E1 rules engine) | — | 651 тест |
 | M6 Research Proxy | ✅ Gate M6 пройден (§19, этап 5): T6.1 закрыт (research proxy: единственный egress, read-only, SSRF-guard private/loopback/link-local/metadata, редиректы/размер/время, удаление активного содержимого) + T6.2 закрыт (режимы Sealed=локальный индекс / Curated=SearXNG через прокси c upstream-логом и rate limits / Open Lab=закрытый список доменов, отдельный профиль) + T6.3 закрыт (provenance: original+normalized+hash, origin в sources/artifact_chunks, fenced-маркировка в контексте §11.2, research.fetch — единственный egress сессии) + T6.4 закрыт (injection/poisoning: capabilities неизменны, similarity→require_operator, poisoned artifact не самооценивается) | noezema-m6 (после gate) | см. раздел M6 ниже | 651 тест |
-| M7 полный веб + эксплуатация | ✅ Gate M7 пройден (T7.1 ✅ knowledge graph + provenance + diagnostics; T7.2 ✅ backup/PITR §15.3; T7.3 ✅ GC full root set; T7.4 ✅ security regression gate + §16 metrics; T7.5 ✅ evaluation run §22.2 mechanism; T7.6 ✅ ADR-0004); после gate — дефекты EVAL-3b/EVAL-3: T7.7–T7.20 закрыты (T7.15 E2E-валидация, T7.16 assertion-окно, T7.17 хост-деривация scope, rules-v2, ADR-0007; T7.18 относительная опорная дата «на текущую дату» = дата сессии по часам хоста, уточнение ADR-0007 — тесты test_scope.py / test_rules_engine.py / test_scope_coverage.py; T7.19 гейты считают ровно один head на claim — head активного snapshot по указателю runtime_config_heads (§14.1), дефект учёта дублей после mid-run активации EVAL-3d — тесты test_evaluation_gates_activation.py; детали в разделе M7; досчёт EVAL-3d 2026-09-19 (eligible=50, completed=50, overall insufficient_sample — приёмка §22.2 не пройдена) + слепая выборка для ручной проверки — ADR-0008; T7.20 quiesce-барьер online-активации (гонка EVAL-3d §10.5): committed admission-запись сессии (миграция 0022 + trigger на sessions) блокирует flip при in-flight сессии + carry-over на fenced commit (pending head + durable job на активном snapshot) — инвариант «нет claim'а с head только на superseded» при любом переплетении — тест test_quiesce_race.py, ADR-0009; T7.21 разбор E1 по EVAL-3d: корень 75% — окно фрагмента T7.16 (оба источника скачаны, куратор привязал один), 25% — неполное скачивание (группы B/C) → host-гейт покрытия названных вопросом источников (complete отклоняется до fetched/errored каждого, хост-пол бюджета, fail-closed + explainable report-audit; prompt explorer-v4 — подстраховка) — тесты test_source_coverage.py (9 unit + 5 scenario), ADR-0010; дробление куратором не чинится (1 случай, обоснование ADR-0010 §5); следующий прогон — новая заморозка, EVAL-3-freeze §11; T7.22 окно assertion-фрагмента (группа A, §6.4): замер 12 промахов (7 чинимы окном, 5 — точное значение отсутствует в источнике и честно не вернутся) → второе НЕПЕРЕСЕКАЮЩЕЕСЯ value-окно (позиция значения + термины вопроса, факт-зона 16k с затуханием, TOC-фильтр; терминальное окно T7.16 без изменений; фрагмент до 2×2000+5 символов, худшая пара evidence = 1287 токенов из 8192 — без вытеснения) — тесты test_assertion_window.py (+14, реальные страницы-фикстуры, по тесту на класс промаха), ADR-0011; оценка гейта 2 уточнена: T7.21+T7.22 → 22–24 supported (проходимость N≥20); следующий прогон — новая заморозка, EVAL-3-freeze §12; T7.23 совместимость структурированного вывода с движками, не принимающими часть ключевых слов JSON Schema (halogen): замер прямыми HTTP — движок halogen-flash-next отвергает ровно {format, pattern}, всё остальное (anyOf/$defs/$ref/enum/budgets/strict) принимает → профиль возможностей `LLMGatewayConfig.schema_profile` (env NOEZEMA_LLM_SCHEMA_PROFILE): "none" (default, байт в байт = текущее поведение, qwen36/EVAL-3d не тронут) / "halogen" (снимает {format, pattern} из схемы, уходящей движку; валидация ответа хостом — полной pydantic-моделью — НЕ ослаблена); fail-closed: HTTP 4xx → LLMRequestRejectedError (не ретраится, ≠ «модель недоступна»), audit `curator_error_kind = request_rejected` (мягкий отказ, сессия без знания); живая проверка реальной схемы CuratorProposal — движок принял (HTTP 200), model_validate OK; смена модели (halogen вместо qwen36) ломает сопоставимость с EVAL-3d сама по себе — решение о модели/прогоне за пользователем (EVAL-3-freeze §13) — тесты test_schema_compat.py (+8), test_llm_gateway.py (+6), test_schema_rejection_audit.py (2 scenario), ADR-0012); 2026-09-20 — решение пользователя: модель halogen-flash-next (Qwen3.8 Flash Next, `.hgn`) + профиль схемы halogen (env noezema-llm.env); подготовлена заморозка EVAL-4 (НЕ запущено): новый код HEAD ff59dbf (T7.19–T7.23), новые payload'ы config-v4/v5-payload.json (diff ровно 1 строка — context_window 262144 = измеренный предел движка, validate()==[], rules_hash как у v2/v3), корпус v2 без изменений, замеренные пределы движка (контекст 262144, max_tokens без потолка до 32768) и оценка N под halogen (n=3, планировочный диапазон) — docs/eval/EVAL-4-freeze.md; решение о запуске и объёме серии — за пользователем); T7.24 обрыв EVAL-4 (2026-09-21, 15 сессий + обрыв на 16-й): commit-boundary dead end — `hostctl reconcile-tick` (точка входа примирителя M2: fenced row-lock, живой finalizer ≠ rollback, transient → retry с backoff; worker-цикл теперь reassessment-tick + reconcile-tick), staging-последовательность (миграция 0023 — корень обрыва: claim→evidence-пара перепутывалась UUID-порядком при константной created_at phase-1-транзакции) и known rollback из final-транзакции → детерминированное terminal `failed (commit_boundary_error)` (§6.5/§6.7), не зависание сессии — тесты test_reconciler.py (+1), test_commit_boundary.py (2), test_memory_service.py (+1), детали в разделе M7) | noezema-m7 (на `2e1631c`) | см. раздел M7 ниже | 831 тест |
+| M7 полный веб + эксплуатация | ✅ Gate M7 пройден (T7.1 ✅ knowledge graph + provenance + diagnostics; T7.2 ✅ backup/PITR §15.3; T7.3 ✅ GC full root set; T7.4 ✅ security regression gate + §16 metrics; T7.5 ✅ evaluation run §22.2 mechanism; T7.6 ✅ ADR-0004); после gate — дефекты EVAL-3b/EVAL-3: T7.7–T7.20 закрыты (T7.15 E2E-валидация, T7.16 assertion-окно, T7.17 хост-деривация scope, rules-v2, ADR-0007; T7.18 относительная опорная дата «на текущую дату» = дата сессии по часам хоста, уточнение ADR-0007 — тесты test_scope.py / test_rules_engine.py / test_scope_coverage.py; T7.19 гейты считают ровно один head на claim — head активного snapshot по указателю runtime_config_heads (§14.1), дефект учёта дублей после mid-run активации EVAL-3d — тесты test_evaluation_gates_activation.py; детали в разделе M7; досчёт EVAL-3d 2026-09-19 (eligible=50, completed=50, overall insufficient_sample — приёмка §22.2 не пройдена) + слепая выборка для ручной проверки — ADR-0008; T7.20 quiesce-барьер online-активации (гонка EVAL-3d §10.5): committed admission-запись сессии (миграция 0022 + trigger на sessions) блокирует flip при in-flight сессии + carry-over на fenced commit (pending head + durable job на активном snapshot) — инвариант «нет claim'а с head только на superseded» при любом переплетении — тест test_quiesce_race.py, ADR-0009; T7.21 разбор E1 по EVAL-3d: корень 75% — окно фрагмента T7.16 (оба источника скачаны, куратор привязал один), 25% — неполное скачивание (группы B/C) → host-гейт покрытия названных вопросом источников (complete отклоняется до fetched/errored каждого, хост-пол бюджета, fail-closed + explainable report-audit; prompt explorer-v4 — подстраховка) — тесты test_source_coverage.py (9 unit + 5 scenario), ADR-0010; дробление куратором не чинится (1 случай, обоснование ADR-0010 §5); следующий прогон — новая заморозка, EVAL-3-freeze §11; T7.22 окно assertion-фрагмента (группа A, §6.4): замер 12 промахов (7 чинимы окном, 5 — точное значение отсутствует в источнике и честно не вернутся) → второе НЕПЕРЕСЕКАЮЩЕЕСЯ value-окно (позиция значения + термины вопроса, факт-зона 16k с затуханием, TOC-фильтр; терминальное окно T7.16 без изменений; фрагмент до 2×2000+5 символов, худшая пара evidence = 1287 токенов из 8192 — без вытеснения) — тесты test_assertion_window.py (+14, реальные страницы-фикстуры, по тесту на класс промаха), ADR-0011; оценка гейта 2 уточнена: T7.21+T7.22 → 22–24 supported (проходимость N≥20); следующий прогон — новая заморозка, EVAL-3-freeze §12; T7.23 совместимость структурированного вывода с движками, не принимающими часть ключевых слов JSON Schema (halogen): замер прямыми HTTP — движок halogen-flash-next отвергает ровно {format, pattern}, всё остальное (anyOf/$defs/$ref/enum/budgets/strict) принимает → профиль возможностей `LLMGatewayConfig.schema_profile` (env NOEZEMA_LLM_SCHEMA_PROFILE): "none" (default, байт в байт = текущее поведение, qwen36/EVAL-3d не тронут) / "halogen" (снимает {format, pattern} из схемы, уходящей движку; валидация ответа хостом — полной pydantic-моделью — НЕ ослаблена); fail-closed: HTTP 4xx → LLMRequestRejectedError (не ретраится, ≠ «модель недоступна»), audit `curator_error_kind = request_rejected` (мягкий отказ, сессия без знания); живая проверка реальной схемы CuratorProposal — движок принял (HTTP 200), model_validate OK; смена модели (halogen вместо qwen36) ломает сопоставимость с EVAL-3d сама по себе — решение о модели/прогоне за пользователем (EVAL-3-freeze §13) — тесты test_schema_compat.py (+8), test_llm_gateway.py (+6), test_schema_rejection_audit.py (2 scenario), ADR-0012); 2026-09-20 — решение пользователя: модель halogen-flash-next (Qwen3.8 Flash Next, `.hgn`) + профиль схемы halogen (env noezema-llm.env); подготовлена заморозка EVAL-4 (НЕ запущено): новый код HEAD ff59dbf (T7.19–T7.23), новые payload'ы config-v4/v5-payload.json (diff ровно 1 строка — context_window 262144 = измеренный предел движка, validate()==[], rules_hash как у v2/v3), корпус v2 без изменений, замеренные пределы движка (контекст 262144, max_tokens без потолка до 32768) и оценка N под halogen (n=3, планировочный диапазон) — docs/eval/EVAL-4-freeze.md; решение о запуске и объёме серии — за пользователем); T7.24 обрыв EVAL-4 (2026-09-21, 15 сессий + обрыв на 16-й): commit-boundary dead end — `hostctl reconcile-tick` (точка входа примирителя M2: fenced row-lock, живой finalizer ≠ rollback, transient → retry с backoff; worker-цикл теперь reassessment-tick + reconcile-tick), staging-последовательность (миграция 0023 — корень обрыва: claim→evidence-пара перепутывалась UUID-порядком при константной created_at phase-1-транзакции) и known rollback из final-транзакции → детерминированное terminal `failed (commit_boundary_error)` (§6.5/§6.7), не зависание сессии — тесты test_reconciler.py (+1), test_commit_boundary.py (2), test_memory_service.py (+1), детали в разделе M7); T7.25 переиспользование между днями относительной даты (2026-09-21): решение (а) — корректный fail-closed, НЕ дефект (E1 при переиспользовании после полуночи — честный ответ «состояние на завтра не подкреплено evidence вчера»; §6.4/§8.7 every(scope_covers_claim), §8.2/§8.6 — покрытие и freshness независимы; окна в спеке нет, rules_hash заморожен); код не тронут, «утренний старт» остался операционным (ADR-0007 уточнение T7.25); строка EVAL-4c (2026-09-21 19:06, остановлена через минуту — 7–9-часовой прогон пересёк бы 00:00 UTC) закрыта штатно как прерванная (compute_gates + finish_evaluation_run, noezema-eval4c, 0 сессий) — тест test_scope_coverage.py (+1), детали в разделе M7) | noezema-m7 (на `2e1631c`) | см. раздел M7 ниже | 832 тест |
 
 ## Gate M2 (§19, этап 2) — пройден (noezema-m2)
 
@@ -3142,6 +3142,102 @@ rollback, `database_unavailable`/`finalizer_in_progress` → retry c
 запущенный worker-инстанс не перезапущен (было бы трогание
 уликовой БД) — обновлённый `eval4-worker.sh` действует с следующего
 прогона. Перезапуск EVAL-4 — отдельное решение пользователя.
+
+### T7.25 — переиспользование между днями claim'а с относительной датой: решение (а) — корректный fail-closed, не дефект (ADR-0007, §3.7, §8.2, §8.6, §8.7, §11.3)
+
+**Вопрос** (выявлен при подготовке перезапуска EVAL-4, 2026-09-21):
+прогон на 69 сессий (7–9 ч по первому расчёту, 9,5–20 ч по
+пересчёту EVAL-4-freeze §3.2) практически неизбежно пересекает
+00:00 UTC. Для вопроса с относительной датой («на текущую дату»)
+опорная дата = дата сессии (T7.18); переиспользованный claim
+ре-деривирует scope по дате НОВОЙ сессии → evidence вчерашнего дня не
+покрывает новую опорную дату → E1. Дефект ли это?
+
+**Решение: (а) — корректный fail-closed. Код не тронут.** Вариант (б)
+(окно допуска вместо календарного дня) отклонён:
+- покрытие — предикат ПРЕДМЕТА, а не часы: §11.3 «Источник
+  поддерживает claim только в пределах scope и provenance», §8.7 —
+  правило задаёт «предикат покрытия claim scope», §6.4 — grade
+  считает rules engine по evidence set и их scope. Claim «X на день
+  N+1» не подкреплён evidence дня N — ровно как и в случае явной
+  даты (один и тот же предикат, fail-closed с T7.17); собственный
+  пример машиночитаемого правила в спеке: `every(scope_covers_claim)
+  == true` (§8.7) — по всем supporting-evidence;
+- хост-деривированная относительная дата и явная дата вопроса — один
+  и тот же вид входов (вопрос — единственный scope-якорь, ADR-0007):
+  асимметрия «строгая явная / оконная относительная» была бы
+  произвольной;
+- посылка (б) «устаревание уже обрабатывает due/stale» неверна: due/
+  stale — другой механизм, который grade НЕ меняет (§8.6 «Истечение
+  срока меняет freshness, но не confidence», §8.2 — confidence не
+  меняется «из-за одного течения времени»); claim может быть
+  одновременно E1 и fresh — два независимых поля (§20.3);
+- окно не имеет основания в полях правила §8.7 (kinds, счётчики,
+  AND/OR, предикат, max grade, volatility/reverify_after) и потребовало
+  бы нового поля `claim_type_rules` → сменy `rules_hash` — запрещено
+  для замороженных payload'ов config-v2…v5 (§22.2: пороги — только до
+  нового прогона с новой config version); окно из volatility (30 дней)
+  означало бы «на текущую дату» = E3 по 29-дневным данным — ровно то
+  смешение, которое §8.2/§8.6 запрещают;
+- вариант (в) (зафиксировать scope при создании / dedup с датой)
+  противоречит ADR-0007: follow-up «на текущую дату» в день N+1
+  получил бы claim о дне N — ответ «про вчера» на вопрос «про
+  сегодня».
+
+**Новое следствие (факт, не дефект)**, зафиксировано в ADR-0007
+уточнении: в прогоне, пересекающем полночь, относительный claim,
+созданный до полуночи и переиспользованный после, опускается до E1 и
+как правило остаётся на нём до конца прогона — idempotent-рифетч
+T7.11 не обновляет `sources.retrieved_at` для неизменённого контента
+(повторный фетч → тот же source-row и тот же identity_hash → dedup,
+без нового evidence), а предикат `every(...)` идёт по полному
+evidence-set (старая непокрывающая строка неизменяема и остаётся).
+Это ожидаемый и честный результат (EVAL-3-freeze §9.6: «провал гейта —
+результат», прогон не останавливается и не переигрывается) — и причина
+существования ограничения «старт утром UTC»: оно ОСТАЛОСЬ в чек-листе
+(EVAL-4-freeze §6 п.8) как операционное митигирование (снижает
+вероятность пересечения полуночи внутри серии), а не как
+исправление кода.
+
+**EVAL-4c** (2026-09-21 19:06 UTC, БД `noezema-eval4c`, код
+`defff9a`): запущен и остановлен через ~1 минуту — прогон на 69
+сессий (7–9 ч) пересёк бы 00:00 UTC, и запуск не соответствовал
+митигированию «утренний старт». Состояние на останов: 0 сессий, 0
+попыток, одна запись `session_admissions`, строка рана `running`.
+Строка закрыта **штатно как прерванная** — `compute_gates +
+finish_evaluation_run` (те же доменные сервисы, что в `_finish`
+драйвера; аналог закрытия EVAL-3c и draft2, EVAL-3-freeze §10.6;
+скрипт `/home/denis/dsh1/close-eval4c-run.py`): outcome
+`insufficient_sample` (все гейты insufficient_sample на 0 сессий,
+кроме `high_severity_incidents` = passed при 0 инцидентов),
+eligible=0, completed=0, finished_at 2026-09-21 19:34:52 UTC. Данные
+прогона не трогались; `noezema-eval4c` — улика, SELECT only.
+Детали — EVAL-4-freeze §8.
+
+**Тест**: `tests/scenario/test_scope_coverage.py::
+test_relative_date_reuse_next_day_same_evidence_stays_E1` — сценарий
+«claim с относительной датой создан 23:50 UTC в день N (E3/supported,
+assessed_scope.as_of = день N), переиспользован 00:10 UTC в день N+1
+с тем же evidence и без нового» → claim переиспользован (1 строка
+claims, 2 assessments), новая опорная — день N+1 (host-scope-v1),
+grade E1/hypothesis, причина scope_not_covered (НЕ independence —
+остальные требования E3-правила выполнены), head current/hypothesis,
+claim одновременно fresh (reverify_after в будущем — независимость
+механизмов покрытия и freshness). Регрессия T7.18 (модельный
+завтрашний `as_of` не сдвигает дату —
+`test_relative_date_model_as_of_tomorrow_reaches_E3`) и fail-closed
+для явной даты
+(`test_canonical_coverage_retrieved_before_as_of_fails_closed`,
+`test_source_retrieved_before_as_of_stays_E1`) — сохранены и
+пройдены.
+
+Не тронуто: код (`packages/memory/scope.py`, `service.py`,
+`rules_engine.py`), `rules-v2`/`rules_hash`, `claim_type_rules`,
+пороги §22.2, замороженные payload'ы config-v2…v5 и корпуса v2/v3
+(файловые и canonical-хэши перепроверены 2026-09-21: v2
+`2b22b417…`/`ffc98c9e…`, v3 `87278c77…`/`2e93889c…`, v4
+`74da16f9…`/`7ef0f579…`, v5 `87fcdb7c…`/`f9c23ba9…`, корпус v2
+`93c1a93a…`, v3 `20db6f0d…`), `ARCHITECTURE.md`.
 
 ### Корпус v3 (EVAL-4) — 2026-09-20
 

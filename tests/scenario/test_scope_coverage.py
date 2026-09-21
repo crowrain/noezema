@@ -152,10 +152,13 @@ async def _apply_claim(
     scope: dict[str, Any],
     claim_type: str = "external_fact",
     as_of: str | None = None,
+    session_created_at: datetime | None = None,
 ) -> None:
     """The commit boundary with a QUESTION attached to the session
     (the trusted scope anchor): staging ops + the real MemoryService
-    apply (the same code the fenced final transaction runs)."""
+    apply (the same code the fenced final transaction runs).
+    ``session_created_at`` (T7.25): the session's START on the host's
+    clock — the relative-date anchor (T7.18); None = the real now()."""
     engine = create_async_engine(scratch_url)
     factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
@@ -173,13 +176,28 @@ async def _apply_claim(
                 {"id": str(qid), "t": question_text},
             )
             sid = uuid.uuid4()
-            await db.execute(
-                text(
-                    "INSERT INTO sessions (id, state, config_snapshot_id, question_id, "
-                    "started_at) VALUES (:id, 'exploring', :c, :q, now())"
-                ),
-                {"id": str(sid), "c": str(snap.id), "q": str(qid)},
-            )
+            if session_created_at is not None:
+                await db.execute(
+                    text(
+                        "INSERT INTO sessions (id, state, config_snapshot_id, "
+                        "question_id, started_at, created_at) "
+                        "VALUES (:id, 'exploring', :c, :q, now(), :ca)"
+                    ),
+                    {
+                        "id": str(sid),
+                        "c": str(snap.id),
+                        "q": str(qid),
+                        "ca": session_created_at,
+                    },
+                )
+            else:
+                await db.execute(
+                    text(
+                        "INSERT INTO sessions (id, state, config_snapshot_id, question_id, "
+                        "started_at) VALUES (:id, 'exploring', :c, :q, now())"
+                    ),
+                    {"id": str(sid), "c": str(snap.id), "q": str(qid)},
+                )
             o_session = (
                 (await db.execute(select(ORMSession).where(ORMSession.id == sid)))
                 .scalars()
@@ -499,6 +517,233 @@ async def test_relative_date_model_as_of_tomorrow_reaches_E3(
     assert scope["scope_schema"] == "host-scope-v1"
     assert scope["as_of"] == datetime.now(UTC).date().isoformat()
     assert scope["source_domains"] == ["alpha.example", "beta.example"]
+
+
+# ── T7.25: cross-day reuse of a relative-date claim (decision (a)) ─────
+
+
+async def _apply_claim_reuse(
+    scratch_url: str,
+    *,
+    statement: str,
+    question_text: str,
+    scope: dict[str, Any],
+    claim_type: str = "temporal_fact",
+    as_of: str | None = None,
+    session_created_at: datetime,
+) -> None:
+    """The commit boundary of a REUSE session (T7.25): the model proposes
+    the SAME claim (dedup by statement+type) WITHOUT new evidence. The
+    host re-derives the claim scope from the session's QUESTION and the
+    session's date (T7.18) and re-assesses the claim against its FULL
+    existing evidence set (the same code the fenced final transaction
+    runs)."""
+    engine = create_async_engine(scratch_url)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with factory() as db, db.begin():
+            snap = (
+                (await db.execute(select(ORMConfigSnapshot).limit(1))).scalars().first()
+            )
+            assert snap is not None
+            qid = uuid.uuid4()
+            await db.execute(
+                text(
+                    "INSERT INTO questions (id, text, origin, priority, state) "
+                    "VALUES (:id, :t, 'seeded', 1, 'candidate')"
+                ),
+                {"id": str(qid), "t": question_text},
+            )
+            sid = uuid.uuid4()
+            await db.execute(
+                text(
+                    "INSERT INTO sessions (id, state, config_snapshot_id, "
+                    "question_id, started_at, created_at) "
+                    "VALUES (:id, 'exploring', :c, :q, now(), :ca)"
+                ),
+                {
+                    "id": str(sid),
+                    "c": str(snap.id),
+                    "q": str(qid),
+                    "ca": session_created_at,
+                },
+            )
+            o_session = (
+                (await db.execute(select(ORMSession).where(ORMSession.id == sid)))
+                .scalars()
+                .first()
+            )
+            assert o_session is not None
+            audit = AuditService(db)
+            staging = StagingService(HostReserveService.for_snapshot(snap))
+            service = MemoryService(snap)
+
+            claim_payload: dict[str, Any] = {
+                "statement": statement,
+                "claim_type": claim_type,
+                "scope": scope,
+            }
+            if as_of is not None:
+                claim_payload["as_of"] = as_of
+            proposal = CuratorProposal(
+                summary="Reuse of a known claim",
+                claims=[claim_payload],
+                evidence_links=[],
+                new_questions=[],
+            )
+            assert proposal.validate_against(0, questions_max=4) == []
+            await staging.record(
+                db, audit, o_session, "claim", claim_payload, proposed_claims=1
+            )
+            result = await service.apply_claim_staging(db, audit, o_session, [])
+            assert result.problems == (), f"commit boundary problems: {result.problems}"
+            assert result.claims_reused == 1, f"expected a reuse, got {result}"
+            assert result.evidence_added == 0
+            assert result.assessments == 1
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_relative_date_reuse_next_day_same_evidence_stays_E1(
+    migrated_db: tuple[str, Any], tmp_path: Path, fake_fetch: None
+) -> None:
+    """T7.25 (decision (a), ADR-0007 уточнение — NOT a defect): a
+    relative-date claim («на текущую дату») is created at 23:50 UTC of
+    day N with day-N evidence → E3 supported. Reused at 00:10 UTC of
+    day N+1 (a new session, the same question, NO new evidence): the
+    host re-derives the claim scope — the reference date is the NEW
+    session's date (T7.18). Yesterday's evidence predates the new
+    reference date and does not cover it: the SAME fail-closed
+    predicate as for an explicit date (a source retrieved before the
+    reference date cannot speak about it; the spec's rule is
+    ``every(scope_covers_claim) == true``, §8.7). The claim honestly
+    drops to E1 hypothesis (scope_not_covered): "the state as of day
+    N+1" is NOT supported by day-N evidence. Freshness is untouched —
+    §8.2/§8.6: expiry changes freshness, never the grade; the claim is
+    simultaneously E1 (scope) and fresh (reverify_after in the future):
+    the two mechanisms are independent, and the drop is NOT due/stale."""
+    scratch_url, _engine = migrated_db
+    store = FilesystemArtifactStore(tmp_path / "artifacts")
+    await _set_section(scratch_url, _section())
+
+    # day N 23:50 UTC → day N+1 00:10 UTC (yesterday → today, so
+    # reverify_after = as_of + 30d stays in the future)
+    now = datetime.now(UTC)
+    day_n = (now - timedelta(days=1)).date()
+    day_n1 = now.date()
+    assert day_n1 == day_n + timedelta(days=1)
+    t1 = datetime(day_n.year, day_n.month, day_n.day, 23, 50, tzinfo=UTC)
+    t2 = datetime(day_n1.year, day_n1.month, day_n1.day, 0, 10, tzinfo=UTC)
+
+    records = await _fetch_records(
+        scratch_url, store, ("http://alpha.example/apollo", "http://beta.example/landing")
+    )
+    # provenance: both sources were fetched at 23:50 of day N
+    await _update(scratch_url, f"UPDATE sources SET retrieved_at = '{t1.isoformat()}'")
+
+    # session 1 (day N 23:50): the claim is created, covered, E3
+    await _apply_claim(
+        scratch_url,
+        records,
+        statement="Ключевая ставка Банка России составляет 14,00%.",
+        question_text=QUESTION_KEY_RATE_RELATIVE,
+        scope={"объект": "ключевая ставка", "на дату": day_n.isoformat()},
+        claim_type="temporal_fact",
+        as_of=t1.isoformat(),
+        session_created_at=t1,
+    )
+    row = await _scalar(
+        scratch_url,
+        _assessment("Ключевая ставка Банка России%")
+        + " GROUP BY a.effective_grade, a.epistemic_status",
+    )
+    assert row is not None, "no assessment for the temporal claim"
+    assert row[0] == "E3", f"expected E3 on day N, got {row[0]}"
+    assert row[1] == "supported"
+    assessed = await _scalar(
+        scratch_url,
+        "SELECT a.assessed_scope FROM claim_assessments a "
+        "JOIN claims c ON c.id = a.claim_id "
+        "WHERE c.statement LIKE 'Ключевая ставка Банка России%'",
+    )
+    assert assessed is not None
+    assert dict(assessed[0])["as_of"] == day_n.isoformat()
+
+    # session 2 (day N+1 00:10): the SAME claim is reused, no new
+    # evidence — the reference date is now day N+1
+    await _apply_claim_reuse(
+        scratch_url,
+        statement="Ключевая ставка Банка России составляет 14,00%.",
+        question_text=QUESTION_KEY_RATE_RELATIVE,
+        scope={"объект": "ключевая ставка"},
+        claim_type="temporal_fact",
+        as_of=t2.isoformat(),
+        session_created_at=t2,
+    )
+
+    # the claim was REUSED (dedup by statement+type): one row, two
+    # assessments
+    n_claims = await _scalar(
+        scratch_url,
+        "SELECT count(*) FROM claims WHERE statement LIKE 'Ключевая ставка Банка России%'",
+    )
+    assert n_claims[0] == 1
+    n_assessments = await _scalar(
+        scratch_url,
+        "SELECT count(*) FROM claim_assessments a JOIN claims c ON c.id = a.claim_id "
+        "WHERE c.statement LIKE 'Ключевая ставка Банка России%'",
+    )
+    assert n_assessments[0] == 2
+
+    # the new assessment: E1 hypothesis; the re-derived reference is the
+    # NEW session's date — yesterday's evidence does not cover it
+    row = await _scalar(
+        scratch_url,
+        "SELECT a.assessed_scope FROM claim_assessments a "
+        "JOIN claims c ON c.id = a.claim_id "
+        "WHERE c.statement LIKE 'Ключевая ставка Банка России%' "
+        "AND a.effective_grade = 'E1'",
+    )
+    assert row is not None, "the reused claim must be assessed E1, not lifted"
+    scope = dict(row[0])
+    assert scope["scope_schema"] == "host-scope-v1"
+    assert scope["as_of"] == day_n1.isoformat()
+    assert scope["source_domains"] == ["alpha.example", "beta.example"]
+
+    # head: current / hypothesis — the claim is NOT served as supported
+    head = await _scalar(
+        scratch_url,
+        "SELECT h.assessment_state, h.epistemic_status "
+        "FROM claim_assessment_heads h JOIN claims c ON c.id = h.claim_id "
+        "WHERE c.statement LIKE 'Ключевая ставка Банка России%'",
+    )
+    assert head is not None
+    assert head[0] == "current" and head[1] == "hypothesis"
+
+    # the reason is the DATE (scope_not_covered), not independence or
+    # counts — the E3 rule's other requirements are met (two
+    # independent groups, two source_assertion)
+    reasons = await _scalar(
+        scratch_url,
+        "SELECT payload->'reasons' FROM audit_events "
+        "WHERE type = 'claim_assessed' AND payload->>'grade' = 'E1'",
+    )
+    assert reasons is not None
+    assert "scope_not_covered" in reasons[0]
+    assert "insufficient_independence" not in reasons[0]
+    assert "insufficient_evidence" not in reasons[0]
+
+    # freshness is UNTOUCHED: the claim is simultaneously E1 (scope) and
+    # fresh — the coverage failure is not due/stale (§8.2/§8.6)
+    fr = await _scalar(
+        scratch_url,
+        "SELECT c.freshness_status, c.reverify_after > now() FROM claims c "
+        "WHERE c.statement LIKE 'Ключевая ставка Банка России%'",
+    )
+    assert fr is not None
+    assert fr[0] == "fresh"
+    assert fr[1] is True
 
 
 async def _update(scratch_url: str, sql: str) -> None:
