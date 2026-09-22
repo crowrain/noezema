@@ -108,7 +108,7 @@ from __future__ import annotations
 
 import math
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal, get_args
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -124,14 +124,33 @@ _GRADE_CASE = (
     "WHEN 'E3' THEN 3 WHEN 'E4' THEN 4 ELSE 0 END"
 )
 
-#: direction of each ratio gate: "at_least" (pass when ratio >=
-#: threshold), "at_most" (pass when ratio <= threshold) or "below"
-#: (pass when ratio < threshold, STRICT). The spec wording decides the
-#: direction: ARCHITECTURE.md:2607 «due/stale time-sensitive claims
-#: <20%» is strictly less, so ``due_stale_time_sensitive`` is "below"
-#: (T7.28, ADR-0015: previously "at_most" — exactly 20% passed,
-#: changing the boundary outcome 6/30 from spec-failed to passed).
-_GATE_DIRECTION: dict[str, str] = {
+#: the CLOSED set of §22.2 comparison directions (ARCHITECTURE.md:
+#: 2602–2611): "at_least" (pass when ratio >= threshold), "at_most"
+#: (pass when ratio <= threshold) or "below" (pass when ratio <
+#: threshold, STRICT). Closed at the type level — mypy strict rejects
+#: any other value statically — and ``_gate()`` additionally fails
+#: closed with ``ValueError`` at runtime for a value that reached it
+#: untyped: there is no silent "at_most" default (T7.28, ADR-0015:
+#: the class of boundary mismatch where a misspelled direction
+#: silently flips the boundary outcome).
+GateDirection = Literal["at_least", "at_most", "below"]
+
+#: the same three values as a runtime set (derived from the Literal via
+#: ``get_args`` — one source of truth). ``_gate()`` validates against
+#: this and fails
+#: closed with ``ValueError`` for a value that reached it untyped —
+#: the type-level closure is the primary guard (mypy strict rejects
+#: any other value statically at the call site); there is no silent
+#: "at_most" default (T7.28, ADR-0015).
+_GATE_DIRECTIONS: frozenset[str] = frozenset(get_args(GateDirection))
+
+#: direction of each ratio gate (one of ``GateDirection``). The spec
+#: wording decides the direction: ARCHITECTURE.md:2607 «due/stale
+#: time-sensitive claims <20%» is strictly less, so
+#: ``due_stale_time_sensitive`` is "below" (T7.28, ADR-0015:
+#: previously "at_most" — exactly 20% passed, changing the boundary
+#: outcome 6/30 from spec-failed to passed).
+_GATE_DIRECTION: dict[str, GateDirection] = {
     "new_supported_refuted_e2": "at_least",
     "external_temporal_e3": "at_least",
     "eligible_sessions_with_outcome": "at_least",
@@ -213,9 +232,26 @@ def _gate(
     numerator: int,
     denominator: int,
     threshold: float,
-    direction: str,
+    direction: GateDirection,
+    gate_name: str | None = None,
 ) -> dict[str, Any]:
-    """Apply the three-outcome rule to one ratio gate."""
+    """Apply the three-outcome rule to one ratio gate.
+
+    ``gate_name`` (the gate's key in ``_GATE_DIRECTION``) is reported
+    in the ``ValueError`` for an unknown direction. A well-typed
+    ``GateDirection`` can never be unknown — the runtime check fails
+    closed for a value that reached ``_gate`` untyped (no silent
+    "at_most" default; T7.28, ADR-0015)."""
+    if direction not in _GATE_DIRECTIONS:
+        # a well-typed GateDirection can never fail this check (mypy
+        # strict rejects any other value statically at the call site);
+        # the guard fails closed for a value that reached _gate
+        # untyped — it must NOT silently become a non-strict "at_most"
+        name = f"gate {gate_name!r}: " if gate_name is not None else ""
+        raise ValueError(
+            f"{name}unknown gate direction {direction!r} "
+            "(expected 'at_least', 'at_most' or 'below')"
+        )
     base: dict[str, Any] = {
         "numerator": numerator,
         "denominator": denominator,
@@ -229,10 +265,11 @@ def _gate(
     ratio = numerator / denominator
     if direction == "at_least":
         ok = ratio >= threshold
-    elif direction == "below":  # strict: exactly at the threshold fails
-        ok = ratio < threshold
-    else:  # "at_most": exactly at the threshold passes
+    elif direction == "at_most":  # exactly at the threshold passes
         ok = ratio <= threshold
+    else:  # "below" — the only remaining member of the closed set;
+        # strict: exactly at the threshold fails
+        ok = ratio < threshold
     return {**base, "ratio": round(ratio, 4), "outcome": "passed" if ok else "failed"}
 
 
@@ -272,6 +309,7 @@ async def _gate_new_e2(db: AsyncSession, run: EvaluationRun) -> dict[str, Any]:
         denominator=total,
         threshold=th,
         direction=_GATE_DIRECTION["new_supported_refuted_e2"],
+        gate_name="new_supported_refuted_e2",
     )
 
 
@@ -302,6 +340,7 @@ async def _gate_external_e3(db: AsyncSession, run: EvaluationRun) -> dict[str, A
         denominator=total,
         threshold=th,
         direction=_GATE_DIRECTION["external_temporal_e3"],
+        gate_name="external_temporal_e3",
     )
 
 
@@ -334,6 +373,7 @@ async def _gate_sessions(db: AsyncSession, run: EvaluationRun) -> dict[str, Any]
         denominator=total,
         threshold=th,
         direction=_GATE_DIRECTION["eligible_sessions_with_outcome"],
+        gate_name="eligible_sessions_with_outcome",
     )
 
 
@@ -356,6 +396,7 @@ async def _gate_near_dup(db: AsyncSession, run: EvaluationRun) -> dict[str, Any]
         denominator=selected,
         threshold=th,
         direction=_GATE_DIRECTION["near_duplicate_questions"],
+        gate_name="near_duplicate_questions",
     )
 
 
@@ -404,6 +445,7 @@ async def _gate_reuse(db: AsyncSession, run: EvaluationRun) -> dict[str, Any]:
         denominator=total,
         threshold=th,
         direction=_GATE_DIRECTION["significant_claim_reuse"],
+        gate_name="significant_claim_reuse",
     )
 
 
@@ -439,6 +481,7 @@ async def _gate_due_stale(
         denominator=total,
         threshold=th,
         direction=_GATE_DIRECTION["due_stale_time_sensitive"],
+        gate_name="due_stale_time_sensitive",
     )
 
 
@@ -471,6 +514,7 @@ async def _gate_slo(db: AsyncSession, run: EvaluationRun) -> dict[str, Any]:
         denominator=total,
         threshold=1.0,
         direction=_GATE_DIRECTION["reassessment_slo"],
+        gate_name="reassessment_slo",
     )
     gate["slo_seconds"] = float(slo)
     return gate
@@ -559,6 +603,7 @@ async def _gate_blind_provenance(
         denominator=len(blind),
         threshold=th,
         direction=_GATE_DIRECTION["blind_provenance_path"],
+        gate_name="blind_provenance_path",
     )
 
 
@@ -633,6 +678,7 @@ async def _gate_blind_scope(
         denominator=len(blind),
         threshold=th,
         direction=_GATE_DIRECTION["blind_scope"],
+        gate_name="blind_scope",
     )
 
 
