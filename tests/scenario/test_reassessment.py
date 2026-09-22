@@ -283,9 +283,86 @@ async def test_worker_promotes_head_to_current(migrated_db: tuple[str, AsyncEngi
     )
     assert ev is not None and ev[0] == ACTOR and ev[1] == "E2"
 
+    # T7.27 (ADR-0014): the re-evaluated head's stored freshness follows
+    # the §8.6/T3.7 rule — computed_result (static, 90 days, no as_of)
+    # re-derives reverify_after = now + 90d → fresh
+    fr = await _scalar(
+        engine,
+        "SELECT c.freshness_status, c.reverify_after > now() "
+        "FROM claims c WHERE c.id = :c",
+        {"c": claim},
+    )
+    assert fr is not None and fr[0] == "fresh" and bool(fr[1])
+
     # a second run is a no-op (the job is terminal)
     out2 = await _run(engine)
     assert out2.processed == 0 and out2.deferred
+
+
+async def test_worker_reassessment_keeps_due_when_deadline_passed(migrated_db: tuple[str, AsyncEngine]) -> None:
+    """T7.27 (ADR-0014): reassessment does NOT contradict the freshness
+    rule — a claim re-evaluated by the worker with an as_of in the past
+    (reverify_after = as_of + 30d already passed) keeps the DUE status
+    after the head promotion. The rule is the shared pure function
+    (packages.memory.freshness) — the same one the gate and retrieval
+    evaluate."""
+    from datetime import UTC, datetime, timedelta
+
+    _, engine = migrated_db
+    claim = _u("2")
+    as_of = datetime(2026, 6, 1, tzinfo=UTC)  # reverify 2026-07-01 — passed
+    await _seed_claim(
+        engine, claim, "Ставка составляет 14 процентов",
+        claim_type="external_fact", state="pending",
+    )
+    await _scalar(
+        engine, "UPDATE claims SET as_of = :ao WHERE id = :c",
+        {"ao": as_of, "c": claim},
+    )
+    # external_fact allows source_assertion (NOT the computation kind of
+    # _seed_evidence) — one source, one group → E1/hypothesis
+    src = str(_u("a2"))
+    await _scalar(
+        engine,
+        "INSERT INTO sources (id, source_type, canonical_uri, retrieved_at) "
+        "VALUES (:s, 'external_url', :u, now())",
+        {"s": src, "u": "https://example.org/page"},
+    )
+    await _scalar(
+        engine,
+        "INSERT INTO evidence (id, claim_id, relation, evidence_kind, "
+        "identity_hash, scope, source_id, chunk_id) "
+        "VALUES (:id, :c, 'supports', 'source_assertion', :h, "
+        "CAST(:sc AS jsonb), :src, 'c1')",
+        {
+            "id": uuid.uuid4(),
+            "c": claim,
+            "h": "ev-2-h",
+            "sc": '{"domain": "example.org"}',
+            "src": src,
+        },
+    )
+    job = await _seed_job(engine, claim)
+
+    out = await _run(engine)
+    assert out.processed == 1 and out.completed == 1 and out.blocked == 0
+
+    st = await _job_state(engine, job)
+    assert st["status"] == "completed"
+    # the head is current again and the stored freshness follows the
+    # rule: reverify_after = as_of + 30d is in the past → due
+    row = await _scalar(
+        engine,
+        "SELECT c.freshness_status, c.reverify_after, h.assessment_state "
+        "FROM claims c JOIN claim_assessment_heads h "
+        f"ON h.claim_id = c.id AND h.config_snapshot_id = {SNAP_SUBQUERY} "
+        "WHERE c.id = :c",
+        {"c": claim},
+    )
+    assert row is not None
+    assert row[2] == "current"
+    assert row[1] == as_of + timedelta(days=30)
+    assert row[0] == "due"
 
 
 # ─── insufficient data → invalid + question ─────────────────────────────────

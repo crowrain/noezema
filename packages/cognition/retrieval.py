@@ -1,7 +1,11 @@
 """Claim retrieval for the context pack (T3.9, §5.4, §5.4.2).
 
 Hybrid search for the MVP: PostgreSQL full-text (``ts_rank``) +
-significance (grade level, confidence) + freshness + link to the question.
+significance (grade level, confidence) + freshness + link to the
+question. Freshness is evaluated PER CLAIM at the retrieval instant by
+the §8.6/T3.7 rule over ``reverify_after`` (T7.27, ADR-0014) — an
+overdue claim is never surfaced to the model's context as fresh,
+regardless of the stored ``claims.freshness_status`` cache.
 Embeddings are off in the bootstrap config (``embeddings.enabled=False``);
 pgvector would be an ADR-gated extension, not part of v1.
 
@@ -22,6 +26,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 
 from sqlalchemy import RowMapping, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -32,6 +37,7 @@ from packages.domain.models.enums import (
     EpistemicStatus,
     FreshnessStatus,
 )
+from packages.memory.freshness import freshness_status
 
 PENDING_LABEL = "[без действующей оценки: pending]"
 INVALID_LABEL = "[оценка недействительна: invalid]"
@@ -91,7 +97,7 @@ class RetrievalResult:
     pending_invalid: list[RetrievedClaim] = field(default_factory=list)
 
 
-def _row_to_claim(row: RowMapping, state: AssessmentState) -> RetrievedClaim:
+def _row_to_claim(row: RowMapping, state: AssessmentState, now: datetime) -> RetrievedClaim:
     label = ""
     if state is AssessmentState.PENDING:
         label = PENDING_LABEL
@@ -103,7 +109,13 @@ def _row_to_claim(row: RowMapping, state: AssessmentState) -> RetrievedClaim:
     significance = (grade.level if grade is not None else 0) * 0.15 + (
         row["confidence"] if row["confidence"] is not None else 0.0
     )
-    freshness = _FRESHNESS_SCORE.get(row["freshness_status"], 0.5)
+    # T7.27 (ADR-0014): freshness is the §8.6/T3.7 rule evaluated at the
+    # retrieval instant over reverify_after — NEVER the stored
+    # claims.freshness_status column (a display cache updated only by
+    # write paths; an overdue claim must not be surfaced as fresh to the
+    # model's context, regardless of whether a reassessment ran).
+    status = freshness_status(row["reverify_after"], now)
+    freshness = _FRESHNESS_SCORE.get(status.value, 0.5)
     score = relevance + significance + freshness
     raw_id = row["id"]
     claim_id = raw_id if isinstance(raw_id, uuid.UUID) else uuid.UUID(str(raw_id))
@@ -115,7 +127,7 @@ def _row_to_claim(row: RowMapping, state: AssessmentState) -> RetrievedClaim:
         epistemic_status=epistemic,
         grade=grade,
         confidence=row["confidence"],
-        freshness=FreshnessStatus(row["freshness_status"]),
+        freshness=status,
         relevance=relevance,
         score=score,
         label=label,
@@ -129,6 +141,7 @@ async def retrieve(
     snapshot_id: uuid.UUID,
     current_limit: int = 20,
     pending_limit: int = 5,
+    now: datetime | None = None,
 ) -> RetrievalResult:
     """Retrieve current + (separately) pending/invalid claims for the
     question, under the effective config snapshot (pointer equality,
@@ -137,7 +150,11 @@ async def retrieve(
     Matching is PARTIAL (a claim sharing any question word is a
     candidate), ranked by ``ts_rank`` + significance; the strict
     all-words AND of ``plainto_tsquery`` would drop near-misses.
+
+    ``now`` fixes the instant the §8.6/T3.7 freshness rule is applied
+    (T7.27, ADR-0014); defaults to the retrieval instant.
     """
+    ts = now or datetime.now(UTC)
     # Cross-lingual ranking (ADR-0006 rev): ``statement`` is indexed
     # with the ``russian`` config, ``search_statements`` (the
     # model-provided English renderings) with ``english``; a query in
@@ -147,7 +164,7 @@ async def retrieve(
     # that actually matched.
     query = text(
         """
-        SELECT c.id, c.statement, c.claim_type, c.freshness_status,
+        SELECT c.id, c.statement, c.claim_type, c.reverify_after,
                h.assessment_state, h.epistemic_status,
                a.effective_grade, a.confidence,
                GREATEST(
@@ -201,7 +218,7 @@ async def retrieve(
         if float(row["relevance"]) < MIN_RELEVANCE:
             continue  # float-noise "match" = no match
         state = AssessmentState(row["assessment_state"])
-        claim = _row_to_claim(row, state)
+        claim = _row_to_claim(row, state, ts)
         if state is AssessmentState.CURRENT:
             if claim.claim_id in protected:
                 continue  # open barrier ancestor protection (§8.6)

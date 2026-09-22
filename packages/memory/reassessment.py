@@ -61,7 +61,6 @@ from packages.domain.models.enums import (
     AssessmentState,
     AuditEventType,
     AuditVisibility,
-    FreshnessStatus,
     QuestionOrigin,
     ReassessmentJobStatus,
 )
@@ -81,6 +80,7 @@ from packages.memory.env_independence import (
     build_environment_independence_snapshot,
 )
 from packages.memory.evidence import rules_hash
+from packages.memory.freshness import freshness_status
 from packages.memory.rules_engine import (
     RULES_ENGINE_VERSION,
     EvaluatedEvidence,
@@ -575,11 +575,7 @@ async def _process_one_job(
     head_row.epistemic_status = result.epistemic_status.value
     head_row.prepared_by = "reassessment_worker"
     claim.reverify_after = reverify_after(result, claim.as_of, now)
-    claim.freshness_status = (
-        FreshnessStatus.FRESH.value
-        if now < claim.reverify_after
-        else FreshnessStatus.DUE.value
-    )
+    claim.freshness_status = freshness_status(claim.reverify_after, now).value
 
     job.status = ReassessmentJobStatus.COMPLETED.value
     job.completed_at = text("clock_timestamp()")  # type: ignore[assignment]

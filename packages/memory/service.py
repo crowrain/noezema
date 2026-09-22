@@ -58,6 +58,7 @@ from packages.memory.evidence import (
     session_environment_fields,
     source_assertion_identity,
 )
+from packages.memory.freshness import freshness_status
 from packages.memory.independence import registrable_domain
 from packages.memory.rules_engine import (
     ClaimTypeRule,
@@ -178,12 +179,9 @@ class MemoryService:
 
     def freshness_status(self, claim: ORMClaim, now: datetime) -> FreshnessStatus:
         """Expiry changes ONLY the freshness status (T3.7, §8.6) — never
-        the grade or confidence. valid_to=NULL means an open end."""
-        if claim.reverify_after is None:
-            return FreshnessStatus.UNKNOWN
-        if now < claim.reverify_after:
-            return FreshnessStatus.FRESH
-        return FreshnessStatus.DUE
+        the grade or confidence. Delegates to the pure rule
+        (``packages.memory.freshness``), the single source of truth."""
+        return freshness_status(claim.reverify_after, now)
 
     # ── T7.9: pre-commit proposal validation (EVAL-3b post-mortem P.2) ───
 
@@ -948,9 +946,13 @@ class MemoryService:
             head.epistemic_status = result.epistemic_status.value
             head.prepared_by = "session"
 
-        # freshness: reverify_after is derived, not a mutable clock
+        # freshness: reverify_after is derived, not a mutable clock; the
+        # stored status follows the §8.6/T3.7 rule — a claim committed
+        # with an as_of in the past (reverify_after already passed) is
+        # DUE, not FRESH (T7.27, EVAL-4d: the unconditional FRESH here
+        # kept every claim "fresh" until a reassessment flip ran)
         claim.reverify_after = reverify_after(result, claim.as_of, now)
-        claim.freshness_status = FreshnessStatus.FRESH.value
+        claim.freshness_status = self.freshness_status(claim, now).value
 
         await db.flush()
         await audit.record(

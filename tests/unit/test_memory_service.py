@@ -443,6 +443,106 @@ async def test_env_manifest_hash_is_content_addressed(migrated_db: Any) -> None:
 
 
 @pytest.mark.asyncio
+async def test_commit_stores_due_when_reverify_deadline_already_passed(migrated_db: Any) -> None:
+    """T7.27 (EVAL-4d, §8.6/T3.7): a claim committed with an as_of in
+    the past derives reverify_after in the past — the stored
+    freshness_status must be 'due' at the commit itself, not the
+    unconditional 'fresh' (which kept the claim "fresh" until an
+    activation flip triggered a reassessment — a process that in
+    EVAL-4d never ran, so the gate saw 0/28 due on 22/28 overdue).
+
+    Control: the same claim type with a recent as_of (deadline still
+    in the future) commits as 'fresh'."""
+    from datetime import UTC, datetime, timedelta
+
+    _url, engine = migrated_db
+    factory, sid = await _seed_session(engine)
+    snap = await _snapshot(engine)
+    source_id = await _seed_source(engine)
+
+    past_as_of = "1957-10-04T19:28:34+00:00"  # the EVAL-4d Sputnik-1 case
+    recent_as_of = (datetime.now(UTC) - timedelta(days=1)).isoformat()
+    await _record_staging(
+        engine,
+        sid,
+        [
+            (
+                "claim",
+                {
+                    "statement": "Спутник-1 запущен 4 октября 1957",
+                    "claim_type": "temporal_fact",
+                    "as_of": past_as_of,
+                    "scope": {},
+                },
+            ),
+            (
+                "claim",
+                {
+                    "statement": "Ставка ЦБ РФ на текущую дату",
+                    "claim_type": "temporal_fact",
+                    "as_of": recent_as_of,
+                    "scope": {},
+                },
+            ),
+            ("evidence", {"evidence_index": 0, "claim_index": 0, "relation": "supports"}),
+            ("evidence", {"evidence_index": 1, "claim_index": 1, "relation": "supports"}),
+        ],
+    )
+    records = [
+        _source_assertion_record(str(source_id), "o" * 64),
+        _source_assertion_record(str(source_id), "p" * 64),
+    ]
+
+    memory = MemoryService(snap)
+    async with factory() as db, transaction(db):
+        session = await db.get(ORMSession, sid)
+        assert session is not None
+        result = await memory.apply_claim_staging(db, AuditService(db), session, records)
+
+    assert result.claims_created == 2
+    assert result.assessments == 2
+    assert result.problems == ()
+
+    async with factory() as db:
+        rows = (
+            (
+                await db.execute(
+                    text(
+                        "SELECT statement, as_of, reverify_after, freshness_status "
+                        "FROM claims ORDER BY statement"
+                    )
+                )
+            )
+            .all()
+        )
+        assert len(rows) == 2
+        by_statement = {r[0]: r for r in rows}
+        # the past-as_of claim: reverify_after = as_of + 30d (past) and
+        # the stored status is DUE — the rule, not a write-time constant
+        past = by_statement["Спутник-1 запущен 4 октября 1957"]
+        assert past[2] is not None and past[2] < datetime.now(UTC)
+        assert past[2] == past[1] + timedelta(days=30)
+        assert past[3] == "due"
+        # control: recent as_of → deadline in the future → fresh
+        recent = by_statement["Ставка ЦБ РФ на текущую дату"]
+        assert recent[2] is not None and recent[2] > datetime.now(UTC)
+        assert recent[3] == "fresh"
+        # and the claim view (read path) agrees with the stored value
+        claims = (
+            (
+                await db.execute(select(ORMClaim).order_by(ORMClaim.statement))
+            )
+            .scalars()
+            .all()
+        )
+        assert [c.statement for c in claims] == list(by_statement)
+        past_view = await memory.claim_view(db, claims[0].id)
+        recent_view = await memory.claim_view(db, claims[1].id)
+        assert past_view is not None and past_view.freshness is FreshnessStatus.DUE
+        assert recent_view is not None and recent_view.freshness is FreshnessStatus.FRESH
+
+
+@pytest.mark.asyncio
 async def test_apply_claim_staging_uses_recording_order_not_uuid_order(migrated_db: Any) -> None:
     """T7.24 (EVAL-4 abort 2026-09-21 — the root cause).
 

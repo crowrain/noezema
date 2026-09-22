@@ -36,8 +36,15 @@ Gate definitions (fixed here; see ADR-0005 for the operational run):
    distinct sessions via evidence / revisions / dependencies
    (threshold ≥0.25).
 6. ``due_stale_time_sensitive`` — of the current
-   ``temporal_fact`` claims, the share with freshness
-   ``due | stale`` (threshold <0.20, direction: at most).
+   ``temporal_fact`` claims, the share whose freshness, evaluated at
+   the gate-computation instant by the §8.6/T3.7 rule
+   (``packages.memory.freshness.freshness_status`` over
+   ``reverify_after``, NOT the stored ``claims.freshness_status``
+   column), is ``due`` (``now >= reverify_after``; a NULL
+   ``reverify_after`` is ``unknown`` and never counts as due — T7.27,
+   ADR-0014: the gate measures the real state at computation time and
+   does not depend on whether a background reassessment/activation
+   flip ever ran). Threshold <0.20, direction: at most.
 7. ``reassessment_slo`` — of the completed reassessment jobs, the
    share that completed within the fixed wall-clock SLO (``thresholds.
    reassessment_slo_seconds``; blocked jobs have an alert and are
@@ -98,6 +105,7 @@ ratios distorted) and the blind-gate per-claim queries raise
 from __future__ import annotations
 
 import math
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import text
@@ -130,16 +138,22 @@ _GATE_DIRECTION: dict[str, str] = {
 
 
 async def compute_gates(
-    db: AsyncSession, *, run: EvaluationRun
+    db: AsyncSession, *, run: EvaluationRun, now: datetime | None = None
 ) -> dict[str, dict[str, Any]]:
-    """Compute all 11 §22.2 gates for the run's session window."""
+    """Compute all 11 §22.2 gates for the run's session window.
+
+    ``now`` fixes the wall-clock instant the time-dependent gate
+    (``due_stale_time_sensitive``, the §8.6 freshness rule) is
+    evaluated at — a pure function of (domain data, ``now``); defaults
+    to the computation instant."""
+    ts = now or datetime.now(UTC)
     gates: dict[str, dict[str, Any]] = {}
     gates["new_supported_refuted_e2"] = await _gate_new_e2(db, run)
     gates["external_temporal_e3"] = await _gate_external_e3(db, run)
     gates["eligible_sessions_with_outcome"] = await _gate_sessions(db, run)
     gates["near_duplicate_questions"] = await _gate_near_dup(db, run)
     gates["significant_claim_reuse"] = await _gate_reuse(db, run)
-    gates["due_stale_time_sensitive"] = await _gate_due_stale(db, run)
+    gates["due_stale_time_sensitive"] = await _gate_due_stale(db, run, ts)
     gates["reassessment_slo"] = await _gate_slo(db, run)
     gates["current_pending_invalid_ancestor"] = await _gate_pending_ancestor(db)
     gates["high_severity_incidents"] = await _gate_incidents(db, run)
@@ -381,17 +395,32 @@ async def _gate_reuse(db: AsyncSession, run: EvaluationRun) -> dict[str, Any]:
     )
 
 
-async def _gate_due_stale(db: AsyncSession, run: EvaluationRun) -> dict[str, Any]:
+async def _gate_due_stale(
+    db: AsyncSession, run: EvaluationRun, now: datetime
+) -> dict[str, Any]:
+    """T7.27 (ADR-0014): the §8.6/T3.7 freshness rule evaluated at the
+    gate-computation instant over ``reverify_after`` — the same rule as
+    ``packages.memory.freshness.freshness_status`` (``now <
+    reverify_after`` → fresh; ``now >= reverify_after`` → due; NULL →
+    unknown, never counted). The stored ``claims.freshness_status``
+    column is NOT read: it is a display cache updated only by write
+    paths, and the gate must not depend on whether a background
+    reassessment (triggered by an activation flip) ever ran (EVAL-4d:
+    no flip, no reassessment, the column stayed 'fresh' for 22/28
+    overdue claims and the gate reported 0/28 passed)."""
     sql = f"""
         SELECT count(*),
-               count(*) FILTER (WHERE c.freshness_status IN ('due', 'stale'))
+               count(*) FILTER (
+                 WHERE c.reverify_after IS NOT NULL
+                   AND c.reverify_after <= :now
+               )
         FROM claims c
         JOIN claim_assessment_heads h
           ON h.claim_id = c.id AND h.assessment_state = 'current'
              AND h.config_snapshot_id = {EFFECTIVE_SNAPSHOT_SQL}
         WHERE c.claim_type = 'temporal_fact'
     """
-    total, due_stale = await _two(db, sql, {})
+    total, due_stale = await _two(db, sql, {"now": now})
     th = float(run.thresholds.get("due_stale_time_sensitive", 0.20))
     return _gate(
         numerator=due_stale,

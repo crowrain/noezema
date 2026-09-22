@@ -215,16 +215,29 @@ class _ActivationSeeder:
         session: uuid.UUID,
         side: str = "a",
         claim_row: bool = True,
+        reverify_after: datetime | None = None,
     ) -> uuid.UUID:
         """The claim row is shared per idx (one claim; ``claim_row``
         for the first side only); the assessment / evidence / source
         rows are per (claim, snapshot) side — the same claim gets a
         separate assessment per head, exactly like the online
-        activation's shadow heads + reassessment."""
+        activation's shadow heads + reassessment.
+
+        T7.27 (ADR-0014): the gate evaluates the §8.6 rule over
+        reverify_after, so the seeded rows stay self-consistent — when
+        ``reverify_after`` is not given it is derived from the stored
+        ``freshness`` (past for due/stale, future for fresh)."""
         cid = _uid(f"claim-{idx}")
         aid = _uid(f"assessment-{side}-{idx}")
         eid = _uid(f"evidence-{side}-{idx}")
         srcid = _uid(f"source-{side}-{idx}")
+        if reverify_after is None:
+            now = datetime.now(UTC)
+            reverify_after = (
+                now - timedelta(days=30)
+                if freshness in ("due", "stale")
+                else now + timedelta(days=30)
+            )
         if evidence:
             await self._exec(
                 "INSERT INTO sources (id, source_type, canonical_uri) "
@@ -234,9 +247,10 @@ class _ActivationSeeder:
         if claim_row:
             await self._exec(
                 "INSERT INTO claims (id, statement, claim_type, freshness_status, "
-                "created_in_session, observed_at) "
-                "VALUES (:id, :st, :ct, :f, :s, now())",
-                {"id": cid, "st": f"statement {idx}", "ct": ctype, "f": freshness, "s": session},
+                "created_in_session, observed_at, reverify_after) "
+                "VALUES (:id, :st, :ct, :f, :s, now(), :rv)",
+                {"id": cid, "st": f"statement {idx}", "ct": ctype, "f": freshness, "s": session,
+                 "rv": reverify_after},
             )
         await self._exec(
             "INSERT INTO claim_assessments (id, claim_id, effective_grade, "

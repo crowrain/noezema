@@ -154,6 +154,8 @@ class _Seeder:
         evidence_source: bool = True,
         source_exists: bool = True,
         freshness: str = "fresh",
+        as_of: datetime | None = None,
+        reverify_after: datetime | None = None,
     ) -> uuid.UUID:
         cid = _uid(f"claim-{idx}")
         aid = _uid(f"assessment-{idx}")
@@ -169,14 +171,16 @@ class _Seeder:
             )
         await self._exec(
             "INSERT INTO claims (id, statement, claim_type, freshness_status, "
-            "created_in_session, observed_at) "
-            "VALUES (:id, :st, :ct, :f, :s, now())",
+            "created_in_session, observed_at, as_of, reverify_after) "
+            "VALUES (:id, :st, :ct, :f, :s, now(), :ao, :rv)",
             {
                 "id": cid,
                 "st": f"claim statement {idx}",
                 "ct": ctype,
                 "f": freshness,
                 "s": session,
+                "ao": as_of,
+                "rv": reverify_after,
             },
         )
         await self._exec(
@@ -377,19 +381,31 @@ async def _seed_rich(engine: AsyncEngine) -> _Seeder:
             status="hypothesis",
             evidence_source=i >= 23,
         )
+    # T7.27 (ADR-0014): the gate evaluates the §8.6 rule over
+    # reverify_after, so the seeded rows are self-consistent with it —
+    # the stored freshness_status is the rule's output for the seeded
+    # reverify_after (the legacy rows set only the stored column).
+    gate_now = datetime.now(UTC)
     for i in range(24, 44):
         grade = "E3" if i < 43 else "E2"
         freshness = "fresh"
+        reverify: datetime | None
         if i in (40, 41):
             freshness = "due"
+            reverify = gate_now - timedelta(days=30)
         elif i == 42:
             freshness = "stale"
+            reverify = gate_now - timedelta(days=60)
+        else:
+            reverify = gate_now + timedelta(days=30)
         await s.add_claim(
             i,
             session=s.session_ids[i % 24],
             ctype="temporal_fact",
             grade=grade,
             freshness=freshness,
+            as_of=reverify - timedelta(days=30),
+            reverify_after=reverify,
         )
     # gate 5 (reuse): claims 0..12 get a second evidence from a
     # different session → 13/51 significant claims reused
@@ -543,6 +559,111 @@ async def test_gates_empty_db(migrated_db: tuple[str, AsyncEngine]) -> None:
     # the zero-count incident gate passes vacuously (no incidents)
     assert gates["high_severity_incidents"]["numerator"] == 0
     assert gates["high_severity_incidents"]["outcome"] == "passed"
+
+
+@pytest.mark.asyncio
+async def test_gates_due_stale_counts_expired_without_reassessment_or_flip(
+    migrated_db: tuple[str, AsyncEngine],
+) -> None:
+    """T7.27 (EVAL-4d, ADR-0014): the gate measures the §8.6/T3.7 rule
+    at the computation instant, from ``reverify_after`` — not the
+    stored ``freshness_status`` column.
+
+    The data state is exactly what EVAL-4d left behind: every current
+    temporal claim stores ``freshness_status='fresh'`` because the
+    v4→v5 flip never happened and no reassessment was ever triggered.
+    The gate must still count the expired claims — with NO
+    reassessment job in the queue and NO activation flip. A claim
+    stored 'due' whose deadline has not passed is NOT counted: the
+    gate follows the rule, never the display cache."""
+    _scratch, engine = migrated_db
+    run = await _mk_run(engine)  # default thresholds: due_stale 0.20
+    now = datetime(2026, 9, 22, 8, 0, tzinfo=UTC)
+    s = _Seeder(engine)
+    await s.setup()
+    # 17 within the deadline + 3 EXPIRED (the stored column says
+    # 'fresh' on all of them — the EVAL-4d state) + 1 stored 'due'
+    # but not yet expired + 1 without a deadline (unknown)
+    for i in range(17):
+        await s.add_claim(
+            i, session=None, ctype="temporal_fact",
+            as_of=now - timedelta(days=20), reverify_after=now + timedelta(days=10),
+        )
+    for i in range(17, 20):
+        await s.add_claim(
+            i, session=None, ctype="temporal_fact",
+            as_of=now - timedelta(days=50), reverify_after=now - timedelta(days=20),
+        )
+    await s.add_claim(
+        20, session=None, ctype="temporal_fact", freshness="due",
+        as_of=now - timedelta(days=20), reverify_after=now + timedelta(days=10),
+    )
+    await s.add_claim(
+        21, session=None, ctype="temporal_fact", freshness="unknown",
+        as_of=None, reverify_after=None,
+    )
+    # the state under test: no reassessment jobs at all, no flip
+    factory = async_sessionmaker(engine)
+    async with factory() as db:
+        assert (
+            await db.execute(text("SELECT count(*) FROM reassessment_jobs"))
+        ).scalar_one() == 0
+        head = (
+            await db.execute(
+                text(
+                    "SELECT activating_config_snapshot_id FROM "
+                    "runtime_config_heads WHERE scope = 'global'"
+                )
+            )
+        ).scalar_one()
+        assert head is None
+        gates = await compute_gates(db, run=run, now=now)
+
+    g6 = gates["due_stale_time_sensitive"]
+    # 3 expired of 22 current temporal claims — counted from
+    # reverify_after alone, 0.136 <= 0.20
+    assert g6["denominator"] == 22 and g6["numerator"] == 3
+    assert g6["ratio"] == 0.1364
+    assert g6["outcome"] == "passed"
+
+
+@pytest.mark.asyncio
+async def test_gates_due_stale_eval4d_shape(migrated_db: tuple[str, AsyncEngine]) -> None:
+    """T7.27 regression, the EVAL-4d form on synthetic data: 28 current
+    ``temporal_fact`` claims, 22 with ``reverify_after`` already in the
+    past — all 28 stored ``freshness_status='fresh'`` (no flip, no
+    reassessment). The legacy gate reported 0/28 ``passed``; the
+    rule-based gate must report 22/28 (0.7857 >= 0.20) → ``failed``.
+    The threshold (0.20) and direction (at most) are unchanged."""
+    _scratch, engine = migrated_db
+    run = await _mk_run(engine)
+    now = datetime(2026, 9, 22, 8, 0, tzinfo=UTC)
+    s = _Seeder(engine)
+    await s.setup()
+    # the 22 overdue ones (EVAL-4d: 16 model as_of-artifacts + 6
+    # by-design old-as_of questions) and the 6 within the deadline
+    for i in range(22):
+        await s.add_claim(
+            i, session=None, ctype="temporal_fact",
+            as_of=now - timedelta(days=30 + i),
+            reverify_after=now - timedelta(days=100 - i),
+        )
+    for i in range(22, 28):
+        await s.add_claim(
+            i, session=None, ctype="temporal_fact",
+            as_of=now - timedelta(days=10),
+            reverify_after=now + timedelta(days=20),
+        )
+    factory = async_sessionmaker(engine)
+    async with factory() as db:
+        gates = await compute_gates(db, run=run, now=now)
+
+    g6 = gates["due_stale_time_sensitive"]
+    assert g6["denominator"] == 28 and g6["numerator"] == 22
+    assert g6["ratio"] == 0.7857
+    assert g6["threshold"] == 0.20
+    assert g6["outcome"] == "failed"
+    assert "ci95" in g6  # §22.2: the interval is published with the gate
 
 
 @pytest.mark.asyncio

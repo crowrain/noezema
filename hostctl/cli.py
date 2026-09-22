@@ -1285,14 +1285,17 @@ def eval_run(
         async with factory() as db, db.begin():
             run = await get_evaluation_run(db, run_id)
             assert run is not None
-            gates = await compute_gates(db, run=run)
+            # one wall-clock instant for the gates (the §8.6 freshness
+            # rule, T7.27) and the run finish row
+            ts = datetime.now(UTC)
+            gates = await compute_gates(db, run=run, now=ts)
             finished = await finish_evaluation_run(
                 db,
                 run_id,
                 gates=gates,
                 eligible_sessions=completed,
                 completed_sessions=succeeded,
-                now=datetime.now(UTC),
+                now=ts,
             )
             click.echo(f"run finished: outcome={finished.outcome}")
             click.echo("gates (§22.2; ratio gates carry the 95% Wilson ci95):")
