@@ -38,7 +38,14 @@ full v1 acceptance» (Gate M7) требуют механизма, который
   `reassessment_slo_seconds: null` (зафиксировано до run оператором),
   `current_pending_invalid_ancestor: 0`,
   `high_severity_incidents: 0`, `blind_provenance_path: 0.90`,
-  `blind_scope: 0.80`.
+  `blind_scope: 0.80`. Направление сравнения каждого долевого гейта
+  задаёт формулировка спеки (`_GATE_DIRECTION`,
+  `packages/evaluation/gates.py`): «≥ X%»/«каждый» → `at_least`
+  (проход при `ratio >= threshold`), «≤ X%» → `at_most` (проход при
+  `ratio <= threshold`), «< X%» → `below`, **строго** (проход при
+  `ratio < threshold`) — `due_stale_time_sensitive`: спека говорит
+  «<20%» строго (`ARCHITECTURE.md:2607`), приведение кода к
+  спецификации — ADR-0015 (T7.28).
 - **gates** (jsonb): `{gate_name: {outcome, numerator, denominator, ...}}`.
   Каждый gate имеет один из трёх исходов §22.2: `passed` (порог
   достигнут на достаточной выборке), `failed` (порог не достигнут на

@@ -682,3 +682,403 @@ async def test_blind_sample_deterministic(migrated_db: tuple[str, AsyncEngine]) 
     # only claims with a CURRENT head enter the sample: the pending/
     # invalid heads (claims 44..46) are excluded
     assert len(s1) == min(50, len(seeder.claim_ids) - 3)
+
+
+# ---------------------------------------------------------------------------
+# T7.28 (ADR-0015): boundary tests — EVERY ratio gate exactly at its
+# §22.2 threshold and just off it. The spec wording (ARCHITECTURE.md:
+# 2602–2611) fixes the comparison direction per gate:
+#   «≥ X%» (at_least)  → exactly at the threshold PASSES;
+#   «≤ X%» (at_most)   → exactly at the threshold PASSES;
+#   «< X%» (below, due_stale_time_sensitive) → exactly at the threshold
+#   FAILS (strict: 6/30 = 0.200 → failed, 6/31 = 0.1935 → passed).
+# The Wilson-95 interval is pinned in every assertion: it is
+# reporting-only (§22.2) and must not change with the direction fix.
+# ---------------------------------------------------------------------------
+
+
+async def _gates(
+    engine: AsyncEngine, run: EvaluationRun, now: datetime | None = None
+) -> dict[str, dict[str, Any]]:
+    factory = async_sessionmaker(engine)
+    async with factory() as db:
+        return await compute_gates(db, run=run, now=now)
+
+
+@pytest.mark.asyncio
+async def test_gate1_new_e2_exactly_at_threshold_passes(
+    migrated_db: tuple[str, AsyncEngine],
+) -> None:
+    """g1 (at_least, spec «≥80%»): 16/20 = 0.80 exactly → passed."""
+    _scratch, engine = migrated_db
+    run = await _mk_run(engine, thresholds={"new_supported_refuted_e2": 0.80})
+    s = _Seeder(engine)
+    await s.setup()
+    for i in range(20):
+        await s.add_session(i, state="succeeded")
+        await s.add_claim(i, session=s.session_ids[i], grade="E2" if i < 16 else "E1")
+    g = (await _gates(engine, run))["new_supported_refuted_e2"]
+    assert (g["numerator"], g["denominator"]) == (16, 20)
+    assert g["ratio"] == 0.8
+    assert g["outcome"] == "passed"
+    assert g["ci95"] == {"low": 0.584, "high": 0.9193}
+
+
+@pytest.mark.asyncio
+async def test_gate1_new_e2_below_threshold_fails(
+    migrated_db: tuple[str, AsyncEngine],
+) -> None:
+    """g1 (at_least): 15/20 = 0.75 < 0.80 → failed."""
+    _scratch, engine = migrated_db
+    run = await _mk_run(engine, thresholds={"new_supported_refuted_e2": 0.80})
+    s = _Seeder(engine)
+    await s.setup()
+    for i in range(20):
+        await s.add_session(i, state="succeeded")
+        await s.add_claim(i, session=s.session_ids[i], grade="E2" if i < 15 else "E1")
+    g = (await _gates(engine, run))["new_supported_refuted_e2"]
+    assert (g["numerator"], g["denominator"]) == (15, 20)
+    assert g["ratio"] == 0.75
+    assert g["outcome"] == "failed"
+    assert g["ci95"] == {"low": 0.5313, "high": 0.8881}
+
+
+@pytest.mark.asyncio
+async def test_gate2_external_e3_exactly_at_threshold_passes(
+    migrated_db: tuple[str, AsyncEngine],
+) -> None:
+    """g2 (at_least, spec «каждый … выполняет E3» = 100%): 20/20 =
+    1.00 exactly → passed."""
+    _scratch, engine = migrated_db
+    run = await _mk_run(engine, thresholds={"external_temporal_e3": 1.00})
+    s = _Seeder(engine)
+    await s.setup()
+    for i in range(20):
+        await s.add_session(i, state="succeeded")
+        await s.add_claim(i, session=s.session_ids[i], ctype="external_fact", grade="E3")
+    g = (await _gates(engine, run))["external_temporal_e3"]
+    assert (g["numerator"], g["denominator"]) == (20, 20)
+    assert g["ratio"] == 1.0
+    assert g["outcome"] == "passed"
+    assert g["ci95"] == {"low": 0.8389, "high": 1.0}
+
+
+@pytest.mark.asyncio
+async def test_gate2_external_e3_below_threshold_fails(
+    migrated_db: tuple[str, AsyncEngine],
+) -> None:
+    """g2 (at_least): 19/20 = 0.95 < 1.00 → failed."""
+    _scratch, engine = migrated_db
+    run = await _mk_run(engine, thresholds={"external_temporal_e3": 1.00})
+    s = _Seeder(engine)
+    await s.setup()
+    for i in range(20):
+        await s.add_session(i, state="succeeded")
+        await s.add_claim(
+            i, session=s.session_ids[i], ctype="external_fact",
+            grade="E3" if i < 19 else "E2",
+        )
+    g = (await _gates(engine, run))["external_temporal_e3"]
+    assert (g["numerator"], g["denominator"]) == (19, 20)
+    assert g["ratio"] == 0.95
+    assert g["outcome"] == "failed"
+    assert g["ci95"] == {"low": 0.7639, "high": 0.9911}
+
+
+@pytest.mark.asyncio
+async def test_gate3_sessions_exactly_at_threshold_passes(
+    migrated_db: tuple[str, AsyncEngine],
+) -> None:
+    """g3 (at_least, spec «≥60%»): 12/20 = 0.60 exactly → passed.
+    Outcome = the question moved out of candidate (no evidence/revision)."""
+    _scratch, engine = migrated_db
+    run = await _mk_run(engine, thresholds={"eligible_sessions_with_outcome": 0.60})
+    s = _Seeder(engine)
+    await s.setup()
+    for i in range(20):
+        await s.add_session(
+            i, state="succeeded", qstate="verified" if i < 12 else "candidate"
+        )
+    g = (await _gates(engine, run))["eligible_sessions_with_outcome"]
+    assert (g["numerator"], g["denominator"]) == (12, 20)
+    assert g["ratio"] == 0.6
+    assert g["outcome"] == "passed"
+    assert g["ci95"] == {"low": 0.3866, "high": 0.7812}
+
+
+@pytest.mark.asyncio
+async def test_gate3_sessions_below_threshold_fails(
+    migrated_db: tuple[str, AsyncEngine],
+) -> None:
+    """g3 (at_least): 11/20 = 0.55 < 0.60 → failed."""
+    _scratch, engine = migrated_db
+    run = await _mk_run(engine, thresholds={"eligible_sessions_with_outcome": 0.60})
+    s = _Seeder(engine)
+    await s.setup()
+    for i in range(20):
+        await s.add_session(
+            i, state="succeeded", qstate="verified" if i < 11 else "candidate"
+        )
+    g = (await _gates(engine, run))["eligible_sessions_with_outcome"]
+    assert (g["numerator"], g["denominator"]) == (11, 20)
+    assert g["ratio"] == 0.55
+    assert g["outcome"] == "failed"
+    assert g["ci95"] == {"low": 0.3421, "high": 0.7418}
+
+
+@pytest.mark.asyncio
+async def test_gate4_near_dup_exactly_at_threshold_passes(
+    migrated_db: tuple[str, AsyncEngine],
+) -> None:
+    """g4 (at_most, spec «≤15%»): 3/20 = 0.15 exactly → passed."""
+    _scratch, engine = migrated_db
+    run = await _mk_run(engine, thresholds={"near_duplicate_questions": 0.15})
+    s = _Seeder(engine)
+    await s.setup()
+    for i in range(20):
+        await s.add_session(i, state="succeeded")
+    for i in range(3):
+        await s.add_repeat_cycle(s.session_ids[i], s.question_ids[i])
+    g = (await _gates(engine, run))["near_duplicate_questions"]
+    assert (g["numerator"], g["denominator"]) == (3, 20)
+    assert g["ratio"] == 0.15
+    assert g["outcome"] == "passed"
+    assert g["ci95"] == {"low": 0.0524, "high": 0.3604}
+
+
+@pytest.mark.asyncio
+async def test_gate4_near_dup_above_threshold_fails(
+    migrated_db: tuple[str, AsyncEngine],
+) -> None:
+    """g4 (at_most): 4/20 = 0.20 > 0.15 → failed."""
+    _scratch, engine = migrated_db
+    run = await _mk_run(engine, thresholds={"near_duplicate_questions": 0.15})
+    s = _Seeder(engine)
+    await s.setup()
+    for i in range(20):
+        await s.add_session(i, state="succeeded")
+    for i in range(4):
+        await s.add_repeat_cycle(s.session_ids[i], s.question_ids[i])
+    g = (await _gates(engine, run))["near_duplicate_questions"]
+    assert (g["numerator"], g["denominator"]) == (4, 20)
+    assert g["ratio"] == 0.2
+    assert g["outcome"] == "failed"
+    assert g["ci95"] == {"low": 0.0807, "high": 0.416}
+
+
+@pytest.mark.asyncio
+async def test_gate5_reuse_exactly_at_threshold_passes(
+    migrated_db: tuple[str, AsyncEngine],
+) -> None:
+    """g5 (at_least, spec «≥25%»): 5/20 = 0.25 exactly → passed.
+    Reused = referenced by ≥2 distinct sessions (own evidence + one
+    second-evidence row from a different session)."""
+    _scratch, engine = migrated_db
+    run = await _mk_run(engine, thresholds={"significant_claim_reuse": 0.25})
+    s = _Seeder(engine)
+    await s.setup()
+    for i in range(20):
+        await s.add_session(i, state="succeeded")
+        await s.add_claim(i, session=s.session_ids[i], grade="E2")
+    for i in range(5):
+        await s.add_second_evidence(i, s.session_ids[i + 1])
+    g = (await _gates(engine, run))["significant_claim_reuse"]
+    assert (g["numerator"], g["denominator"]) == (5, 20)
+    assert g["ratio"] == 0.25
+    assert g["outcome"] == "passed"
+    assert g["ci95"] == {"low": 0.1119, "high": 0.4687}
+
+
+@pytest.mark.asyncio
+async def test_gate5_reuse_below_threshold_fails(
+    migrated_db: tuple[str, AsyncEngine],
+) -> None:
+    """g5 (at_least): 4/20 = 0.20 < 0.25 → failed."""
+    _scratch, engine = migrated_db
+    run = await _mk_run(engine, thresholds={"significant_claim_reuse": 0.25})
+    s = _Seeder(engine)
+    await s.setup()
+    for i in range(20):
+        await s.add_session(i, state="succeeded")
+        await s.add_claim(i, session=s.session_ids[i], grade="E2")
+    for i in range(4):
+        await s.add_second_evidence(i, s.session_ids[i + 1])
+    g = (await _gates(engine, run))["significant_claim_reuse"]
+    assert (g["numerator"], g["denominator"]) == (4, 20)
+    assert g["ratio"] == 0.2
+    assert g["outcome"] == "failed"
+    assert g["ci95"] == {"low": 0.0807, "high": 0.416}
+
+
+@pytest.mark.asyncio
+async def test_gate6_due_stale_exactly_at_threshold_fails(
+    migrated_db: tuple[str, AsyncEngine],
+) -> None:
+    """g6 (below, spec «<20%» — STRICT, ADR-0015): 6/30 = 0.200 exactly
+    → failed. Under the pre-T7.28 direction (at_most, `ratio <=
+    threshold`) this data reported passed — the boundary outcome
+    changed, the threshold (0.20) did not."""
+    _scratch, engine = migrated_db
+    run = await _mk_run(engine, thresholds={"due_stale_time_sensitive": 0.20})
+    now = datetime(2026, 9, 22, 8, 0, tzinfo=UTC)
+    s = _Seeder(engine)
+    await s.setup()
+    for i in range(30):
+        # the 6 by-design overdue (reverify_after in the past) and the
+        # 24 within the deadline
+        await s.add_claim(
+            i, session=None, ctype="temporal_fact",
+            as_of=now - timedelta(days=31) if i < 6 else now - timedelta(days=10),
+            reverify_after=now - timedelta(days=1) if i < 6 else now + timedelta(days=20),
+        )
+    g = (await _gates(engine, run, now=now))["due_stale_time_sensitive"]
+    assert (g["numerator"], g["denominator"]) == (6, 30)
+    assert g["ratio"] == 0.2
+    assert g["threshold"] == 0.20
+    assert g["outcome"] == "failed"  # 0.200 is NOT < 0.20
+    assert g["ci95"] == {"low": 0.0951, "high": 0.3731}
+
+
+@pytest.mark.asyncio
+async def test_gate6_due_stale_just_below_threshold_passes(
+    migrated_db: tuple[str, AsyncEngine],
+) -> None:
+    """g6 (below): 6/31 = 0.1935 < 0.20 → passed — one more temporal
+    claim in the denominator is enough (the corpus-v3 pre-registration
+    N ≥ 31, EVAL-4-freeze §3.1)."""
+    _scratch, engine = migrated_db
+    run = await _mk_run(engine, thresholds={"due_stale_time_sensitive": 0.20})
+    now = datetime(2026, 9, 22, 8, 0, tzinfo=UTC)
+    s = _Seeder(engine)
+    await s.setup()
+    for i in range(31):
+        await s.add_claim(
+            i, session=None, ctype="temporal_fact",
+            as_of=now - timedelta(days=31) if i < 6 else now - timedelta(days=10),
+            reverify_after=now - timedelta(days=1) if i < 6 else now + timedelta(days=20),
+        )
+    g = (await _gates(engine, run, now=now))["due_stale_time_sensitive"]
+    assert (g["numerator"], g["denominator"]) == (6, 31)
+    assert g["ratio"] == 0.1935
+    assert g["threshold"] == 0.20
+    assert g["outcome"] == "passed"  # 0.1935 < 0.20
+    assert g["ci95"] == {"low": 0.0919, "high": 0.3628}
+
+
+@pytest.mark.asyncio
+async def test_gate7_slo_exactly_at_threshold_passes(
+    migrated_db: tuple[str, AsyncEngine],
+) -> None:
+    """g7 (at_least, spec «укладываются в SLO» = all completed jobs,
+    threshold 1.0): 20/20 = 1.00 exactly → passed."""
+    _scratch, engine = migrated_db
+    run = await _mk_run(engine, thresholds={"reassessment_slo_seconds": 3600})
+    s = _Seeder(engine)
+    await s.setup()
+    for i in range(20):
+        await s.add_claim(i, session=None)
+        await s.add_job(i, within_slo=True, claim=s.claim_ids[i])
+    g = (await _gates(engine, run))["reassessment_slo"]
+    assert (g["numerator"], g["denominator"]) == (20, 20)
+    assert g["ratio"] == 1.0
+    assert g["outcome"] == "passed"
+    assert g["slo_seconds"] == 3600.0
+    assert g["ci95"] == {"low": 0.8389, "high": 1.0}
+
+
+@pytest.mark.asyncio
+async def test_gate7_slo_below_threshold_fails(
+    migrated_db: tuple[str, AsyncEngine],
+) -> None:
+    """g7 (at_least): 19/20 = 0.95 < 1.00 (one job outside the SLO) →
+    failed."""
+    _scratch, engine = migrated_db
+    run = await _mk_run(engine, thresholds={"reassessment_slo_seconds": 3600})
+    s = _Seeder(engine)
+    await s.setup()
+    for i in range(20):
+        await s.add_claim(i, session=None)
+        await s.add_job(i, within_slo=i < 19, claim=s.claim_ids[i])
+    g = (await _gates(engine, run))["reassessment_slo"]
+    assert (g["numerator"], g["denominator"]) == (19, 20)
+    assert g["ratio"] == 0.95
+    assert g["outcome"] == "failed"
+    assert g["ci95"] == {"low": 0.7639, "high": 0.9911}
+
+
+@pytest.mark.asyncio
+async def test_gate10_blind_provenance_exactly_at_threshold_passes(
+    migrated_db: tuple[str, AsyncEngine],
+) -> None:
+    """g10 (at_least, spec «≥90%»): 18/20 = 0.90 exactly → passed
+    (2 sampled claims with a missing source row)."""
+    _scratch, engine = migrated_db
+    run = await _mk_run(
+        engine, thresholds={"blind_provenance_path": 0.90}, size=100
+    )
+    s = _Seeder(engine)
+    await s.setup()
+    for i in range(20):
+        await s.add_claim(i, session=None, source_exists=i < 18)
+    g = (await _gates(engine, run))["blind_provenance_path"]
+    assert (g["numerator"], g["denominator"]) == (18, 20)
+    assert g["ratio"] == 0.9
+    assert g["outcome"] == "passed"
+    assert g["ci95"] == {"low": 0.699, "high": 0.9721}
+
+
+@pytest.mark.asyncio
+async def test_gate10_blind_provenance_below_threshold_fails(
+    migrated_db: tuple[str, AsyncEngine],
+) -> None:
+    """g10 (at_least): 17/20 = 0.85 < 0.90 → failed."""
+    _scratch, engine = migrated_db
+    run = await _mk_run(
+        engine, thresholds={"blind_provenance_path": 0.90}, size=100
+    )
+    s = _Seeder(engine)
+    await s.setup()
+    for i in range(20):
+        await s.add_claim(i, session=None, source_exists=i < 17)
+    g = (await _gates(engine, run))["blind_provenance_path"]
+    assert (g["numerator"], g["denominator"]) == (17, 20)
+    assert g["ratio"] == 0.85
+    assert g["outcome"] == "failed"
+    assert g["ci95"] == {"low": 0.6396, "high": 0.9476}
+
+
+@pytest.mark.asyncio
+async def test_gate11_blind_scope_exactly_at_threshold_passes(
+    migrated_db: tuple[str, AsyncEngine],
+) -> None:
+    """g11 (at_least, spec «≥80%»): 16/20 = 0.80 exactly → passed
+    (4 sampled claims with an empty assessed_scope)."""
+    _scratch, engine = migrated_db
+    run = await _mk_run(engine, thresholds={"blind_scope": 0.80}, size=100)
+    s = _Seeder(engine)
+    await s.setup()
+    for i in range(20):
+        await s.add_claim(i, session=None, scope={} if i >= 16 else None)
+    g = (await _gates(engine, run))["blind_scope"]
+    assert (g["numerator"], g["denominator"]) == (16, 20)
+    assert g["ratio"] == 0.8
+    assert g["outcome"] == "passed"
+    assert g["ci95"] == {"low": 0.584, "high": 0.9193}
+
+
+@pytest.mark.asyncio
+async def test_gate11_blind_scope_below_threshold_fails(
+    migrated_db: tuple[str, AsyncEngine],
+) -> None:
+    """g11 (at_least): 15/20 = 0.75 < 0.80 → failed."""
+    _scratch, engine = migrated_db
+    run = await _mk_run(engine, thresholds={"blind_scope": 0.80}, size=100)
+    s = _Seeder(engine)
+    await s.setup()
+    for i in range(20):
+        await s.add_claim(i, session=None, scope={} if i >= 15 else None)
+    g = (await _gates(engine, run))["blind_scope"]
+    assert (g["numerator"], g["denominator"]) == (15, 20)
+    assert g["ratio"] == 0.75
+    assert g["outcome"] == "failed"
+    assert g["ci95"] == {"low": 0.5313, "high": 0.8881}

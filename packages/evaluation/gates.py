@@ -44,7 +44,9 @@ Gate definitions (fixed here; see ADR-0005 for the operational run):
    ``reverify_after`` is ``unknown`` and never counts as due — T7.27,
    ADR-0014: the gate measures the real state at computation time and
    does not depend on whether a background reassessment/activation
-   flip ever ran). Threshold <0.20, direction: at most.
+   flip ever ran). Threshold <0.20, direction: strictly below
+    (``ratio < threshold`` — the spec «<20%» is strict; T7.28,
+    ADR-0015: exactly 20% is ``failed``).
 7. ``reassessment_slo`` — of the completed reassessment jobs, the
    share that completed within the fixed wall-clock SLO (``thresholds.
    reassessment_slo_seconds``; blocked jobs have an alert and are
@@ -123,14 +125,19 @@ _GRADE_CASE = (
 )
 
 #: direction of each ratio gate: "at_least" (pass when ratio >=
-#: threshold) or "at_most" (pass when ratio <= threshold)
+#: threshold), "at_most" (pass when ratio <= threshold) or "below"
+#: (pass when ratio < threshold, STRICT). The spec wording decides the
+#: direction: ARCHITECTURE.md:2607 «due/stale time-sensitive claims
+#: <20%» is strictly less, so ``due_stale_time_sensitive`` is "below"
+#: (T7.28, ADR-0015: previously "at_most" — exactly 20% passed,
+#: changing the boundary outcome 6/30 from spec-failed to passed).
 _GATE_DIRECTION: dict[str, str] = {
     "new_supported_refuted_e2": "at_least",
     "external_temporal_e3": "at_least",
     "eligible_sessions_with_outcome": "at_least",
     "near_duplicate_questions": "at_most",
     "significant_claim_reuse": "at_least",
-    "due_stale_time_sensitive": "at_most",
+    "due_stale_time_sensitive": "below",
     "reassessment_slo": "at_least",
     "blind_provenance_path": "at_least",
     "blind_scope": "at_least",
@@ -220,7 +227,12 @@ def _gate(
     if denominator < MIN_SAMPLE:
         return {**base, "outcome": "insufficient_sample"}
     ratio = numerator / denominator
-    ok = ratio >= threshold if direction == "at_least" else ratio <= threshold
+    if direction == "at_least":
+        ok = ratio >= threshold
+    elif direction == "below":  # strict: exactly at the threshold fails
+        ok = ratio < threshold
+    else:  # "at_most": exactly at the threshold passes
+        ok = ratio <= threshold
     return {**base, "ratio": round(ratio, 4), "outcome": "passed" if ok else "failed"}
 
 
