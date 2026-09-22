@@ -601,3 +601,107 @@ EVAL-3-freeze §10.6, скрипт `/home/denis/dsh1/close-eval4c-run.py`):
 eligible=0, completed=0. Данные прогона не трогались (кроме штатного
 закрытия строки рана). БД `noezema-eval4c` остаётся уликой — SELECT
 только.
+
+## 9. EVAL-4d — 2026-09-21 20:33 UTC: флип не состоялся (T7.26)
+
+Прогон **EVAL-4d** (БД `noezema-eval4d` — улика, SELECT только; строка
+рана `ca5933c4-54e1-451e-91ff-faa23546e612`; код `375f759` (T7.25),
+payload v4, корпус v3 — строка рана: corpus_sha256 `20db6f0d…`,
+rules_hash `a0b78e2d…`, rules-v2) запущен 2026-09-21 в 20:33 UTC,
+завершён 2026-09-22 в 04:38 UTC, **outcome=failed** — не по сессиям, а
+потому что **mid-run флип v4→v5 не состоялся ни разу**.
+
+**Факты** (логи `/home/denis/dsh1/eval4d-logs/`, SELECT по
+`noezema-eval4d`):
+
+- все 69 сессий серии `succeeded`, failed = 0;
+- watchdog (`eval4d-watchdog.log`) начал попытки активации, когда
+  `et=20` (порог), в 2026-09-22 00:54:04 UTC;
+- до конца прогона — **442 попытки** `activate-online`, **все 442**
+  завершились `activate-online failed: active sessions present: 1`
+  (опрос ~каждые 30 с);
+- финальная строка watchdog'а: `run EVAL-4d finished (outcome=failed)
+  WITHOUT v3 activation`; гейт `reassessment_slo` без флипа задач не
+  получал (`significant_claim_reuse: failed 0/29`, остальной набор —
+  insufficient/structural, см. хвост `eval4d-run.log`).
+
+**Корневая причина** (по коду `375f759`; разбор — ADR-0013 §1):
+
+Спека §8.7.2 «Activation acquisition» замышляет quiesce как
+«activating pointer опубликован → новые admissions не проходят».
+Реализация `acquire_activation` (packages/memory/activation.py) делала
+проверку «нет активных сессий» **до** публикации pointer'а, в той же
+транзакции: pointer писался только если в момент проверки сессий ноль.
+А серийный eval-run (драйвер запускает следующую сессию сразу после
+предыдущей; admission-запись T7.20 коммитится до phase-1 tx) в момент
+проверки watchdog'а ВСЕГДА имеет одну активную сессию — окно между
+сессиями длится миллисекунды, опрос 30 с его не ловил. Pointer
+опубликовывался никогда → «quiesce через pointer» (scheduler
+`activation_slot_busy`, worker-deferral, отказ admission) не
+запускался → каждая попытка снова «active sessions present: 1».
+
+T7.20 (ADR-0009) закрыл гонку EVAL-3d (claim `8bbbb06a`) — барьер
+стал честным (in-flight сессия видна по committed `session_admissions`),
+но именно честность барьера + порядок «проверка до публикации»
+сделали mid-run активацию невозможной в серийном прогоне. Это дефект,
+исправленный T7.26.
+
+**Исправление (T7.26, ADR-0013)** — drain-протокол:
+
+1. Активация публикует **durable «намерение» (drain)**: fenced slot
+   (`runtime_config_heads.activating_config_snapshot_id` + lease)
+   **до** проверки «нет активных сессий»; candidate остаётся `draft`.
+   С этого момента scheduler отбивает wake (`activation_slot_busy`),
+   worker defer'ит батчи, а регистрация admission новой сессии
+   (orchestrator phase 0, head-lock) отклоняется
+   (`ActivationInFlightError` — сессия не стартовала).
+2. Активация **ожидает окно** между сессиями (bounded,
+   `drain_wait_seconds`, default 2400s): polling «active sessions +
+   живые admission-записи + unresolved attempts = 0» (истёкшие
+   admission-записи свипятся — T7.20). Окно найдено → flip (с
+   повторной quiesce-проверкой под head-lock в самой flip-tx).
+   Таймаут → намерение снято (slot очищен, candidate остаётся `draft`),
+   понятная ретраиваемая ошибка — следующая попытка публикует drain
+   заново.
+3. Инвариант T7.20 сохранён (и усилен): регистрация admission и flip
+   сериализованы head-lock'ом — запись либо учтена на flip'е (flip
+   заблокирован), либо отклонена при регистрации. Flip при живой
+   сессии невозможен. Крахнутый drain (`draft` + истёкший lease) не
+   держит допуск вечно (lease-aware slot-правило — аналог T7.20 sweep).
+   Тесты: `tests/scenario/test_activation_drain.py` (4 сценария),
+   `test_quiesce_race.py` (T7.20) — зелёные.
+
+**Как watchdog должен вызывать активацию с T7.26** (скрипт watchdog'а
+вне репо — обновить при следующем запуске):
+
+```
+noezemactl activate-online \
+  --payload docs/eval/config-v5-payload.json \
+  --reason "EVAL-4: mid-run v4->v5 (volatility temporal)" \
+  --drain-wait-seconds 2400
+```
+
+- `--drain-wait-seconds N` (default 2400 =
+  `packages.memory.activation.DEFAULT_DRAIN_WAIT_SECONDS`): бюджет
+  ожидания окна. 2400s покрывает худший случай (сессия до phase
+  deadline 1800s + 600s на её admission-lease); для eval-серии с
+  сессиями по ~5–15 мин любое значение от 600s работает.
+- Watchdog **не меняется в логике опроса**: та же частота (~30 с), тот
+  же порог `et=20`; каждая попытка теперь либо делает флип (окно
+  найдено за время drain-бюджета), либо завершается понятной ошибкой
+  «drain timed out … active sessions present: N» — намерение снято,
+  следующая попытка продолжает. Двойной drain одного и того же
+  candidate безопасен (resume: живой lease → lease обновляется,
+  без нового audit-события).
+- Драйвер `eval-run` (в репо, обновлён T7.26): skip reason
+  `activation_slot_busy` → ждать (10с-цикл, **без** 600s deadline —
+  drain ограничен в БД: drain-таймаут или истечение drain-lease),
+  серия не прерывается и это **не** `nonterminal_session`;
+  `ActivationInFlightError` из `run_session()` → сессия не стартовала
+  → повтор admission той же сессии (не failure, не в
+  `consecutive_failures`). `wake-tick`: `ActivationInFlightError` →
+  exit 0 (не failure — иначе копил бы backoff → auto-pause).
+- Запуск серии: «утренний старт» (§6, п.8) остаётся в силе; при
+  drain-механизме watchdog может вызывать `activate-online` с
+  `--drain-wait-seconds 2400` — флип пройдёт в первом же окне между
+  сессиями после порога `et=20`.

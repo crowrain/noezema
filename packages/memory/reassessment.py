@@ -154,12 +154,26 @@ def _as_uuid(raw: object) -> uuid.UUID:
 
 
 async def _head_row(db: AsyncSession) -> tuple[uuid.UUID, uuid.UUID | None] | None:
-    """Lock the global runtime head (first canonical row)."""
+    """Lock the global runtime head (first canonical row).
+
+    The returned ``activating`` is the EFFECTIVE slot (T7.26, ADR-0013):
+    a ``draft`` candidate with an EXPIRED lease is a crashed drain
+    intent — it no longer holds admission (the same lease-aware rule as
+    the scheduler and the session admission gate; the analogy of the
+    T7.20 sweep of expired admission records). A non-draft candidate
+    blocks regardless of the lease."""
     row = (
         await db.execute(
             text(
-                "SELECT active_config_snapshot_id, activating_config_snapshot_id "
-                "FROM runtime_config_heads WHERE scope = 'global' FOR UPDATE"
+                "SELECT h.active_config_snapshot_id, "
+                "CASE WHEN c.activation_state = 'draft' "
+                "AND h.activation_lease_expires_at IS NOT NULL "
+                "AND h.activation_lease_expires_at <= now() "
+                "THEN NULL ELSE h.activating_config_snapshot_id END "
+                "FROM runtime_config_heads h "
+                "LEFT JOIN config_snapshots c "
+                "ON c.id = h.activating_config_snapshot_id "
+                "WHERE h.scope = 'global' FOR UPDATE OF h"
             )
         )
     ).first()

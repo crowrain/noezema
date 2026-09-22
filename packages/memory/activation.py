@@ -1,4 +1,4 @@
-"""Online activation of a config snapshot (§8.7.2, T4.5).
+"""Online activation of a config snapshot (§8.7.2, T4.5; T7.26 drain).
 
 The fenced protocol for a LIVE system: the reassessment worker is a
 concurrent knowledge writer, so every step is a conditional write over
@@ -8,14 +8,34 @@ and the runtime head is the first canonical lock of every transaction.
 
 Protocol (one activating candidate per scope):
 
-  1. acquire: the exclusive ``knowledge_write_gate`` (waits for a
-     running worker batch to finish) + a fenced lease on
-     ``runtime_config_heads`` (the fence increases monotonically; a
-     recovery takeover bumps it — the old runner is fenced out of
-     every subsequent write);
+  0. DRAIN (T7.26, ADR-0013): the durable activation intent — the
+     fenced slot — is published FIRST (the candidate stays ``draft``:
+     ``slot set + draft`` is the drain phase), WITHOUT the quiesce
+     check. From that moment the admission gate rejects new sessions
+     (scheduler ``activation_slot_busy``; the session's own admission
+     registration takes the head lock and fails closed while the slot
+     is set), the worker defers batches, and the in-flight session —
+     the only one that can still be running — finishes on its own.
+     The activation then WAITS (bounded by ``drain_wait_seconds``) for
+     the window between sessions: zero active sessions, zero live
+     admission records (the T7.20 barrier; expired records are swept),
+     zero unresolved commit attempts. On timeout the intent is
+     cancelled (slot cleared, the candidate stays ``draft``) and a
+     clear error is raised — the next run re-publishes it. A crashed
+     drain must not hold admission forever: a ``draft`` candidate with
+     an EXPIRED lease is not a busy slot (the scheduler/worker checks
+     are lease-aware for draft — the analogy of the T7.20 sweep of
+     expired admission records).
+  1. confirm: the exclusive ``knowledge_write_gate`` (waits for a
+     running worker batch to finish — at the freeze moment no batch is
+     in flight and the slot defers new ones) + the candidate
+     ``draft → preparing_heads`` (the fenced lease was written by the
+     drain; the fence increases monotonically, a recovery takeover
+     bumps it — the old runner is fenced out of every subsequent
+     write);
   2. freeze the cohort + activation manifest against the knowledge
      revision (the worker is quiesced by the activating pointer from
-     step 1);
+     step 0);
   3. prepare shadow heads in bounded idempotent batches — an AFFECTED
      claim (its claim-type rule changed, or it has no current head
      under the base) gets a ``pending`` head + a durable reassessment
@@ -27,11 +47,14 @@ Protocol (one activating candidate per scope):
      the immutable seal (``state=ready``); the sealed-interval trigger
      then freezes the shadow heads;
   5. ``publishing`` → the atomic flip (ONE transaction): lock head →
-     knowledge, verify fence/lease/base pointer/complete seal/revision
-     equality, move the runtime pointer, candidate → ``post_publish``
-     (the manifest starts at cursor 0), the previous snapshot →
-     ``superseded`` (except the immutable bootstrap), knowledge
-     revision bump, audit + outbox;
+     knowledge, re-verify the quiesce under the head lock (T7.26: the
+     admission registration takes the same lock, so an admission is
+     either counted here — the flip is blocked — or rejected at
+     registration), verify fence/lease/base pointer/complete
+     seal/revision equality, move the runtime pointer, candidate →
+     ``post_publish`` (the manifest starts at cursor 0), the previous
+     snapshot → ``superseded`` (except the immutable bootstrap),
+     knowledge revision bump, audit + outbox;
   6. the post-publish manifest (deterministic UUIDv5 research
      questions for the pending heads) runs in bounded CAS batches —
      the slot stays held, so the worker and sessions remain quiesced;
@@ -39,12 +62,18 @@ Protocol (one activating candidate per scope):
      exhausted → ``post_publish_blocked`` + alert, pre-publish
      failure → ``failed``; the activating slot and lease clear and
      admission resumes. A terminal state with a non-empty slot is an
-     invariant violation, not a normal intermediate.
+     invariant violation, not a normal intermediate. A drain cancel
+     (step 0 timeout / gate wait timeout) is NOT a terminal state: the
+     slot clears and the candidate stays ``draft`` (the pre-publish
+     failure states of §8.7.2 start at ``preparing_heads``).
 
 Crash semantics: every step keys on the candidate state, so a
 repeated run resumes where the crash left it (same owner; an expired
-lease is a takeover with a fence bump). After terminal cleanup the
-slot is empty and the trusted repair runner completes a
+lease is a takeover with a fence bump). A crash in the drain phase
+leaves ``slot set + draft``: a live lease keeps the admission gate
+closed, an expired one does not (lease-aware, above); the next run
+takes over (fence bump) and continues the wait. After terminal
+cleanup the slot is empty and the trusted repair runner completes a
 ``post_publish_blocked`` manifest via the repair CAS (or closes it as
 ``superseded`` when a newer flip owns the pointer).
 """
@@ -110,6 +139,23 @@ DEFAULT_GATE_LEASE_SECONDS = 600
 DEFAULT_ACTIVATION_LEASE_SECONDS = 3600
 DEFAULT_GATE_WAIT_SECONDS = 900
 
+#: T7.26 (ADR-0013): the drain wait budget. Must cover the longest
+#: possible in-flight session: a session cannot outlive its phase
+#: deadline (the watchdog refuses renewals past it), and a CRASHED
+#: session's admission record expires at phase_deadline + the T7.20
+#: margin (600 s) and is swept — 2400 s = 1800 s phase deadline +
+#: 600 s margin covers both. The operator may pin a smaller value for
+#: a fast "no window right now" answer.
+DEFAULT_DRAIN_WAIT_SECONDS = 2400
+
+#: margin added to the drain wait for the slot lease at the drain
+#: publish (the lease must outlive the wait; a non-draft candidate
+#: blocks admission regardless of the lease)
+DRAIN_LEASE_MARGIN_SECONDS = 600
+
+#: the drain wait poll interval (jitter +0..1 s on top)
+DEFAULT_DRAIN_POLL_SECONDS = 1.0
+
 #: post-publish/repair retry budget when the snapshot does not pin one
 DEFAULT_MAX_ATTEMPTS = 78
 
@@ -117,6 +163,34 @@ DEFAULT_MAX_ATTEMPTS = 78
 class ActivationError(RuntimeError):
     """The online activation cannot proceed (fence mismatch, seal
     mismatch, preconditions, ...)."""
+
+
+class ActivationInFlightError(RuntimeError):
+    """T7.26 (ADR-0013): a session admission was rejected because an
+    activation (drain intent or pipeline) is in flight. The session did
+    NOT start (no session row, no admission record): the caller retries
+    its admission loop — it is a skip, not a failure and not a
+    ``nonterminal_session``."""
+
+
+def activation_slot_busy(*, state: str | None, lease: datetime | None) -> bool:
+    """T7.26 (ADR-0013): whether a SET slot holds admission.
+
+    A slot holding a ``draft`` candidate is a DRAIN intent — it holds
+    admission only while its lease is live: a crashed drain (expired
+    lease, dead publisher) must not hold admission forever, by analogy
+    with the T7.20 sweep of expired admission records. A non-draft
+    candidate is the pipeline in flight and blocks regardless of the
+    lease (recovery is the watchdog's takeover, as before). A set slot
+    with a missing lease or an unknown candidate is corrupt: fail
+    closed (busy)."""
+    if state is None:
+        return True  # set slot, candidate row missing — fail closed
+    if state != "draft":
+        return True
+    if lease is None:
+        return True
+    return lease > _now()
 
 
 def _validate_payload_budgets(requested_payload: dict[str, Any]) -> None:
@@ -416,27 +490,259 @@ async def upsert_online_candidate(
     return existing, False
 
 
-# ─── 1. acquire (fenced lease) ──────────────────────────────────────────────
+# ─── 1. acquire (drain → quiesce → confirm; fenced lease) ───────────────────
 
 
-async def acquire_activation(
+def _quiesce_counts_sql() -> str:
+    states_sql = ", ".join(repr(s) for s in ACTIVE_SESSION_STATES)
+    return states_sql
+
+
+async def _quiesce_counts(db: AsyncSession) -> tuple[int, int, int, int]:
+    """The quiesce counts (T7.20 barrier + T7.26 drain), to be run by a
+    transaction that ALREADY holds the runtime head lock. Returns
+    ``(active_sessions, live_admissions, unresolved_attempts,
+    swept)``: expired admission records are swept in the same
+    transaction (re-runnable — it rolls back with it)."""
+    states_sql = _quiesce_counts_sql()
+    active_sessions = (
+        await db.execute(
+            text(f"SELECT count(*) FROM sessions WHERE state IN ({states_sql})")
+        )
+    ).scalar_one()
+    swept = await sweep_expired_admissions(db)
+    live_admissions = await count_live_admissions(db)
+    unresolved = (
+        await db.execute(
+            text(
+                "SELECT count(*) FROM commit_attempts WHERE status IN "
+                "('prepared', 'reconciling')"
+            )
+        )
+    ).scalar_one()
+    return int(active_sessions), int(live_admissions), int(unresolved), swept
+
+
+async def publish_activation_drain(
     db: AsyncSession,
     audit: AuditService,
     *,
     candidate: ORMConfigSnapshot,
     owner: str = ACTOR,
     lease_seconds: int = DEFAULT_ACTIVATION_LEASE_SECONDS,
-    gate_wait_seconds: int = DEFAULT_GATE_WAIT_SECONDS,
+    drain_wait_seconds: int = DEFAULT_DRAIN_WAIT_SECONDS,
 ) -> int:
-    """Acquire the activation lease (§8.7.2, steps 1-5). Returns the
-    fence for every subsequent conditional write.
+    """Publish the durable activation intent — the DRAIN (T7.26,
+    §8.7.2, ADR-0013). ONE transaction: the fenced slot is written
+    WITHOUT the quiesce check — the intent must be visible before the
+    window between sessions appears, otherwise the next session's
+    admission is registered first and the window is lost (EVAL-4d).
 
-    Slot states: empty → acquire (fence+1, ``activation_acquired``);
+    The candidate stays ``draft``: ``slot set + draft`` is the drain
+    phase (no new lifecycle state). From this moment the scheduler
+    rejects wakes (``activation_slot_busy``), the worker defers
+    batches, and a session's admission registration (which takes the
+    head lock) fails closed while the slot is set (
+    ``ActivationInFlightError``).
+
+    Slot states: empty → publish (fence+1, ``activation_drain_published``);
     same candidate + same owner + LIVE lease → idempotent resume (the
-    fence is returned as-is, no new event); same candidate + EXPIRED
-    lease (own or foreign) → recovery takeover (fence+1,
-    ``activation_takeover`` — the old runner is fenced out); a foreign
-    candidate or a foreign LIVE lease → error."""
+    lease is refreshed, the fence is returned as-is, no new event);
+    same candidate + EXPIRED lease (own or foreign) → recovery takeover
+    (fence+1, ``activation_takeover`` — the old runner is fenced out);
+    a foreign candidate or a foreign LIVE lease → error.
+
+    The lease covers the drain wait plus a margin (a crashed drain must
+    not hold admission forever: a ``draft`` with an expired lease is
+    not a busy slot — ``activation_slot_busy``)."""
+    lease = max(lease_seconds, drain_wait_seconds + DRAIN_LEASE_MARGIN_SECONDS)
+    async with transaction(db):
+        head = await _lock_head(db)
+        if head is None:
+            raise ActivationError("global runtime head missing")
+        existing = _as_uuid(head.activating_config_snapshot_id)
+        fence: int
+        event: AuditEventType | None
+        if existing is None:
+            fence = int(head.activation_fence or 0) + 1
+            event = AuditEventType.ACTIVATION_DRAIN_PUBLISHED
+        elif (
+            existing == candidate.id
+            and head.activation_lease_owner == owner
+            and _lease_live(head)
+        ):
+            # idempotent resume: the drain (or the pipeline) is ours —
+            # refresh the lease so the wait can outlive a crash-restart
+            fence = int(head.activation_fence or 0)
+            event = None
+            head.activation_lease_expires_at = _now() + timedelta(seconds=lease)
+            await db.flush()
+        elif existing == candidate.id and not _lease_live(head):
+            # recovery takeover (own crash or a dead foreign owner):
+            # the fence bumps — the old runner is fenced out
+            fence = int(head.activation_fence or 0) + 1
+            event = AuditEventType.ACTIVATION_TAKEOVER
+        else:
+            raise ActivationError(
+                "activation slot busy (foreign candidate or live foreign lease)"
+            )
+
+        if event is not None:
+            head.activating_config_snapshot_id = candidate.id
+            head.activation_fence = fence
+            head.activation_lease_owner = owner
+            head.activation_lease_expires_at = _now() + timedelta(seconds=lease)
+            candidate.activation_mode = "online"
+            await db.flush()
+            await audit.record(
+                event,
+                actor=owner,
+                payload={
+                    "candidate_id": str(candidate.id),
+                    "base_snapshot_id": str(candidate.base_snapshot_id),
+                    "fence": fence,
+                    "scope": SCOPE,
+                    "drain_wait_seconds": drain_wait_seconds,
+                },
+                public_summary=(
+                    "online activation "
+                    f"{'lease taken over' if event is AuditEventType.ACTIVATION_TAKEOVER else 'drain published'} "
+                    f"(fence {fence}): {candidate.id}"
+                ),
+            )
+        return fence
+
+
+async def _cancel_activation_drain(
+    db: AsyncSession,
+    audit: AuditService,
+    *,
+    candidate: ORMConfigSnapshot,
+    fence: int,
+    owner: str,
+    reason: str,
+    active_sessions: int,
+    live_admissions: int,
+    unresolved_attempts: int,
+) -> None:
+    """Clear the drain intent (T7.26): ONE transaction — the slot and
+    lease clear, the candidate STAYS ``draft`` (the pipeline never
+    started: the pre-publish failure states of §8.7.2 start at
+    ``preparing_heads``, so there is no terminal state and no terminal
+    cleanup — the next run's upsert resumes the same candidate row and
+    re-publishes the drain). If the tuple no longer matches (a takeover
+    happened between the last poll and the cancel), the new owner's
+    slot is left untouched."""
+    async with transaction(db):
+        head = await _lock_head(db)
+        if head is None:
+            raise ActivationError("global runtime head missing")
+        if not _tuple_ok(head, candidate_id=candidate.id, fence=fence, owner=owner):
+            raise ActivationError(
+                "activation tuple changed during the drain cancel — the intent was "
+                "taken over; the new owner's slot is left untouched"
+            )
+        head.activating_config_snapshot_id = None
+        head.activation_lease_owner = None
+        head.activation_lease_expires_at = None
+        await db.flush()
+        await audit.record(
+            AuditEventType.ACTIVATION_DRAIN_CANCELLED,
+            actor=owner,
+            payload={
+                "candidate_id": str(candidate.id),
+                "base_snapshot_id": str(candidate.base_snapshot_id),
+                "fence": fence,
+                "reason": reason,
+                "active_sessions": active_sessions,
+                "live_admissions": live_admissions,
+                "unresolved_attempts": unresolved_attempts,
+            },
+            public_summary=(
+                f"activation drain cancelled ({reason}): {candidate.id}"
+            ),
+        )
+
+
+async def wait_activation_drain(
+    db: AsyncSession,
+    audit: AuditService,
+    *,
+    candidate: ORMConfigSnapshot,
+    fence: int,
+    owner: str = ACTOR,
+    wait_seconds: int = DEFAULT_DRAIN_WAIT_SECONDS,
+    poll_seconds: float = DEFAULT_DRAIN_POLL_SECONDS,
+) -> int:
+    """Wait for the quiesce window (T7.26, ADR-0013). Bounded by
+    ``wait_seconds``; each poll is a SHORT transaction that holds the
+    runtime head lock (the same lock the admission registration takes,
+    so a poll observing zero is sound against concurrent admissions)
+    and counts: active sessions + live admission records (the T7.20
+    barrier; expired records are swept) + unresolved commit attempts.
+
+    Returns the total number of admission records swept. On timeout the
+    intent is cancelled (slot cleared, candidate stays ``draft``) and
+    an ``ActivationError`` is raised — a clear, retryable error."""
+    deadline = time.monotonic() + wait_seconds
+    swept_total = 0
+    while True:
+        async with transaction(db):
+            head = await _lock_head(db)
+            if head is None:
+                raise ActivationError("global runtime head missing")
+            if not _tuple_ok(head, candidate_id=candidate.id, fence=fence, owner=owner):
+                raise ActivationError(
+                    "activation tuple changed during the drain wait — this runner "
+                    "is fenced out (takeover happened)"
+                )
+            active, live, unresolved, swept = await _quiesce_counts(db)
+        swept_total += swept
+        if active == 0 and live == 0 and unresolved == 0:
+            return swept_total
+        if time.monotonic() >= deadline:
+            await _cancel_activation_drain(
+                db,
+                audit,
+                candidate=candidate,
+                fence=fence,
+                owner=owner,
+                reason=f"drain_wait_timeout ({wait_seconds}s)",
+                active_sessions=active,
+                live_admissions=live,
+                unresolved_attempts=unresolved,
+            )
+            raise ActivationError(
+                f"drain timed out after {wait_seconds}s: "
+                f"active sessions present: {active + live}"
+            )
+        # the window appears when the in-flight session reaches its
+        # terminal state (the trigger releases its admission record in
+        # the same transaction) — poll with jitter, never past the
+        # deadline
+        await asyncio.sleep(
+            min(poll_seconds + random.uniform(0.0, 1.0), max(0.0, deadline - time.monotonic()))
+        )
+
+
+async def _confirm_drain(
+    db: AsyncSession,
+    audit: AuditService,
+    *,
+    candidate: ORMConfigSnapshot,
+    fence: int,
+    owner: str,
+    gate_wait_seconds: int,
+    swept: int,
+) -> None:
+    """The quiesce is reached: the old step 1 of §8.7.2 (the writer
+    gate — at the freeze moment no worker batch is in flight and the
+    slot defers new ones) + the candidate ``draft → preparing_heads``
+    (audit ``activation_acquired`` — the event the T7.20 tests read,
+    with the accumulated ``swept_admissions``). A gate wait timeout is
+    a DRAIN CANCEL, not a failure: the slot clears, the candidate stays
+    ``draft`` (the next run resumes it), as in the old protocol where
+    the gate wait preceded the slot write."""
     deadline = time.monotonic() + gate_wait_seconds
     while True:
         async with transaction(db):
@@ -450,6 +756,17 @@ async def acquire_activation(
         if got:
             break
         if time.monotonic() >= deadline:
+            await _cancel_activation_drain(
+                db,
+                audit,
+                candidate=candidate,
+                fence=fence,
+                owner=owner,
+                reason=f"gate_wait_timeout ({gate_wait_seconds}s)",
+                active_sessions=0,
+                live_admissions=0,
+                unresolved_attempts=0,
+            )
             raise ActivationError("could not acquire the writer gate before the deadline")
         # the gate is released when the running batch finishes — poll
         # with jitter (only a live foreign holder can keep it)
@@ -457,102 +774,100 @@ async def acquire_activation(
 
     try:
         async with transaction(db):
-            # the canonical lock order: runtime head → sessions →
-            # commit_attempts
             head = await _lock_head(db)
             if head is None:
                 raise ActivationError("global runtime head missing")
-            states_sql = ", ".join(repr(s) for s in ACTIVE_SESSION_STATES)
-            await db.execute(text(f"SELECT id FROM sessions WHERE state IN ({states_sql}) FOR UPDATE"))
-            active_sessions = (
-                await db.execute(
-                    text(f"SELECT count(*) FROM sessions WHERE state IN ({states_sql})")
+            if not _tuple_ok(head, candidate_id=candidate.id, fence=fence, owner=owner):
+                raise ActivationError(
+                    "activation tuple mismatch at the drain confirm — fenced out"
                 )
-            ).scalar_one()
-            await db.execute(
-                text(
-                    "SELECT id FROM commit_attempts WHERE status IN "
-                    "('prepared', 'reconciling') FOR UPDATE"
-                )
+            # the quiesce was verified by the last drain poll; re-verify
+            # under the head lock (belt and suspenders — the admission
+            # registration takes the same lock)
+            active, live, unresolved, swept_now = await _quiesce_counts(db)
+            if active + live > 0:
+                raise ActivationError(f"active sessions present: {active + live}")
+            if unresolved > 0:
+                raise ActivationError(f"unresolved commit attempts: {unresolved}")
+            if candidate.activation_state == "draft":
+                candidate.activation_state = "preparing_heads"
+            await db.flush()
+            await audit.record(
+                AuditEventType.ACTIVATION_ACQUIRED,
+                actor=owner,
+                payload={
+                    "candidate_id": str(candidate.id),
+                    "base_snapshot_id": str(candidate.base_snapshot_id),
+                    "fence": fence,
+                    "scope": SCOPE,
+                    "swept_admissions": swept + swept_now,
+                },
+                public_summary=f"online activation quiesced (fence {fence}): {candidate.id}",
             )
-            unresolved = (
-                await db.execute(
-                    text(
-                        "SELECT count(*) FROM commit_attempts WHERE status IN "
-                        "('prepared', 'reconciling')"
-                    )
-                )
-            ).scalar_one()
-            # T7.20 (§8.7.2, ADR-0009): the phase-1 visibility gap — a
-            # session admitted before the flip keeps its ``sessions`` row
-            # uncommitted until COMMITTING, so the count above misses it.
-            # The committed admission record is the barrier: sweep the
-            # expired ones (crashed sessions — they cannot commit
-            # knowledge, their own lease is dead) and count the live.
-            swept = await sweep_expired_admissions(db)
-            live_admissions = await count_live_admissions(db)
-            if int(active_sessions) + live_admissions > 0:
-                raise ActivationError(
-                    f"active sessions present: {int(active_sessions) + live_admissions}"
-                )
-            if int(unresolved) > 0:
-                raise ActivationError(f"unresolved commit attempts: {int(unresolved)}")
-
-            existing = _as_uuid(head.activating_config_snapshot_id)
-            fence: int
-            event: AuditEventType | None
-            if existing is None:
-                fence = int(head.activation_fence or 0) + 1
-                event = AuditEventType.ACTIVATION_ACQUIRED
-            elif (
-                existing == candidate.id
-                and head.activation_lease_owner == owner
-                and _lease_live(head)
-            ):
-                # idempotent resume: the lease is still ours
-                fence = int(head.activation_fence or 0)
-                event = None
-            elif existing == candidate.id and not _lease_live(head):
-                # recovery takeover (own crash or a dead foreign owner):
-                # the fence bumps — the old runner is fenced out
-                fence = int(head.activation_fence or 0) + 1
-                event = AuditEventType.ACTIVATION_TAKEOVER
-            else:
-                raise ActivationError(
-                    "activation slot busy (foreign candidate or live foreign lease)"
-                )
-
-            if event is not None:
-                head.activating_config_snapshot_id = candidate.id
-                head.activation_fence = fence
-                head.activation_lease_owner = owner
-                head.activation_lease_expires_at = _now() + timedelta(seconds=lease_seconds)
-                candidate.activation_mode = "online"
-                if candidate.activation_state == "draft":
-                    candidate.activation_state = "preparing_heads"
-                await db.flush()
-                await audit.record(
-                    event,
-                    actor=owner,
-                    payload={
-                        "candidate_id": str(candidate.id),
-                        "base_snapshot_id": str(candidate.base_snapshot_id),
-                        "fence": fence,
-                        "scope": SCOPE,
-                        "swept_admissions": swept,
-                    },
-                    public_summary=(
-                        "online activation lease "
-                        f"{'taken over' if event is AuditEventType.ACTIVATION_TAKEOVER else 'acquired'} "
-                        f"(fence {fence}): {candidate.id}"
-                    ),
-                )
-            return fence
     finally:
-        # the gate is released: new worker batches and sessions see the
-        # activating pointer and fail admission (quiesce)
         async with transaction(db):
             await release_writer_gate(db, owner_kind=OWNER_ACTIVATION, owner_id=owner)
+
+
+async def acquire_activation(
+    db: AsyncSession,
+    audit: AuditService,
+    *,
+    candidate: ORMConfigSnapshot,
+    owner: str = ACTOR,
+    lease_seconds: int = DEFAULT_ACTIVATION_LEASE_SECONDS,
+    gate_wait_seconds: int = DEFAULT_GATE_WAIT_SECONDS,
+    drain_wait_seconds: int = DEFAULT_DRAIN_WAIT_SECONDS,
+    drain_poll_seconds: float = DEFAULT_DRAIN_POLL_SECONDS,
+) -> int:
+    """Acquire the activation lease with the drain protocol (T7.26,
+    §8.7.2, ADR-0013). Returns the fence for every subsequent
+    conditional write.
+
+    1. ``publish_activation_drain`` — the durable intent (the fenced
+       slot; the candidate stays ``draft``); from this moment new
+       sessions, worker batches and admission registrations are
+       rejected/deferred;
+    2. ``wait_activation_drain`` — wait for the window between
+       sessions (bounded by ``drain_wait_seconds``); on timeout the
+       intent is cancelled and an ``ActivationError`` is raised;
+    3. ``_confirm_drain`` — the writer gate + ``draft →
+       preparing_heads`` (audit ``activation_acquired``).
+
+    A resume where the candidate is ALREADY past ``draft`` (a pipeline
+    crash with an expired lease) takes over the slot but skips the
+    drain wait — the quiesce was reached before the crash."""
+    fence = await publish_activation_drain(
+        db,
+        audit,
+        candidate=candidate,
+        owner=owner,
+        lease_seconds=lease_seconds,
+        drain_wait_seconds=drain_wait_seconds,
+    )
+    async with transaction(db):
+        await db.refresh(candidate)
+        past_drain = candidate.activation_state != "draft"
+    if not past_drain:
+        swept = await wait_activation_drain(
+            db,
+            audit,
+            candidate=candidate,
+            fence=fence,
+            owner=owner,
+            wait_seconds=drain_wait_seconds,
+            poll_seconds=drain_poll_seconds,
+        )
+        await _confirm_drain(
+            db,
+            audit,
+            candidate=candidate,
+            fence=fence,
+            owner=owner,
+            gate_wait_seconds=gate_wait_seconds,
+            swept=swept,
+        )
+    return fence
 
 
 # ─── 2-4. freeze / prepare / verify ─────────────────────────────────────────
@@ -835,6 +1150,23 @@ async def publish_online(
             raise ActivationError("pointer already moved but the candidate is not post_publish")
         if active != candidate.base_snapshot_id:
             raise ActivationError("active pointer is not the candidate base revision")
+        # T7.26 (§8.7.2, ADR-0013): re-verify the quiesce at the flip
+        # moment, under the head lock. The admission registration takes
+        # the SAME lock (orchestrator phase 0) and fails closed while
+        # the slot is set, so an admission is either counted here — the
+        # flip is blocked — or rejected at registration: a live session
+        # can never slip past the flip (the T7.20 invariant, ADR-0009:
+        # no claim with a head only on a superseded snapshot).
+        active_sessions, live_admissions, unresolved_attempts, _ = await _quiesce_counts(db)
+        if active_sessions + live_admissions > 0:
+            raise ActivationError(
+                f"active sessions present: {active_sessions + live_admissions} — "
+                "the flip is blocked (quiesce re-check at the flip moment)"
+            )
+        if unresolved_attempts > 0:
+            raise ActivationError(
+                f"unresolved commit attempts: {unresolved_attempts} — the flip is blocked"
+            )
         if not candidate.activation_heads_sha256 or candidate.activation_verified_head_count is None:
             raise ActivationError("verification seal missing")
         if int(candidate.activation_verified_head_count) != int(
@@ -1430,6 +1762,8 @@ async def run_online_change(
     owner: str = ACTOR,
     prepare_batch: int = DEFAULT_PREPARE_BATCH,
     gate_wait_seconds: int = DEFAULT_GATE_WAIT_SECONDS,
+    drain_wait_seconds: int = DEFAULT_DRAIN_WAIT_SECONDS,
+    drain_poll_seconds: float = DEFAULT_DRAIN_POLL_SECONDS,
 ) -> ActivationResult:
     """The full online change, crash-idempotent: every step keys on the
     candidate state, so a repeated run resumes where the crash left it
@@ -1439,7 +1773,13 @@ async def run_online_change(
     step manages its own bounded transaction. A pre-publish failure is
     a terminal cleanup with ``failed`` (re-raised); a post-publish
     backoff/blocked state is RETURNED (the repair runner or the next
-    run continues it)."""
+    run continues it).
+
+    ``drain_wait_seconds`` (T7.26, ADR-0013): the budget for the drain
+    wait — the bounded wait for the window between sessions. On
+    timeout the drain intent is cancelled (slot cleared, the candidate
+    stays ``draft``) and an ``ActivationError`` is raised; the next run
+    re-publishes the drain."""
     _validate_payload_budgets(requested_payload)
     async with transaction(db):
         head_row = (
@@ -1487,11 +1827,22 @@ async def run_online_change(
             and head.activation_lease_owner == owner
             and not _lease_live(head)
         )
-    if own_live:
+    if own_live and early_state != "draft":
+        # pipeline resume: the drain (the quiesce) was reached before
+        # the crash — just reuse the fenced slot
         fence = int(head.activation_fence or 0)
-    elif existing is None or own_dead:
+    elif existing is None or own_dead or (own_live and early_state == "draft"):
+        # a fresh run, a dead lease (self-takeover), or a crash restart
+        # DURING the drain (slot set + candidate still ``draft``):
+        # (re-)publish the drain intent and wait for the window (T7.26)
         fence = await acquire_activation(
-            db, audit, candidate=candidate, owner=owner, gate_wait_seconds=gate_wait_seconds
+            db,
+            audit,
+            candidate=candidate,
+            owner=owner,
+            gate_wait_seconds=gate_wait_seconds,
+            drain_wait_seconds=drain_wait_seconds,
+            drain_poll_seconds=drain_poll_seconds,
         )
     elif existing == candidate.id:
         # foreign owner — only a dead lease can be taken over
@@ -1500,7 +1851,13 @@ async def run_online_change(
                 "the candidate's activation lease is held by another live owner"
             )
         fence = await acquire_activation(
-            db, audit, candidate=candidate, owner=owner, gate_wait_seconds=gate_wait_seconds
+            db,
+            audit,
+            candidate=candidate,
+            owner=owner,
+            gate_wait_seconds=gate_wait_seconds,
+            drain_wait_seconds=drain_wait_seconds,
+            drain_poll_seconds=drain_poll_seconds,
         )
     else:
         raise ActivationError("another candidate is being activated")

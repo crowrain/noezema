@@ -48,6 +48,7 @@ from packages.domain.models.enums import AuditEventType, AuditVisibility, Sessio
 from packages.domain.models.wake import ORMWakeSchedulerState
 from packages.domain.services.audit import AuditService
 from packages.domain.services.config import ConfigService
+from packages.memory.activation import activation_slot_busy
 
 NODE_STATE_KEY = "node_state"
 NODE_OWNER_ENV = "NOEZEMA_NODE_OWNER"
@@ -455,15 +456,27 @@ class WakeScheduler:
         ).scalar_one()
         if int(unresolved) > 0:
             return False, REASON_UNRESOLVED_COMMIT
-        activating = (
+        # T7.26 (ADR-0013): the activation slot is lease-aware for a
+        # DRAFT candidate — a draft in the slot is a drain intent, and a
+        # crashed drain (expired lease) must not hold admission forever
+        # (the analogy of the T7.20 sweep of expired admission records).
+        # A non-draft candidate is the pipeline in flight and blocks
+        # regardless of the lease (recovery via the takeover, as before).
+        slot_row = (
             await self.db.execute(
                 text(
-                    "SELECT activating_config_snapshot_id FROM runtime_config_heads "
-                    "WHERE scope = 'global'"
+                    "SELECT h.activating_config_snapshot_id, c.activation_state, "
+                    "h.activation_lease_expires_at "
+                    "FROM runtime_config_heads h "
+                    "LEFT JOIN config_snapshots c "
+                    "ON c.id = h.activating_config_snapshot_id "
+                    "WHERE h.scope = 'global'"
                 )
             )
-        ).scalar_one_or_none()
-        if activating is not None:
+        ).first()
+        if slot_row is not None and slot_row[0] is not None and activation_slot_busy(
+            state=slot_row[1], lease=slot_row[2]
+        ):
             return False, REASON_ACTIVATION_SLOT
         # T4.4 (§5.9.1 liveness): the wake does not start while the oldest
         # runnable dependency-critical reassessment job is older than

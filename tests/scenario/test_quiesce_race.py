@@ -120,8 +120,13 @@ async def test_inflight_session_admission_blocks_activation(
     uncommitted) when the flip runs. Old code: the flip would pass the
     quiesce check (the row is invisible) and leave the later commit with
     a superseded-only head. New code: the live admission record blocks
-    the acquire; after the terminal state the trigger releases it and the
-    activation proceeds unchanged."""
+    the drain (T7.26: the activation waits for the window, hits the
+    bounded drain timeout, cancels the intent and fails — the flip does
+    NOT happen while the session is live); after the terminal state the
+    trigger releases the record and the activation proceeds unchanged.
+    ``drain_wait_seconds`` is pinned small so the bounded wait is a
+    fraction of a second (the meaning — the barrier blocks the flip —
+    is unchanged)."""
     _, engine = migrated_db
     try:
         await _seed_current_claims(engine, ["81"])
@@ -151,9 +156,12 @@ async def test_inflight_session_admission_blocks_activation(
                 ),
                 {"id": sid, "c": bootstrap},
             )
-            # the flip must be blocked while the row is invisible
+            # the flip must be blocked while the row is invisible (the
+            # live admission record holds the drain; bounded wait)
             with pytest.raises(act.ActivationError, match="active sessions present"):
-                await _run_online(engine, payload)
+                await _run_online(
+                    engine, payload, drain_wait_seconds=1, drain_poll_seconds=0.1
+                )
             assert (await _slot(engine))["activating"] is None
             assert await _pointer(engine) == bootstrap
 
@@ -171,7 +179,7 @@ async def test_inflight_session_admission_blocks_activation(
             await t1.commit()
 
         with pytest.raises(act.ActivationError, match="active sessions present"):
-            await _run_online(engine, payload)
+            await _run_online(engine, payload, drain_wait_seconds=1, drain_poll_seconds=0.1)
         assert await _admission_count(engine) == 1  # the record is still live
 
         # the session ends: the terminal state (one tx) releases the

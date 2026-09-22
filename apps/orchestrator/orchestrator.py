@@ -29,7 +29,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from apps.orchestrator.evidence import observation_to_evidence
@@ -111,6 +111,7 @@ from packages.llm_gateway.client import LLMError, LLMMiddleware, LLMRequestRejec
 from packages.llm_gateway.config import ModelProfile
 from packages.llm_gateway.fingerprint import build_model_fingerprint
 from packages.llm_gateway.roles import Role, load_prompt, tool_schema_hash
+from packages.memory.activation import ActivationInFlightError, activation_slot_busy
 from packages.memory.session_admission import register_session_admission
 from packages.policy.engine import PolicyEngine
 from packages.policy.profiles import CapabilityProfile, ProfileError, effective_profile
@@ -272,6 +273,39 @@ class Orchestrator:
         # shorter lease is dead; the activation sweeps expired rows).
         session_id = uuid.uuid4()
         async with self.session_factory() as db, transaction(db):
+            # ── T7.26 (§8.7.2, ADR-0013): the activation admission gate ─
+            # The canonical head lock FIRST (the same order as the
+            # activation's drain/flip transactions), then the
+            # activation-slot check: while the slot holds admission, a
+            # NEW admission is rejected — a wake granted on a stale read
+            # must not register a record after the drain was published.
+            # The flip re-check takes the SAME lock, so a record is
+            # either counted there (the flip is blocked) or rejected
+            # here: a live session can never slip past the flip (the
+            # T7.20 invariant, ADR-0009). A DRAFT candidate with an
+            # EXPIRED lease is a crashed drain — it no longer holds
+            # admission (lease-aware; the analogy of the T7.20 sweep of
+            # expired admission records).
+            slot_row = (
+                await db.execute(
+                    text(
+                        "SELECT h.activating_config_snapshot_id, "
+                        "c.activation_state, h.activation_lease_expires_at "
+                        "FROM (SELECT * FROM runtime_config_heads "
+                        "WHERE scope = 'global' FOR UPDATE) h "
+                        "LEFT JOIN config_snapshots c "
+                        "ON c.id = h.activating_config_snapshot_id"
+                    )
+                )
+            ).first()
+            if slot_row is not None and slot_row[0] is not None and activation_slot_busy(
+                state=slot_row[1], lease=slot_row[2]
+            ):
+                raise ActivationInFlightError(
+                    f"session admission rejected: an activation is in flight "
+                    f"(candidate {slot_row[0]}); the session did not start — "
+                    "retry the admission"
+                )
             active = await SessionRepository.list_nonterminal(db)
             if active:
                 raise RuntimeError(

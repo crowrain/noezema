@@ -463,6 +463,11 @@ class AuditEventType(StrEnum):
     # T4.5 (§8.7.2): the online activation lifecycle
     ACTIVATION_ACQUIRED = "activation_acquired"
     ACTIVATION_TAKEOVER = "activation_takeover"
+    # T7.26 (§8.7.2, ADR-0013): the drain phase — the durable activation
+    # intent (the fenced slot) is published BEFORE the quiesce check, so a
+    # serial session series gets a window between sessions
+    ACTIVATION_DRAIN_PUBLISHED = "activation_drain_published"
+    ACTIVATION_DRAIN_CANCELLED = "activation_drain_cancelled"
     ACTIVATION_PUBLISHED = "activation_published"
     ACTIVATION_POST_PUBLISH_BATCH = "activation_post_publish_batch"
     ACTIVATION_POST_PUBLISH_COMPLETED = "activation_post_publish_completed"
