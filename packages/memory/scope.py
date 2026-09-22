@@ -197,6 +197,48 @@ def extract_question_urls(text: str) -> tuple[str, ...]:
     return tuple(urls)
 
 
+def derive_claim_as_of(
+    *,
+    question: str | None,
+    as_of: datetime | None,
+    session_date: date | None = None,
+) -> datetime | None:
+    """The reference datetime of one claim row — HOST-DERIVED
+    (T7.30, ADR-0016). This is the single source of truth for the
+    reference date: the claim row's ``as_of`` (the base date of
+    ``reverify_after``, §8.6/§22.2) and the claim scope's reference
+    date (``derive_claim_scope``) are both derived by this function —
+    the same priority rule T7.18 uses for the scope, one function, no
+    copied logic.
+
+    Priority (T7.17, refined by T7.18 — ADR-0007; ADR-0016):
+    1. the date the QUESTION names explicitly (the operator's input,
+       trusted — leftmost valid match of the closed form set);
+    2. else, when the QUESTION anchors the date RELATIVELY (a closed
+       set: «на текущую дату», «сейчас», …) — the SESSION's date on
+       the host's trusted clock (``session_date``, UTC — the session
+       START, not the commit moment, ADR-0007 T7.18);
+    3. else (the question names no date at all, neither explicitly
+       nor relatively) — the claim's typed ``as_of`` (the model's
+       value; host-validated structure, not free-form; see ADR-0007,
+       уточнение T7.18).
+    The model's ``as_of`` can never shift the reference date of a
+    question that carries a date anchor (explicit or relative): with a
+    date anchor it is an audit-only value (staging payload + audit),
+    never stored on the claim row (ADR-0016).
+    """
+    day: date | None = None
+    if question:
+        day = parse_question_date(question)
+        if day is None and question_uses_relative_date(question) and session_date is not None:
+            day = session_date
+    if day is not None:
+        return datetime(day.year, day.month, day.day, tzinfo=UTC)
+    if as_of is not None:
+        return as_of if as_of.tzinfo is not None else as_of.replace(tzinfo=UTC)
+    return None
+
+
 def derive_claim_scope(
     *,
     question: str | None,
@@ -205,30 +247,20 @@ def derive_claim_scope(
 ) -> JsonDict:
     """The canonical scope of one claim (host-scope-v1).
 
-    - ``as_of``: the reference date, host-derived, in priority order
-      (T7.17, refined by T7.18 — ADR-0007):
-      1. the date the QUESTION names explicitly (the operator's input,
-         trusted — leftmost valid match of the closed form set);
-      2. else, when the QUESTION anchors the date RELATIVELY (a closed
-         set: «на текущую дату», «сейчас», …) — the SESSION's date on
-         the host's trusted clock (``session_date``, UTC);
-      3. else (the question names no date at all, neither explicitly
-         nor relatively) — the claim's typed ``as_of`` (host-validated
-         structure, not free-form; see ADR-0007, уточнение T7.18);
-      The model's ``as_of`` can never shift the reference date of a
-      question that carries a date anchor (explicit or relative): it is
-      stored on the claim row and in the staging/audit only.
+    - ``as_of``: the reference date — the DATE part of the host-derived
+      reference datetime (``derive_claim_as_of`` — the single source of
+      truth, shared with the claim row, ADR-0016):
+      1. the date the QUESTION names explicitly;
+      2. else, when the QUESTION anchors the date RELATIVELY — the
+         SESSION's date on the host's trusted clock (UTC);
+      3. else — the claim's typed ``as_of`` (the model's value,
+         host-validated structure).
     - ``source_domains``: the registrable domains of the sources the
       question names (empty = the question names no sources — no source
       constraint).
     """
-    day: date | None = None
-    if question:
-        day = parse_question_date(question)
-        if day is None and question_uses_relative_date(question) and session_date is not None:
-            day = session_date
-    if day is None and as_of is not None:
-        day = as_of.date() if as_of.tzinfo is None else as_of.astimezone(UTC).date()
+    reference = derive_claim_as_of(question=question, as_of=as_of, session_date=session_date)
+    day = reference.date() if reference is not None else None
     domains: list[str] = []
     if question:
         for url in extract_question_urls(question):

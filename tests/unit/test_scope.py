@@ -13,6 +13,7 @@ from datetime import UTC, date, datetime, timedelta, timezone
 
 from packages.memory.scope import (
     SCOPE_SCHEMA,
+    derive_claim_as_of,
     derive_claim_scope,
     derive_evidence_scope,
     extract_question_urls,
@@ -207,6 +208,95 @@ def test_derive_claim_scope_naive_as_of_treated_as_utc() -> None:
         as_of=datetime(2026, 9, 17, 5, 0),  # naive
     )
     assert scope["as_of"] == "2026-09-17"
+
+
+# ── T7.30 (ADR-0016): the claim row's reference datetime ───────────────
+
+
+def test_derive_claim_as_of_explicit_date_wins() -> None:
+    # priority 1: the explicit question date beats BOTH the model's
+    # typed as_of and the session date
+    ref = derive_claim_as_of(
+        question="По состоянию на 15 апреля 2026 года: сколько стран в ЕС?",
+        as_of=datetime(2026, 8, 13, 12, 0, tzinfo=UTC),
+        session_date=date(2026, 9, 22),
+    )
+    assert ref == datetime(2026, 4, 15, tzinfo=UTC)
+
+
+def test_derive_claim_as_of_relative_form_uses_session_date() -> None:
+    # priority 2: a relative form anchors on the SESSION's date on the
+    # host's clock (midnight UTC) — the model's typed as_of (in the
+    # future OR the past) does not shift it
+    session_date = date(2026, 9, 22)
+    for model_as_of in (
+        datetime(2026, 9, 23, 12, 0, tzinfo=UTC),  # tomorrow
+        datetime(2026, 6, 15, 0, 0, tzinfo=UTC),  # the EVAL-4d artifact
+    ):
+        ref = derive_claim_as_of(
+            question="Какова ключевая ставка Банка России на текущую дату?",
+            as_of=model_as_of,
+            session_date=session_date,
+        )
+        assert ref == datetime(2026, 9, 22, tzinfo=UTC)
+
+
+def test_derive_claim_as_of_relative_form_without_session_date_falls_back() -> None:
+    # fail-closed: a relative form with NO session date available
+    # (session_date=None) has no host anchor — the model's typed as_of
+    # stands (the same fallback the scope has since T7.18)
+    ref = derive_claim_as_of(
+        question="Какова ключевая ставка Банка России на текущую дату?",
+        as_of=datetime(2026, 6, 15, tzinfo=UTC),
+        session_date=None,
+    )
+    assert ref == datetime(2026, 6, 15, tzinfo=UTC)
+
+
+def test_derive_claim_as_of_dateless_question_keeps_model_as_of() -> None:
+    # priority 3: a question with NO date anchor (neither explicit nor
+    # relative) keeps the model's typed as_of — the Sputnik-1 / release
+    # event date (ADR-0016, fallback unchanged from T7.17/T7.18)
+    ref = derive_claim_as_of(
+        question="Когда был запущен Спутник-1?",
+        as_of=datetime(1957, 10, 4, 19, 28, 34, tzinfo=UTC),
+        session_date=date(2026, 9, 22),
+    )
+    assert ref == datetime(1957, 10, 4, 19, 28, 34, tzinfo=UTC)
+    # naive model as_of is treated as UTC
+    ref_naive = derive_claim_as_of(
+        question="Когда был запущен Спутник-1?",
+        as_of=datetime(1957, 10, 4, 19, 28, 34),
+        session_date=date(2026, 9, 22),
+    )
+    assert ref_naive == datetime(1957, 10, 4, 19, 28, 34, tzinfo=UTC)
+
+
+def test_derive_claim_as_of_no_question_no_as_of_is_none() -> None:
+    assert (
+        derive_claim_as_of(question=None, as_of=None, session_date=date(2026, 9, 22))
+        is None
+    )
+
+
+def test_derive_claim_scope_date_is_the_reference_datetime_date_part() -> None:
+    # one function, one source of truth (T7.30): the claim scope's
+    # reference date is the DATE part of derive_claim_as_of — for all
+    # three priorities, explicit / relative / dateless fallback
+    model = datetime(2026, 6, 15, tzinfo=UTC)
+    session_date = date(2026, 9, 22)
+    for question in (
+        "По состоянию на 15 апреля 2026 года: сколько стран в ЕС?",
+        "Какова ключевая ставка Банка России на текущую дату?",
+        "Когда был запущен Спутник-1?",
+    ):
+        ref = derive_claim_as_of(
+            question=question, as_of=model, session_date=session_date
+        )
+        scope = derive_claim_scope(
+            question=question, as_of=model, session_date=session_date
+        )
+        assert scope["as_of"] == ref.date().isoformat()
 
 
 # ── evidence scope derivation ──────────────────────────────────────────

@@ -1118,7 +1118,7 @@ Confidence имеет одного producer: rules engine вычисляет е�
 
 ### 8.6. Жизненный цикл знания и каскадная invalidation
 
-- Reverify deadline выводится из claim type, volatility, `as_of` и valid interval. `valid_to=NULL` означает неизвестный конец действия.
+- Reverify deadline выводится из claim type, volatility, `as_of` и valid interval. `valid_to=NULL` означает неизвестный конец действия. Опорная дата `as_of` в строке claim выводится доверенным хостом из якоря вопроса (явная дата вопроса; относительная форма → дата сессии по часам хоста; вопрос без опорной даты → модельный `as_of`); модельная дата — аудиторская (ADR-0016).
 - Истечение срока меняет freshness, но не confidence.
 - Hypothesis не служит достаточным evidence; она может быть исследовательской зависимостью только с явной пометкой.
 - Experiment получает reproducibility capsule и structured environment manifest.
@@ -1173,6 +1173,8 @@ external_fact          E3: >=2 source_assertion из разных independence g
 temporal_fact          E3: external_fact rule + обязательные as_of и temporal scope
 self_model             E2: локальное наблюдение config/identity state
 ```
+
+Обязательный `as_of` у `temporal_fact` (и опорная дата `external_fact`) — хост-выводимая опорная дата (ADR-0016): явная дата вопроса, дата сессии при относительной форме или модельный `as_of` только при вопросе без опорной даты; модельное значение остаётся предложением модели (staging/audit).
 
 Пример машиночитаемого правила:
 
