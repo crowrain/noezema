@@ -269,6 +269,38 @@ class _Seeder:
             {"a": aid, "e": eid},
         )
 
+    async def add_reverify_assessment(
+        self,
+        claim_idx: int,
+        session: uuid.UUID,
+        *,
+        worker: bool = False,
+    ) -> None:
+        """T7.34 (ADR-0018): the reverify RECORD — a fresh
+        ``claim_assessments`` row bound to the reverifying session,
+        WITHOUT any new evidence row (the re-fetched identical source
+        reuses the anchor's evidence row by identity — the trap the
+        record exists to survive). ``worker=True`` seeds the
+        reassessment-worker shape (``created_in_session IS NULL``),
+        which the gate must NOT count as a session touch."""
+        cid = _uid(f"claim-{claim_idx}")
+        await self._exec(
+            "INSERT INTO claim_assessments (id, claim_id, effective_grade, "
+            "epistemic_status, rules_version, rules_hash, evidence_set_hash, "
+            "assessed_scope, confidence, valid, created_in_session) "
+            "VALUES (:id, :c, :g, 'supported', 'rules-v1', :rh, :eh, "
+            "CAST(:sc AS jsonb), 0.9, true, :s)",
+            {
+                "id": _uid(f"reverify-{claim_idx}-{session}"),
+                "c": cid,
+                "g": "E3",
+                "rh": "0" * 64,
+                "eh": "2" * 64,
+                "sc": _json({"reverify": True}),
+                "s": None if worker else session,
+            },
+        )
+
     async def add_job(
         self, idx: int, *, within_slo: bool, claim: uuid.UUID
     ) -> None:
@@ -1129,3 +1161,125 @@ async def test_gate11_blind_scope_below_threshold_fails(
     assert g["ratio"] == 0.75
     assert g["outcome"] == "failed"
     assert g["ci95"] == {"low": 0.5313, "high": 0.8881}
+
+
+# ─── T7.34 (ADR-0018): the reverify path of gate 5, EVAL-4d form ────────────
+#
+# Fixture (NOT the evidence DB): the EVAL-4d §7.2 shape — 29 significant
+# claims (19 temporal_fact E3 + 6 external_fact E3 + 3 local_observation
+# E2 + 1 computed_result E2), each created in its own session, plus the
+# 13 follow-up re-verifies over 8 distinct claims. The reverify record
+# is the fresh assessment row bound to the reverifying session — with NO
+# new evidence row (the collapsed re-fetch trap: a naive evidence-only
+# path would count 0 of these).
+
+
+# EVAL-4d §7.2: follow-up session → anchor claim (fixture indices)
+_EVAL4D_REVERIFIES_FULL: dict[int, list[int]] = {
+    0: [100, 101],  # d3475eca ← 4d510a51, 848106dd
+    1: [102],  # 07d655cf ← 4dd12dfa
+    2: [103, 104],  # 70ff7a38 ← 7add23b6, 7871250d
+    3: [105, 106],  # 80c1908c ← 46bec75c, 8c370d7f (total collapse)
+    4: [107, 108],  # c701f374 ← 4d67e817, de3f809a
+    5: [109, 110],  # 426fe04a ← 70235790, 5cc41d0a
+    6: [111],  # 5a37ce68 ← c3537eb3
+    7: [112],  # 6cc8a0d8 ← 3b2a4a7d
+}
+# the strict variant: only the 5 re-verifies the model expressed BY ID
+_EVAL4D_REVERIFIES_STRICT: dict[int, list[int]] = {
+    0: [101],  # 848106dd → d3475eca (by id)
+    2: [104],  # 7871250d → 70ff7a38 (by id)
+    4: [108],  # de3f809a → c701f374 (by id)
+    5: [110],  # 5cc41d0a → 426fe04a (by id)
+    6: [111],  # c3537eb3 → 5a37ce68 (by id)
+}
+
+
+async def _seed_eval4d_reverify(
+    engine: AsyncEngine, reverifies: dict[int, list[int]]
+) -> _Seeder:
+    s = _Seeder(engine)
+    await s.setup()
+    # 29 anchor sessions + their significant claims (the EVAL-4d
+    # denominator composition, §7.3)
+    for i in range(29):
+        await s.add_session(i, state="succeeded")
+        ctype = "temporal_fact" if i < 19 else (
+            "external_fact" if i < 25 else (
+                "local_observation" if i < 28 else "computed_result"
+            )
+        )
+        grade = "E3" if i < 25 else "E2"
+        await s.add_claim(
+            i, session=s.session_ids[i], ctype=ctype, grade=grade
+        )
+    # the re-verify sessions + their records (assessment rows ONLY —
+    # no new evidence: the identical re-fetch collapses into the
+    # anchor's evidence row by identity). The session ROW is returned
+    # by add_session (the session_ids list is position-ordered, not
+    # keyed by idx).
+    for claim_idx, fu_idxs in sorted(reverifies.items()):
+        for fu in fu_idxs:
+            fu_sid = await s.add_session(fu, state="succeeded")
+            await s.add_reverify_assessment(claim_idx, fu_sid)
+    # a reassessment-worker assessment (created_in_session IS NULL) on
+    # claim 8: the gate must NOT count it as a second session
+    await s.add_reverify_assessment(8, _uid("worker"), worker=True)
+    return s
+
+
+@pytest.mark.asyncio
+async def test_gate5_reverify_eval4d_full_form_passes(
+    migrated_db: tuple[str, AsyncEngine],
+) -> None:
+    """T7.34 (ADR-0018): the EVAL-4d §7.2 full form — 13 re-verifies over
+    8 distinct claims, recorded ONLY as session-bound assessment rows
+    (no new evidence). Gate 5 must count them: 8/29 = 0.276 ≥ 0.25 →
+    passed (the saved EVAL-4d run reported 0/29 — the record did not
+    exist)."""
+    _scratch, engine = migrated_db
+    run = await _mk_run(engine, thresholds={"significant_claim_reuse": 0.25})
+    await _seed_eval4d_reverify(engine, _EVAL4D_REVERIFIES_FULL)
+    g = (await _gates(engine, run))["significant_claim_reuse"]
+    assert (g["numerator"], g["denominator"]) == (8, 29)
+    assert g["ratio"] == round(8 / 29, 4)  # 0.2759 (reported, 4 dp)
+    assert g["outcome"] == "passed"  # 0.2759 >= 0.25
+
+
+@pytest.mark.asyncio
+async def test_gate5_reverify_eval4d_strict_form_fails(
+    migrated_db: tuple[str, AsyncEngine],
+) -> None:
+    """T7.34 (ADR-0018): the strict form — only the 5 re-verifies the
+    model expressed BY ID (EVAL-4d §7.2). 5/29 = 0.172 < 0.25 → failed
+    (the pre-registration analysis: the reverify operation alone does
+    not turn the gate — the strict variant fails, the full form
+    passes; both are reported, the saved run is 0/29)."""
+    _scratch, engine = migrated_db
+    run = await _mk_run(engine, thresholds={"significant_claim_reuse": 0.25})
+    await _seed_eval4d_reverify(engine, _EVAL4D_REVERIFIES_STRICT)
+    g = (await _gates(engine, run))["significant_claim_reuse"]
+    assert (g["numerator"], g["denominator"]) == (5, 29)
+    assert g["ratio"] == round(5 / 29, 4)  # 0.1724 (reported, 4 dp)
+    assert g["outcome"] == "failed"  # 0.1724 < 0.25
+
+
+@pytest.mark.asyncio
+async def test_gate5_reverify_worker_rows_do_not_count(
+    migrated_db: tuple[str, AsyncEngine],
+) -> None:
+    """T7.34 (ADR-0018): only SESSION-created assessment rows count as
+    reverify records — reassessment-worker rows (created_in_session
+    IS NULL) must not make a claim 'two-session' (worker rows on every
+    non-reverified claim; the full form's numerator stays 8/29)."""
+    _scratch, engine = migrated_db
+    run = await _mk_run(engine, thresholds={"significant_claim_reuse": 0.25})
+    s = await _seed_eval4d_reverify(engine, _EVAL4D_REVERIFIES_FULL)
+    # worker rows on EVERY remaining non-reverified claim (9..28; claim
+    # 8's worker row comes from the fixture): without the
+    # created_in_session IS NOT NULL filter the numerator would jump to
+    # 29/29
+    for i in range(9, 29):
+        await s.add_reverify_assessment(i, _uid(f"worker-{i}"), worker=True)
+    g = (await _gates(engine, run))["significant_claim_reuse"]
+    assert (g["numerator"], g["denominator"]) == (8, 29)

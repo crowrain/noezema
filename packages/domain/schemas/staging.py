@@ -1,9 +1,15 @@
-"""Curator staging proposal schema (T1.13).
+"""Curator staging proposal schema (T1.13; T7.34 reverify — ADR-0018).
 
 The curator proposes; the trusted host validates and records these as
 session_staging operations (in M1 — in memory; the durable table arrives
 with M2). Grade/epistemic status are NOT proposed here: only the
 deterministic rules engine assigns them (§3.7).
+
+A claim op is one of two: a NEW claim (statement + type), or a REVERIFY
+of an existing one (`existing_claim_id` — the host-issued id, full or a
+unique prefix). Reverify changes no claim row: it re-derives the
+reference date/scope and produces a fresh assessment (the reverify
+record, bound to the session) — the gate-5 "reverified" path.
 """
 
 from __future__ import annotations
@@ -42,6 +48,17 @@ class ClaimProposal(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     statement: str = Field(min_length=1, max_length=2000)
+    # T7.34 (ADR-0018): reverify of an EXISTING claim — the host-issued
+    # id the model REFERENCEs (never mints), as seen in the knowledge
+    # context line `[c:<uuid>]`. String (not UUID) on purpose: the
+    # engine schema profile (ADR-0012) strips `format`, and the model
+    # has truncated UUIDs (EVAL-4d pack 7) — the host resolves a full
+    # UUID or a UNIQUE prefix among the session-visible claims,
+    # fail-closed. When set, the op attaches to that claim: no new
+    # claim row, the statement is a restatement (audit-only), and the
+    # reverify record is the fresh assessment row (the session's
+    # verification moment).
+    existing_claim_id: str | None = Field(default=None, min_length=8, max_length=36)
     # ADR-0006 rev (cross-lingual search): the model renders the
     # statement in the other corpus language (MVP: English) so that
     # retrieval matches queries in either language. Search index only —

@@ -464,6 +464,11 @@ class AuditEventType(StrEnum):
     STAGING_REJECTED = "staging_rejected"
     CLAIM_CREATED = "claim_created"
     CLAIM_REVISION = "claim_revision"
+    # T7.34 (ADR-0018): the reverify of an existing claim — a claim op
+    # carrying existing_claim_id. The record of the reverify is the
+    # fresh assessment row (created_in_session); this event is the
+    # direct audit trail (model restatement, resolved reference).
+    CLAIM_REVERIFIED = "claim_reverified"
     CLAIM_ASSESSED = "claim_assessed"
     CLAIM_INVALIDATED = "claim_invalidated"
     DEPENDENCY_EDGE_REJECTED = "dependency_edge_rejected"

@@ -66,8 +66,10 @@ def test_real_prompts_are_versioned() -> None:
     # curator: no assertion text in evidence → question, not claim)
     # T7.21: explorer bumped to v4 (fetch every question-named source
     # before completing — backstop for the host coverage gate, ADR-0010)
+    # T7.34: curator bumped to v4 (the reverify operation —
+    # existing_claim_id, ADR-0018)
     assert explorer.version == "explorer-v4"
-    assert curator.version == "curator-v3"
+    assert curator.version == "curator-v4"
     assert len(explorer.sha256) == 64
     assert len(curator.sha256) == 64
     # config snapshot references these exact paths/versions

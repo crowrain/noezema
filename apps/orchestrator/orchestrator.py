@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import re
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -1996,17 +1997,89 @@ class Orchestrator:
             )
             return 0, 0
 
+        # T7.34 (ADR-0018): reverify references — resolved BEFORE the
+        # rules pre-check (the reverify is validated under the ANCHOR's
+        # claim type — the model's restatement is audit-only) and
+        # BEFORE any staging op is recorded. Fail-closed: an unknown /
+        # invisible / ambiguous reference rejects the whole proposal
+        # with a clear audit reason — never a silent drop. The id is
+        # host-issued; the model only REFERENCEs it (full UUID or a
+        # prefix that is unique among the claims visible in the
+        # context pack).
+        from packages.memory.service import resolve_claim_reference
+
+        reverify_anchor_types: dict[int, str] = {}
+        claims_for_validation = [c.model_dump(mode="json") for c in proposal.claims]
+        if any(c.existing_claim_id is not None for c in proposal.claims):
+            visible_pack_ids = _pack_claim_ids(knowledge)
+            for i, c in enumerate(proposal.claims):
+                if c.existing_claim_id is None:
+                    continue
+                ref_id, ref_problem = resolve_claim_reference(c.existing_claim_id, visible_pack_ids)
+                if ref_problem is not None:
+                    await audit.record(
+                        AuditEventType.SESSION_STATE_CHANGED,
+                        session_id=session.id,
+                        payload={
+                            "curator_rejected": [
+                                f"claim[{i}]: reverify reference {ref_problem}"
+                            ],
+                            "curator_reject_kind": "reverify_unresolved",
+                        },
+                        public_summary=(
+                            "curator proposal rejected: reverify reference "
+                            f"{ref_problem} (unknown or ambiguous claim id)"
+                        ),
+                    )
+                    return 0, 0
+                # the same condition as the T7.9 dedup: the target must
+                # have a head in THIS session's snapshot
+                anchor_type = (
+                    (
+                        await db.execute(
+                            text(
+                                "SELECT c.claim_type FROM claims c "
+                                "WHERE c.id = :id AND EXISTS (SELECT 1 "
+                                "FROM claim_assessment_heads h "
+                                "WHERE h.claim_id = c.id "
+                                "AND h.config_snapshot_id = :s)"
+                            ),
+                            {"id": ref_id, "s": session.config_snapshot_id},
+                        )
+                    )
+                    .first()
+                )
+                if anchor_type is None:
+                    await audit.record(
+                        AuditEventType.SESSION_STATE_CHANGED,
+                        session_id=session.id,
+                        payload={
+                            "curator_rejected": [
+                                f"claim[{i}]: reverify target {ref_id} has no head in the session snapshot"
+                            ],
+                            "curator_reject_kind": "reverify_unresolved",
+                        },
+                        public_summary=(
+                            "curator proposal rejected: reverify target has no "
+                            "head in the session snapshot"
+                        ),
+                    )
+                    return 0, 0
+                reverify_anchor_types[i] = str(anchor_type[0])
+                claims_for_validation[i]["claim_type"] = str(anchor_type[0])
+
         # T7.9 (EVAL-3b post-mortem P.2, §14.1): the rules engine
         # pre-commit check — a proposal the rules engine would reject
         # (a support evidence of a kind the claim-type rule does not
         # allow) is bounced BEFORE any staging op is recorded: the
         # commit boundary never continues with a problems entry and
         # never commits a claim without a head (the rules engine is the
-        # only producer, §3.7)
+        # only producer, §3.7). Reverify claims (T7.34/ADR-0018) are
+        # validated under the anchor's claim type.
         from packages.memory import MemoryService
 
         rule_problems = MemoryService(snapshot).validate_claim_proposal(
-            [c.model_dump(mode="json") for c in proposal.claims],
+            claims_for_validation,
             [
                 {
                     "evidence_index": link.evidence_index,
@@ -2283,6 +2356,27 @@ class Orchestrator:
                 payload={"reason": reason},
                 public_summary=f"session failed ({reason})",
             )
+
+
+#: T7.34 (ADR-0018): the claim-id prefix of a knowledge-context line
+#: (`[c:<uuid>]`, T4.1) — the exact text the model sees and copies.
+_PACK_CLAIM_ID_RE = re.compile(r"\[c:([0-9a-fA-F-]{36})\]")
+
+
+def _pack_claim_ids(knowledge: str) -> list[uuid.UUID]:
+    """T7.34 (ADR-0018): the claim IDs visible to the curator in the
+    knowledge context — the resolution set for reverify references
+    (a prefix is accepted only when it is UNIQUE among these,
+    fail-closed)."""
+    seen: list[uuid.UUID] = []
+    for m in _PACK_CLAIM_ID_RE.finditer(knowledge):
+        try:
+            cid = uuid.UUID(m.group(1))
+        except ValueError:
+            continue
+        if cid not in seen:
+            seen.append(cid)
+    return seen
 
 
 def _cap_args(value: object) -> str:

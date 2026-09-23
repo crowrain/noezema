@@ -741,3 +741,400 @@ async def test_apply_claim_staging_uses_recording_order_not_uuid_order(migrated_
         )
         assert {h.claim_id for h in heads} == {obs_claim.id, comp_claim.id}
         assert all(h.current_assessment_id is not None for h in heads)
+
+
+# ─── T7.34 (ADR-0018): reverify of an existing claim ────────────────────────
+#
+# The scenario runs through MemoryService (not direct inserts): the anchor
+# session CREATES a claim, the follow-up session REVERIFIES it by the
+# host-issued id. The reverify record is the fresh assessment row bound
+# to the follow-up session — independent of whether any evidence is new
+# (a re-fetched identical source reuses the anchor's evidence row by
+# identity — the trap ADR-0018 documents).
+
+
+async def _anchor_comp_claim(
+    engine: AsyncEngine, question: str | None = None
+) -> tuple[async_sessionmaker, uuid.UUID, uuid.UUID]:
+    """Session 1: create a computed_result claim (E2 supported) with one
+    computation evidence. Returns (factory, session_id, claim_id)."""
+    factory, sid = await _seed_session(engine, question_text=question)
+    snap = await _snapshot(engine)
+    await _record_staging(
+        engine,
+        sid,
+        [
+            ("claim", {"statement": "6*7 равно 42", "claim_type": "computed_result", "scope": {"expr": "6*7"}}),
+            ("evidence", {"evidence_index": 0, "claim_index": 0, "relation": "supports"}),
+        ],
+    )
+    records = [_comp_record({"code": "print(6*7)", "stdout": "42", "exit_code": 0})]
+    memory = MemoryService(snap)
+    async with factory() as db, transaction(db):
+        session = await db.get(ORMSession, sid)
+        assert session is not None
+        r1 = await memory.apply_claim_staging(db, AuditService(db), session, records)
+    assert r1.claims_created == 1 and r1.evidence_added == 1
+    async with factory() as db:
+        claim = (await db.execute(select(ORMClaim))).scalars().one()
+    return factory, sid, claim.id
+
+
+def _reverify_ops(claim_id: uuid.UUID, ref: str | None = None) -> list[tuple[str, JsonDict]]:
+    """Session 2's proposal: a claim op carrying existing_claim_id (a
+    restatement, not a new assertion) + the evidence link to it."""
+    return [
+        (
+            "claim",
+            {
+                "statement": "6*7 равно 42 (перепроверено по источнику)",
+                "claim_type": "computed_result",
+                "scope": {"expr": "6*7"},
+                "existing_claim_id": ref if ref is not None else str(claim_id),
+            },
+        ),
+        ("evidence", {"evidence_index": 0, "claim_index": 0, "relation": "supports"}),
+    ]
+
+
+async def _apply_reverify(
+    engine: AsyncEngine, snap: ORMConfigSnapshot, ops: list[tuple[str, JsonDict]],
+    question: str | None, records: list[Any],
+) -> tuple[async_sessionmaker, uuid.UUID, Any]:
+    _f, sid = await _seed_session(engine, question_text=question)
+    await _record_staging(engine, sid, ops)
+    memory = MemoryService(snap)
+    async with _f() as db, transaction(db):
+        session = await db.get(ORMSession, sid)
+        assert session is not None
+        result = await memory.apply_claim_staging(db, AuditService(db), session, records)
+    return _f, sid, result
+
+
+@pytest.mark.asyncio
+async def test_reverify_same_evidence_record_exists_grade_unchanged(
+    migrated_db: Any,
+) -> None:
+    """The core scenario: anchor creates the claim; the follow-up
+    re-verifies the SAME id with the SAME evidence. The evidence must NOT
+    duplicate (identity dedup — the invariant is not weakened), the grade
+    must NOT change, the reverify RECORD (a fresh assessment row bound to
+    the follow-up session) must exist, and no new claim row appears."""
+    _url, engine = migrated_db
+    _factory, sid, claim_id = await _anchor_comp_claim(engine)
+    snap = await _snapshot(engine)
+    records = [_comp_record({"code": "print(6*7)", "stdout": "42", "exit_code": 0})]
+    _f2, sid2, r2 = await _apply_reverify(
+        engine, snap, _reverify_ops(claim_id), None, records
+    )
+
+    assert r2.claims_created == 0
+    assert r2.claims_reused == 0
+    assert r2.claims_reverified == 1
+    assert r2.evidence_added == 0
+    assert r2.evidence_deduped == 1  # the anchor's row is REUSED, not copied
+    assert r2.assessments == 1
+    assert r2.problems == ()
+
+    async with _f2() as db:
+        # exactly one claim and ONE evidence row in the whole DB —
+        # the trap: a naive evidence-only record would see one session
+        claims = (await db.execute(select(ORMClaim))).scalars().all()
+        evidence = (await db.execute(select(ORMEvidence))).scalars().all()
+        assert len(claims) == 1 and claims[0].id == claim_id
+        assert len(evidence) == 1
+        assert evidence[0].created_in_session == sid  # the ANCHOR's session
+        # the reverify record: a second assessment, bound to session 2
+        assessments = (
+            (
+                await db.execute(
+                    text(
+                        "SELECT created_in_session FROM claim_assessments "
+                        "WHERE claim_id = :c ORDER BY created_at"
+                    ),
+                    {"c": claim_id},
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert assessments == [sid, sid2]
+        # grade unchanged: head is current E2 supported
+        view = await MemoryService(snap).claim_view(db, claim_id)
+        assert view is not None
+        assert view.assessment_state is AssessmentState.CURRENT
+        assert view.grade is EffectiveGrade.E2
+        assert view.epistemic_status is EpistemicStatus.SUPPORTED
+        # audit trail: the direct reverify event (same tx as the change)
+        n_rev = (
+            (
+                await db.execute(
+                    text(
+                        "SELECT count(*) FROM audit_events "
+                        "WHERE type = 'claim_reverified' "
+                        "AND payload->>'claim_id' = :c AND session_id = :s"
+                    ),
+                    {"c": str(claim_id), "s": sid2},
+                )
+            )
+            .scalar_one()
+        )
+        assert n_rev == 1
+
+
+@pytest.mark.asyncio
+async def test_reverify_new_evidence_added_grade_by_rules(migrated_db: Any) -> None:
+    """Reverify with a NEW (different-identity) evidence — the ordinary
+    rules-engine path: the row is added, the claim is re-assessed, the
+    grade comes from the rules (one independence group → E2 stays)."""
+    _url, engine = migrated_db
+    _factory, _sid, claim_id = await _anchor_comp_claim(engine)
+    snap = await _snapshot(engine)
+    new_records = [_comp_record({"code": "print(7*6)", "stdout": "42", "exit_code": 0})]
+    _f2, _sid2, r2 = await _apply_reverify(
+        engine, snap, _reverify_ops(claim_id), None, new_records
+    )
+    assert r2.claims_reverified == 1
+    assert r2.evidence_added == 1
+    assert r2.evidence_deduped == 0
+    assert r2.problems == ()
+    async with _f2() as db:
+        n_evidence = (
+            (
+                await db.execute(
+                    text("SELECT count(*) FROM evidence WHERE claim_id = :c"),
+                    {"c": claim_id},
+                )
+            )
+            .scalar_one()
+        )
+        assert n_evidence == 2
+        view = await MemoryService(snap).claim_view(db, claim_id)
+        assert view is not None
+        assert view.grade is EffectiveGrade.E2
+        assert view.epistemic_status is EpistemicStatus.SUPPORTED
+
+
+@pytest.mark.asyncio
+async def test_reverify_counterevidence_disputed_by_rules(migrated_db: Any) -> None:
+    """Reverify with counter-evidence — the existing rules: disputed,
+    capped at E1 (AGENTS.md §3)."""
+    _url, engine = migrated_db
+    _factory, _sid, claim_id = await _anchor_comp_claim(engine)
+    snap = await _snapshot(engine)
+    ops = [
+        (
+            "claim",
+            {
+                "statement": "6*7 равно 42 (перепроверено)",
+                "claim_type": "computed_result",
+                "scope": {"expr": "6*7"},
+                "existing_claim_id": str(claim_id),
+            },
+        ),
+        ("evidence", {"evidence_index": 0, "claim_index": 0, "relation": "counters"}),
+    ]
+    counter_records = [_comp_record({"code": "print(6*8)", "stdout": "48", "exit_code": 0})]
+    _f2, _sid2, r2 = await _apply_reverify(
+        engine, snap, ops, None, counter_records
+    )
+    assert r2.claims_reverified == 1
+    assert r2.evidence_added == 1
+    assert r2.problems == ()
+    async with _f2() as db:
+        view = await MemoryService(snap).claim_view(db, claim_id)
+        assert view is not None
+        assert view.epistemic_status is EpistemicStatus.DISPUTED
+        assert view.grade is EffectiveGrade.E1  # counterevidence → disputed ≤ E1
+
+
+@pytest.mark.asyncio
+async def test_reverify_headless_claim_rejected_fail_closed(migrated_db: Any) -> None:
+    """T7.9 condition, fail-closed: a claim WITHOUT a head in the
+    session's snapshot (the headless legacy) is not a valid reverify
+    target — a clear problem in the commit audit, no new claim, no
+    assessment, no silent drop (and no silent fallback to creation)."""
+    _url, engine = migrated_db
+    factory, _sid, claim_id = await _anchor_comp_claim(engine)
+    # strip the head — make it a headless legacy claim
+    async with factory() as db, db.begin():
+        await db.execute(
+            text(
+                "DELETE FROM claim_assessment_heads WHERE claim_id = :c"
+            ),
+            {"c": claim_id},
+        )
+    snap = await _snapshot(engine)
+    records = [_comp_record({"code": "print(6*7)", "stdout": "42", "exit_code": 0})]
+    _f2, _sid2, r2 = await _apply_reverify(
+        engine, snap, _reverify_ops(claim_id), None, records
+    )
+    assert r2.claims_reverified == 0
+    assert r2.claims_created == 0  # NOT a silent fallback to creation
+    assert r2.assessments == 0
+    # two clear reasons: the reverify reference AND the evidence link to
+    # the rejected op (the indices stay aligned with the proposal)
+    assert len(r2.problems) == 2
+    assert "reverify reference" in r2.problems[0]
+    assert "not visible" in r2.problems[0]
+    assert "claim op 0 was rejected" in r2.problems[1]
+    async with _f2() as db:
+        n_claims = (await db.execute(text("SELECT count(*) FROM claims"))).scalar_one()
+        assert n_claims == 1  # the headless one, untouched
+        n_evidence = (await db.execute(text("SELECT count(*) FROM evidence"))).scalar_one()
+        assert n_evidence == 1  # the reverify evidence was NOT attached
+
+
+@pytest.mark.asyncio
+async def test_reverify_unknown_claim_rejected_fail_closed(migrated_db: Any) -> None:
+    """An id that exists in no corpus is rejected fail-closed — with a
+    clear reason, and without creating a claim from the restatement."""
+    _url, engine = migrated_db
+    _factory, _sid, claim_id = await _anchor_comp_claim(engine)
+    snap = await _snapshot(engine)
+    unknown = uuid.uuid4()
+    records = [_comp_record({"code": "print(6*7)", "stdout": "42", "exit_code": 0})]
+    _f2, _sid2, r2 = await _apply_reverify(
+        engine, snap, _reverify_ops(claim_id, ref=str(unknown)), None, records
+    )
+    assert r2.claims_reverified == 0
+    assert r2.claims_created == 0
+    assert r2.assessments == 0
+    assert len(r2.problems) >= 1
+    assert "not visible" in r2.problems[0]
+    async with _f2() as db:
+        n_claims = (await db.execute(text("SELECT count(*) FROM claims"))).scalar_one()
+        assert n_claims == 1
+
+
+@pytest.mark.asyncio
+async def test_reverify_unique_prefix_resolves(migrated_db: Any) -> None:
+    """The observed model failure (EVAL-4d pack 7): a truncated UUID. A
+    prefix unique among the session-visible claims resolves (the host
+    re-checks the T7.9 condition on the resolved id)."""
+    _url, engine = migrated_db
+    _factory, _sid, claim_id = await _anchor_comp_claim(engine)
+    snap = await _snapshot(engine)
+    prefix = str(claim_id).replace("-", "")[:16]
+    records = [_comp_record({"code": "print(6*7)", "stdout": "42", "exit_code": 0})]
+    _f2, _sid2, r2 = await _apply_reverify(
+        engine, snap, _reverify_ops(claim_id, ref=prefix), None, records
+    )
+    assert r2.claims_reverified == 1
+    assert r2.problems == ()
+    async with _f2() as db:
+        n_claims = (await db.execute(text("SELECT count(*) FROM claims"))).scalar_one()
+        assert n_claims == 1
+        # the audit event records the raw reference AND the resolved id
+        row = (
+            (
+                await db.execute(
+                    text(
+                        "SELECT payload->>'reference', payload->>'resolved' "
+                        "FROM audit_events WHERE type = 'claim_reverified'"
+                    )
+                )
+            )
+            .first()
+        )
+        assert row is not None
+        assert row[0] == prefix
+        assert row[1] == str(claim_id).lower()
+
+
+@pytest.mark.asyncio
+async def test_reverify_relative_anchor_shifts_deadline_to_moment(migrated_db: Any) -> None:
+    """T7.32/ADR-0017 + ADR-0018: the deadline exists only for a claim
+    about the PRESENT (anchor relative) and is the VERIFICATION MOMENT +
+    the volatility window. A confirmed reverify is a new verification
+    moment — the SAME single rule (reverify_after in _assess) shifts the
+    anchor's deadline to the reverify session's moment. The anchor
+    session is back-dated so the shift is observable."""
+    _url, engine = migrated_db
+    factory, sid, claim_id = await _anchor_comp_claim(engine, question="Проверь сейчас")
+    async with factory() as db:
+        row = (
+            (
+                await db.execute(
+                    text("SELECT reverify_after FROM claims WHERE id = :c"),
+                    {"c": claim_id},
+                )
+            )
+            .first()
+        )
+        assert row is not None and row[0] is not None  # relative → deadline
+    # back-date the anchor session by 2 days (its deadline is now in the
+    # past relative to the reverify moment)
+    async with factory() as db, db.begin():
+        await db.execute(
+            text("UPDATE sessions SET created_at = created_at - interval '2 days' WHERE id = :s"),
+            {"s": sid},
+        )
+    snap = await _snapshot(engine)
+    records = [_comp_record({"code": "print(6*7)", "stdout": "42", "exit_code": 0})]
+    _f2, sid2, r2 = await _apply_reverify(
+        engine, snap, _reverify_ops(claim_id), "Проверь сейчас", records
+    )
+    assert r2.claims_reverified == 1
+    async with _f2() as db:
+        moment = (
+            (
+                await db.execute(
+                    text("SELECT created_at FROM sessions WHERE id = :s"),
+                    {"s": sid2},
+                )
+            )
+            .scalar_one()
+        )
+        new_deadline = (
+            (
+                await db.execute(
+                    text("SELECT reverify_after FROM claims WHERE id = :c"),
+                    {"c": claim_id},
+                )
+            )
+            .scalar_one()
+        )
+    assert new_deadline is not None
+    # the deadline was recomputed from the REVERIFY moment (computed
+    # result: static → +90d), not inherited from the back-dated anchor
+    # (whose deadline is 2 days in the past)
+    assert new_deadline >= moment
+    delta = (new_deadline - moment).total_seconds()
+    assert abs(delta - 90 * 86400) < 3600
+
+
+@pytest.mark.asyncio
+async def test_reverify_evergreen_claim_stays_deadline_less(migrated_db: Any) -> None:
+    """An evergreen claim (anchor none — no question date) keeps NO
+    deadline through the reverify: NULL stays NULL (ADR-0017)."""
+    _url, engine = migrated_db
+    factory, _sid, claim_id = await _anchor_comp_claim(engine)  # no question
+    async with factory() as db:
+        deadline = (
+            (
+                await db.execute(
+                    text("SELECT reverify_after FROM claims WHERE id = :c"),
+                    {"c": claim_id},
+                )
+            )
+            .scalar_one()
+        )
+    assert deadline is None  # anchor none → evergreen by construction
+    snap = await _snapshot(engine)
+    records = [_comp_record({"code": "print(6*7)", "stdout": "42", "exit_code": 0})]
+    _f2, _sid2, r2 = await _apply_reverify(
+        engine, snap, _reverify_ops(claim_id), None, records
+    )
+    assert r2.claims_reverified == 1
+    async with _f2() as db:
+        deadline2 = (
+            (
+                await db.execute(
+                    text("SELECT reverify_after FROM claims WHERE id = :c"),
+                    {"c": claim_id},
+                )
+            )
+            .scalar_one()
+        )
+    assert deadline2 is None  # the reverify did not create a deadline

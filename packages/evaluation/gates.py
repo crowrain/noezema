@@ -406,6 +406,27 @@ async def _gate_near_dup(db: AsyncSession, run: EvaluationRun) -> dict[str, Any]
 
 
 async def _gate_reuse(db: AsyncSession, run: EvaluationRun) -> dict[str, Any]:
+    """§22.2 gate 5: ≥25% of significant claims are reused/REVERIFIED
+    across ≥2 distinct sessions. A claim is "touched" by a session via
+    one of five paths:
+
+    1. ``evidence.claim_id`` + ``evidence.created_in_session`` — the
+       session attached evidence to the claim (new or dedup-reused);
+    2. ``claim_revisions.claim_id`` + ``session_id`` — the session
+       revised the claim's value (dead in v1 — no writer, T7.33);
+    3. ``claim_dependencies.from_claim_id`` + ``created_in_session``;
+    4. ``claim_dependencies.to_claim_id`` + ``created_in_session``;
+    5. T7.34 (ADR-0018): ``claim_assessments.claim_id`` +
+       ``created_in_session`` — the REVERIFY path. The reverify of an
+       existing claim (a claim op carrying ``existing_claim_id``) is
+       recorded as a fresh assessment row bound to the reverifying
+       session (the verification moment, ADR-0017); the row exists
+       whether or not any evidence is new — a re-fetched identical
+       source collapses into the anchor's evidence row by identity
+       (§14.3), so the evidence path alone cannot see it. Only
+       session-created assessments are counted (worker/activation
+       rows have ``created_in_session IS NULL``).
+    """
     sql = f"""
         WITH cur AS (
           SELECT h.claim_id, a.effective_grade
@@ -434,6 +455,10 @@ async def _gate_reuse(db: AsyncSession, run: EvaluationRun) -> dict[str, Any]:
           UNION
           SELECT to_claim_id, created_in_session FROM claim_dependencies
           WHERE to_claim_id IN (SELECT claim_id FROM significant)
+            AND created_in_session IS NOT NULL
+          UNION
+          SELECT claim_id, created_in_session FROM claim_assessments
+          WHERE claim_id IN (SELECT claim_id FROM significant)
             AND created_in_session IS NOT NULL
         ),
         per_claim AS (

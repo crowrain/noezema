@@ -12,6 +12,7 @@ heads are not current evidence and not dependencies.
 
 from __future__ import annotations
 
+import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -84,6 +85,56 @@ def _dependency_dict(value: Any) -> JsonDict | None:
     return value if isinstance(value, dict) else None
 
 
+#: T7.34 (ADR-0018): a hex prefix of a UUID — 8..31 chars (32+ without
+#: dashes is a full UUID; 7 or fewer is too short to be a reference).
+_CLAIM_REF_PREFIX_RE = re.compile(r"^[0-9a-f]{8,31}$")
+
+
+def resolve_claim_reference(
+    raw: str, visible_ids: list[uuid.UUID]
+) -> tuple[uuid.UUID | None, str | None]:
+    """T7.34 (ADR-0018): resolve the model's reference to an EXISTING
+    claim against the claims visible to the session.
+
+    ``raw`` is the model's free-form string (``ClaimProposal.
+    existing_claim_id``). The id is host-issued; the model only
+    REFERENCEs it (the invariant «id генерирует хост»). Resolution is
+    STRICT fail-closed — every failure returns a clear reason, never a
+    silent drop:
+
+    - a full UUID (canonical form, or 32 hex without dashes) is
+      accepted ONLY when it is in ``visible_ids``;
+    - a hex prefix (the model has truncated UUIDs — curator_error,
+      EVAL-4d pack 7) is accepted ONLY when it is UNAMBIGUOUS among
+      ``visible_ids`` (exactly one match); dashes in the reference are
+      ignored (a truncated canonical form keeps its dash);
+    - anything else → a parse problem.
+
+    ``visible_ids`` is the session's knowledge set at the resolution
+    point (curator boundary: the context pack's ``[c:<uuid>]`` lines;
+    commit boundary: the claims with a head in the session's snapshot —
+    the T7.9 dedup condition).
+    """
+    ref = str(raw).strip().lower()
+    nodash = ref.replace("-", "")
+    try:
+        full = uuid.UUID(ref)
+    except ValueError:
+        full = None
+    if full is not None:
+        if full in visible_ids:
+            return full, None
+        return None, f"claim {full} is not visible to the session"
+    if _CLAIM_REF_PREFIX_RE.match(nodash):
+        candidates = [c for c in visible_ids if str(c).replace("-", "").startswith(nodash)]
+        if len(candidates) == 1:
+            return candidates[0], None
+        if not candidates:
+            return None, f"no visible claim matches prefix {nodash[:16]}…"
+        return None, f"prefix {nodash[:16]}… is ambiguous among {len(candidates)} visible claims"
+    return None, f"unparseable claim reference {str(raw)[:20]!r}"
+
+
 def find_evidential_cycles(
     existing: list[tuple[uuid.UUID, uuid.UUID]],
     new: list[tuple[uuid.UUID, uuid.UUID]],
@@ -125,6 +176,9 @@ def find_evidential_cycles(
 class MemoryApplyResult:
     claims_created: int = 0
     claims_reused: int = 0
+    #: T7.34 (ADR-0018): existing claims reverified by id — no new row,
+    #: the record is the fresh assessment (the session's moment)
+    claims_reverified: int = 0
     evidence_added: int = 0
     evidence_deduped: int = 0
     assessments: int = 0
@@ -293,7 +347,14 @@ class MemoryService:
 
         now = datetime.now(UTC)
         problems: list[str] = []
-        counters = {"created": 0, "reused": 0, "added": 0, "deduped": 0, "assessments": 0}
+        counters = {
+            "created": 0,
+            "reused": 0,
+            "reverified": 0,
+            "added": 0,
+            "deduped": 0,
+            "assessments": 0,
+        }
 
         # T7.17 (§3.7, §11.2): the question the session answers is the
         # trusted scope anchor (host input). The model's free-form
@@ -345,16 +406,112 @@ class MemoryService:
         env_hash = manifest_content_hash(env_fields)
         env = await self._environment_manifest(db, env_hash, env_fields)
 
-        # 1. claims (exact statement+type dedup against the corpus)
-        claims: list[ORMClaim] = []
+        # 1. claims (exact statement+type dedup against the corpus;
+        #    T7.34/ADR-0018: + reverify of an existing claim by
+        #    host-issued id). A rejected op keeps its index in
+        #    ``claims`` as a None placeholder — the evidence-link
+        #    claim_index refers to the proposal's position, so the
+        #    indices must stay aligned (T7.24).
+        claims: list[ORMClaim | None] = []
         claim_scopes: dict[uuid.UUID, JsonDict] = {}
         claim_deps: list[tuple[ORMClaim, list[Any]]] = []
+        # T7.34 (ADR-0018): the reverify reference set at the commit
+        # boundary — the claims with a head in THIS session's snapshot
+        # (the T7.9 dedup condition). Fetched once, lazily.
+        reverify_visible: list[uuid.UUID] | None = None
         for row in claim_ops:
             payload = dict(row.payload)
             statement = str(payload.get("statement", ""))[:2000]
             claim_type = str(payload.get("claim_type", ""))
             if not statement or claim_type not in self._rules:
                 problems.append(f"claim staging rejected: bad statement/type ({row.id})")
+                claims.append(None)
+                continue
+            raw_ref = payload.get("existing_claim_id")
+            if raw_ref is not None:
+                if reverify_visible is None:
+                    reverify_visible = list(
+                        (
+                            await db.execute(
+                                select(ORMClaim.id).where(
+                                    exists(
+                                        select(ORMClaimAssessmentHead.claim_id).where(
+                                            ORMClaimAssessmentHead.claim_id == ORMClaim.id,
+                                            ORMClaimAssessmentHead.config_snapshot_id
+                                            == session.config_snapshot_id,
+                                        )
+                                    )
+                                )
+                            )
+                        )
+                        .scalars()
+                        .all()
+                    )
+                ref_id, ref_problem = resolve_claim_reference(
+                    str(raw_ref), reverify_visible
+                )
+                if ref_problem is not None:
+                    # fail-closed: a clear reason in the commit audit
+                    # (problems), never a silent drop
+                    problems.append(
+                        f"claim staging rejected: reverify reference {ref_problem} ({row.id})"
+                    )
+                    claims.append(None)
+                    continue
+                target_claim = await db.get(ORMClaim, ref_id)
+                if target_claim is None:
+                    problems.append(
+                        f"claim staging rejected: reverify target vanished ({row.id})"
+                    )
+                    claims.append(None)
+                    continue
+                # T7.34 (ADR-0018): the reverify attaches to the
+                # EXISTING claim — no new row, the statement/type are
+                # the anchor's (the model's restatement is audit-only,
+                # a revision of the value is claim_revisions, not this).
+                # The reverify RECORD is the fresh assessment row
+                # created in step 3 (created_in_session = this session
+                # — the verification moment); it exists whether or not
+                # any evidence is new (a re-fetched identical source
+                # reuses the anchor's evidence row by identity — the
+                # trap ADR-0018 documents, so the record must not be
+                # the evidence).
+                as_of_raw = payload.get("as_of")
+                model_as_of = datetime.fromisoformat(as_of_raw) if as_of_raw else None
+                host_ref = derive_claim_as_of(
+                    question=question_text, as_of=model_as_of, session_date=session_date
+                )
+                rv_deps = payload.get("dependencies")
+                rv_deps_list: list[Any] = list(rv_deps) if isinstance(rv_deps, list) else []
+                target_claim.as_of = host_ref.as_of
+                claim_scopes[target_claim.id] = derive_claim_scope(
+                    question=question_text,
+                    as_of=target_claim.as_of,
+                    session_date=session_date,
+                )
+                counters["reverified"] += 1
+                claim_deps.append((target_claim, rv_deps_list))
+                claims.append(target_claim)
+                await audit.record(
+                    AuditEventType.CLAIM_REVERIFIED,
+                    session_id=session.id,
+                    payload={
+                        "claim_id": str(target_claim.id),
+                        "reference": str(raw_ref)[:36],
+                        "resolved": str(ref_id),
+                        "statement": statement[:500],
+                        "as_of": (
+                            model_as_of.isoformat() if model_as_of is not None else None
+                        ),
+                        "assessed_as_of": (
+                            host_ref.as_of.isoformat()
+                            if host_ref.as_of is not None
+                            else None
+                        ),
+                        "date_anchor": host_ref.anchor.value,
+                    },
+                    public_summary=f"reverify: {statement[:120]}",
+                )
                 continue
             # T7.17: the model's free-form scope proposal (untrusted;
             # audit/staging only) vs the host-derived assessed scope
@@ -611,7 +768,9 @@ class MemoryService:
                 )
 
         # 2. evidence (identity recomputed by the trusted host)
-        linked: dict[uuid.UUID, list[ORMEvidence]] = {c.id: [] for c in claims}
+        linked: dict[uuid.UUID, list[ORMEvidence]] = {
+            c.id: [] for c in claims if c is not None
+        }
         for row in evidence_ops:
             payload = dict(row.payload)
             index = int(payload.get("evidence_index", -1))
@@ -627,7 +786,16 @@ class MemoryService:
                 problems.append(f"evidence staging rejected: bad relation {relation!r} ({row.id})")
                 continue
             record = evidence_records[index]
-            claim = claims[claim_index]
+            linked_claim = claims[claim_index]
+            if linked_claim is None:
+                # T7.34 (ADR-0018): the claim op at this index was
+                # rejected (e.g. an unresolvable reverify reference) —
+                # its evidence links are rejected too, with a clear
+                # reason; the indices stay aligned with the proposal
+                problems.append(
+                    f"evidence staging rejected: claim op {claim_index} was rejected ({row.id})"
+                )
+                continue
             kind = str(record.kind.value)
             identity, artifact_id = await self._identity_for(db, record, kind, env_hash)
             if artifact_id is None and kind in (
@@ -642,7 +810,7 @@ class MemoryService:
                 (
                     await db.execute(
                         select(ORMEvidence).where(
-                            ORMEvidence.claim_id == claim.id,
+                            ORMEvidence.claim_id == linked_claim.id,
                             ORMEvidence.evidence_kind == kind,
                             ORMEvidence.identity_hash == identity,
                         )
@@ -673,7 +841,7 @@ class MemoryService:
                         continue
                 ev = ORMEvidence(
                     id=uuid.uuid4(),
-                    claim_id=claim.id,
+                    claim_id=linked_claim.id,
                     relation=relation,
                     evidence_kind=kind,
                     identity_hash=identity,
@@ -693,14 +861,30 @@ class MemoryService:
                 )
                 db.add(ev)
                 counters["added"] += 1
-            if ev not in linked[claim.id]:
-                linked[claim.id].append(ev)
+            if ev not in linked[linked_claim.id]:
+                linked[linked_claim.id].append(ev)
 
-        # 3. assessment per claim (rules engine is the only producer, §3.7)
-        for claim in claims:
+        # 3. assessment per claim (rules engine is the only producer,
+        # §3.7). T7.34 (ADR-0018): a reverified claim goes through the
+        # SAME path as a created/reused one — one fresh assessment row
+        # (created_in_session = this session) is the reverify record;
+        # the deadline rule (T7.32/ADR-0017) is the single
+        # ``reverify_after`` call in _assess — a confirmed reverify of
+        # a relative-anchored claim shifts it to this verification
+        # moment, an evergreen claim stays deadline-less (no copied
+        # logic). Rejected ops (None) are skipped; a claim reached by
+        # two ops (dedup + reverify of the same target) is assessed
+        # ONCE — one verification moment per claim per commit.
+        assessed_ids: set[uuid.UUID] = set()
+        for assess_claim in claims:
+            if assess_claim is None or assess_claim.id in assessed_ids:
+                continue
+            assessed_ids.add(assess_claim.id)
             all_evidence = list(
                 (
-                    await db.execute(select(ORMEvidence).where(ORMEvidence.claim_id == claim.id))
+                    await db.execute(
+                        select(ORMEvidence).where(ORMEvidence.claim_id == assess_claim.id)
+                    )
                 )
                 .scalars()
                 .all()
@@ -722,7 +906,13 @@ class MemoryService:
                     ev_row.scope = expected
             try:
                 ok = await self._assess(
-                    db, audit, session, claim, claim_scopes.get(claim.id, {}), all_evidence, now
+                    db,
+                    audit,
+                    session,
+                    assess_claim,
+                    claim_scopes.get(assess_claim.id, {}),
+                    all_evidence,
+                    now,
                 )
             except RuleValidationError:
                 # T7.9 (EVAL-3b post-mortem P.2, §14.1): a rules engine
@@ -742,6 +932,7 @@ class MemoryService:
         return MemoryApplyResult(
             claims_created=counters["created"],
             claims_reused=counters["reused"],
+            claims_reverified=counters["reverified"],
             evidence_added=counters["added"],
             evidence_deduped=counters["deduped"],
             assessments=counters["assessments"],
