@@ -493,6 +493,11 @@ class AuditEventType(StrEnum):
     OPERATOR_COMMAND_REJECTED = "operator_command_rejected"
     CONFIG_SNAPSHOT_CREATED = "config_snapshot_created"
     CONFIG_ACTIVATED = "config_activated"
+    # T7.35 (ADR-0019): a session was rejected at admission because a
+    # payload prompt pin could not be satisfied (missing sha256 pin,
+    # content hash mismatch, version-header mismatch). Out-of-session
+    # event (session_id IS NULL): the session never started.
+    PROMPT_PIN_MISMATCH = "prompt_pin_mismatch"
     # T4.5 (§8.7.2): the online activation lifecycle
     ACTIVATION_ACQUIRED = "activation_acquired"
     ACTIVATION_TAKEOVER = "activation_takeover"

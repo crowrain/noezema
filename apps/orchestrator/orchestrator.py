@@ -111,7 +111,13 @@ from packages.domain.services.staging import StagingService
 from packages.llm_gateway.client import LLMError, LLMMiddleware, LLMRequestRejectedError, LLMSchemaError
 from packages.llm_gateway.config import ModelProfile
 from packages.llm_gateway.fingerprint import build_model_fingerprint
-from packages.llm_gateway.roles import Role, load_prompt, tool_schema_hash
+from packages.llm_gateway.roles import (
+    LoadedPrompt,
+    PromptPinError,
+    Role,
+    resolve_prompts,
+    tool_schema_hash,
+)
 from packages.memory.activation import ActivationInFlightError, activation_slot_busy
 from packages.memory.session_admission import register_session_admission
 from packages.policy.engine import PolicyEngine
@@ -241,13 +247,16 @@ class Orchestrator:
         # change, §5.3.1)
         self._injected_selector = selector
         self.selector = selector if selector is not None else FIFOQuestionSelector()
-        self.prompts = {
-            Role.EXPLORER: load_prompt(Role.EXPLORER),
-            Role.CURATOR: load_prompt(Role.CURATOR),
-            Role.PLANNER: load_prompt(Role.PLANNER),
-            Role.VERIFIER: load_prompt(Role.VERIFIER),
-            Role.EXTRACTOR: load_prompt(Role.EXTRACTOR),
-        }
+        # T7.35 (ADR-0019): prompts are resolved PER SESSION from the
+        # effective config snapshot's prompts section (content pins —
+        # path + version + sha256 of the file bytes), fail-closed at
+        # admission. No longer read from disk at construction: the
+        # payload reference, not a hardcoded file name, decides the text.
+        # Single session at a time (M1) makes the instance attribute
+        # safe: it is resolved before the session starts and used only
+        # by that session's phases.
+        self.prompts: dict[Role, LoadedPrompt] = {}
+        self._prompt_section: dict[str, Any] | None = None
         self.node_owner = node_owner if node_owner is not None else f"node-{os.getpid()}"
         # T3.30: the lease TTL is injectable for tests (scenario regression:
         # an LLM call longer than the TTL must not starve the fenced commit)
@@ -313,15 +322,40 @@ class Orchestrator:
                     f"session {active[0].id} is still nonterminal; single session at a time (M1)"
                 )
             probe_snapshot = await ConfigService.get_effective(db)
-            await register_session_admission(
-                db,
-                session_id,
-                node_owner=self.node_owner,
-                config_snapshot_id=probe_snapshot.id,
-                phase_deadline_seconds=int(
-                    probe_snapshot.session_limits.get("phase_deadline_seconds", 600)
-                ),
-            )
+            # T7.35 (ADR-0019): the prompt set is resolved from the
+            # snapshot's CONTENT PINS before the session starts —
+            # fail-closed: on any mismatch the session does not start
+            # and the reason lands in the audit (out-of-session event).
+            # The admission record is NOT registered in that case.
+            prompt_error: PromptPinError | None = None
+            try:
+                self.prompts = resolve_prompts(probe_snapshot.prompts)
+                self._prompt_section = dict(probe_snapshot.prompts or {})
+            except PromptPinError as exc:
+                prompt_error = exc
+            if prompt_error is None:
+                await register_session_admission(
+                    db,
+                    session_id,
+                    node_owner=self.node_owner,
+                    config_snapshot_id=probe_snapshot.id,
+                    phase_deadline_seconds=int(
+                        probe_snapshot.session_limits.get("phase_deadline_seconds", 600)
+                    ),
+                )
+            else:
+                await AuditService(db).record(
+                    AuditEventType.PROMPT_PIN_MISMATCH,
+                    session_id=None,
+                    payload={
+                        "session_id": str(session_id),
+                        "config_snapshot_id": str(probe_snapshot.id),
+                        "error": str(prompt_error)[:500],
+                    },
+                    public_summary=f"session {session_id} not started: prompt pin mismatch",
+                )
+        if prompt_error is not None:
+            raise prompt_error
 
         # ── phase 1: lifecycle up to COMMITTING ───────────────────────────
         try:
@@ -514,6 +548,16 @@ class Orchestrator:
         # T7.20: the host-generated id is bound to the committed admission
         # record written before this transaction opened (ADR-0009)
         snapshot = await ConfigService.get_effective(db)
+        # T7.35 (ADR-0019): the prompts were resolved at admission from
+        # the effective snapshot of THAT moment. If the pointer flipped
+        # in between (a mid-run activation, EVAL-3d), the session must
+        # not run under a different prompt set than the one it was
+        # admitted with — fail-closed, before the session row exists.
+        if canonical_sha256(dict(snapshot.prompts or {})) != canonical_sha256(self._prompt_section or {}):
+            raise RuntimeError(
+                "effective config snapshot changed between admission and start "
+                "(prompts section differs) — the session does not start (ADR-0019)"
+            )
         limits = snapshot.session_limits
 
         # capability profile from the config snapshot (fail-closed):
@@ -795,6 +839,7 @@ class Orchestrator:
         explorer_fp = build_model_fingerprint(
             self.profile,
             prompt_version=self.prompts[Role.EXPLORER].version,
+            prompt_sha256=self.prompts[Role.EXPLORER].sha256,
             tool_schema_hash=tool_schema_hash(sorted(cap_profile.tools)),
             policy_version=cap_profile.policy_version,
         )
@@ -860,6 +905,7 @@ class Orchestrator:
         fingerprint = build_model_fingerprint(
             self.profile,
             prompt_version=extractor.version,
+            prompt_sha256=extractor.sha256,
             tool_schema_hash=tool_schema_hash([]),
             policy_version=cap_profile.policy_version,
         )
@@ -878,6 +924,9 @@ class Orchestrator:
                 turn_id=uuid.uuid4(),
                 phase=session.state,
                 model_fingerprint=fingerprint,
+                prompt_version=extractor.version,
+                prompt_sha256=extractor.sha256,
+                tool_schema_hash=tool_schema_hash([]),
                 input_tokens=record.input_tokens if record is not None else 0,
                 output_tokens=record.output_tokens if record is not None else 0,
                 latency_ms=record.latency_ms if record is not None else 0.0,
@@ -899,6 +948,9 @@ class Orchestrator:
             turn_id=uuid.uuid4(),
             phase=session.state,
             model_fingerprint=fingerprint,
+            prompt_version=extractor.version,
+            prompt_sha256=extractor.sha256,
+            tool_schema_hash=tool_schema_hash([]),
             input_tokens=record.input_tokens,
             output_tokens=record.output_tokens,
             latency_ms=record.latency_ms,
@@ -1107,6 +1159,7 @@ class Orchestrator:
         fingerprint = build_model_fingerprint(
             self.profile,
             prompt_version=verifier.version,
+            prompt_sha256=verifier.sha256,
             tool_schema_hash=tool_schema_hash([]),
             policy_version=cap_profile.policy_version,
         )
@@ -1126,6 +1179,9 @@ class Orchestrator:
                 turn_id=turn_id,
                 phase=session.state,
                 model_fingerprint=fingerprint,
+                prompt_version=verifier.version,
+                prompt_sha256=verifier.sha256,
+                tool_schema_hash=tool_schema_hash([]),
                 input_tokens=record.input_tokens if record is not None else 0,
                 output_tokens=record.output_tokens if record is not None else 0,
                 latency_ms=record.latency_ms if record is not None else 0.0,
@@ -1148,6 +1204,9 @@ class Orchestrator:
             turn_id=turn_id,
             phase=session.state,
             model_fingerprint=fingerprint,
+            prompt_version=verifier.version,
+            prompt_sha256=verifier.sha256,
+            tool_schema_hash=tool_schema_hash([]),
             input_tokens=record.input_tokens,
             output_tokens=record.output_tokens,
             latency_ms=record.latency_ms,
@@ -1202,6 +1261,7 @@ class Orchestrator:
         fingerprint = build_model_fingerprint(
             self.profile,
             prompt_version=planner.version,
+            prompt_sha256=planner.sha256,
             tool_schema_hash=tool_schema_hash([]),
             policy_version=cap_profile.policy_version,
         )
@@ -1221,6 +1281,9 @@ class Orchestrator:
                 turn_id=turn_id,
                 phase=session.state,
                 model_fingerprint=fingerprint,
+                prompt_version=planner.version,
+                prompt_sha256=planner.sha256,
+                tool_schema_hash=tool_schema_hash([]),
                 input_tokens=record.input_tokens if record is not None else 0,
                 output_tokens=record.output_tokens if record is not None else 0,
                 latency_ms=record.latency_ms if record is not None else 0.0,
@@ -1243,6 +1306,9 @@ class Orchestrator:
             turn_id=turn_id,
             phase=session.state,
             model_fingerprint=fingerprint,
+            prompt_version=planner.version,
+            prompt_sha256=planner.sha256,
+            tool_schema_hash=tool_schema_hash([]),
             input_tokens=record.input_tokens,
             output_tokens=record.output_tokens,
             latency_ms=record.latency_ms,
@@ -1319,6 +1385,7 @@ class Orchestrator:
             fingerprint = build_model_fingerprint(
                 self.profile,
                 prompt_version=explorer.version,
+                prompt_sha256=explorer.sha256,
                 tool_schema_hash=tool_schema_hash(allowed_tools),
                 policy_version=cap_profile.policy_version,
             )
@@ -1354,6 +1421,9 @@ class Orchestrator:
                 turn_id=turn_id,
                 phase=session.state,
                 model_fingerprint=fingerprint,
+                prompt_version=explorer.version,
+                prompt_sha256=explorer.sha256,
+                tool_schema_hash=tool_schema_hash(allowed_tools),
                 input_tokens=record.input_tokens,
                 output_tokens=record.output_tokens,
                 latency_ms=record.latency_ms,
@@ -1916,6 +1986,7 @@ class Orchestrator:
         fingerprint = build_model_fingerprint(
             self.profile,
             prompt_version=curator.version,
+            prompt_sha256=curator.sha256,
             tool_schema_hash=None,
             policy_version="sealed-m1-stub",
         )
@@ -1978,6 +2049,9 @@ class Orchestrator:
             turn_id=uuid.uuid4(),
             phase=session.state,
             model_fingerprint=fingerprint,
+            prompt_version=curator.version,
+            prompt_sha256=curator.sha256,
+            tool_schema_hash=None,
             input_tokens=record.input_tokens,
             output_tokens=record.output_tokens,
             latency_ms=record.latency_ms,

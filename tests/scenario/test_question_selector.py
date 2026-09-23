@@ -56,24 +56,8 @@ async def test_empty_queue_returns_none(migrated_db: tuple[str, object]) -> None
         assert await selector.select(db) is None
 
 
-def test_real_prompts_are_versioned() -> None:
-    """Repo prompts load with the versions pinned in the config snapshot."""
-    from packages.llm_gateway.roles import Role, load_prompt
-
-    explorer = load_prompt(Role.EXPLORER)
-    curator = load_prompt(Role.CURATOR)
-    # T7.14: prompts bumped to v3 (explorer: ≤2 repeats after a tool error;
-    # curator: no assertion text in evidence → question, not claim)
-    # T7.21: explorer bumped to v4 (fetch every question-named source
-    # before completing — backstop for the host coverage gate, ADR-0010)
-    # T7.34: curator bumped to v4 (the reverify operation —
-    # existing_claim_id, ADR-0018)
-    assert explorer.version == "explorer-v4"
-    assert curator.version == "curator-v4"
-    assert len(explorer.sha256) == 64
-    assert len(curator.sha256) == 64
-    # config snapshot references these exact paths/versions
-    from packages.domain.config import BOOTSTRAP_PAYLOAD
-
-    assert BOOTSTRAP_PAYLOAD["prompts"]["explorer"]["version"] == explorer.version
-    assert BOOTSTRAP_PAYLOAD["prompts"]["curator"]["version"] == curator.version
+# T7.35 (ADR-0019): the old test_real_prompts_are_versioned (file header
+# == BOOTSTRAP_PAYLOAD version label) is superseded, STRENGTHENED, by
+# tests/unit/test_prompt_pinning.py::test_bootstrap_payload_pins_match_repo_files
+# — the pin is now CONTENT (path + version + sha256 of the file bytes),
+# and the check verifies all three against the committed repo files.

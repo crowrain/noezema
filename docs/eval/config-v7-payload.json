@@ -1,0 +1,273 @@
+{
+  "activation_limits": {
+    "offline_activation_max_invalid_questions": 100,
+    "online_activation_max_attempts": 78,
+    "online_activation_max_pending_questions": 100
+  },
+  "claim_type_rules": {
+    "computed_result": {
+      "allowed_kinds": [
+        "computation"
+      ],
+      "min_grade_for_supported": "E2",
+      "min_independence_groups": 1,
+      "min_support_evidence": 1,
+      "requires_scope": true,
+      "volatility": "static"
+    },
+    "empirical_conjecture": {
+      "allowed_kinds": [
+        "experiment_run"
+      ],
+      "min_grade_for_supported": "E3",
+      "min_independence_groups": 2,
+      "min_support_evidence": 2,
+      "required_independence": "independent_replication",
+      "requires_scope": true,
+      "volatility": "static"
+    },
+    "external_fact": {
+      "allowed_kinds": [
+        "source_assertion",
+        "quote_integrity"
+      ],
+      "min_grade_for_supported": "E3",
+      "min_independence_groups": 2,
+      "min_support_evidence": 2,
+      "requires_scope": true,
+      "volatility": "temporal"
+    },
+    "formal_theorem": {
+      "allowed_kinds": [
+        "formal_check"
+      ],
+      "min_grade_for_supported": "E4",
+      "min_independence_groups": 1,
+      "min_support_evidence": 1,
+      "requires_scope": true,
+      "volatility": "static"
+    },
+    "local_observation": {
+      "allowed_kinds": [
+        "local_observation"
+      ],
+      "min_grade_for_supported": "E2",
+      "min_independence_groups": 1,
+      "min_support_evidence": 1,
+      "requires_scope": true,
+      "volatility": "static"
+    },
+    "procedural": {
+      "allowed_kinds": [
+        "experiment_run",
+        "computation"
+      ],
+      "min_grade_for_supported": "E3",
+      "min_independence_groups": 2,
+      "min_support_evidence": 2,
+      "required_independence": "independent_replication",
+      "requires_scope": true,
+      "volatility": "static"
+    },
+    "self_model": {
+      "allowed_kinds": [
+        "local_observation"
+      ],
+      "min_grade_for_supported": "E2",
+      "min_independence_groups": 1,
+      "min_support_evidence": 1,
+      "requires_scope": false,
+      "volatility": "static"
+    },
+    "temporal_fact": {
+      "allowed_kinds": [
+        "source_assertion",
+        "quote_integrity"
+      ],
+      "min_grade_for_supported": "E3",
+      "min_independence_groups": 2,
+      "min_support_evidence": 2,
+      "requires_as_of": true,
+      "requires_scope": true,
+      "volatility": "temporal"
+    }
+  },
+  "curiosity": {
+    "delta": 0.0,
+    "epsilon": 0.0,
+    "normalization": {
+      "cost_word_threshold": 400.0,
+      "feasibility_word_limit": 200.0,
+      "gap_debt_threshold": 4.0,
+      "min_word_len": 3.0,
+      "topic_overlap_threshold": 0.34
+    },
+    "recency_sessions": 5,
+    "selector": "fifo",
+    "similarity": {
+      "fingerprint": "token-jaccard-v1"
+    },
+    "top_m": 1,
+    "weights": {
+      "cost": 0.1,
+      "coverage_gap": 0.2,
+      "evidenceability": 0.2,
+      "feasibility": 0.1,
+      "novelty": 0.3,
+      "risk": 0.0,
+      "topic_recency": 0.1
+    }
+  },
+  "embeddings": {
+    "dimensions": null,
+    "enabled": false
+  },
+  "extraction": {
+    "max_chunks": 8,
+    "min_document_bytes": 500,
+    "mode": "off"
+  },
+  "model": {
+    "backend_context_limit": 262144,
+    "context_window": 262144,
+    "max_output_tokens": 8192,
+    "model_alias": "thinker-local",
+    "provider": "openai-compatible",
+    "safety_margin_tokens": 2048,
+    "sampling": {
+      "seed": 42,
+      "temperature_by_phase": {
+        "exploration": 0.6,
+        "planning": 0.25,
+        "verification": 0.15
+      },
+      "top_k": 40,
+      "top_p": 0.95
+    },
+    "structured_output": {
+      "mode": "json_schema",
+      "schema_version": "action-envelope/v1"
+    }
+  },
+  "planning": {
+    "max_steps": 10,
+    "mode": "template"
+  },
+  "policy": {
+    "access_profile": "curated",
+    "capabilities": {
+      "network": "research_proxy",
+      "tools": [
+        "workspace.read",
+        "workspace.list",
+        "workspace.write",
+        "artifact.create",
+        "memory.search",
+        "question.create",
+        "message.reply",
+        "shell.execute",
+        "python.execute",
+        "research.fetch"
+      ],
+      "write_paths": [
+        "/workspace"
+      ]
+    },
+    "limits": {
+      "command_timeout_seconds": 60,
+      "max_output_bytes": 1048576,
+      "session_timeout_seconds": 1800,
+      "workspace_quota_mb": 512
+    }
+  },
+  "prompts": {
+    "curator": {
+      "path": "prompts/curator/curator-v4.md",
+      "sha256": "6e129ded5485733a4f8e83a64e102a4985ec1a4d0f758bef88549e770d4f5692",
+      "version": "curator-v4"
+    },
+    "explorer": {
+      "path": "prompts/explorer/explorer-v2.md",
+      "sha256": "38e9b6885d1fdcdb4700ec745091074fe907954630308512c0629935cf6a1c3f",
+      "version": "explorer-v2"
+    },
+    "extractor": {
+      "path": "prompts/extractor/extractor-v1.md",
+      "sha256": "af5dba626b8a5a3995f89e6ca0b892a82976d8a7d32737c1f834e4b1b4c37866",
+      "version": "extractor-v1"
+    },
+    "planner": {
+      "path": "prompts/planner/planner-v1.md",
+      "sha256": "6aeb22bc727b9c0e24bcd8c31ba64fc653b842072bd9130409682283f83a87ee",
+      "version": "planner-v1"
+    },
+    "verifier": {
+      "path": "prompts/verifier/verifier-v1.md",
+      "sha256": "34fe8069f7ab88dc337efeb82e89c01853f645d3a4cc1c14fec3ce4fd53c9463",
+      "version": "verifier-v1"
+    }
+  },
+  "reassessment_admission": {
+    "queue_slo_seconds": 172800,
+    "t_escalate_seconds": 7200,
+    "t_worker_admission_seconds": 7200
+  },
+  "repair_admission": {
+    "repair_slo_seconds": 172800,
+    "t_repair_admission_seconds": 7200
+  },
+  "repetition": {
+    "enabled": true,
+    "no_progress_limit": 2,
+    "plan_cycle_threshold": 0.5,
+    "rephrase_threshold": 0.6
+  },
+  "research_proxy": {
+    "allowed_domains": [],
+    "max_redirects": 3,
+    "max_response_bytes": 4194304,
+    "mode": "curated",
+    "private_allowlist": [
+      "127.0.0.1:8888"
+    ],
+    "rate_limit_max": 20,
+    "rate_limit_window_seconds": 3600,
+    "searxng_url": "http://127.0.0.1:8888",
+    "timeout_seconds": 10,
+    "user_agent": "noezema-research-proxy/1.0"
+  },
+  "schema_version": 1,
+  "session_limits": {
+    "max_claims_assessed_per_session": 32,
+    "max_evidence_items_per_session": 64,
+    "max_explorer_steps": 10,
+    "max_new_claims_per_session": 16,
+    "max_new_questions_per_session": 4,
+    "phase_deadline_seconds": 1800,
+    "session_timeout_seconds": 1800
+  },
+  "token_budgets": {
+    "claims_evidence": 8192,
+    "contradictions": 3072,
+    "identity": 2048,
+    "last_session": 2048,
+    "messages": 2048,
+    "protocol": 4096,
+    "question_plan": 3072,
+    "recent_errors": 2048
+  },
+  "verification": {
+    "max_checks": 8,
+    "mode": "off"
+  },
+  "wake_schedule": {
+    "backoff_base_seconds": 60,
+    "backoff_max_seconds": 86400,
+    "backoff_multiplier": 2,
+    "disk_quota_mb": 1024,
+    "gpu_required": false,
+    "interval_seconds": 3600,
+    "max_consecutive_failures": 3,
+    "min_session_interval_seconds": 600
+  }
+}

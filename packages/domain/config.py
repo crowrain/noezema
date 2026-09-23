@@ -47,21 +47,48 @@ BOOTSTRAP_PAYLOAD: dict[str, Any] = {
     },
     "embeddings": {"enabled": False, "dimensions": None},
     "prompts": {
+        # T7.35 (ADR-0019): every role is a CONTENT PIN — path (the
+        # versioned file, relative to the repo root), version (the
+        # header label) and sha256 of the file bytes. The loader
+        # resolves the prompt BY THIS REFERENCE and verifies the header
+        # AND the content hash; any mismatch is fail-closed (the
+        # session does not start). The versioned files under
+        # prompts/<role>/<version>.md are the single source of truth.
         # T7.21 (ADR-0010): v4 — rule 7 (fetch every question-named
         # source before completing; backstop for the host coverage gate)
-        "explorer": {"version": "explorer-v4", "path": "prompts/explorer.md"},
+        "explorer": {
+            "version": "explorer-v4",
+            "path": "prompts/explorer/explorer-v4.md",
+            "sha256": "5829a55c4e5d92762c2d9909dd7ced9614c389448a813d52496e9d46e4b5e87e",
+        },
         # T7.34 (ADR-0018): v4 — the reverify operation
         # (`existing_claim_id`: re-check an existing claim without
         # creating a new one; the record is the fresh assessment row)
-        "curator": {"version": "curator-v4", "path": "prompts/curator.md"},
+        "curator": {
+            "version": "curator-v4",
+            "path": "prompts/curator/curator-v4.md",
+            "sha256": "6e129ded5485733a4f8e83a64e102a4985ec1a4d0f758bef88549e770d4f5692",
+        },
         # T5.2 (stage 4): the planner role (multi-step planning)
-        "planner": {"version": "planner-v1", "path": "prompts/planner.md"},
+        "planner": {
+            "version": "planner-v1",
+            "path": "prompts/planner/planner-v1.md",
+            "sha256": "6aeb22bc727b9c0e24bcd8c31ba64fc653b842072bd9130409682283f83a87ee",
+        },
         # T5.3 (stage 4): the verifier role (deterministic checks;
         # never assigns grade/confidence — §3.7)
-        "verifier": {"version": "verifier-v1", "path": "prompts/verifier.md"},
+        "verifier": {
+            "version": "verifier-v1",
+            "path": "prompts/verifier/verifier-v1.md",
+            "sha256": "34fe8069f7ab88dc337efeb82e89c01853f645d3a4cc1c14fec3ce4fd53c9463",
+        },
         # T5.5 (stage 4): the extraction profile (untrusted documents,
         # §11.2) — a model without tools extracts verbatim chunks
-        "extractor": {"version": "extractor-v1", "path": "prompts/extractor.md"},
+        "extractor": {
+            "version": "extractor-v1",
+            "path": "prompts/extractor/extractor-v1.md",
+            "sha256": "af5dba626b8a5a3995f89e6ca0b892a82976d8a7d32737c1f834e4b1b4c37866",
+        },
     },
     "policy": {
         "access_profile": "sealed",

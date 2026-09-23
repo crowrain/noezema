@@ -9,7 +9,13 @@ import pytest
 from packages.llm_gateway.client import LLMMiddleware
 from packages.llm_gateway.compat import run_compat_suite
 from packages.llm_gateway.config import LLMGatewayConfig
-from packages.llm_gateway.roles import Role, load_prompt, tool_schema_hash
+from packages.llm_gateway.roles import (
+    PromptPinError,
+    Role,
+    parse_prompt_version,
+    resolve_prompts,
+    tool_schema_hash,
+)
 from tests.conftest import FakeLLM
 
 VALID_TOOL = {
@@ -70,27 +76,61 @@ async def test_compat_suite_reports_schema_failure(fake_llm: FakeLLM) -> None:
     assert all(not c.passed for c in report.checks)
 
 
-@pytest.mark.unit
-def test_load_prompt_extracts_version(tmp_path: Path) -> None:
-    prompts = tmp_path / "prompts"
-    prompts.mkdir()
-    (prompts / "explorer.md").write_text(
-        "version: explorer-v1\n\n# Explorer\nDo one thing per turn.\n", encoding="utf-8"
-    )
-    loaded = load_prompt(Role.EXPLORER, prompts_dir=prompts)
-    assert loaded.version == "explorer-v1"
-    assert loaded.role is Role.EXPLORER
-    assert loaded.sha256 and len(loaded.sha256) == 64
-    assert "Do one thing per turn" in loaded.text
+def _full_tree(tmp_path: Path, override: dict[str, str] | None = None) -> dict:
+    """A complete 5-role prompt tree under tmp_path + its honest pins."""
+    import hashlib
+
+    texts: dict[str, str] = {
+        role.value: f"version: {role.value}-v1\n\n# {role.value}\n"
+        for role in Role
+    }
+    texts["explorer"] = "version: explorer-v1\n\n# Explorer\nDo one thing per turn.\n"
+    texts.update(override or {})
+    section = {}
+    for role, text in texts.items():
+        rel = f"prompts/{role}/{role}-v1.md"
+        path = tmp_path / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        section[role] = {
+            "version": parse_prompt_version(text),
+            "path": rel,
+            "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        }
+    return section
 
 
 @pytest.mark.unit
-def test_load_prompt_without_version(tmp_path: Path) -> None:
-    prompts = tmp_path / "prompts"
-    prompts.mkdir()
-    (prompts / "curator.md").write_text("just text", encoding="utf-8")
-    loaded = load_prompt(Role.CURATOR, prompts_dir=prompts)
-    assert loaded.version == "unversioned"
+def test_resolve_prompt_extracts_version_and_content_hash(tmp_path: Path) -> None:
+    import hashlib
+
+    section = _full_tree(tmp_path)
+    loaded = resolve_prompts(section, prompts_root=tmp_path)
+    assert set(loaded) == set(Role)
+    explorer = loaded[Role.EXPLORER]
+    assert explorer.version == "explorer-v1"
+    assert explorer.role is Role.EXPLORER
+    assert explorer.sha256 and len(explorer.sha256) == 64
+    assert explorer.sha256 == hashlib.sha256(explorer.text.encode("utf-8")).hexdigest()
+    assert "Do one thing per turn" in explorer.text
+
+
+@pytest.mark.unit
+def test_unversioned_file_fails_the_version_pin(tmp_path: Path) -> None:
+    import hashlib
+
+    text = "just text"
+    section = _full_tree(tmp_path, override={"curator": text})
+    # the honest pin for the unversioned file: the header check must
+    # still fail closed (declared label vs absent header)
+    assert parse_prompt_version(text) == "unversioned"
+    section["curator"] = {
+        "version": "curator-v1",
+        "path": "prompts/curator/curator-v1.md",
+        "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+    }
+    with pytest.raises(PromptPinError, match="version header"):
+        resolve_prompts(section, prompts_root=tmp_path)
 
 
 @pytest.mark.unit
