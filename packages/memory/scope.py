@@ -25,7 +25,8 @@ Canonical scope shape (``host-scope-v1``):
 
     claim scope:    {"scope_schema": "host-scope-v1",
                      "as_of": "2026-01-01" | None,
-                     "source_domains": ["example.org", ...]}
+                     "source_domains": ["example.org", ...],
+                     "date_anchor": "explicit" | "relative" | "none"}
     evidence scope: {"scope_schema": "host-scope-v1",
                      "as_of": "2026-09-16T13:49:14+00:00" | None,
                      "source_domain": "example.org" | None}
@@ -50,9 +51,11 @@ never silently re-grade existing knowledge in either direction.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
 
 from packages.domain.models.base import JsonDict
+from packages.domain.models.enums import ClaimDateAnchor
 from packages.memory.independence import registrable_domain
 
 #: the marker of a host-derived (canonical) scope; stored on the
@@ -68,6 +71,12 @@ CLAIM_SOURCE_DOMAINS_KEY = "source_domains"
 EVIDENCE_AS_OF_KEY = "as_of"
 #: the evidence scope's source's registrable domain
 EVIDENCE_SOURCE_DOMAIN_KEY = "source_domain"
+#: the claim scope's date ANCHOR (T7.32, ADR-0017): which branch of
+#: ``derive_claim_as_of`` produced the reference date — a value of
+#: ``ClaimDateAnchor``. It is the persisted form of the anchor: the
+#: write paths (commit, reassessment) derive the reverify deadline from
+#: it (the worker has no question to re-derive from).
+DATE_ANCHOR_KEY = "date_anchor"
 
 _RU_MONTHS = {
     "января": 1,
@@ -197,46 +206,98 @@ def extract_question_urls(text: str) -> tuple[str, ...]:
     return tuple(urls)
 
 
+@dataclass(frozen=True)
+class ClaimAsOf:
+    """The result of ``derive_claim_as_of`` (T7.30, ADR-0016; the
+    anchor — T7.32, ADR-0017): the host-derived reference datetime of
+    the claim row AND the ANCHOR that produced it — the closed set of
+    question branches. Callers must never re-derive the anchor from the
+    question (no second ``parse_question_date`` /
+    ``question_uses_relative_date`` call): this function is the single
+    source of truth for both values."""
+
+    as_of: datetime | None
+    anchor: ClaimDateAnchor
+
+
 def derive_claim_as_of(
     *,
     question: str | None,
     as_of: datetime | None,
     session_date: date | None = None,
-) -> datetime | None:
-    """The reference datetime of one claim row — HOST-DERIVED
-    (T7.30, ADR-0016). This is the single source of truth for the
-    reference date: the claim row's ``as_of`` (the base date of
-    ``reverify_after``, §8.6/§22.2) and the claim scope's reference
-    date (``derive_claim_scope``) are both derived by this function —
-    the same priority rule T7.18 uses for the scope, one function, no
-    copied logic.
+) -> ClaimAsOf:
+    """The reference datetime of one claim row and its ANCHOR —
+    HOST-DERIVED (T7.30, ADR-0016; the anchor — T7.32, ADR-0017). This
+    is the single source of truth for the reference date AND for the
+    anchor: the claim row's ``as_of``, the claim scope's reference date
+    and anchor (``derive_claim_scope``) and the existence of the
+    ``reverify_after`` deadline (§8.6/§22.2) are all decided from this
+    one function — the same priority rule T7.18 uses for the scope,
+    one function, no copied logic.
 
     Priority (T7.17, refined by T7.18 — ADR-0007; ADR-0016):
     1. the date the QUESTION names explicitly (the operator's input,
-       trusted — leftmost valid match of the closed form set);
+       trusted — leftmost valid match of the closed form set) →
+       anchor ``explicit`` (a claim about a FIXED point — no reverify
+       deadline, ADR-0017);
     2. else, when the QUESTION anchors the date RELATIVELY (a closed
        set: «на текущую дату», «сейчас», …) — the SESSION's date on
        the host's trusted clock (``session_date``, UTC — the session
-       START, not the commit moment, ADR-0007 T7.18);
+       START, not the commit moment, ADR-0007 T7.18) → anchor
+       ``relative`` (a claim about the PRESENT — the only claim class
+       that gets a reverify deadline: the verification moment + the
+       volatility window, ADR-0017);
     3. else (the question names no date at all, neither explicitly
-       nor relatively) — the claim's typed ``as_of`` (the model's
-       value; host-validated structure, not free-form; see ADR-0007,
-       уточнение T7.18).
+       nor relatively — including a relative form with no session
+       date available, the fail-closed fallback of T7.18) — the
+       claim's typed ``as_of`` (the model's value; host-validated
+       structure, not free-form; see ADR-0007, уточнение T7.18) →
+       anchor ``none`` (a claim about a FIXED point — no reverify
+       deadline, ADR-0017).
     The model's ``as_of`` can never shift the reference date of a
     question that carries a date anchor (explicit or relative): with a
     date anchor it is an audit-only value (staging payload + audit),
     never stored on the claim row (ADR-0016).
     """
-    day: date | None = None
     if question:
         day = parse_question_date(question)
-        if day is None and question_uses_relative_date(question) and session_date is not None:
-            day = session_date
-    if day is not None:
-        return datetime(day.year, day.month, day.day, tzinfo=UTC)
+        if day is not None:
+            return ClaimAsOf(
+                datetime(day.year, day.month, day.day, tzinfo=UTC),
+                ClaimDateAnchor.EXPLICIT,
+            )
+        if question_uses_relative_date(question) and session_date is not None:
+            return ClaimAsOf(
+                datetime(session_date.year, session_date.month, session_date.day, tzinfo=UTC),
+                ClaimDateAnchor.RELATIVE,
+            )
     if as_of is not None:
-        return as_of if as_of.tzinfo is not None else as_of.replace(tzinfo=UTC)
-    return None
+        return ClaimAsOf(
+            as_of if as_of.tzinfo is not None else as_of.replace(tzinfo=UTC),
+            ClaimDateAnchor.NONE,
+        )
+    return ClaimAsOf(None, ClaimDateAnchor.NONE)
+
+
+def anchor_from_scope(scope: JsonDict) -> ClaimDateAnchor:
+    """The claim's date anchor from a STORED host scope (T7.32,
+    ADR-0017) — the persistence seam for the write paths that have no
+    question to derive from (the reassessment worker).
+
+    Legacy scopes (pre-ADR-0017 rows, or scopes without the
+    ``date_anchor`` key) are treated as ``relative`` — the
+    CONSERVATIVE default: a deadline is kept/refreshed (the claim is
+    re-verified) rather than declared valid forever on the strength of
+    missing data. Every claim committed at or after T7.32 carries the
+    anchor explicitly."""
+    value = scope.get(DATE_ANCHOR_KEY)
+    if value in (
+        ClaimDateAnchor.EXPLICIT.value,
+        ClaimDateAnchor.RELATIVE.value,
+        ClaimDateAnchor.NONE.value,
+    ):
+        return ClaimDateAnchor(value)
+    return ClaimDateAnchor.RELATIVE
 
 
 def derive_claim_scope(
@@ -257,10 +318,16 @@ def derive_claim_scope(
          host-validated structure).
     - ``source_domains``: the registrable domains of the sources the
       question names (empty = the question names no sources — no source
-      constraint).
+      constraint);
+    - ``date_anchor`` (T7.32, ADR-0017): the ANCHOR that produced the
+      reference date (a value of ``ClaimDateAnchor``) — the persisted
+      form of the branch of ``derive_claim_as_of``: it decides whether
+      the claim has a reverify deadline at all (only ``relative``
+      does), so the write paths (commit, reassessment) can derive the
+      deadline from the stored scope without a question.
     """
     reference = derive_claim_as_of(question=question, as_of=as_of, session_date=session_date)
-    day = reference.date() if reference is not None else None
+    day = reference.as_of.date() if reference.as_of is not None else None
     domains: list[str] = []
     if question:
         for url in extract_question_urls(question):
@@ -271,6 +338,7 @@ def derive_claim_scope(
         SCOPE_SCHEMA_KEY: SCOPE_SCHEMA,
         CLAIM_AS_OF_KEY: day.isoformat() if day is not None else None,
         CLAIM_SOURCE_DOMAINS_KEY: domains,
+        DATE_ANCHOR_KEY: reference.anchor.value,
     }
 
 

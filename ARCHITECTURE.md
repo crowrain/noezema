@@ -1074,7 +1074,7 @@ epistemic_status: nullable
   hypothesis | supported | disputed | refuted | deferred
 assessment_state:
   current | pending | invalid
-freshness_status: fresh | due | stale | unknown
+freshness_status: fresh | due | stale | unknown | evergreen (срока перепроверки нет по построению, ADR-0017)
 valid_from
 valid_to: nullable
 as_of
@@ -1118,7 +1118,7 @@ Confidence имеет одного producer: rules engine вычисляет е�
 
 ### 8.6. Жизненный цикл знания и каскадная invalidation
 
-- Reverify deadline выводится из claim type, volatility, `as_of` и valid interval. `valid_to=NULL` означает неизвестный конец действия. Опорная дата `as_of` в строке claim выводится доверенным хостом из якоря вопроса (явная дата вопроса; относительная форма → дата сессии по часам хоста; вопрос без опорной даты → модельный `as_of`); модельная дата — аудиторская (ADR-0016).
+- Reverify deadline существует ТОЛЬКО у утверждения о настоящем (вопрос с относительной формой даты): выводится из claim type и volatility как момент проверки + окно перепроверки и НЕ отсчитывается от `as_of`; утверждение о фиксированном моменте (явная дата вопроса или вопрос без даты с модельным `as_of`) срока перепроверки не имеет — оно не может устареть (ADR-0017). `valid_to=NULL` означает неизвестный конец действия. Опорная дата `as_of` в строке claim выводится доверенным хостом из якоря вопроса (явная дата вопроса; относительная форма → дата сессии по часам хоста; вопрос без опорной даты → модельный `as_of`); модельная дата — аудиторская (ADR-0016).
 - Истечение срока меняет freshness, но не confidence.
 - Hypothesis не служит достаточным evidence; она может быть исследовательской зависимостью только с явной пометкой.
 - Experiment получает reproducibility capsule и structured environment manifest.
@@ -1158,7 +1158,7 @@ Invalidation выполняется так:
 - AND/OR-комбинации методов;
 - предикат покрытия claim scope;
 - максимальный grade при отсутствии обязательных полей;
-- volatility и расчёт `reverify_after`.
+- volatility и расчёт `reverify_after` (срок существует только у утверждения о настоящем: момент проверки + окно volatility; ADR-0017).
 
 Базовые типы v1:
 

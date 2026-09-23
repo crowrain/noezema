@@ -227,6 +227,34 @@ class FreshnessStatus(StrEnum):
     DUE = "due"
     STALE = "stale"
     UNKNOWN = "unknown"
+    # T7.32 (ADR-0017): no reverify deadline BY CONSTRUCTION — the claim
+    # is about a fixed point (explicit question date / dateless question
+    # with the model's as_of), later events cannot spoil it, it can
+    # never become due. Not "unknown": the system knows there is no
+    # deadline, and the claim is valid forever.
+    EVERGREEN = "evergreen"
+
+
+class ClaimDateAnchor(StrEnum):
+    """T7.32 (ADR-0017): the closed set of date ANCHORS of the
+    question, as derived by ``derive_claim_as_of`` (the single source
+    of truth, one function). Determines whether the claim has a
+    reverify deadline at all:
+
+    - ``explicit`` — the question names a date explicitly: the claim
+      is about a FIXED point in time → no deadline;
+    - ``relative`` — the question anchors the date RELATIVELY
+      («на текущую дату», «сейчас», …): the claim is about the
+      PRESENT → deadline = the verification moment + the volatility
+      window;
+    - ``none`` — the question names no date at all (the model's
+      ``as_of`` stands as the reference date): the claim is about a
+      fixed point → no deadline.
+    """
+
+    EXPLICIT = "explicit"
+    RELATIVE = "relative"
+    NONE = "none"
 
 
 class ClaimType(StrEnum):

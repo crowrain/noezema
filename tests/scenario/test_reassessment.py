@@ -283,9 +283,11 @@ async def test_worker_promotes_head_to_current(migrated_db: tuple[str, AsyncEngi
     )
     assert ev is not None and ev[0] == ACTOR and ev[1] == "E2"
 
-    # T7.27 (ADR-0014): the re-evaluated head's stored freshness follows
-    # the §8.6/T3.7 rule — computed_result (static, 90 days, no as_of)
-    # re-derives reverify_after = now + 90d → fresh
+    # T7.27 (ADR-0014) + T7.32 (ADR-0017): the re-evaluated head's
+    # stored freshness follows the §8.6/T3.7 rule — computed_result
+    # (static, 90-day window); the LEGACY seeded scope ({"x": 1}) has
+    # no date_anchor key → the conservative default anchor is relative
+    # (ADR-0017): re-derives reverify_after = now + 90d → fresh
     fr = await _scalar(
         engine,
         "SELECT c.freshness_status, c.reverify_after > now() "
@@ -299,18 +301,28 @@ async def test_worker_promotes_head_to_current(migrated_db: tuple[str, AsyncEngi
     assert out2.processed == 0 and out2.deferred
 
 
-async def test_worker_reassessment_keeps_due_when_deadline_passed(migrated_db: tuple[str, AsyncEngine]) -> None:
-    """T7.27 (ADR-0014): reassessment does NOT contradict the freshness
-    rule — a claim re-evaluated by the worker with an as_of in the past
-    (reverify_after = as_of + 30d already passed) keeps the DUE status
-    after the head promotion. The rule is the shared pure function
-    (packages.memory.freshness) — the same one the gate and retrieval
-    evaluate."""
+async def test_worker_reassessment_legacy_scope_refreshes_deadline(
+    migrated_db: tuple[str, AsyncEngine],
+) -> None:
+    """T7.27 (ADR-0014) + T7.32 (ADR-0017): reassessment does NOT
+    contradict the freshness rule. A claim with a LEGACY scope (no
+    date_anchor key — pre-ADR-0017 data) and an as_of in the past is
+    re-evaluated by the worker with the CONSERVATIVE default anchor
+    (relative, ADR-0017): the deadline is the worker's verification
+    moment + the volatility window — refreshed to the FUTURE — never
+    counted from the stored as_of (the pre-T7.32 expectation was
+    reverify_after = as_of + 30d = 2026-07-01, past → due; under
+    ADR-0017 the deadline no longer rests on as_of at all). The rule
+    is the shared pure function (packages.memory.freshness) — the
+    same one the gate and retrieval evaluate. (A claim with a
+    PERSISTED fixed-point anchor is covered by
+    test_as_of_commit.test_reassessment_does_not_return_deadline_to_
+    fixed_point_claim: the worker keeps reverify_after NULL.)"""
     from datetime import UTC, datetime, timedelta
 
     _, engine = migrated_db
     claim = _u("2")
-    as_of = datetime(2026, 6, 1, tzinfo=UTC)  # reverify 2026-07-01 — passed
+    as_of = datetime(2026, 6, 1, tzinfo=UTC)  # the stored (legacy) base date
     await _seed_claim(
         engine, claim, "Ставка составляет 14 процентов",
         claim_type="external_fact", state="pending",
@@ -350,19 +362,24 @@ async def test_worker_reassessment_keeps_due_when_deadline_passed(migrated_db: t
     st = await _job_state(engine, job)
     assert st["status"] == "completed"
     # the head is current again and the stored freshness follows the
-    # rule: reverify_after = as_of + 30d is in the past → due
+    # rule: legacy scope → relative default → reverify_after =
+    # verification moment + 30d (the external_fact window), in the
+    # future — NOT as_of + 30d (2026-07-01, past)
     row = await _scalar(
         engine,
-        "SELECT c.freshness_status, c.reverify_after, h.assessment_state "
+        "SELECT c.freshness_status, c.reverify_after, c.reverify_after > now(), "
+        "h.assessment_state "
         "FROM claims c JOIN claim_assessment_heads h "
         f"ON h.claim_id = c.id AND h.config_snapshot_id = {SNAP_SUBQUERY} "
         "WHERE c.id = :c",
         {"c": claim},
     )
     assert row is not None
-    assert row[2] == "current"
-    assert row[1] == as_of + timedelta(days=30)
-    assert row[0] == "due"
+    assert row[3] == "current"
+    assert row[1] is not None
+    assert bool(row[2])  # the deadline was refreshed to the future
+    assert row[1] != as_of + timedelta(days=30)  # never counted from as_of
+    assert row[0] == "fresh"
 
 
 # ─── insufficient data → invalid + question ─────────────────────────────────

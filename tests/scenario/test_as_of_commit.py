@@ -1,18 +1,23 @@
 """Scenario (DB): T7.30 (ADR-0016) — the claim row's `as_of` is the
 HOST-DERIVED reference date; the model's typed as_of is audit-only.
+T7.32 (ADR-0017) — the reverify deadline exists ONLY for a claim about
+the PRESENT (the question anchors the date relatively): reverify_after
+= the verification moment + the volatility window, never counted from
+as_of. A claim about a fixed point (explicit question date / dateless
+question with the model's as_of) is immutable → NO deadline (NULL,
+freshness evergreen), and reassessment never returns a deadline to it.
 
 The commit boundary (the same code the fenced final transaction runs):
-the claim row's `as_of` — the base date of `reverify_after`
-(§8.6/§22.2) — is derived by `derive_claim_as_of` (one function, the
-same priority rule T7.17/T7.18 uses for the scope): explicit question
-date > relative form → session start (host clock, UTC) > model's
-as_of (dateless question fallback). The model's value stays in the
-staging payload and the `claim_created` audit; reassessment re-derives
-`reverify_after` from the stored host date and never returns the
-model's date. The EVAL-4d form (14 relative + 6 explicit-old + 2
-dateless of 28 — 19 relative + 6 explicit-old + 3 dateless, the
-fixture — NOT the evidence DB) → gate 6 = 8/28 → failed (the T7.29
-recalculation).
+the claim row's `as_of` is derived by `derive_claim_as_of` (one
+function, one source of truth — it also returns the ANCHOR of the
+branch that won: explicit > relative form → session start (host
+clock, UTC) > model's as_of (dateless question fallback)). The
+model's value stays in the staging payload and the `claim_created`
+audit. The EVAL-4d form (the fixture — NOT the evidence DB): the 19
+relative claims are fresh (deadline = commit + 30d) and the 6
+explicit-old + 3 dateless fixed-point claims have NO deadline — the
+pre-T7.32 due set (8 of 28) is gone by construction: gate 6 counts
+only the relative claims, 0 due of them (T7.32/ADR-0017).
 """
 
 from __future__ import annotations
@@ -247,9 +252,12 @@ async def test_relative_question_as_of_is_session_start(migrated_db: Any) -> Non
     # the host-derived reference date: the session START (midnight
     # UTC of the session's date) — NOT the model's 2026-06-15
     assert as_of == expected
-    # reverify_after = as_of + 30d (volatility configurable, the
-    # unchanged rules_engine formula) → fresh
-    assert reverify == as_of + timedelta(days=30)
+    # T7.32 (ADR-0017): a relative claim is about the PRESENT —
+    # reverify_after = the VERIFICATION MOMENT (the commit, between
+    # the session start and the session start + 1d) + the volatility
+    # window (30d) — never counted from as_of → fresh
+    assert reverify is not None
+    assert as_of + timedelta(days=30) <= reverify < as_of + timedelta(days=31)
     assert freshness == "fresh"
 
     # the model's date is AUDIT-ONLY: the staging payload (durable,
@@ -282,12 +290,16 @@ async def test_relative_question_as_of_is_session_start(migrated_db: Any) -> Non
 
 
 @pytest.mark.asyncio
-async def test_explicit_question_date_wins_and_stays_due(migrated_db: Any) -> None:
-    """T7.30 (ADR-0016): a question with an EXPLICIT old date stores
-    `as_of` = that date (the model's as_of — in the future of the
-    question's date — does not shift it); `reverify_after` = the
-    explicit date + 30d is already past → the by-design corpus
-    overdue is preserved (freshness 'due', never the model's value)."""
+async def test_explicit_question_date_wins_and_has_no_deadline(migrated_db: Any) -> None:
+    """T7.30 (ADR-0016) + T7.32 (ADR-0017): a question with an
+    EXPLICIT old date stores `as_of` = that date (the model's as_of —
+    in the future of the question's date — does not shift it). Under
+    ADR-0017 the explicitly-dated claim is about a FIXED point — a
+    fixed moment is immutable, later events cannot spoil it — so it
+    has NO reverify deadline: `reverify_after` is NULL, freshness
+    ``evergreen``. (The pre-T7.32 expectation was 'due': reverify was
+    counted from as_of, so the claim was overdue forever — the root of
+    the EVAL-4d/T7.31 «просрочен навсегда» class.)"""
     _scratch, engine = migrated_db
     snap = await _snapshot(engine)
     factory = await _commit_claims(
@@ -299,15 +311,20 @@ async def test_explicit_question_date_wins_and_stays_due(migrated_db: Any) -> No
 
     as_of, reverify, freshness = await _claim_row(factory, "Сколько станций")
     assert as_of == datetime(2026, 6, 15, tzinfo=UTC)  # the explicit question date
-    assert reverify == datetime(2026, 7, 15, tzinfo=UTC)  # +30d, in the past
-    assert freshness == "due"  # by-design overdue (the corpus shape)
+    assert reverify is None  # no deadline by construction (ADR-0017)
+    assert freshness == "evergreen"
 
 
 @pytest.mark.asyncio
-async def test_dateless_question_keeps_model_as_of(migrated_db: Any) -> None:
-    """T7.30 (ADR-0016): a question with NO date anchor (the Sputnik-1
-    shape) keeps the model's typed as_of as-is — the event date;
-    reverify_after = the model's date + 30d (past → due)."""
+async def test_dateless_question_keeps_model_as_of_and_has_no_deadline(
+    migrated_db: Any,
+) -> None:
+    """T7.30 (ADR-0016) + T7.32 (ADR-0017): a question with NO date
+    anchor (the Sputnik-1 shape) keeps the model's typed as_of as-is
+    — the event date; the claim is about a FIXED point → NO reverify
+    deadline (NULL, evergreen). (The pre-T7.32 expectation was
+    reverify_after = the model's date + 30d = 1957-11-03, due forever
+    — claim `de9855eb` in EVAL-4d; the class is gone per ADR-0017.)"""
     _scratch, engine = migrated_db
     snap = await _snapshot(engine)
     factory = await _commit_claims(
@@ -319,8 +336,8 @@ async def test_dateless_question_keeps_model_as_of(migrated_db: Any) -> None:
 
     as_of, reverify, freshness = await _claim_row(factory, "Спутник-1 запущен")
     assert as_of == datetime(1957, 10, 4, 19, 28, 34, tzinfo=UTC)  # unchanged
-    assert reverify == datetime(1957, 11, 3, 19, 28, 34, tzinfo=UTC)
-    assert freshness == "due"
+    assert reverify is None  # no deadline by construction (ADR-0017)
+    assert freshness == "evergreen"
 
 
 @pytest.mark.asyncio
@@ -348,8 +365,14 @@ async def test_session_crossing_midnight_anchors_on_session_start(migrated_db: A
     # the anchor is the session start's date — NOT the commit day
     assert as_of == datetime(day_n.year, day_n.month, day_n.day, tzinfo=UTC)
     assert as_of != datetime(day_n1.year, day_n1.month, day_n1.day, tzinfo=UTC)
-    assert reverify == as_of + timedelta(days=30)
-    assert freshness == "fresh"  # day N + 30d is still in the future
+    # T7.32 (ADR-0017): the deadline is the commit moment (day N+1,
+    # right after the session start `start`) + 30d — within a day of
+    # start + 30d — never counted from as_of (as_of + 30d = day N + 30d
+    # would be the pre-T7.32 value)
+    assert reverify is not None
+    assert start + timedelta(days=30) <= reverify < start + timedelta(days=31)
+    assert reverify != as_of + timedelta(days=30)  # never counted from as_of
+    assert freshness == "fresh"  # commit + 30d is still in the future
 
 
 @pytest.mark.asyncio
@@ -407,11 +430,79 @@ async def test_reassessment_keeps_host_as_of(migrated_db: Any) -> None:
 
     as_of, reverify, freshness = await _claim_row(factory, "Сколько государств-членов")
     # the host date is kept (the model's 2026-06-15 → reverify
-    # 2026-07-15 did NOT come back)
+    # 2026-07-15 did NOT come back); T7.32 (ADR-0017): the worker
+    # refreshes the deadline to its OWN verification moment + 30d —
+    # between the session date + 30d and the session date + 31d
     assert as_of == expected
-    assert reverify == expected + timedelta(days=30)
+    assert reverify is not None
+    assert expected + timedelta(days=30) <= reverify < expected + timedelta(days=31)
     assert reverify != datetime(2026, 7, 15, tzinfo=UTC)
     assert freshness == "fresh"
+
+
+@pytest.mark.asyncio
+async def test_reassessment_does_not_return_deadline_to_fixed_point_claim(
+    migrated_db: Any,
+) -> None:
+    """T7.32 (ADR-0017): reassessment NEVER returns a deadline to a
+    claim about a fixed point. A claim committed on an EXPLICIT old
+    date question has reverify_after = NULL (evergreen — the
+    fixed moment is immutable); after the head is invalidated and the
+    worker re-evaluates it, the deadline is STILL NULL (the worker
+    applies the same anchor rule from the persisted scope's
+    ``date_anchor``) — no as_of-based deadline comes back."""
+    _scratch, engine = migrated_db
+    snap = await _snapshot(engine)
+    factory = await _commit_claims(
+        engine,
+        snap,
+        question_text=QUESTION_EXPLICIT_OLD,
+        claims=[("Сколько станций в московском метро", "2026-08-13T00:00:00+00:00")],
+    )
+    # the fixed-point state BEFORE the worker: NULL deadline, evergreen
+    as_of, reverify, freshness = await _claim_row(factory, "Сколько станций")
+    assert as_of == datetime(2026, 6, 15, tzinfo=UTC)
+    assert reverify is None and freshness == "evergreen"
+
+    # move the head to pending (as a rules/config change would) so the
+    # worker actually re-evaluates, and queue a reassessment job
+    cid: Any
+    async with factory() as db, db.begin():
+        cid = (
+            await db.execute(
+                text(
+                    "SELECT id FROM claims WHERE statement LIKE "
+                    "'Сколько станций%'"
+                )
+            )
+        ).one()[0]
+        await db.execute(
+            text(
+                "UPDATE claim_assessment_heads SET assessment_state = 'pending', "
+                "current_assessment_id = NULL, epistemic_status = NULL "
+                f"WHERE claim_id = :c AND config_snapshot_id = {SNAP_SUBQUERY}"
+            ),
+            {"c": cid},
+        )
+        await db.execute(
+            text(
+                "INSERT INTO reassessment_jobs (id, claim_id, "
+                "target_config_snapshot_id, status, reason, priority) "
+                f"VALUES (:id, :c, {SNAP_SUBQUERY}, 'queued', 'test', 0)"
+            ),
+            {"id": str(uuid.uuid4()), "c": cid},
+        )
+
+    async with factory() as db:
+        out = await run_reassessment_batch(db)
+    assert out.completed == 1 and out.blocked == 0
+
+    # the worker re-evaluated the head (current again) but did NOT
+    # return a deadline to the fixed-point claim
+    as_of, reverify, freshness = await _claim_row(factory, "Сколько станций")
+    assert as_of == datetime(2026, 6, 15, tzinfo=UTC)
+    assert reverify is None
+    assert freshness == "evergreen"
 
 
 @pytest.mark.asyncio
@@ -465,36 +556,48 @@ async def test_reused_claim_as_of_rederived_from_current_question(migrated_db: A
     as_of, reverify, _freshness = await _claim_row(factory, "Сколько букв")
     # re-derived from the CURRENT session's question: day N+1
     assert as_of == datetime(day_n1.year, day_n1.month, day_n1.day, tzinfo=UTC)
-    assert reverify == as_of + timedelta(days=30)
+    # T7.32 (ADR-0017): the deadline is the SECOND commit's moment +
+    # 30d (the relative claim is re-asserted for the current
+    # session's date) — between as_of + 30d and as_of + 31d
+    assert reverify is not None
+    assert as_of + timedelta(days=30) <= reverify < as_of + timedelta(days=31)
 
 
 @pytest.mark.asyncio
-async def test_eval4d_shape_host_as_of_gate_8_of_28_failed(migrated_db: Any) -> None:
-    """T7.30 (ADR-0016), the EVAL-4d form in a FIXTURE (not the
-    evidence DB — `noezema-eval4d` stays SELECT-only): 28 current
-    temporal_fact claims committed through the real commit path —
-    19 on RELATIVE questions (14 with the model's as_of in the past —
-    the EVAL-4d artifact clusters 2026-06-15/2026-08-13 — and 5 with
-    a recent model's as_of that were already within the deadline), 6
-    on an EXPLICIT OLD date (by-design overdue), 3 on a DATELESS
-    question (model's as_of: Sputnik 1957 and population 2026-07-01 —
-    overdue; the line opening 2026-09-05 — within the deadline). The
-    14 + 6 + 2 = 22 are exactly the T7.29 due set. With the
-    host-derived as_of: all 19 relative are fresh (as_of = session
-    date, reverify +30d); due = 6 (by-design) + 2 (dateless) = 8 →
-    gate 6 = 8/28 = 0.2857 → failed — the T7.29 recalculation
-    (option (iii)/(iv))."""
+async def test_eval4d_shape_fixed_points_have_no_deadline_gate_0_of_20_passed(
+    migrated_db: Any,
+) -> None:
+    """T7.30 (ADR-0016) + T7.32 (ADR-0017), the EVAL-4d form in a
+    FIXTURE (not the evidence DB — `noezema-eval4d` stays SELECT-only):
+    29 current temporal_fact claims committed through the real commit
+    path — 20 on RELATIVE questions (15 with the model's as_of in the
+    past — the EVAL-4d artifact clusters 2026-06-15/2026-08-13 — and
+    5 with a recent model's as_of), 6 on an EXPLICIT OLD date, 3 on a
+    DATELESS question (model's as_of: Sputnik 1957, population
+    2026-07-01, the line opening 2026-09-05).
+
+    Under ADR-0017 the pre-T7.32 due set (8 of 28: 6 explicit-old +
+    2 dateless — "overdue forever" by construction) is GONE: the
+    6 explicit-old and 3 dateless fixed-point claims have NO deadline
+    (reverify_after NULL, evergreen) and are OUT of the gate's
+    denominator (they cannot become due — counting them would dilute
+    the ratio with composition). The 20 relative claims are fresh
+    (deadline = commit moment + 30d) → gate 6 = 0/20 = 0.0 → passed.
+    (The pre-T7.32 version of this test asserted 8/28 = 0.2857
+    failed — the T7.29 recalculation; the expectation is corrected
+    per ADR-0017.)"""
     _scratch, engine = migrated_db
     snap = await _snapshot(engine)
     now = datetime.now(UTC)
 
     # the run row FIRST (the window starts now; the gate itself counts
-    # all current temporal claims of the effective snapshot)
+    # the current temporal claims WITH a deadline of the effective
+    # snapshot)
     factory = async_sessionmaker(engine, expire_on_commit=False)
     async with factory() as db, db.begin():
         run = await create_evaluation_run(
             db,
-            label="t730-gate-test",
+            label="t732-gate-test",
             config_snapshot_id=snap.id,
             model_fingerprint={"model": "test", "backend": "local"},
             rules_version="rules-v2",
@@ -505,18 +608,20 @@ async def test_eval4d_shape_host_as_of_gate_8_of_28_failed(migrated_db: Any) -> 
         )
         assert run is not None
 
-    # 19 relative + 6 explicit-old + 3 dateless = 28 (the EVAL-4d
-    # shape: 16 overdue A = 14 relative + 2 dateless, 6 by-design B,
-    # 6 within the deadline = 5 relative + 1 dateless)
+    # 20 relative + 6 explicit-old + 3 dateless = 29 (the EVAL-4d
+    # shape, +1 relative so the post-ADR-0017 denominator stays at the
+    # MIN_SAMPLE = 20 boundary)
     relative = [
         (
             f"Факт {i} на текущую дату",
-            # the 14 overdue ones: the EVAL-4d artifact clusters
+            # the 15 artifact ones: the EVAL-4d artifact clusters
             MODEL_AS_OF_ARTIFACT if i % 2 == 0 else "2026-08-13T00:00:00+00:00",
         )
-        for i in range(14)
+        for i in range(15)
     ] + [
-        # the 5 within the deadline (the EVAL-4d 2026-09-07..21 dates)
+        # the 5 with a recent model's as_of (the EVAL-4d 2026-09-07..21
+        # dates) — under ADR-0017 the model's as_of is audit-only for
+        # relative questions
         (f"Факт {i} на текущую дату", d)
         for i, d in enumerate(
             (
@@ -526,7 +631,7 @@ async def test_eval4d_shape_host_as_of_gate_8_of_28_failed(migrated_db: Any) -> 
                 "2026-09-18T00:00:00+00:00",
                 "2026-09-21T21:00:00+00:00",
             ),
-            start=14,
+            start=15,
         )
     ]
     explicit = [(f"Станций метро факт {i}", "2026-08-13T00:00:00+00:00") for i in range(6)]
@@ -535,7 +640,7 @@ async def test_eval4d_shape_host_as_of_gate_8_of_28_failed(migrated_db: Any) -> 
         ("Численность населения Земли 8,2 миллиарда", "2026-07-01T00:00:00+00:00"),
         ("Сколько станций открыто на Рублёво-Архангельской", "2026-09-05T00:00:00+00:00"),
     ]
-    # the 19 relative claims go in TWO sessions (the staging reserve
+    # the 20 relative claims go in TWO sessions (the staging reserve
     # caps max_new_claims_per_session at 16); the gate counts claims
     await _commit_claims(
         engine, snap, question_text=QUESTION_RELATIVE, claims=relative[:10]
@@ -552,27 +657,29 @@ async def test_eval4d_shape_host_as_of_gate_8_of_28_failed(migrated_db: Any) -> 
         gates = await compute_gates(db, run=run, now=now)
 
     g6 = gates["due_stale_time_sensitive"]
-    assert g6["denominator"] == 28
-    # 6 by-design overdue (explicit 2026-06-15 → reverify 2026-07-15)
-    # + 2 dateless (1957-10-04, 2026-07-01) — the 19 relative are
-    # fresh (as_of = session date → reverify +30d in the future) and
-    # the dateless line opening (2026-09-05) is within the deadline
-    assert g6["numerator"] == 8
-    assert g6["ratio"] == 0.2857
+    # ADR-0017: the denominator counts ONLY the claims with a deadline
+    # (the 20 relative) — the 6 explicit-old + 3 dateless fixed-point
+    # claims are out (no deadline, can never be due)
+    assert g6["denominator"] == 20
+    # all 20 relative are fresh (deadline = commit + 30d, in the
+    # future) → 0 due
+    assert g6["numerator"] == 0
+    assert g6["ratio"] == 0.0
     assert g6["threshold"] == 0.20
-    assert g6["outcome"] == "failed"
+    assert g6["outcome"] == "passed"
     assert "ci95" in g6  # §22.2: the interval is published with the gate
 
-    # sanity: the model's artifact date is GONE from the claim rows of
-    # the relative questions (audit-only) — all 19 carry the session
-    # date (midnight UTC of today) and are fresh
+    # sanity 1: the model's artifact date is GONE from the claim rows
+    # of the relative questions (audit-only) — all 20 carry the
+    # session date (midnight UTC of today), a deadline, and are fresh
     async with factory() as db:
         fresh, total = (
             await db.execute(
                 text(
                     "SELECT count(*) FILTER (WHERE c.as_of = "
                     "date_trunc('day', now())::timestamptz "
-                    "AND c.freshness_status = 'fresh'), count(*) "
+                    "AND c.freshness_status = 'fresh' "
+                    "AND c.reverify_after IS NOT NULL), count(*) "
                     "FROM claims c "
                     "JOIN claim_assessment_heads h ON h.claim_id = c.id "
                     f"AND h.config_snapshot_id = {SNAP_SUBQUERY} "
@@ -582,4 +689,22 @@ async def test_eval4d_shape_host_as_of_gate_8_of_28_failed(migrated_db: Any) -> 
                 )
             )
         ).one()
-    assert (fresh, total) == (19, 19)
+    assert (fresh, total) == (20, 20)
+    # sanity 2: all 9 fixed-point claims (6 explicit + 3 dateless)
+    # have NO deadline and are evergreen
+    async with factory() as db:
+        fixed_no_deadline, fixed_total = (
+            await db.execute(
+                text(
+                    "SELECT count(*) FILTER (WHERE c.reverify_after IS NULL "
+                    "AND c.freshness_status = 'evergreen'), count(*) "
+                    "FROM claims c "
+                    "JOIN claim_assessment_heads h ON h.claim_id = c.id "
+                    f"AND h.config_snapshot_id = {SNAP_SUBQUERY} "
+                    "AND h.assessment_state = 'current' "
+                    "WHERE c.claim_type = 'temporal_fact' "
+                    "AND c.statement NOT LIKE 'Факт %'"
+                )
+            )
+        ).one()
+    assert (fixed_no_deadline, fixed_total) == (9, 9)

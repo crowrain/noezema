@@ -583,7 +583,9 @@ async def test_gates_due_stale_counts_expired_without_reassessment_or_flip(
     await s.setup()
     # 17 within the deadline + 3 EXPIRED (the stored column says
     # 'fresh' on all of them — the EVAL-4d state) + 1 stored 'due'
-    # but not yet expired + 1 without a deadline (unknown)
+    # but not yet expired + 1 WITHOUT a deadline (T7.32, ADR-0017: a
+    # fixed-point claim — no deadline by construction, evergreen; it
+    # cannot become due and is OUT of the denominator)
     for i in range(17):
         await s.add_claim(
             i, session=None, ctype="temporal_fact",
@@ -599,7 +601,7 @@ async def test_gates_due_stale_counts_expired_without_reassessment_or_flip(
         as_of=now - timedelta(days=20), reverify_after=now + timedelta(days=10),
     )
     await s.add_claim(
-        21, session=None, ctype="temporal_fact", freshness="unknown",
+        21, session=None, ctype="temporal_fact", freshness="evergreen",
         as_of=None, reverify_after=None,
     )
     # the state under test: no reassessment jobs at all, no flip
@@ -620,10 +622,12 @@ async def test_gates_due_stale_counts_expired_without_reassessment_or_flip(
         gates = await compute_gates(db, run=run, now=now)
 
     g6 = gates["due_stale_time_sensitive"]
-    # 3 expired of 22 current temporal claims — counted from
-    # reverify_after alone, 0.136 <= 0.20
-    assert g6["denominator"] == 22 and g6["numerator"] == 3
-    assert g6["ratio"] == 0.1364
+    # 3 expired of 21 claims WITH a deadline (T7.32, ADR-0017: the
+    # deadline-less fixed-point claim is out of the denominator — it
+    # cannot become due) — counted from reverify_after alone,
+    # 3/21 = 0.1429 < 0.20
+    assert g6["denominator"] == 21 and g6["numerator"] == 3
+    assert g6["ratio"] == 0.1429
     assert g6["outcome"] == "passed"
 
 
@@ -664,6 +668,49 @@ async def test_gates_due_stale_eval4d_shape(migrated_db: tuple[str, AsyncEngine]
     assert g6["threshold"] == 0.20
     assert g6["outcome"] == "failed"
     assert "ci95" in g6  # §22.2: the interval is published with the gate
+
+
+@pytest.mark.asyncio
+async def test_gate6_due_stale_mixed_deadline_and_fixed_point_claims(
+    migrated_db: tuple[str, AsyncEngine],
+) -> None:
+    """T7.32 (ADR-0017): gate 6 on a MIX of claims with a deadline
+    (relative anchor) and fixed-point claims without one (explicit /
+    dateless anchor — reverify_after NULL). The fixed-point claims
+    cannot become due, so they are OUT of the denominator — the gate
+    measures the freshness health of the claims that CAN become due,
+    and cannot be passed by composition (padding the corpus with
+    fixed-point claims). 5 due of 20 deadline-bearing claims →
+    5/20 = 0.25 → failed (the pre-T7.32 arithmetic 5/30 = 0.1667 would
+    have passed — the dilution the ADR removes)."""
+    _scratch, engine = migrated_db
+    run = await _mk_run(engine, thresholds={"due_stale_time_sensitive": 0.20})
+    now = datetime(2026, 9, 22, 8, 0, tzinfo=UTC)
+    s = _Seeder(engine)
+    await s.setup()
+    # 20 claims WITH a deadline: 5 due + 15 fresh (the MIN_SAMPLE = 20
+    # boundary is met on the NEW denominator)
+    for i in range(5):
+        await s.add_claim(
+            i, session=None, ctype="temporal_fact",
+            as_of=now - timedelta(days=60), reverify_after=now - timedelta(days=30 + i),
+        )
+    for i in range(5, 20):
+        await s.add_claim(
+            i, session=None, ctype="temporal_fact",
+            as_of=now - timedelta(days=10), reverify_after=now + timedelta(days=20),
+        )
+    # 10 FIXED-POINT claims: no deadline (evergreen) — they dilute the
+    # pre-T7.32 denominator but must not count at all under ADR-0017
+    for i in range(20, 30):
+        await s.add_claim(
+            i, session=None, ctype="temporal_fact", freshness="evergreen",
+            as_of=now - timedelta(days=3650), reverify_after=None,
+        )
+    g = (await _gates(engine, run, now=now))["due_stale_time_sensitive"]
+    assert (g["numerator"], g["denominator"]) == (5, 20)
+    assert g["ratio"] == 0.25
+    assert g["outcome"] == "failed"  # 0.25 >= 0.20, strictly-below gate
 
 
 @pytest.mark.asyncio

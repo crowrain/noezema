@@ -67,7 +67,12 @@ from packages.memory.rules_engine import (
     evaluate,
     reverify_after,
 )
-from packages.memory.scope import derive_claim_as_of, derive_claim_scope, derive_evidence_scope
+from packages.memory.scope import (
+    anchor_from_scope,
+    derive_claim_as_of,
+    derive_claim_scope,
+    derive_evidence_scope,
+)
 from packages.memory.source_graph import build_source_independence_snapshot
 
 GLOBAL_SCOPE = "global"
@@ -356,15 +361,20 @@ class MemoryService:
             model_scope = dict(payload.get("scope") or {})
             # T7.30 (ADR-0016): the model's typed as_of (audit-only
             # with a date anchor) vs the HOST-DERIVED reference
-            # datetime stored on the claim row — the base date of
-            # reverify_after (§8.6/§22.2). The derivation is the same
-            # function the claim scope uses (T7.17/T7.18, ADR-0007;
-            # ADR-0016): explicit question date > relative form →
-            # session start (host clock, UTC) > model's as_of
-            # (dateless question fallback).
+            # datetime stored on the claim row. The derivation is the
+            # same function the claim scope uses (T7.17/T7.18,
+            # ADR-0007; ADR-0016): explicit question date > relative
+            # form → session start (host clock, UTC) > model's as_of
+            # (dateless question fallback). T7.32 (ADR-0017): the same
+            # function also returns the ANCHOR of the branch that won
+            # (explicit / relative / none) — one function, one source
+            # of truth; it decides whether the claim gets a reverify
+            # deadline at all (only ``relative`` does), and the anchor
+            # is persisted in the claim scope (``date_anchor``) so the
+            # reassessment worker can apply the same rule.
             as_of_raw = payload.get("as_of")
             model_as_of = datetime.fromisoformat(as_of_raw) if as_of_raw else None
-            host_as_of = derive_claim_as_of(
+            host_ref = derive_claim_as_of(
                 question=question_text, as_of=model_as_of, session_date=session_date
             )
             deps = payload.get("dependencies")
@@ -411,8 +421,9 @@ class MemoryService:
                 # THIS question anchors (the relative claim is
                 # "the state on THIS session's date", ADR-0007
                 # T7.18), so reverify_after (recomputed below from
-                # claim.as_of) never rests on a stale or model value.
-                existing_claim.as_of = host_as_of
+                # the question's date anchor, T7.32/ADR-0017) never
+                # rests on a stale or model value.
+                existing_claim.as_of = host_ref.as_of
                 claim_scopes[existing_claim.id] = derive_claim_scope(
                     question=question_text,
                     as_of=existing_claim.as_of,
@@ -429,7 +440,7 @@ class MemoryService:
                     # T7.30 (ADR-0016): the HOST-DERIVED reference
                     # date — not the model's typed as_of (audit-only
                     # with a date anchor; see above)
-                    as_of=host_as_of,
+                    as_of=host_ref.as_of,
                     observed_at=now,
                     created_in_session=session.id,
                 )
@@ -460,8 +471,14 @@ class MemoryService:
                         # date stored on the claim row
                         "as_of": model_as_of.isoformat() if model_as_of is not None else None,
                         "assessed_as_of": (
-                            host_as_of.isoformat() if host_as_of is not None else None
+                            host_ref.as_of.isoformat()
+                            if host_ref.as_of is not None
+                            else None
                         ),
+                        # T7.32 (ADR-0017): the anchor of the branch
+                        # that produced the reference date (the
+                        # deadline decision, audit-trail form)
+                        "date_anchor": host_ref.anchor.value,
                     },
                     public_summary=f"claim: {statement[:120]}",
                 )
@@ -985,15 +1002,19 @@ class MemoryService:
             head.epistemic_status = result.epistemic_status.value
             head.prepared_by = "session"
 
-        # freshness: reverify_after is derived, not a mutable clock; the
-        # stored status follows the §8.6/T3.7 rule — a claim committed
-        # with an as_of in the past (reverify_after already passed) is
-        # DUE, not FRESH (T7.27, EVAL-4d: the unconditional FRESH here
-        # kept every claim "fresh" until a reassessment flip ran).
-        # claim.as_of here is the HOST-DERIVED reference date
-        # (T7.30, ADR-0016) — the base of reverify_after is a host
-        # input, not the model's typed as_of (audit-only).
-        claim.reverify_after = reverify_after(result, claim.as_of, now)
+        # freshness: reverify_after is derived, not a mutable clock.
+        # T7.32 (ADR-0017): the deadline exists ONLY for a claim about
+        # the present — the question's date anchor (persisted in the
+        # claim scope as ``date_anchor`` by derive_claim_as_of, the
+        # same call that produced claim.as_of, T7.30/ADR-0016) is
+        # ``relative``; then reverify_after = the verification moment
+        # + the volatility window (never counted from as_of). A claim
+        # about a fixed point (explicit question date / dateless
+        # question with the model's as_of) is immutable: NULL
+        # reverify_after, freshness ``evergreen``. The stored status
+        # follows the §8.6/T3.7 rule (T7.27, ADR-0014: never an
+        # unconditional FRESH).
+        claim.reverify_after = reverify_after(result, anchor_from_scope(claim_scope), now)
         claim.freshness_status = self.freshness_status(claim, now).value
 
         await db.flush()

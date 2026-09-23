@@ -34,17 +34,41 @@ from packages.memory.service import MemoryService
 pytestmark = [pytest.mark.unit]
 
 
-async def _seed_session(engine: AsyncEngine) -> tuple[async_sessionmaker, uuid.UUID]:
+async def _seed_session(
+    engine: AsyncEngine, question_text: str | None = None
+) -> tuple[async_sessionmaker, uuid.UUID]:
     factory = async_sessionmaker(engine, expire_on_commit=False)
     sid = uuid.uuid4()
     async with factory() as db, db.begin():
-        await db.execute(
-            text(
-                "INSERT INTO sessions (id, state, config_snapshot_id) "
-                "VALUES (:id, 'committing', (SELECT id FROM config_snapshots LIMIT 1))"
-            ),
-            {"id": sid},
-        )
+        if question_text is not None:
+            # T7.32 (ADR-0017): the session's QUESTION is the trusted
+            # anchor for the claim's reference date and its date
+            # anchor (derive_claim_as_of)
+            qid = uuid.uuid4()
+            await db.execute(
+                text(
+                    "INSERT INTO questions (id, text, origin, priority, state) "
+                    "VALUES (:id, :t, 'seeded', 1, 'candidate')"
+                ),
+                {"id": qid, "t": question_text},
+            )
+            await db.execute(
+                text(
+                    "INSERT INTO sessions (id, state, config_snapshot_id, "
+                    "question_id) "
+                    "VALUES (:id, 'committing', "
+                    "(SELECT id FROM config_snapshots LIMIT 1), :q)"
+                ),
+                {"id": sid, "q": qid},
+            )
+        else:
+            await db.execute(
+                text(
+                    "INSERT INTO sessions (id, state, config_snapshot_id) "
+                    "VALUES (:id, 'committing', (SELECT id FROM config_snapshots LIMIT 1))"
+                ),
+                {"id": sid},
+            )
     async with factory() as db:
         orm = await db.get(ORMSession, sid)
         assert orm is not None
@@ -120,7 +144,14 @@ async def test_apply_claim_and_evidence_creates_current_head(migrated_db: Any) -
         assert view.assessment_state is AssessmentState.CURRENT
         assert view.epistemic_status is EpistemicStatus.SUPPORTED
         assert view.grade is EffectiveGrade.E2
-        assert view.freshness is FreshnessStatus.FRESH
+        # T7.32 (ADR-0017): the session has NO question — no date
+        # anchor to derive (anchor none, the model's as_of stands or
+        # there is no date at all): the claim is about a FIXED point
+        # → no reverify deadline → evergreen (the pre-T7.32
+        # expectation was FRESH: every claim got a deadline counted
+        # from now/as_of — the "formal theorem stale after 90 days"
+        # class the ADR removes)
+        assert view.freshness is FreshnessStatus.EVERGREEN
         assert len(view.evidence) == 1
         assert view.evidence[0].kind == "computation"
 
@@ -443,28 +474,39 @@ async def test_env_manifest_hash_is_content_addressed(migrated_db: Any) -> None:
 
 
 @pytest.mark.asyncio
-async def test_commit_stores_due_when_reverify_deadline_already_passed(migrated_db: Any) -> None:
-    """T7.27 (EVAL-4d, §8.6/T3.7): a claim committed with an as_of in
-    the past derives reverify_after in the past — the stored
-    freshness_status must be 'due' at the commit itself, not the
-    unconditional 'fresh' (which kept the claim "fresh" until an
-    activation flip triggered a reassessment — a process that in
-    EVAL-4d never ran, so the gate saw 0/28 due on 22/28 overdue).
+async def test_commit_deadline_exists_only_for_present_anchored_claims(
+    migrated_db: Any,
+) -> None:
+    """T7.32 (ADR-0017): the reverify deadline exists ONLY for a claim
+    about the PRESENT — the session's question anchors the date
+    RELATIVELY («на текущую дату»): reverify_after = the verification
+    moment + the volatility window (future → fresh). A claim about a
+    FIXED point (a DATELESS question keeps the model's as_of — the
+    Sputnik-1 case that was DUE FOREVER under the pre-T7.32 rule,
+    EVAL-4d/T7.31) has NO deadline at the commit itself:
+    reverify_after is NULL, freshness ``evergreen``.
 
-    Control: the same claim type with a recent as_of (deadline still
-    in the future) commits as 'fresh'."""
+    (The pre-T7.32 version of this test committed the same
+    past-as_of claim and expected 'due': reverify_after was counted
+    FROM as_of. The expectation is corrected per ADR-0017 — the
+    deadline is no longer counted from as_of at all; a fixed-point
+    claim is immutable and valid forever, and the relative claim is
+    fresh until the verification moment + 30d.)"""
     from datetime import UTC, datetime, timedelta
 
     _url, engine = migrated_db
-    factory, sid = await _seed_session(engine)
     snap = await _snapshot(engine)
     source_id = await _seed_source(engine)
 
+    # session 1: a DATELESS question (the Sputnik-1 shape) — the
+    # model's as_of (1957) stands as the reference date; anchor none
+    factory, sid_dateless = await _seed_session(
+        engine, question_text="Когда был запущен Спутник-1?"
+    )
     past_as_of = "1957-10-04T19:28:34+00:00"  # the EVAL-4d Sputnik-1 case
-    recent_as_of = (datetime.now(UTC) - timedelta(days=1)).isoformat()
     await _record_staging(
         engine,
-        sid,
+        sid_dateless,
         [
             (
                 "claim",
@@ -475,33 +517,48 @@ async def test_commit_stores_due_when_reverify_deadline_already_passed(migrated_
                     "scope": {},
                 },
             ),
+            ("evidence", {"evidence_index": 0, "claim_index": 0, "relation": "supports"}),
+        ],
+    )
+    records = [_source_assertion_record(str(source_id), "o" * 64)]
+    memory = MemoryService(snap)
+    async with factory() as db, transaction(db):
+        session = await db.get(ORMSession, sid_dateless)
+        assert session is not None
+        result = await memory.apply_claim_staging(db, AuditService(db), session, records)
+    assert result.claims_created == 1 and result.assessments == 1
+    assert result.problems == ()
+
+    # session 2: a RELATIVE question («на текущую дату») — the session
+    # start (host clock) is the reference date; anchor relative → the
+    # claim about the present gets the deadline
+    recent_as_of = (datetime.now(UTC) - timedelta(days=1)).isoformat()
+    factory2, sid_relative = await _seed_session(
+        engine, question_text="Какова ключевая ставка ЦБ РФ на текущую дату?"
+    )
+    await _record_staging(
+        engine,
+        sid_relative,
+        [
             (
                 "claim",
                 {
-                    "statement": "Ставка ЦБ РФ на текущую дату",
+                    "statement": "Ставка ЦБ РФ составляет 14 процентов",
                     "claim_type": "temporal_fact",
                     "as_of": recent_as_of,
                     "scope": {},
                 },
             ),
             ("evidence", {"evidence_index": 0, "claim_index": 0, "relation": "supports"}),
-            ("evidence", {"evidence_index": 1, "claim_index": 1, "relation": "supports"}),
         ],
     )
-    records = [
-        _source_assertion_record(str(source_id), "o" * 64),
-        _source_assertion_record(str(source_id), "p" * 64),
-    ]
-
-    memory = MemoryService(snap)
-    async with factory() as db, transaction(db):
-        session = await db.get(ORMSession, sid)
+    records2 = [_source_assertion_record(str(source_id), "p" * 64)]
+    async with factory2() as db, transaction(db):
+        session = await db.get(ORMSession, sid_relative)
         assert session is not None
-        result = await memory.apply_claim_staging(db, AuditService(db), session, records)
-
-    assert result.claims_created == 2
-    assert result.assessments == 2
-    assert result.problems == ()
+        result2 = await memory.apply_claim_staging(db, AuditService(db), session, records2)
+    assert result2.claims_created == 1 and result2.assessments == 1
+    assert result2.problems == ()
 
     async with factory() as db:
         rows = (
@@ -517,16 +574,17 @@ async def test_commit_stores_due_when_reverify_deadline_already_passed(migrated_
         )
         assert len(rows) == 2
         by_statement = {r[0]: r for r in rows}
-        # the past-as_of claim: reverify_after = as_of + 30d (past) and
-        # the stored status is DUE — the rule, not a write-time constant
-        past = by_statement["Спутник-1 запущен 4 октября 1957"]
-        assert past[2] is not None and past[2] < datetime.now(UTC)
-        assert past[2] == past[1] + timedelta(days=30)
-        assert past[3] == "due"
-        # control: recent as_of → deadline in the future → fresh
-        recent = by_statement["Ставка ЦБ РФ на текущую дату"]
-        assert recent[2] is not None and recent[2] > datetime.now(UTC)
-        assert recent[3] == "fresh"
+        # the fixed-point claim (dateless question, model's as_of
+        # 1957): NO deadline — reverify_after NULL, evergreen (never
+        # "due forever" again, ADR-0017)
+        sputnik = by_statement["Спутник-1 запущен 4 октября 1957"]
+        assert sputnik[2] is None
+        assert sputnik[3] == "evergreen"
+        # the present claim (relative question): reverify_after = the
+        # verification moment + 30d → future → fresh
+        rate = by_statement["Ставка ЦБ РФ составляет 14 процентов"]
+        assert rate[2] is not None and rate[2] > datetime.now(UTC)
+        assert rate[3] == "fresh"
         # and the claim view (read path) agrees with the stored value
         claims = (
             (
@@ -536,10 +594,13 @@ async def test_commit_stores_due_when_reverify_deadline_already_passed(migrated_
             .all()
         )
         assert [c.statement for c in claims] == list(by_statement)
-        past_view = await memory.claim_view(db, claims[0].id)
-        recent_view = await memory.claim_view(db, claims[1].id)
-        assert past_view is not None and past_view.freshness is FreshnessStatus.DUE
-        assert recent_view is not None and recent_view.freshness is FreshnessStatus.FRESH
+        sputnik_view = await memory.claim_view(db, claims[0].id)
+        rate_view = await memory.claim_view(db, claims[1].id)
+        assert (
+            sputnik_view is not None
+            and sputnik_view.freshness is FreshnessStatus.EVERGREEN
+        )
+        assert rate_view is not None and rate_view.freshness is FreshnessStatus.FRESH
 
 
 @pytest.mark.asyncio

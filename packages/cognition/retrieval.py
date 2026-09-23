@@ -51,6 +51,10 @@ MIN_RELEVANCE = 1e-9
 
 _FRESHNESS_SCORE = {
     FreshnessStatus.FRESH.value: 1.0,
+    # T7.32 (ADR-0017): no deadline by construction — a claim about a
+    # fixed point is valid forever and is NOT doubtful: it ranks
+    # exactly like a fresh claim, never below it.
+    FreshnessStatus.EVERGREEN.value: 1.0,
     FreshnessStatus.UNKNOWN.value: 0.7,
     FreshnessStatus.DUE.value: 0.4,
     FreshnessStatus.STALE.value: 0.1,

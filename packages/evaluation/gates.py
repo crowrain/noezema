@@ -36,17 +36,22 @@ Gate definitions (fixed here; see ADR-0005 for the operational run):
    distinct sessions via evidence / revisions / dependencies
    (threshold ≥0.25).
 6. ``due_stale_time_sensitive`` — of the current
-   ``temporal_fact`` claims, the share whose freshness, evaluated at
-   the gate-computation instant by the §8.6/T3.7 rule
+   ``temporal_fact`` claims that CAN become due (``reverify_after``
+   NOT NULL), the share whose freshness, evaluated at the
+   gate-computation instant by the §8.6/T3.7 rule
    (``packages.memory.freshness.freshness_status`` over
    ``reverify_after``, NOT the stored ``claims.freshness_status``
-   column), is ``due`` (``now >= reverify_after``; a NULL
-   ``reverify_after`` is ``unknown`` and never counts as due — T7.27,
-   ADR-0014: the gate measures the real state at computation time and
-   does not depend on whether a background reassessment/activation
-   flip ever ran). Threshold <0.20, direction: strictly below
-    (``ratio < threshold`` — the spec «<20%» is strict; T7.28,
-    ADR-0015: exactly 20% is ``failed``).
+   column), is ``due`` (``now >= reverify_after`` — T7.27, ADR-0014:
+   the gate measures the real state at computation time and does not
+   depend on whether a background reassessment/activation flip ever
+   ran). T7.32 (ADR-0017): the denominator counts ONLY claims with a
+   deadline — a NULL ``reverify_after`` is "no deadline by
+   construction" (a claim about a fixed point: explicit question date
+   or a dateless question with the model's as_of); such a claim can
+   never be due, and counting it would dilute the ratio with
+   composition instead of measuring freshness. Threshold <0.20,
+   direction: strictly below (``ratio < threshold`` — the spec
+   «<20%» is strict; T7.28, ADR-0015: exactly 20% is ``failed``).
 7. ``reassessment_slo`` — of the completed reassessment jobs, the
    share that completed within the fixed wall-clock SLO (``thresholds.
    reassessment_slo_seconds``; blocked jobs have an alert and are
@@ -456,14 +461,22 @@ async def _gate_due_stale(
     gate-computation instant over ``reverify_after`` — the same rule as
     ``packages.memory.freshness.freshness_status`` (``now <
     reverify_after`` → fresh; ``now >= reverify_after`` → due; NULL →
-    unknown, never counted). The stored ``claims.freshness_status``
-    column is NOT read: it is a display cache updated only by write
-    paths, and the gate must not depend on whether a background
-    reassessment (triggered by an activation flip) ever ran (EVAL-4d:
-    no flip, no reassessment, the column stayed 'fresh' for 22/28
-    overdue claims and the gate reported 0/28 passed)."""
+    no deadline by construction, T7.32/ADR-0017). T7.32 (ADR-0017):
+    the DENOMINATOR counts only the claims that CAN become due
+    (``reverify_after IS NOT NULL``) — a fixed-point claim (explicit
+    question date / dateless question with the model's as_of) has no
+    deadline and can never be due; including it would let the gate
+    pass by composition (more fixed-point claims) instead of by
+    freshness health. The stored ``claims.freshness_status`` column is
+    NOT read: it is a display cache updated only by write paths, and
+    the gate must not depend on whether a background reassessment
+    (triggered by an activation flip) ever ran (EVAL-4d: no flip, no
+    reassessment, the column stayed 'fresh' for 22/28 overdue claims
+    and the gate reported 0/28 passed)."""
     sql = f"""
-        SELECT count(*),
+        SELECT count(*) FILTER (
+                 WHERE c.reverify_after IS NOT NULL
+             ),
                count(*) FILTER (
                  WHERE c.reverify_after IS NOT NULL
                    AND c.reverify_after <= :now

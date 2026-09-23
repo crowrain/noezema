@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
 from packages.domain.models.base import JsonDict
-from packages.domain.models.enums import EffectiveGrade, EpistemicStatus
+from packages.domain.models.enums import ClaimDateAnchor, EffectiveGrade, EpistemicStatus
 from packages.memory.scope import scope_covers
 
 RULES_ENGINE_VERSION = "rules-v2"
@@ -260,8 +260,20 @@ def evaluate(
     )
 
 
-def reverify_after(result: AssessmentResult, as_of: datetime | None, now: datetime) -> datetime:
-    """reverify_after is derived from claim type/volatility/as_of (T3.7).
-    Only the freshness status may change with time — never the grade."""
-    base = as_of if (as_of is not None and result.reverify_after_days == 30) else now
-    return base + timedelta(days=result.reverify_after_days)
+def reverify_after(
+    result: AssessmentResult, anchor: ClaimDateAnchor, now: datetime
+) -> datetime | None:
+    """reverify_after from claim type/volatility and the question's
+    DATE ANCHOR (T3.7; T7.32, ADR-0017). The deadline exists ONLY for
+    a claim about the PRESENT (anchor ``relative`` — «на текущую
+    дату», «сейчас», …): it is the VERIFICATION MOMENT (``now``) plus
+    the volatility window — never counted from ``as_of``. A claim
+    about a FIXED point (anchor ``explicit`` — the question names a
+    date; anchor ``none`` — dateless question, the model's as_of) is
+    immutable: later events cannot spoil it, so it has NO deadline
+    (``None`` — the stored ``reverify_after`` is NULL, freshness
+    ``evergreen``). Only the freshness status may change with time —
+    never the grade."""
+    if anchor is not ClaimDateAnchor.RELATIVE:
+        return None
+    return now + timedelta(days=result.reverify_after_days)

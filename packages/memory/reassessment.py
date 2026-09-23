@@ -88,6 +88,7 @@ from packages.memory.rules_engine import (
     evaluate,
     reverify_after,
 )
+from packages.memory.scope import anchor_from_scope
 from packages.memory.service import MemoryService, _evidence_set_hash
 from packages.memory.source_graph import build_source_independence_snapshot
 from packages.memory.writer_gate import (
@@ -574,7 +575,17 @@ async def _process_one_job(
     head_row.current_assessment_id = assessment.id
     head_row.epistemic_status = result.epistemic_status.value
     head_row.prepared_by = "reassessment_worker"
-    claim.reverify_after = reverify_after(result, claim.as_of, now)
+    # T7.32 (ADR-0017): the deadline rule is the same as on the commit
+    # path, applied from the PERSISTED anchor (the claim scope's
+    # ``date_anchor``, carried by the stored assessments — the worker
+    # has no question to derive from): a claim about the present
+    # (relative) gets reverify_after = now + the volatility window
+    # (the deadline is REFRESHED by the re-verification moment); a
+    # claim about a fixed point (explicit / none) KEEPS no deadline
+    # (NULL, evergreen) — reassessment never returns a deadline to a
+    # fixed-point claim. Legacy scopes without the key default to
+    # relative (conservative: the deadline is kept, ADR-0017).
+    claim.reverify_after = reverify_after(result, anchor_from_scope(scope), now)
     claim.freshness_status = freshness_status(claim.reverify_after, now).value
 
     job.status = ReassessmentJobStatus.COMPLETED.value
