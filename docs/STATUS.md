@@ -101,7 +101,7 @@ overall failed по `significant_claim_reuse`) → **EVAL-3d** (2026-09-19,
 | external/temporal facts E3 | 100% в выборке ≥20 | mechanism: ADR-0004 + test_evaluation.py (insufficient_sample при N<20); расчёт: gates.py + test_evaluation_gates.py; actual run — T7.7 (EVAL-1/2); EVAL-3d (2026-09-19, mid-run v2→v3) — ADR-0008 |
 | eligible sessions с результатом | ≥60% | mechanism: ADR-0004 + test_evaluation.py (eligible/completed sessions); расчёт: gates.py + test_evaluation_gates.py; actual run — T7.7 (EVAL-1/2); EVAL-3d (2026-09-19, mid-run v2→v3) — ADR-0008 |
 | near-duplicate вопросы | ≤15% | mechanism: ADR-0004 + test_evaluation.py (thresholds jsonb); расчёт: gates.py + test_evaluation_gates.py; actual run — T7.7 (EVAL-1/2); EVAL-3d (2026-09-19, mid-run v2→v3) — ADR-0008 |
-| переиспользование значимых claims | ≥25% / 20 сессий | mechanism: ADR-0004 + test_evaluation.py (thresholds jsonb); расчёт: gates.py + test_evaluation_gates.py; actual run — T7.7 (EVAL-1/2); EVAL-3d (2026-09-19, mid-run v2→v3) — ADR-0008 |
+| переиспользование значимых claims | ≥25% / 20 сессий | mechanism: ADR-0004 + test_evaluation.py (thresholds jsonb); расчёт: gates.py + test_evaluation_gates.py; actual run — T7.7 (EVAL-1/2); EVAL-3d (2026-09-19, mid-run v2→v3) — ADR-0008; EVAL-4d — **0/29 failed**: разбор (три пути гейта — evidence/revisions/dependencies, 0 срабатываний; 11 паков; 14 memory.search, replay 8/14; связывающее ограничение — «follow-up'ы не коммитят знание» (22/33 паковых сессий) + шов побайтового statement+type; у claim'а нет identity (только точный statement+type), у evidence — есть (§14.3); варианты) — **T7.33**, `docs/eval/EVAL-4d-reuse-analysis.md` |
 | due/stale time-sensitive | <20% | mechanism: ADR-0004 + test_evaluation.py (thresholds jsonb); расчёт: gates.py + test_evaluation_gates.py + test_freshness.py (T7.27/ADR-0014: правило §8.6/T3.7 по reverify_after на момент расчёта гейта, не по сохранённому полю — без зависимости от переоценки/флипа; retrieval — то же правило при чтении); T7.28/ADR-0015: строгое направление `below` (`ratio < threshold`) по спеке «<20%» — на границе 6/30 = 0.200 → failed, 6/31 → passed (до T7.28 — `at_most`, расхождение на границе); граничные тесты всех долевых гейтов — test_evaluation_gates.py (+18); actual run — T7.7 (EVAL-1/2); EVAL-3d (2026-09-19, mid-run v2→v3) — ADR-0008; EVAL-4d — passed 0/28 по сохранённому полю (артефакт), по правилу failed 22/28 — ADR-0014; сохранённых результатов g6 ровно на пороге 0.20 в прошлых прогонах нет (SELECT по noezema-eval*); T7.30/ADR-0016: опорная дата as_of строки claim — хост-деривация (явная дата вопроса > относительная форма → дата сессии по часам хоста > модельный as_of при бездатовом вопросе; модельная дата — только аудит: staging + claim_created `as_of`/`assessed_as_of`), формула reverify_after не изменена — test_scope.py (+6), test_as_of_commit.py (7: коммит relative/явная/бездат/полночь-UTC, переоценка без возврата модельной даты, re-деривация as_of при переиспользовании, форма EVAL-4d 19 relative + 6 явных старых + 3 бездатных = 28 → g6 8/28 = 0.2857 → failed — пересчёт T7.29); T7.31 (2026-09-23): заморозка EVAL-5 — корпус v4 (55 вопросов: 34 v2 + 13 v3 дословно + 8 новых; бездатных URL-вопросов 0 — все с явной датой/относительной формой; K = 2 заложенных due: ООН @ 2026-04-15, ЕС @ 2026-01-01; sha256 `b08009ff…`); предрегистрация g6 — **passed** (2/22.3 = 0.090; маржа 2: проходит при ≤ 4 due, падает при 5; N < 20 → insufficient_sample — гейт не оценён, не failed); предрегистрация g5 — failed при наблюдаемом R = 0 (EVAL-4d), но арифметически проходим в отличие от v3 (пул 28–34 ≤ 4R = 40: 10/28 = 0.357 … 10/34 = 0.294 ≥ 0.25; незакрытый в v3 конфликт g5/g6 — 11/47 = 0.234 — снят); EVAL-5-freeze.md, раздел T7.31; T7.32/ADR-0017 (2026-09-23): срок перепроверки существует ТОЛЬКО у утверждения о настоящем (якорь `relative` → now + окно volatility; якоря `explicit`/`none` — срока нет, NULL) — класс «просрочен навсегда» (улика `de9855eb`, Спутник 1957) исчезает по построению; статус `evergreen` (NULL = «срока нет по построению»; retrieval-вес 1.0 = fresh — неизменный факт не опускается как unknown); знаменатель гейта 6 = только `temporal_fact` с `reverify_after IS NOT NULL` (способные просрочиться; фиксированные моменты не проходят гейт композицией); порог 0.20 и направление `below` не тронуты; миграция 0024; предрегистрация PЕРЕСЧИСЛЕНА: K = 0, знаменатель relative-only 20.3–22.6, ожидаемо **passed** 0/20.3 … 0/22.6 (проходит при ≤ 4 due — 4/20.3 = 0.197 < 0.20, падает при 5 — 0.246/0.221; N < 20 → insufficient_sample); тесты: test_scope.py (+3), test_freshness.py (+1), test_rules_engine.py (+1), test_as_of_commit.py (+1), test_evaluation_gates.py (+1), test_retrieval.py/test_memory_service.py/test_reassessment.py (ожидания по правилу ADR-0017) — ADR-0017, пометка в ADR-0014, EVAL-5-freeze.md §3.1, раздел T7.32 |
 | reassessment SLO | зафиксировано до run | mechanism: ADR-0004 + test_evaluation.py (reassessment_slo_seconds в thresholds, фиксация до run); расчёт: gates.py + test_evaluation_gates.py; actual run — T7.7 (SLO 3600 с, зафиксировано); EVAL-3d — ADR-0008 |
 | current assessments с pending/invalid ancestor | 0 | mechanism: ADR-0004 + test_evaluation.py (thresholds jsonb); расчёт: gates.py + test_evaluation_gates.py; actual run — T7.7 (EVAL-1/2); EVAL-3d (2026-09-19, mid-run v2→v3) — ADR-0008 |
@@ -4027,3 +4027,108 @@ failed / 6/31 → passed — T7.28); N<20 независимо от направ
  строка g6, счётчик M7). Прогон не выполнялся, LLM-вызовов
  нет (192.168.1.48 не тронут), фоновых процессов нет;
  noezema-eval* — SELECT только.
+
+### T7.33 — разбор нулевого переиспользования гейта 5 (EVAL-4d): связывающее ограничение + варианты — без изменения поведения
+
+**Задача — разбор, не исправление** (поведение кода не меняется;
+`noezema-eval4d` — только SELECT; сохранённый итог g5 `0/29 failed` не
+пересчитан). Документ: `docs/eval/EVAL-4d-reuse-analysis.md`; пометка-
+ссылка — `docs/adr/0006-eval-2-reuse-results.md` (исторический текст не
+переписан).
+
+1. **Три пути гейта 5** (`gates.py:408-454`) — срабатывания в EVAL-4d:
+ (a) `evidence` (claim затронут ≥2 сессиями через
+ `evidence.created_in_session`) — 0: все 54 evidence-строки 29
+ значимых claim'ов — из их собственной сессии создания (никакого
+ cross-session dedup); (b) `claim_revisions` — 0 **по построению**:
+ таблица пуста во всём ране, и в коде нет НИ ОДНОГО писателя (читают
+ только два запроса гейтов; ORM-модель есть, писателя нет) — путь мёртв
+ в v1; (c) `claim_dependencies` — 0: за весь ран ровно одно ребро
+ (70ff7a38 E3 → 387115c9 **E1**, kind research, сессия-якорь 62586be8) —
+ from-сторона получает только собственную сессию, to-сторона не
+ значима (E1) → гейт не считает. Сохранённый результат 0/29
+ подтверждён пересчётом (SQL — документ §5.1).
+2. **Модель пользовалась поиском**: 17 вызовов `memory.search`
+ (14 completed + 3 `policy:deny` — модель передавала аргумент `limit`,
+ которого нет в схеме). Язык: 6 ru, 4 ru+en смешанных, 2 en, 1
+ filename, 1 product-name. Результаты — из `action_completed` аудита
+ (то, что модель реально получила): 3/14 непустых В МОМЕНТ; **replay
+ против финального snapshot: 8/14 непустых** (EVAL-2: 0/16 — ADR-0006).
+ Кросс-языковый корень ADR-0006 **закрыт** (английские/смешанные
+ запросы матчат русские statement'ы). 8 из 11 пустых в момент поиска —
+ «пусто по праву»: матчащий claim ещё не существовал (якорные сессии
+ его не создали).
+3. **Таблица 11 паков** (документ §3.3, statement'ы дословно):
+ (в) «follow-up не родил claim вовсе» — 5 паков (ЕС, Python,
+ PostgreSQL, ЦБ, reading.md); (а)+(б) «перефраз + другой claim_type» —
+ 1 пак (ООН: якорь 07d655cf temporal E3 «…составляло 193.», follow-up
+ bd0cbc5b external E3 «…составляет 193.» — побайтового совпадения нет,
+ обязательный dependency не объявлен); (д) «якорь не родил claim» — 5
+ паков (население, Рублёво, plan.md, todo.md, glossary.md); (г) — 0.
+4. **Связывающее ограничение — два слоя** (оба по данным):
+ **Слой 1 (доминирующий)**: 22 из 33 паковых сессий (64%) не
+ закоммитили НИ ОДНОГО знания — 13 follow-up'ов предложили ноль
+ операций (при видимом в контексте якоре: 7add23b6 — 6 совпадений,
+ 4d67e817 — 6, …), 8 сессий — предложение отклонено rules engine
+ (систематическая пара type↔evidence у halogen: computed_result ←
+ local_observation ×6, temporal_fact ← computation, computed_result ←
+ source_assertion; T7.9 pre-commit отбой), 1 — curator_error (усечённый
+ 16-символьный UUID в dependency → схема ×3, предложение потеряно). В
+ таких сессиях ни один из трёх путей гейта не может сработать —
+ улучшение поиска/сшивания не помогает. Самое сильное подтверждение:
+ два FU→FU случая (c3537eb3, 3b2a4a7d) видели claim ПЕРВОГО
+ follow-up'а того же пака в контексте с рангом 0.264/0.933 — и всё
+ равно не закоммитили ничего. **Слой 2 (шов)**: сшивка на
+ коммите — только побайтовый `statement+claim_type`
+ (`service.py:348, 396-414`) или явный dependency на значимый claim;
+ единственная связываемая пара (ООН) упёрлась в оба условия
+ (перефраз + другой тип + нет ребра). **Гипотеза «exact statement
+ dedup — связывающее ограничение» подтверждена на шве, недостаточна
+ целиком**: идеальное fact-identity дало бы на сохранённых данных
+ максимум 2/26 = 0.0769 (ООН: 3 строки/3 сессии, ЕС: 2/2 — общие
+ evidence identity `84abcf4730…`/`da578f37…`/`ccd036f7…`), всё равно
+ failed.
+5. **Identity**: у claim'а — ничего, кроме точного (statement,
+ claim_type) (`claims` §14 `ARCHITECTURE.md:1900-1903`, дедуп
+ `service.py:348`); у evidence — `identity_hash` +
+ `UNIQUE(claim_id, evidence_kind, identity_hash)` (§14.3,
+ `ARCHITECTURE.md:2128`). Спека identity claim'а не определяет вовсе —
+ **дизайн-пробел** (не нарушение): вход, определяющий гейт 5,
+ производится модельным free-text, хост сравнивает побайтово — тот же
+ класс, что закрыли ADR-0007 (scope) и ADR-0016 (as_of).
+6. **Измеренный дефект документации retrieval** (улика §3.4): на
+ PostgreSQL 15.17 (контейнер `noezema-test-db`) `ts_rank(vector, query)`
+ для AND-запроса возвращает ранг уровня полного совпадения (0.06–0.1)
+ при ≥2 общих лексемах и ~1e-20 при ≤1 (контрольные тесты в документе) —
+ docstring `retrieval.py:154-156, 216-220` («partial AND matches rank
+ ~1e-20 = no match by design») ложен; SQL-фильтр `> 0` и порог 1e-9
+ частичные совпадения НЕ отсекают → фактическая семантика recall'а —
+ «≥2 общих лексема» (отсюда ложноположительное попадание q12: запрос о
+ населении Земли → claim про ООН).
+7. **Варианты** (решение за пользователем, НЕ реализовано; what-if
+ пересчёт на строках noezema-eval4d, сохранённый итог не тронут —
+ документ §4): (i) ничего — зафиксировать неизмеряемость на модели
+ (g5 0/29; EVAL-5 предрегистрация failed при R=0, арифметически
+ проходим: пул 28–34 ≤ 4R=40); (ii) identity для claim'а (паттерн
+ ADR-0007/0016) — трогает **ARCHITECTURE.md** (§14/§14.1, решение
+ пользователя), rules_hash/payload'ы — нет, what-if ≤2/26 → failed,
+ риск — NLP-ключ по free-text; (iii.a) сшивка через evidence identity
+ §14.3 — трогает ARCHITECTURE.md, what-if ≤2/26, риск — склейка разных
+ фактов из одного фрагмента; (iii.b) dependency-усиление промптом —
+ новый payload (protocol_hash), what-if 0, потолок = соблюдение
+ моделью; (iv) embeddings/pgvector — **отдельная веха, не v1**
+ (`retrieval.py:9-10`), what-if 0/29; (v) корпусное — «дословно» =
+ **подгонка под механизм** (строковое сравнение vs способность
+ переиспользовать), строго помечено; (vi.1) промпт type↔evidence
+ (новый payload) — разблокирует 8 отклонённых сессий, прямой удар по
+ слою 1; (vi.2) UUID-префиксы (деталь, ничего больше) — +1 связываемый
+ пак; (vi.3) host-перепроверка — большой дизайн, не v1.
+8. **Что не тронуто**: код, тесты, пороги §22.2, rules_hash,
+ claim_type_rules, замороженные payload'ы, корпуса v1–v4,
+ ARCHITECTURE.md, сохранённые итоги прогонов (noezema-eval* — SELECT
+ only); прогон НЕ запускался (eval-run, сессии NOEZEMA, LLM на
+ 192.168.1.48 — отсутствуют), фоновых процессов нет.
+
+**Тесты**: код не менялся — полная проверка как подтверждение
+отсутствия регрессии: ruff + mypy strict + pytest
+(NOEZEMA_TEST_DATABASE_URL) — **899 passed без изменений**.
