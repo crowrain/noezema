@@ -15,6 +15,10 @@ import pytest
 
 from hostctl.cli import parse_corpus_questions
 from packages.cognition.curiosity import jaccard, word_set
+from packages.memory.scope import (
+    parse_question_date,
+    question_uses_relative_date,
+)
 
 
 @pytest.mark.unit
@@ -150,4 +154,92 @@ def test_question_set_v3_corpus_shape() -> None:
             assert jaccard(new_sets[i], new_sets[j]) < 0.6
     for ns in new_sets:
         for vs in v2_sets:
+            assert jaccard(ns, vs) < 0.6
+
+
+@pytest.mark.unit
+def test_question_set_v4_corpus_shape() -> None:
+    """The frozen EVAL-5 corpus (docs/eval/question-set-v4.jsonl, T7.31):
+    55 unique questions = 34 v2 + 13 v3 lines VERBATIM (each inherited
+    line byte-identical to a frozen original; T7.31 drops all dateless
+    questions and the Rublyovo pack, whose sources now conflict) + 8 new
+    questions (all relative «на текущую дату»).
+
+    Hard constraints (EVAL-5 corpus design):
+    - priorities 2×100 (old-as_of — the g6 designed numerator, K = 2),
+      10×90 (pack anchors), 14×80 (pack follow-ups), 29×0 (standalone);
+    - every question naming sources names exactly two, on different
+      registrable domains;
+    - NO dateless URL question: every URL-bearing question carries an
+      explicit date (parse_question_date) or a relative form
+      (question_uses_relative_date) — under T7.30/ADR-0016 this bounds
+      the due-by-construction numerator to the 2 old-as_of questions;
+    - pairwise token-Jaccard (curiosity.word_set/jaccard) strictly < 0.6
+      on all three slices: new-new, new-vs-v2 (all 50), new-vs-v3 (all 69).
+    """
+    import json
+
+    raw_v4 = _corpus_path("question-set-v4.jsonl").read_text(encoding="utf-8")
+    raw_v2 = _corpus_path("question-set-v2.jsonl").read_text(encoding="utf-8")
+    raw_v3 = _corpus_path("question-set-v3.jsonl").read_text(encoding="utf-8")
+
+    json_v4 = [ln for ln in raw_v4.splitlines() if ln.strip() and not ln.startswith("#")]
+    json_v2 = [ln for ln in raw_v2.splitlines() if ln.strip() and not ln.startswith("#")]
+    json_v3 = [ln for ln in raw_v3.splitlines() if ln.strip() and not ln.startswith("#")]
+    assert len(json_v2) == 50
+    assert len(json_v3) == 69
+    assert len(json_v4) == 55
+
+    questions = parse_corpus_questions(raw_v4)
+    texts = [t for t, _ in questions]
+    assert len(set(texts)) == 55
+    priorities = [p for _, p in questions]
+    assert priorities.count(100) == 2
+    assert priorities.count(90) == 10
+    assert priorities.count(80) == 14
+    assert priorities.count(0) == 29
+
+    # inherited lines are byte-identical to the frozen v2/v3 originals
+    # (a curated subset, not a contiguous block):
+    orig = set(json_v2) | set(json_v3)
+    new_lines = [ln for ln in json_v4 if ln not in orig]
+    assert len(new_lines) == 8
+    assert all(ln in orig for ln in json_v4 if ln not in new_lines)
+
+    # two independent sources (different registrable domains) per
+    # question that names sources; the new 8 all name sources.
+    for t in texts:
+        urls = _urls(t)
+        if urls:
+            assert len(urls) == 2, t
+            assert _registrable_domain(urls[0]) != _registrable_domain(urls[1]), t
+    for ln in new_lines:
+        t = json.loads(ln)["text"]
+        assert len(_urls(t)) == 2, t
+
+    # no dateless URL question: under T7.30/ADR-0016 the claim as_of of
+    # every URL question is host-derived (explicit date or the session
+    # date for relative forms) — zero model-as_of exposure:
+    for t in texts:
+        if _urls(t):
+            assert parse_question_date(t) is not None or question_uses_relative_date(t), t
+
+    # the 2 old-as_of questions carry explicit PAST dates (g6 K = 2):
+    old = [t for t, p in questions if p == 100]
+    assert len(old) == 2
+    for t in old:
+        d = parse_question_date(t)
+        assert d is not None and d.year <= 2026, t
+
+    # pairwise Jaccard < 0.6 on all three slices (strict).
+    new_sets = [word_set(json.loads(ln)["text"]) for ln in new_lines]
+    v2_sets = [word_set(t) for t in [json.loads(ln)["text"] for ln in json_v2]]
+    v3_sets = [word_set(t) for t in [json.loads(ln)["text"] for ln in json_v3]]
+    for i in range(len(new_sets)):
+        for j in range(i + 1, len(new_sets)):
+            assert jaccard(new_sets[i], new_sets[j]) < 0.6
+    for ns in new_sets:
+        for vs in v2_sets:
+            assert jaccard(ns, vs) < 0.6
+        for vs in v3_sets:
             assert jaccard(ns, vs) < 0.6
