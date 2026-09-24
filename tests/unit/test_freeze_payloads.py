@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 from packages.cognition.tokenizer import TokenBudgets
+from packages.llm_gateway.roles import Role, resolve_prompts
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -59,3 +60,21 @@ def test_frozen_payloads_v2_v3_budgets_identical() -> None:
     v3 = _load("config-v3-payload.json")
     assert v2["model"] == v3["model"]
     assert v2["token_budgets"] == v3["token_budgets"]
+
+
+@pytest.mark.unit
+def test_config_v8_pins_explorer_v4_and_differs_from_v7_only_there() -> None:
+    """T7.35 follow-up (ADR-0019): config-v7 copied v6's stale
+    ``explorer-v2`` label, while every run since T7.21 actually used
+    ``explorer-v4`` (ADR-0019 forensics). With content pinning a stale pin
+    becomes real behaviour, so v8 pins ``explorer-v4`` — and changes
+    nothing else: v7 stays as committed (payloads are never rewritten)."""
+    v7 = _load("config-v7-payload.json")
+    v8 = _load("config-v8-payload.json")
+    assert {k for k in v8 if v8[k] != v7[k]} == {"prompts"}
+    assert {r for r in v8["prompts"] if v8["prompts"][r] != v7["prompts"][r]} == {"explorer"}
+    resolved = resolve_prompts(v8["prompts"], REPO_ROOT)
+    assert resolved[Role.EXPLORER].version == "explorer-v4"
+    assert resolved[Role.CURATOR].version == "curator-v4"
+    budgets = TokenBudgets.from_snapshot(v8["model"], v8["token_budgets"])
+    assert budgets.validate() == []

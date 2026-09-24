@@ -4393,3 +4393,19 @@ prompt_pin_mismatch с причиной); `tests/unit/test_compat_and_roles.py`
 НЕ запускался (eval-run, сессии NOEZEMA, LLM на 192.168.1.48 —
 отсутствуют), фоновых процессов нет.
 
+### T7.35 (follow-up) — config-v8: пин `explorer-v4` для смоук-прогона (ADR-0019)
+
+`config-v7` унаследовал от v6 устаревший ярлык `explorer-v2`, тогда как
+все прогоны с T7.21 фактически шли на `explorer-v4` (криминалистика
+ADR-0019). После T7.35 пин исполняется буквально, поэтому устаревший
+ярлык стал бы реальным поведением: explorer без правила повторов T7.14 и
+без подстраховки покрытия источников T7.21. `docs/eval/config-v8-payload.json`
+= v7 с единственным изменением `prompts.explorer` → `explorer-v4`
+(`prompts/explorer/explorer-v4.md`); все пять пинов разрешаются,
+`TokenBudgets.validate() == []`. canonical sha256
+`9f1fc79ab1f1f1e1743278ebf5494480fd862e87d765afef9d114cc44c587e64`, file
+sha256 `135ebe09fa35c4b999d5fbceddd705802ac56d9474bde8e5eb534acbc1f5bf4e`.
+v7 не переписан. Тест —
+`tests/unit/test_freeze_payloads.py::test_config_v8_pins_explorer_v4_and_differs_from_v7_only_there`.
+Назначение — смоук-прогон новых T7.30/T7.32/T7.34/T7.35 на живых сессиях.
+
