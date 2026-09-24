@@ -166,3 +166,12 @@ halogen-flash-next, одно ключевое слово на запрос (ми
   `test_default_profile_sends_schema_byte_identical`).
 - Решение о модели и о прогоне — за пользователем (freeze §13).
   БД `noezema-smoke-halogen` — улика, SELECT только.
+
+> **Дополнение (2026-09-24, T7.36).** Второй профиль по тому же механизму:
+> `llamacpp-rocmfpx` снимает `minLength`/`maxLength` для сборки llama.cpp
+> ROCmFPX-k2 (модель K2 Horizon MoVA 36B A4B ROCmFP4 FAST на .48): она
+> отвергает полные схемы с HTTP 400 `failed to parse grammar`, а
+> `format`/`pattern` принимает. Хост по-прежнему валидирует ответ полной
+> pydantic-моделью. Замер и обоснование — STATUS.md, раздел T7.36. Текст
+> выше не переписан.
+

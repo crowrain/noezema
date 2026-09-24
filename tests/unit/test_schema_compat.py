@@ -19,6 +19,7 @@ from packages.domain.schemas.staging import CuratorProposal
 from packages.llm_gateway.config import LLMGatewayConfig
 from packages.llm_gateway.schema_compat import (
     HALOGEN_UNSUPPORTED_KEYWORDS,
+    LLAMACPP_ROCMFPX_UNSUPPORTED_KEYWORDS,
     SCHEMA_PROFILES,
     strip_schema_keywords,
 )
@@ -153,6 +154,8 @@ def test_profiles_registry() -> None:
     assert SCHEMA_PROFILES["none"] == frozenset()
     assert SCHEMA_PROFILES["halogen"] == HALOGEN_UNSUPPORTED_KEYWORDS
     assert frozenset({"format", "pattern"}) == HALOGEN_UNSUPPORTED_KEYWORDS
+    assert SCHEMA_PROFILES["llamacpp-rocmfpx"] == LLAMACPP_ROCMFPX_UNSUPPORTED_KEYWORDS
+    assert frozenset({"minLength", "maxLength"}) == LLAMACPP_ROCMFPX_UNSUPPORTED_KEYWORDS
 
 
 @pytest.mark.unit
@@ -162,3 +165,21 @@ def test_unknown_schema_profile_fails_fast() -> None:
     # the default is the current behavior
     assert LLMGatewayConfig().schema_profile == "none"
     assert LLMGatewayConfig(schema_profile="halogen").schema_profile == "halogen"
+    assert (
+        LLMGatewayConfig(schema_profile="llamacpp-rocmfpx").schema_profile == "llamacpp-rocmfpx"
+    )
+
+
+@pytest.mark.unit
+def test_curator_proposal_schema_round_trip_llamacpp_rocmfpx() -> None:
+    """T7.36: the ROCmFPX-k2 profile removes exactly the length bounds and
+    keeps ``format``/``pattern`` (that engine compiles those)."""
+    full = CuratorProposal.model_json_schema()
+    stripped = strip_schema_keywords(full, LLAMACPP_ROCMFPX_UNSUPPORTED_KEYWORDS)
+    assert _count(full, "maxLength") > 0
+    assert _count(stripped, "minLength") == 0
+    assert _count(stripped, "maxLength") == 0
+    assert _count(stripped, "format") == _count(full, "format") == 2
+    assert _count(stripped, "pattern") == _count(full, "pattern")
+    _assert_only_keys_removed(full, stripped, LLAMACPP_ROCMFPX_UNSUPPORTED_KEYWORDS)
+

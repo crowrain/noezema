@@ -4409,3 +4409,32 @@ v7 не переписан. Тест —
 `tests/unit/test_freeze_payloads.py::test_config_v8_pins_explorer_v4_and_differs_from_v7_only_there`.
 Назначение — смоук-прогон новых T7.30/T7.32/T7.34/T7.35 на живых сессиях.
 
+### T7.36 — профиль схемы `llamacpp-rocmfpx` для K2 Horizon MoVA на .48 (ADR-0012)
+
+Решение пользователя 2026-09-24: NOEZEMA переключается на модель
+`k2-horizon-mova-36b-a4b-rocmfp4-fast` (K2 Horizon MoVA 36B A4B ROCmFP4
+FAST; llama-swap на 192.168.1.48, сборка llama.cpp ROCmFPX-k2,
+`--ctx-size 262144` = `context_window` payload'а, `--parallel 1`).
+Payload модель по имени не пинит (`model_alias: thinker-local`) — модель
+задаёт `NOEZEMA_LLM_MODEL`, новый payload не нужен.
+
+Замер прямыми HTTP к движку: ни `none`, ни `halogen` не работают — все
+пять схем ответа, которые шлёт оркестратор (CuratorProposal,
+ExtractionReport, ModelResponse, PlanResponse, VerifierReport), дают
+HTTP 400 `Failed to initialize samplers: failed to parse grammar`
+(перевод JSON Schema -> GBNF). Каждый используемый keyword по отдельности
+принимается (`format` uuid/date-time, `maxLength`, anyOf, $defs/$ref);
+снятие ровно `minLength`/`maxLength` делает все пять схем компилируемыми,
+`format`/`pattern` сохраняются. Реальный ответ куратора через этот профиль
+(HTTP 200, finish=stop) прошёл полную валидацию хоста pydantic-моделью.
+Модель рассуждающая: на тривиальное предложение — 2308 выходных токенов и
+~8,7 тыс. символов reasoning, 58 с (риск `finish_reason=length` при
+`max_output_tokens` 8192 на сложных шагах — AGENTS.md §7).
+
+`packages/llm_gateway/schema_compat.py`: `LLAMACPP_ROCMFPX_UNSUPPORTED_KEYWORDS`
++ запись `llamacpp-rocmfpx` в `SCHEMA_PROFILES`; валидация ответа хостом
+не ослаблена. Тесты — `tests/unit/test_schema_compat.py`
+(`test_profiles_registry`, `test_unknown_schema_profile_fails_fast`,
+`test_curator_proposal_schema_round_trip_llamacpp_rocmfpx`). rules_hash,
+claim_type_rules, пороги, payload'ы, корпуса, ARCHITECTURE.md не тронуты.
+

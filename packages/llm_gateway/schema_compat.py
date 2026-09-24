@@ -28,12 +28,27 @@ from packages.domain.models.base import JsonDict
 #: so every keyword our schemas use was probed individually.
 HALOGEN_UNSUPPORTED_KEYWORDS: frozenset[str] = frozenset({"format", "pattern"})
 
+#: Keywords the llama.cpp ROCmFPX-k2 build (gfx1151; serves K2 Horizon
+#: MoVA 36B A4B ROCmFP4 FAST on 192.168.1.48) cannot compile into a
+#: sampling grammar: HTTP 400 ``Failed to initialize samplers: failed to
+#: parse grammar``.
+#:
+#: Probed directly against the engine (T7.36, 2026-09-24): every keyword
+#: our schemas use is accepted in isolation (``format`` uuid/date-time,
+#: ``maxLength``, anyOf, $defs/$ref), yet all five response schemas the
+#: orchestrator sends (CuratorProposal, ExtractionReport, ModelResponse,
+#: PlanResponse, VerifierReport) fail the JSON Schema -> GBNF conversion
+#: in full; stripping exactly ``minLength``/``maxLength`` makes all five
+#: compile, while ``format``/``pattern`` are kept.
+LLAMACPP_ROCMFPX_UNSUPPORTED_KEYWORDS: frozenset[str] = frozenset({"minLength", "maxLength"})
+
 #: Named capability profiles (key in LLMGatewayConfig.schema_profile,
 #: env NOEZEMA_LLM_SCHEMA_PROFILE). "none" = no transformation (the
 #: default; the schema is sent byte-for-byte as pydantic produces it).
 SCHEMA_PROFILES: dict[str, frozenset[str]] = {
     "none": frozenset(),
     "halogen": HALOGEN_UNSUPPORTED_KEYWORDS,
+    "llamacpp-rocmfpx": LLAMACPP_ROCMFPX_UNSUPPORTED_KEYWORDS,
 }
 
 
