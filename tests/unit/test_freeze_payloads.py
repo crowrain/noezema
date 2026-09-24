@@ -78,3 +78,23 @@ def test_config_v8_pins_explorer_v4_and_differs_from_v7_only_there() -> None:
     assert resolved[Role.CURATOR].version == "curator-v4"
     budgets = TokenBudgets.from_snapshot(v8["model"], v8["token_budgets"])
     assert budgets.validate() == []
+
+
+@pytest.mark.unit
+def test_config_v9_pins_curator_v5_and_differs_from_v8_only_there() -> None:
+    """T7.38 (SMOKE-V8-K2 proposals 1/2/5 — one prompt file, one new
+    payload): config-v9 = v8 with the single change
+    ``prompts.curator`` → curator-v5 (the claim_type↔evidence matrix,
+    the reverify rule with a concrete example, ``dependencies: []``).
+    v8 stays as committed (payloads are never rewritten)."""
+    v8 = _load("config-v8-payload.json")
+    v9 = _load("config-v9-payload.json")
+    assert {k for k in v9 if v9[k] != v8[k]} == {"prompts"}
+    assert {r for r in v9["prompts"] if v9["prompts"][r] != v8["prompts"][r]} == {"curator"}
+    assert v9["prompts"]["curator"]["version"] == "curator-v5"
+    assert v9["prompts"]["curator"]["path"] == "prompts/curator/curator-v5.md"
+    resolved = resolve_prompts(v9["prompts"], REPO_ROOT)
+    assert resolved[Role.CURATOR].version == "curator-v5"
+    assert resolved[Role.EXPLORER].version == "explorer-v4"
+    budgets = TokenBudgets.from_snapshot(v9["model"], v9["token_budgets"])
+    assert budgets.validate() == []

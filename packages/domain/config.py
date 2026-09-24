@@ -63,11 +63,15 @@ BOOTSTRAP_PAYLOAD: dict[str, Any] = {
         },
         # T7.34 (ADR-0018): v4 — the reverify operation
         # (`existing_claim_id`: re-check an existing claim without
-        # creating a new one; the record is the fresh assessment row)
+        # creating a new one; the record is the fresh assessment row);
+        # T7.38 (SMOKE-V8-K2): v5 — the claim_type↔evidence matrix
+        # (mirrors claim_type_rules allowed_kinds), the reverify rule
+        # with a concrete example, and `dependencies: []` when there
+        # are no dependencies (no placeholder ids)
         "curator": {
-            "version": "curator-v4",
-            "path": "prompts/curator/curator-v4.md",
-            "sha256": "6e129ded5485733a4f8e83a64e102a4985ec1a4d0f758bef88549e770d4f5692",
+            "version": "curator-v5",
+            "path": "prompts/curator/curator-v5.md",
+            "sha256": "7978f73a36506c26a751bda9561f779cb7c11f8b561ec192862f85f61dd2b0dd",
         },
         # T5.2 (stage 4): the planner role (multi-step planning)
         "planner": {
