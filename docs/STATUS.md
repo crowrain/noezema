@@ -4438,3 +4438,120 @@ HTTP 400 `Failed to initialize samplers: failed to parse grammar`
 `test_curator_proposal_schema_round_trip_llamacpp_rocmfpx`). rules_hash,
 claim_type_rules, пороги, payload'ы, корпуса, ARCHITECTURE.md не тронуты.
 
+
+### T7.37 — SMOKE-V8-K2: смоук-прогон новых T7.30/T7.32/T7.34/T7.35/T7.36 на K2 и его разбор (2026-09-24)
+
+**T7.37a — переключение на K2 и запуск.** Ревью `smoke-v8/launch.sh`
+против эталона eval4b и кода — ошибок не найдено, правок не потребовалось
+(хэши config-v8 `135ebe09…`/корпуса `b3e05ad5…`/canonical v8 `9f1fc79a…`,
+пины 5 ролей, живой HTTP-чек схемы куратора через профиль
+`llamacpp-rocmfpx` (HTTP 200), searxng, БД `noezema-smoke-v8-k2` (0025),
+активация v8). Env: ровно 2 ключа — `NOEZEMA_LLM_MODEL` →
+`k2-horizon-mova-36b-a4b-rocmfp4-fast`, `NOEZEMA_LLM_SCHEMA_PROFILE` →
+`llamacpp-rocmfpx` (бэкап `noezema-llm.env.bak.2026-09-24T121733Z`); env
+оставлен как есть — K2 остаётся моделью NOEZEMA. Прогон
+(run `a0a84ce9-a327-4531-aede-6f488a1d3d2a`, snapshot `da1b0165…`,
+корпус 7 q, seed 20260924, slo 3600 s): 2026-09-24 12:18:12Z →
+12:42:04Z, EXIT=0; 7 сессий — 2 succeeded (4/7, 5/7), 5
+succeeded_partial (1, 2, 3, 6, 7); `outcome=insufficient_sample`
+(N=7<20 — не приёмка). Отчёт T7.37a: `task27-smoke-launch.log`.
+
+**T7.37b — остановка воркера и разбор (только анализ; код/тесты/
+payload'ы/корпуса/ARCHITECTURE.md не тронуты, БД — SELECT only, LLM
+.48 не тронут).**
+
+1. **Воркер остановлен.** До остановки: 7/7 сессий терминальны,
+   7/7 commit_attempts = `committed`; `systemctl --user stop
+   smoke-v8-k2-worker`; оба юнита inactive (transient-юниты —
+   `LoadState=not-found` после stop), процессов hostctl/worker.sh нет.
+   Воркер за 24 мин не сделал работы (103 × reassessment `deferred=True`
+   — сессии в полёте, 103 × reconcile «nothing to do»).
+2. **Гейт 5 = 0/5 (разбор — `docs/eval/SMOKE-V8-K2-report.md` §3).**
+   Знаменатель 5 = значимые claims (E2+ supported: ООН E3, Python
+   `35d5b7ae` E3, plan.md E2, Спутник E3, Go E3). Числитель 0 по всем
+   пяти путям: evidence — 11/11 строк из сессии-создателя;
+   claim_revisions — 0 (писателя нет); claim_dependencies — 0 (единственное
+   ребро отклонено); **claim_assessments — ни одной строки с
+   created_in_session = сессия-перепроверка**. По пакам:
+   - **Python** (якорь S2 → FU S4): якорь дал значимый claim
+     (`35d5b7ae` E3/supported); FU видела его в контекст-паке полным
+     UUID (`[c:35d5b7ae…] … (supported, E3, p=0.75)`, `retrieval.py:95`)
+     и цитировала в rationale — но **`existing_claim_id` НЕ
+     использован**: куратор предложил НОВЫЙ claim
+     `local_observation`+source_assertion → rules pre-check (T7.9)
+     отклонил ВСЁ предложение (`claim 0 (local_observation): support
+     evidence kind 'source_assertion' not allowed for local_
+     observation`) → 0 staging. Аудит `reverify_unresolved` — 0
+     (путь не входился). Классификация: **модель не воспользовалась
+     операцией** + неверный claim_type → отказ всего (класс (ви.1)
+     T7.33 type↔evidence).
+   - **plan.md** (якорь S3 → FU S5): **якорь не создал claim** — своё
+     предложение отклонено rules engine (`claim 1 (computed_result):
+     support evidence kind 'local_observation' not allowed for computed_
+     result` — та же пара, что 6× в EVAL-4d) → FU видела в паке 0
+     claim'ов и создала НОВЫЙ (local_observation E2, `existing_claim_id:
+     null`). Классификация: **якорь не дал значимого claim'а**.
+   - **Вывод:** 0/5 — не дефект механизма T7.34 (обе fail-closed
+     границы и пятый путь гейта на месте и сверены с кодом), а модельное
+     поведение K2: 0/7 сессий заполнили `existing_claim_id`; оба пака
+     упали до reverify-пути на модельных отказах. Матрица type↔evidence
+     в промпте куратора отсутствует (T7.33 (ви.1)).
+3. **Выдуманные id: 1 за весь ран** — S1 (ООН) dependency
+   `c0000000-0000-0000-0000-000000000000` → host-отказ
+   `dependency_edge_rejected` «target missing» (claim закоммичен без
+   ребра). S1 была первая — id в контексте не было (claims_evidence=0) →
+   нулевой UUID-плейсхолдер (класс галлюцинации T7.33).
+   `existing_claim_id` ≠ null — **0 строк** (поле не использовалось).
+   Причины 5 succeeded_partial (терминал = точное равенство
+   `complete_reason == "goal_reached"`, `orchestrator.py:826`): S1/S3/S6
+   — свободный текст вместо кода; S2 — `goal_reached: <текст>` (код +
+   суффикс, равенство не срабатывает); S7 — budget_exhausted (10 шагов).
+   Уточнение T7.37a: partial S1 не из-за dependency-отказа (на терминал
+   он не влияет). Плюс 9 policy deny — ошибки tool-схем K2
+   (неизвестный `artifact.create` ×2, `memory.search` с чужими
+   аргументами ×4 и т.д.) — хост fail-closed корректен.
+4. **Новинки — числами** (отчёт §5): **T7.35** — 46 model_runs,
+   46/46 несут prompt_version+prompt_sha256, **0 расхождений** с пинами
+   config-v8 (curator-v4 ×7, explorer-v4 ×39); consolidating
+   tool_schema_hash NULL по замыслу (куратор без инструментов).
+   **T7.36** — ошибок 400 «failed to parse grammar» **0**;
+   finish_reason **46/46 stop** (0 length); выходные токены: мин 107,
+   медиана 582,5, **макс 4902** « 8192; reasoning не учитывается
+   отдельно нигде (клиент читает только usage+finish_reason; сырые
+   ответы не ретейнятся) — входит в output_tokens, усечений нет.
+   **T7.30/T7.32** — 7/7 claim'ов без отклонений: ООН explicit →
+   NULL/evergreen; Спутник none → NULL/evergreen; Python/Go relative →
+   as_of = дата сессии, reverify_after = МОМЕНТ ПРОВЕРКИ + 30 д (окно
+   volatility), fresh; якорь — из сохранённого `assessed_scope.
+   date_anchor`.
+5. **«Event loop is closed» (worker.log, 206 traceback'ов на 206
+   тиков)** — teardown-дефект `hostctl/cli.py`: после
+   `asyncio.run(_run())` (цикл A, на нём пул/asyncpg-коннекты) —
+   `asyncio.run(engine.dispose())` на НОВОМ цикле B → «Future attached
+   to a different loop» + `call_soon` по закрытому циклу A. Класс:
+   **безвредный шум** (тик завершается до traceback'а, exit 0, данных не
+   трогает; в ране воркер не работал), но реальный дефект — маскирует
+   ошибки ~6 КБ шума на такт. Паттерн во ~10 командах CLI. Не исправлено
+   (отдельная задача).
+6. **Итоговые гейты** (N=7, не приёмка): new_supported_refuted_e2
+   insufficient_sample 5/5 ci95=[0.5655, 1.0]; external_temporal_e3
+   insufficient_sample 4/4; eligible_sessions_with_outcome insufficient_
+   sample 7/7; near_duplicate_questions insufficient_sample 0/7;
+   **significant_claim_reuse insufficient_sample 0/5 ci95=[0.0,
+   0.4345]**; due_stale_time_sensitive insufficient_sample 0/2;
+   reassessment_slo insufficient_sample 0/0; current_pending_invalid_
+   ancestor insufficient_sample 0/7; high_severity_incidents **passed**
+   0/None; blind-гейты (структурные) insufficient_sample 7/7.
+7. **Предложения (по приоритету; все — отдельные задачи, решение за
+   пользователем):** (1, высокий) матрица type↔evidence в curator-v4 →
+   новый payload (2/7 сессий отклонены — корень гибели обоих паков);
+   (2, высокий) усилить правило 7 «Перепроверка» примером (0/7
+   использовали `existing_claim_id`); (3, средний) нормализация
+   `complete_reason` (4/7 сессий деградировали в partial из-за
+   формулировки); (4, средний) dispose движка в том же `asyncio.run`
+   (hostctl CLI); (5, низкий) «dependencies: [] если нет зависимостей»;
+   (6, низкий) следить за слабостью K2 к tool-схемам (9 deny).
+
+Полная проверка (подтверждение отсутствия регрессии — код не менялся):
+ruff + mypy strict + pytest (NOEZEMA_TEST_DATABASE_URL) — 944 passed.
+Фоновых процессов нет; коммит — только отчёт и STATUS.md.
