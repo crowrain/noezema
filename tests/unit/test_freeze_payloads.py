@@ -98,3 +98,25 @@ def test_config_v9_pins_curator_v5_and_differs_from_v8_only_there() -> None:
     assert resolved[Role.EXPLORER].version == "explorer-v4"
     budgets = TokenBudgets.from_snapshot(v9["model"], v9["token_budgets"])
     assert budgets.validate() == []
+
+
+@pytest.mark.unit
+def test_config_v10_pins_curator_v6_and_differs_from_v9_only_there() -> None:
+    """T7.39 (T7.38 acceptance: the reverify example used a REAL claim
+    id from SMOKE-V8-K2 — on a fresh DB the host would reject the
+    copied reference and kill the whole proposal): config-v10 = v9
+    with the single change ``prompts.curator`` → curator-v6 (the
+    example swapped for a corpus-free fact + a fresh UUID; the matrix
+    is unchanged). v9 stays as committed (payloads are never
+    rewritten)."""
+    v9 = _load("config-v9-payload.json")
+    v10 = _load("config-v10-payload.json")
+    assert {k for k in v10 if v10[k] != v9[k]} == {"prompts"}
+    assert {r for r in v10["prompts"] if v10["prompts"][r] != v9["prompts"][r]} == {"curator"}
+    assert v10["prompts"]["curator"]["version"] == "curator-v6"
+    assert v10["prompts"]["curator"]["path"] == "prompts/curator/curator-v6.md"
+    resolved = resolve_prompts(v10["prompts"], REPO_ROOT)
+    assert resolved[Role.CURATOR].version == "curator-v6"
+    assert resolved[Role.EXPLORER].version == "explorer-v4"
+    budgets = TokenBudgets.from_snapshot(v10["model"], v10["token_budgets"])
+    assert budgets.validate() == []

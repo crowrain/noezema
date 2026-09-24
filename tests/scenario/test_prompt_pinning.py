@@ -91,9 +91,9 @@ async def test_model_runs_record_prompt_version_and_content_hash(
         assert version == "explorer-v4"
         assert sha == pins[Role.EXPLORER]
     for _, version, sha, _ in curator_rows:
-        # T7.38: the bootstrap pin is curator-v5 (pattern T7.14/T7.35:
-        # the pin follows the current curator prompt)
-        assert version == "curator-v5"
+        # T7.39: the bootstrap pin is curator-v6 (pattern T7.14/T7.35/
+        # T7.38: the pin follows the current curator prompt)
+        assert version == "curator-v6"
         assert sha == pins[Role.CURATOR]
 
 

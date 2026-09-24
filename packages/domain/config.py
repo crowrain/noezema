@@ -67,11 +67,17 @@ BOOTSTRAP_PAYLOAD: dict[str, Any] = {
         # T7.38 (SMOKE-V8-K2): v5 — the claim_type↔evidence matrix
         # (mirrors claim_type_rules allowed_kinds), the reverify rule
         # with a concrete example, and `dependencies: []` when there
-        # are no dependencies (no placeholder ids)
+        # are no dependencies (no placeholder ids);
+        # T7.39 (T7.38 acceptance): v6 — the reverify example swapped
+        # for a corpus-free fact (external_fact, as_of null) with a
+        # fresh UUID present nowhere in the repo or the data — the v5
+        # example quoted a REAL claim id from SMOKE-V8-K2, which the
+        # host would reject on a fresh DB and kill the whole proposal
+        # (T7.34); guard: test_prompt_example_no_real_data.py
         "curator": {
-            "version": "curator-v5",
-            "path": "prompts/curator/curator-v5.md",
-            "sha256": "7978f73a36506c26a751bda9561f779cb7c11f8b561ec192862f85f61dd2b0dd",
+            "version": "curator-v6",
+            "path": "prompts/curator/curator-v6.md",
+            "sha256": "a3dbccdcc6c911fc58c8e7339478fd8938cf8291f2d5bd5a9aff02340e046635",
         },
         # T5.2 (stage 4): the planner role (multi-step planning)
         "planner": {

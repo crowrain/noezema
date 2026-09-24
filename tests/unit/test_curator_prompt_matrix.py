@@ -6,8 +6,12 @@ SMOKE-V8-K2 / EVAL-4d: K2 proposed pairs the rules engine rejects
 source_assertion``), because curator-v4 had no matrix and the rules
 reject the WHOLE proposal on one bad pair (T7.9). curator-v5 states
 the matrix; this test parses it out of the prompt and compares it
-pair-by-pair with config-v9's ``claim_type_rules.<type>.allowed_kinds``
+pair-by-pair with the payload's ``claim_type_rules.<type>.allowed_kinds``
 — a future edit of the rules can never silently desync the prompt.
+
+T7.39: extended to curator-v6 / config-v10 — the v5→v6 diff is the
+reverify example only (a safe, corpus-free example), the matrix must
+stay pair-identical.
 """
 
 from __future__ import annotations
@@ -47,12 +51,23 @@ def _load_payload(name: str) -> dict:
 
 
 @pytest.mark.unit
-def test_curator_v5_matrix_matches_config_v9_claim_type_rules() -> None:
-    prompt = (REPO_ROOT / "prompts" / "curator" / "curator-v5.md").read_text(encoding="utf-8")
+@pytest.mark.parametrize(
+    ("prompt_file", "payload_file"),
+    [
+        ("curator-v5.md", "config-v9-payload.json"),
+        # T7.39: the v5→v6 diff is the example of rule 7 only — the
+        # matrix must remain pair-identical to config-v10's rules.
+        ("curator-v6.md", "config-v10-payload.json"),
+    ],
+)
+def test_curator_matrix_matches_claim_type_rules(
+    prompt_file: str, payload_file: str
+) -> None:
+    prompt = (REPO_ROOT / "prompts" / "curator" / prompt_file).read_text(encoding="utf-8")
     prompt_matrix = _parse_prompt_matrix(prompt)
     assert len(prompt_matrix) == 8, f"expected 8 matrix rows, parsed {len(prompt_matrix)}"
 
-    rules = _load_payload("config-v9-payload.json")["claim_type_rules"]
+    rules = _load_payload(payload_file)["claim_type_rules"]
     rule_pairs = {(t, k) for t, r in rules.items() for k in r["allowed_kinds"]}
     prompt_pairs = {(t, k) for t, kinds in prompt_matrix.items() for k in kinds}
 
