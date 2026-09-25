@@ -68,6 +68,11 @@ smoke-v10, task32 smoke-v10b) убраны.
 (`1db12bec` + `6ced7d7e`) — и по ветке evidence (новое source_assertion
 от FU), и по ветке claim_assessments (строка-перепроверка).
 
+*(СЛЕДУЮЩИЙ СМОУК, SMOKE-V11-HALOGEN / T7.44b: гейт 5 = 1/6 — знаменатель
+вырос ровно на 1, потому что план-якорь, исключённый здесь как E0
+(`c6aa88ea`), в v11 стал E2 (связано evidence) и вошёл в знаменатель;
+числитель остался 1. Детали — SMOKE-V11-HALOGEN-report.md §3.)*
+
 ## 4. ПЕРВЫЙ ПАК (Python): перепроверка сработала ВПЕРВЫЕ — полный путь
 
 Сессия-перепроверка `6ced7d7e` (follow-up Python, prio 80: «…Сверь ответ
@@ -205,6 +210,9 @@ no_evidence — замысел; пак без grade-фильтра — замы�
   хотя бы одним связанным evidence из списка сессии (иначе — вопрос,
   а не claim); `evidence_links` — связь с evidence сессии,
   `dependencies` — только между claim'ами, id из раздела «Знание»».
+  *(СЛЕДУЮЩИЙ СМОУК, SMOKE-V11-HALOGEN / T7.44b: исправление
+  (curator-v7) СРАБОТАЛО — план-якорь с 1 evidence, E2/supported,
+  E0-класс исчез, blind_provenance 6/6; детали — в том отчёте §4–5.)*
 - **(Д2)** FU не заполнил `existing_claim_id`, написав в summary
   «перепроверка». Плюс промповый пробел: триггер правила 7 «если факт
   уже установлен» не покрывает случай СЛАБОГО (hypothesis/E0–E1)
@@ -216,6 +224,11 @@ no_evidence — замысел; пак без grade-фильтра — замы�
   перепроверка» + явное: «если существующий claim слабый (hypothesis,
   E0–E1) и у тебя свежий evidence — используй перепроверку со
   supports, он поднимет оценку».
+  *(СЛЕДУЮЩИЙ СМОУК, SMOKE-V11-HALOGEN / T7.44b: на halogen класс
+  НЕ устранён — 0/7 claim-операций с непустым existing_claim_id,
+  план-пак снова дал дубль; Python-пак засчитан гейтом 5 через dedup,
+  а не через existing_claim_id. Не разделено: дефект правки vs
+  модель. Детали — в том отчёте §4–5, §7.)*
 
 ## 6. Регрессия blind_provenance_path 7/7 → 5/6 (порог 0.9)
 
@@ -430,12 +443,17 @@ claim (Д1 → E0 → второй пак всё равно не перепро�
    (как T7.38/T7.39). Устранит: E0-якорь, второй неперепроверенный пак
    (дубли), blind_provenance 5/6 и уберёт стимул путать evidence_links
    с dependencies (выдуманные id). — **сделано в T7.43** (curator-v7,
-   config-v11).
+   config-v11); **проверено в SMOKE-V11-HALOGEN (T7.44b): сработало**
+   (план-якорь E0→E2, blind_provenance 6/6, выдуманных id 0).
 2. **(Высокий, Д2) Промпт: правило 7 — негативный пример + случай
    слабого claim'а.** «перепроверка БЕЗ existing_claim_id — это новый
    claim» + «существующий claim hypothesis/E0–E1 и есть свежий evidence
    → перепроверка со supports поднимет оценку». Улика: `9ec3807f` seq 17.
-   — **сделано в T7.43** (curator-v7, config-v11).
+   — **сделано в T7.43** (curator-v7, config-v11); **проверено в
+   SMOKE-V11-HALOGEN (T7.44b): на halogen НЕ сработало** (0/7
+   existing_claim_id, 0 claim_reverified; план-пак — дубль; Python-пак
+   засчитан через dedup). Разделение «правка vs модель» требует смоука
+   curator-v7+K2 (см. SMOKE-V11-HALOGEN-report.md §7–10).
 3. **(Средний) Мягкая нормализация `complete_reason`** (host-фикс,
    SMOKE-V8-K2 п.3) — 3/7 partial из-за точного равенства.
 4. **(Средний) Teardown hostctl CLI** (SMOKE-V8-K2 п.4): dispose в том
