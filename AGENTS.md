@@ -87,11 +87,21 @@
 
 ```bash
 cd /home/denis/dsh1/noezema-src && export UV_CACHE_DIR="$PWD/.uv-cache" \
+  && export DOCKER_CONFIG="${NOEZEMA_DOCKER_CONFIG:-$PWD/.docker-config}" \
   && .venv/bin/ruff check . \
   && .venv/bin/mypy packages apps hostctl \
+  && { docker image inspect noezema-sandbox:test >/dev/null 2>&1 \
+       || docker build -f sandbox/Containerfile -t noezema-sandbox:test sandbox/; } \
   && NOEZEMA_TEST_DATABASE_URL="postgresql+asyncpg://noezema:noezema_dev@127.0.0.1:54329/noezema" \
-     .venv/bin/pytest -q
+     .venv/bin/pytest -n auto -q
 ```
+
+pytest — параллельно через pytest-xdist `-n auto` (T7.41: на `.87` это 6 воркеров).
+Образ sandbox собирается ОДИН РАЗ до запуска pytest: под xdist каждый воркер — отдельный
+процесс со своим session-scope, параллельный `docker build` одного тега — гонка, поэтому
+фикстура `sandbox_image` только проверяет наличие образа (иначе — понятная ошибка).
+`DOCKER_CONFIG` должен указывать на writable-каталог (sandbox агента запрещает запись
+в `~/.config`; по умолчанию — `.docker-config` в репо, та же логика, что в фикстуре).
 
 Маркеры pytest: `unit`, `scenario` (postgres + fake LLM), `security`, `compat`.
 

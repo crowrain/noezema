@@ -201,21 +201,22 @@ def docker_engine() -> str:
 
 @pytest.fixture(scope="session")
 def sandbox_image(docker_engine: str) -> str:
+    # The image is built ONCE before pytest starts (full check, AGENTS.md
+    # §6, T7.41). Under pytest-xdist every worker is a separate process with
+    # its own session scope, so a build here could race across workers on
+    # one fixed tag; the fixture only verifies presence and fails with a
+    # clear error if the pre-build step was skipped.
     env = _docker_env()
     rc = subprocess.run(
         [docker_engine, "image", "inspect", SANDBOX_IMAGE], capture_output=True, timeout=30, env=env
     ).returncode
     if rc != 0:
-        build_cmd = [
-            docker_engine,
-            "build",
-            "-f",
-            str(REPO_ROOT / "sandbox" / "Containerfile"),
-            "-t",
-            SANDBOX_IMAGE,
-            str(REPO_ROOT / "sandbox"),
-        ]
-        subprocess.run(build_cmd, capture_output=True, timeout=600, check=True, env=env)
+        pytest.fail(
+            f"docker image {SANDBOX_IMAGE} is not built. Run the full check from AGENTS.md §6 "
+            "(it builds the image before pytest) or build it manually: "
+            f"{docker_engine} build -f {REPO_ROOT / 'sandbox' / 'Containerfile'} "
+            f"-t {SANDBOX_IMAGE} {REPO_ROOT / 'sandbox'}"
+        )
     return SANDBOX_IMAGE
 
 
