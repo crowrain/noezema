@@ -122,4 +122,91 @@ config-v2…v11 и промпты (хэши не тронуты), пины, по
 
 Открытые вопросы (отчёт T7.46, п.5): NUL в ТЕКСТЕ МОДЕЛИ (claim
 statement → `session_staging` JSONB) вне трёх границ T7.46a — кандидат
-на отдельное усиление; прочие C0-байты не маскируются (см. выше).
+на отдельное усиление → **закрыт дополнением T7.47a ниже**; прочие
+C0-байты не маскируются (см. выше) → **закрыт фактом в T7.47a** (тест
+`test_postgres_rejects_only_nul_among_c0_bytes`).
+
+## Дополнение T7.47a: граница модельного текста (2026-09-25)
+
+Текст, который генерирует МОДЕЛЬ (ответ LLM), — четвёртый канал NUL,
+внешний трём границам T7.46a (наблюдения инструментов, evidence,
+audit). Он входит в хост в ОДНОЙ точке — `LLMMiddleware.chat`
+(`packages/llm_gateway/client.py`: `json.loads(content)` →
+`model_validate`) — и расходится в столбцы, не тронутые T7.46a:
+
+| Путь модельного текста | Столбец | JSONB/TEXT | До T7.47a |
+|---|---|---|---|
+| claim: statement/scope/search_statements/existing_claim_id | `session_staging.payload` | JSONB | **не покрыт, ФАТАЛЬНО** (откат phase-1) |
+| question: text/origin/rationale | `session_staging.payload` | JSONB | **не покрыт, ФАТАЛЬНО** |
+| evidence link: note | `session_staging.payload` | JSONB | **не покрыт, ФАТАЛЬНО** |
+| план (steps/stopping_criteria/...) | `sessions.plan` | JSONB | **не покрыт, ФАТАЛЬНО** |
+| отчёт верификатора (checks/gaps) | `sessions.verification` | JSONB | **не покрыт, ФАТАЛЬНО** |
+| chunks извлечения (note; quote — вербатим из замаскированного док.) | `sessions.extraction` | JSONB | **не покрыт, ФАТАЛЬНО** |
+| complete reason | `sessions.termination_reason` | TEXT | **не покрыт, ФАТАЛЬНО** (TEXT тоже отклоняет NUL — факт ниже) |
+| любые поля (rationale, summary, claims…) | `audit_events.payload/public_summary`, outbox | JSONB/TEXT | покрыт (граница 3) |
+| claim/evidence/question на commit | `claims.*`, `evidence.*`, `questions.*` | TEXT/JSONB | производные от staging (покрываются маской staging) |
+| `model_runs` (токены/фингерпринт/finish_reason — мета API, сырой ответ в БД не пишется), `actions.arguments_hash` (только хэш), `checkpoints`, `commit_attempts` (хэши/UUID), `sources` (final URL хоста), `workspace_entries.path` (реальные файлы — NUL в пути невозможен) | — | — | N/A |
+
+Решение — тот же принцип, те же примитивы (`mask_nul_deep`, маркер
+`\x00`), две новые границы:
+
+- **граница 4 — ВХОД МОДЕЛЬНОГО ТЕКСТА (`LLMMiddleware.chat`),
+  маска СРАЗУ ПОСЛЕ `json.loads`, ПЕРЕД `model_validate`.** Все пять
+  ролей (explorer/curator/planner/verifier/extractor) проходят через
+  эту единственную точку — проверено: других парсингов ответа модели
+  в хосте нет. Маска до валидации/капов/хэшей → сохранённое значение и
+  вход любого хэша — ОДНО замаскированное значение (mask-then-hash),
+  как в границе 2. На чистом входе маска — тождество: значения,
+  хэши, дедуп-ключи побайтово как до T7.47a (тест
+  `test_clean_response_passes_byte_identical` + существующие тесты
+  identity/дедуп зелёны без изменений).
+- **граница 5 — STAGING (защитная линия, `StagingService.record`),
+  маска payload ДО `payload_hash`.** `session_staging.payload` —
+  JSONB-канал знания; линия идемпотентна (граница 4 уже замаскировала)
+  и страхует любой будущий не-gateway-источник; `payload_hash` и
+  производный от него `commit_attempts.staging_hash` считаются от
+  СОХРАНЁННОГО (замаскированного) значения — дедуп по statement
+  (T7.9) работает по замаскированному тексту (тест
+  `test_nul_in_claim_statement_commits_and_dedupes`: вторая сессия с
+  тем же NUL-высказыванием дедупится, claim не дублируется).
+
+**Факт по C0 (заменяет оценку «только `\u0000`» на измерение).**
+Замер на реальной БД (UTF8, путь приложения SQLAlchemy+asyncpg; тест
+`test_postgres_rejects_only_nul_among_c0_bytes`): среди C0-байтов
+(0x00–0x1F) Postgres отклоняет **только NUL** — в JSONB
+(`UntranslatableCharacterError` на `\u0000`) и в TEXT/VARCHAR
+(`CharacterNotInRepertoireError: invalid byte sequence for encoding
+"UTF8": 0x00`) — все остальные (0x01–0x1F) сохраняются. Диапазон
+маскирования НЕ расширяется (\x00-only, как в T7.46a).
+Побочное наблюдение SMOKE-V12-K2 §3.1 «NUL в бинарном text-параметре
+Postgres принимает» **опровергнуто**: на пути приложения NUL в TEXT
+отклоняется (сам ADR-0020 уже это учитывал: «TEXT-столбец тоже не
+хранит NUL» — граница 3 маскирует `public_summary` по этой причине).
+
+**Семантика повреждённого reason-токена.** `decision.reason` — токен
+словаря хоста (CompleteReason или расширение), не свободный текст.
+NUL-повреждённый «goal_reached\x00» после маски
+(«goal_reached`\\x00`») не равен `GOAL_REACHED` → сессия получает
+ТОТ ЖЕ статус, что любой неизвестный/повреждённый reason:
+`SUCCEEDED_PARTIAL` (работа сохраняется, исход объясним по
+сохранённому маркеру; хост не гадает намерение). До T7.47a этот путь
+был фатальным: NUL писался в `sessions.termination_reason` в финальной
+fenced-транзакции и ронял весь commit (TEXT отклоняет NUL — факт выше).
+
+**Тесты T7.47a** (красный→зелёный; красный до фикса —
+`UntranslatableCharacterError`/`CharacterNotInRepertoireError` с
+откатом транзакции сессии):
+
+- `tests/unit/test_gateway_nul.py` (3) — NUL в claim statement/scope,
+  в complete reason/rationale маскируется на входе; чистый ответ
+  проходит побайтово;
+- `tests/scenario/test_model_text_nul.py` (7) — NUL в claim statement
+  (commit + дедуп + payload_hash от замаскированного), в question text,
+  в complete reason (PARTIAL + маркер + claim выжил), в LLM-плане, в
+  отчёте верификатора, в chunks извлечения (сохранённый sha от
+  замаскированного док.), эмпирический C0-провер (NUL — единственный
+  отклоняемый байт).
+
+**Не изменено (T7.47a):** схемы БД (без миграций), `rules_hash`,
+замороженные payload'ы config-v2…v11 и промпты (хэши не тронуты),
+пины, пороги, корпуса, `ARCHITECTURE.md`, данные прошлых прогонов.

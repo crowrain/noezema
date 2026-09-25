@@ -24,6 +24,7 @@ from packages.domain.models.enums import AuditEventType
 from packages.domain.models.questions import ORMQuestion
 from packages.domain.models.sessions import ORMSession
 from packages.domain.repositories.questions import QuestionRepository
+from packages.domain.sanitization import mask_nul_deep
 from packages.domain.services.audit import AuditService
 from packages.domain.services.reserve import HostReserveService, StagingBudgetExceeded
 
@@ -80,6 +81,15 @@ class StagingService:
             )
             .scalar_one()
         )
+        # T7.47a (ADR-0020): the staging DEFENSIVE line. session_staging
+        # payload is JSONB — a NUL here rolls back the whole phase-1
+        # transaction. The model-text entry boundary (LLMMiddleware.chat)
+        # already masks; this is the idempotent backstop for any future
+        # non-gateway source. Mask-THEN-hash: payload_hash is computed
+        # over the stored (masked) value, so the stored payload and every
+        # derived hash (commit staging_hash, dedup on the stored text)
+        # agree. Identity on NUL-free payloads.
+        payload = mask_nul_deep(payload)
         row = ORMStagingOp(
             session_id=session.id,
             op=op,

@@ -23,6 +23,7 @@ import httpx
 from pydantic import BaseModel, ValidationError
 
 from packages.domain.models.base import JsonDict
+from packages.domain.sanitization import mask_nul_deep
 from packages.llm_gateway.config import LLMGatewayConfig
 from packages.llm_gateway.schema_compat import SCHEMA_PROFILES, strip_schema_keywords
 
@@ -178,6 +179,15 @@ class LLMMiddleware:
             content = data["choices"][0]["message"]["content"]
             try:
                 parsed = json.loads(content)
+                # T7.47a (ADR-0020): the model-text ENTRY boundary. The
+                # response is the only model-text source reaching the
+                # host; mask NUL here — before schema validation, caps
+                # and any hash over the parsed value — so every
+                # downstream consumer (staging, plan, verification,
+                # extraction, complete reason, audit) stores/hashes the
+                # SAME masked text. mask_nul_deep is the identity on
+                # NUL-free input (byte-identical, dedup-safe).
+                parsed = mask_nul_deep(parsed)
                 validated = response_schema.model_validate(parsed)
             except (json.JSONDecodeError, ValidationError, KeyError, TypeError) as exc:
                 record.output_schema_valid = False

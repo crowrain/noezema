@@ -15,7 +15,7 @@
 | M4 зависимости + переоценка | ✅ Gate M4 пройден: T4.1–T4.9 закрыты (claim_dependencies + cycle check, cascade invalidation, worker reassessment, writer admission, online activation §8.7.2, env manifests §14 v2, source graph §11.3, counter-resolutions, failpoints) — [дословно](STATUS-archive.md#m4-зависимости--переоценка) | — | пороги M4 из замеров серии 2026-09-14 зафиксированы в PLAN (батч 32, SLO P95 200 с); 501 тест |
 | M5 расширенный цикл | ✅ Gate M5 пройден (§19, этап 4): T5.1–T5.6 закрыты (curiosity, планирование, verifier, повтор, untrusted extraction, long-horizon) — [дословно](STATUS-archive.md#m5-расширенный-цикл) | — | 651 тест |
 | M6 Research Proxy | ✅ Gate M6 пройден (§19, этап 5): T6.1–T6.4 закрыты (research proxy: egress, режимы, provenance, injection/отравление) — [дословно](STATUS-archive.md#m6-research-proxy) | noezema-m6 (после gate) | см. раздел M6 в архиве | 651 тест |
-| M7 полный веб + эксплуатация | ✅ Gate M7 пройден (T7.1–T7.6: knowledge graph + provenance, backup/PITR §15.3, GC root set, security gate + §16 metrics, evaluation run §22.2, ADR-0004; noezema-m7); после gate — дефектные серии EVAL-1/2/3/3b/4/4d: T7.7–T7.28 закрыты (ADR-0005–0015), активная фаза T7.29–T7.46 — в разделе ниже; [дословно](STATUS-archive.md#m7-полный-веб--эксплуатация) | noezema-m7 (на `2e1631c`) | см. раздел M7 в архиве | 942 тест |
+| M7 полный веб + эксплуатация | ✅ Gate M7 пройден (T7.1–T7.6: knowledge graph + provenance, backup/PITR §15.3, GC root set, security gate + §16 metrics, evaluation run §22.2, ADR-0004; noezema-m7); после gate — дефектные серии EVAL-1/2/3/3b/4/4d: T7.7–T7.28 закрыты (ADR-0005–0015), активная фаза T7.29–T7.47 — в разделе ниже; [дословно](STATUS-archive.md#m7-полный-веб--эксплуатация) | noezema-m7 (на `2e1631c`) | см. раздел M7 в архиве | 942 тест |
 
 ## Матрица §22.1 (техническая приёмка)
 
@@ -164,7 +164,7 @@ overall failed по `significant_claim_reuse`) → **EVAL-3d** (2026-09-19,
 - **T7.28 (follow-up) — направления гейтов — закрытый набор: `GateDirection` Literal + fail-closed в `_gate()`** (2026-09-22) — Literal + ValueError на неизвестное направление; 877 тест → [архив](STATUS-archive.md#t728-follow-up--направления-гейтов--закрытый-набор-gatedirection-literal--fail-closed-в-_gate)
 - **Таблица вех — исходные ячейки «Статус»/«Примечание» (дословно)** (T7.42, 2026-09-25) — дословные ячейки M0–M7 до сжатия таблицы в T7.42 → [архив](STATUS-archive.md#таблица-вех--исходные-ячейки-статуспримечание-дословно)
 
-## Активная история (T7.29–T7.46)
+## Активная история (T7.29–T7.47)
 
  ### T7.29 — разбор поля `as_of` у `temporal_fact` (EVAL-4d): определение по спеке, улика по 22 claim'ам, варианты решения — без изменения поведения
 
@@ -1292,4 +1292,30 @@ ruff + mypy strict + pytest (NOEZEMA_TEST_DATABASE_URL) — 944 passed.
 - **T7.46a** (`39cf85c`): ruff + mypy strict — зелёные; pytest -n auto (NOEZEMA_TEST_DATABASE_URL) — **970 passed, 8 skipped, 5 failed** — 5 = ТОЛЬКО задокументированная time bomb T7.46b (каждый день с 2026-09-25 12:00Z, фикс — следующий коммит, заказанный порядок T7.46a→T7.46b), других падений нет, флок `test_slow_llm` не проявился.
 - **T7.46b** (этот коммит): ruff + mypy strict — зелёные; pytest -n auto — **987 passed, 8 skipped, 1 failed** — 1 = `test_slow_llm_does_not_lose_commit_lease` (задокументированный флок T7.43, PendingRollbackError на параллельном xdist; **одиночный повтор — 1 passed**, как и в T7.43). Все 5 time-bomb тестов — зелёные (дата запуска 2026-09-25, wall-clock уже перечёркнул 10d-окна фиксированного `NOW` — бомба реально взорвалась до фикса, после — зелёная).
 
-Не меняется: схемы (миграций нет), `rules_hash`, замороженные payload'ы config-v2…v11 и промпты (хэши не тронуты), пины, пороги, корпуса, `ARCHITECTURE.md`, curator-v7/config-v11, `create_backup`/GC-сweep/CLI `restore-drill` (интерфейс и production-час не тронуты), данные прошлых прогонов (SELECT only). Открытые вопросы (ADR-0020, отчёт): NUL в ТЕКСТЕ МОДЕЛИ (claim statement → `session_staging` JSONB) вне трёх границ T7.46a — кандидат на отдельное усиление; прочие C0-байты не маскируются.
+Не меняется: схемы (миграций нет), `rules_hash`, замороженные payload'ы config-v2…v11 и промпты (хэши не тронуты), пины, пороги, корпуса, `ARCHITECTURE.md`, curator-v7/config-v11, `create_backup`/GC-сweep/CLI `restore-drill` (интерфейс и production-час не тронуты), данные прошлых прогонов (SELECT only). Открытые вопросы (ADR-0020, отчёт): NUL в ТЕКСТЕ МОДЕЛИ (claim statement → `session_staging` JSONB) вне трёх границ T7.46a — кандидат на отдельное усиление → **закрыто T7.47a**; прочие C0-байты не маскируются → **закрыто фактом T7.47a**.
+
+### T7.47a — NUL в тексте МОДЕЛИ (четвёртый канал, вне трёх границ T7.46a): граница на входе ответа + защитная линия staging — ADR-0020 (дополнение T7.47a)
+
+**Карта путей модельного текста → БД** (полная таблица — в дополнении ADR-0020). Модельный текст входит в хост в ЕДИНСТВЕННОЙ точке — `LLMMiddleware.chat` (grep: других парсингов ответа модели нет; `model_runs` сырой ответ в БД не пишет — `raw_response_artifact_id` ни разу не заполняется, `actions` хранит только `arguments_hash`, `checkpoints`/`commit_attempts` — UUID/хэши, `sources` — final URL хоста, `workspace_entries.path` — реальные файлы). До T7.47a НЕ ПОКРЫТЫ:
+
+1. `session_staging.payload` (JSONB) — claim statement/scope/search_statements/existing_claim_id, question text/origin/rationale, evidence note — **ФАТАЛЬНО**: откат всей phase-1-транзакции (режим SMOKE-V12-K2, теперь достижимый из текста модели);
+2. `sessions.plan` (JSONB) — LLM-план (planning=llm) — фатально;
+3. `sessions.verification` (JSONB) — отчёт верификатора — фатально;
+4. `sessions.extraction` (JSONB) — chunks извлечения (note; quote — вербатим из ЗАМАСКИРОВАННОГО хостом док., NUL в quote невозможен) — фатально;
+5. `sessions.termination_reason` (TEXT) — complete reason — **тоже фатально** (факт ниже: TEXT отклоняет NUL; пишет финальная fenced-транзакция → роняет весь commit).
+
+Покрыто T7.46a: audit/outbox (граница 3). Производные от staging (покрываются маской staging): `claims.*`, `questions.text`, evidence-строки на commit.
+
+**Решение** (тот же принцип ADR-0020, тот же `mask_nul_deep`/маркер `\x00`, новых механизмов нет): **граница 4 — вход модельного текста** (`packages/llm_gateway/client.py`, маска СРАЗУ ПОСЛЕ `json.loads(content)`, ПЕРЕД `model_validate` — до схем/капов/хэшей: сохранённое значение и вход любого хэша — одно замаскированное значение; все 5 ролей проходят через эту точку) + **граница 5 — staging** (`packages/domain/services/staging.py`, `record()`: маска payload ДО `payload_hash` — mask-then-hash; идемпотентна к границе 4, страхует будущие не-gateway-источники; `commit_attempts.staging_hash` — производный от сохранённого payload_hash → согласован).
+
+**Факт по C0-байтам (замер на реальной БД, UTF8, путь приложения SQLAlchemy+asyncpg; тест `test_postgres_rejects_only_nul_among_c0_bytes`):** среди C0 (0x00–0x1F) Postgres отклоняет **только NUL** — JSONB: `UntranslatableCharacterError` (на `\u0000`), TEXT и VARCHAR: `CharacterNotInRepertoireError` (invalid byte sequence for encoding "UTF8": 0x00); остальные 0x01–0x1F сохраняются во всех трёх типах. Диапазон маскирования НЕ расширяется (\x00-only). **Опровергнуто** побочное наблюдение SMOKE-V12-K2 §3.1 «NUL в бинарном text-параметре Postgres принимает» — на пути приложения TEXT NUL отклоняет (сам ADR-0020 уже учитывал: «TEXT-столбец тоже не хранит NUL»).
+
+**Семантика повреждённого reason-токена:** `decision.reason` — токен словаря хоста, не свободный текст; NUL-повреждённый «goal_reached\x00» после маски не равен `GOAL_REACHED` → `SUCCEEDED_PARTIAL` (тот же статус, что любой неизвестный/повреждённый reason; работа сохраняется, исход объясним по сохранённому маркеру; хост не гадает намерение). До T7.47a путь был фатальным (NUL в `termination_reason` ронял финальную fenced-транзакцию).
+
+**Идентичности/дедуп/правила не сломаны** (требование задачи): маска — тождество на чистом входе (тест `test_clean_response_passes_byte_identical`; существующие identity/дедуп-тесты зелёны без изменений: test_evidence_nul, test_session_nul_commit, test_memory_service, test_orchestrator::test_memory_search_and_claim_reuse — 64 теста прогнаны); дедуп T7.9 по ЗАМАСКИРОВАННОМУ statement — вторая сессия с тем же NUL-высказыванием дедупится, claim не дублируется (тест ниже).
+
+**Тесты** (красный→зелёный; красный до фикса — `UntranslatableCharacterError`/`CharacterNotInRepertoireError`, откат транзакции сессии): `tests/unit/test_gateway_nul.py` (3, новый: NUL в claim statement/scope + в complete reason/rationale маскируется на входе; чистый ответ — побайтово), `tests/scenario/test_model_text_nul.py` (7, новый: NUL в claim statement — КОММИТ + дедуп + `payload_hash == canonical_sha256(сохранённый payload)`; NUL в question text — question с маркером; NUL в complete reason — PARTIAL + маркер в `termination_reason` + claim выжил; NUL в LLM-плане / отчёте верификатора / chunks извлечения — JSONB с маркером + сохранённый sha от замаскированного док.; C0-провер).
+
+**Проверка** (AGENTS.md §6): ruff + mypy strict — зелёные; pytest -n auto — см. итог T7.47 (оба коммита).
+
+Не меняется: схемы БД (без миграций), `rules_hash`, замороженные payload'ы config-v2…v11 и промпты (хэши не тронуты), пины, пороги, корпуса, `ARCHITECTURE.md`, curator-v7/config-v11, данные прошлых прогонов (SELECT only). Фоновых процессов нет.
