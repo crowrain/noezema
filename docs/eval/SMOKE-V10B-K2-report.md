@@ -140,6 +140,12 @@ smoke-v10, task32 smoke-v10b) убраны.
 
 ## 5. ВТОРОЙ ПАК (plan.md) перепроверил НЕ — гипотеза менеджера ОПРОВЕРГНУТА
 
+> **SMOKE-V12-K2 (T7.45b) — чистое сравнение с этим прогоном (тот же K2,
+> единственная переменная — промпт curator-v6→v7):** на этой паре K2 под
+> curator-v7 **перепроверил якорь** — `existing_claim_id` полным UUID,
+> событие `claim_reverified`, дубля нет; якорь связан с evidence (E2, не
+> E0). Правки (а) и (б) сработали — см. SMOKE-V12-K2-report.md §4–5.
+
 Сессия `9ec3807f` (follow-up plan.md, prio 80: «Прочитай файл
 notes/plan.md… и подтверди, сколько пунктов») создала НОВЫЙ claim
 `64b1761f-…` (local_observation, E2/supported) с
@@ -444,7 +450,9 @@ claim (Д1 → E0 → второй пак всё равно не перепро�
    (дубли), blind_provenance 5/6 и уберёт стимул путать evidence_links
    с dependencies (выдуманные id). — **сделано в T7.43** (curator-v7,
    config-v11); **проверено в SMOKE-V11-HALOGEN (T7.44b): сработало**
-   (план-якорь E0→E2, blind_provenance 6/6, выдуманных id 0).
+   (план-якорь E0→E2, blind_provenance 6/6, выдуманных id 0) и **на K2 в
+   SMOKE-V12-K2 (T7.45b)** (план-якорь E2×2, blind 6/6 — эффект
+   модельно-независимый, промптовый).
 2. **(Высокий, Д2) Промпт: правило 7 — негативный пример + случай
    слабого claim'а.** «перепроверка БЕЗ existing_claim_id — это новый
    claim» + «существующий claim hypothesis/E0–E1 и есть свежий evidence
@@ -452,8 +460,12 @@ claim (Д1 → E0 → второй пак всё равно не перепро�
    — **сделано в T7.43** (curator-v7, config-v11); **проверено в
    SMOKE-V11-HALOGEN (T7.44b): на halogen НЕ сработало** (0/7
    existing_claim_id, 0 claim_reverified; план-пак — дубль; Python-пак
-   засчитан через dedup). Разделение «правка vs модель» требует смоука
-   curator-v7+K2 (см. SMOKE-V11-HALOGEN-report.md §7–10).
+   засчитан через dedup). Разделение «правка vs модель» требовало смоука
+   curator-v7+K2 (см. SMOKE-V11-HALOGEN-report.md §7–10) — **выполнен:
+   SMOKE-V12-K2 (T7.45b), на K2 сработало** (2/2 FU заполнили
+   `existing_claim_id` полным UUID, 2 `claim_reverified`, гейт 5 = 2/5;
+   неиспользование поля halogen — модельная особенность, правка достаточна —
+   см. SMOKE-V12-K2-report.md §4–5, §10).
 3. **(Средний) Мягкая нормализация `complete_reason`** (host-фикс,
    SMOKE-V8-K2 п.3) — 3/7 partial из-за точного равенства.
 4. **(Средний) Teardown hostctl CLI** (SMOKE-V8-K2 п.4): dispose в том
