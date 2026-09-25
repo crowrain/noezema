@@ -429,11 +429,13 @@ claim (Д1 → E0 → второй пак всё равно не перепро�
    только claim'ы из раздела «Знание»». Новая версия curator + payload
    (как T7.38/T7.39). Устранит: E0-якорь, второй неперепроверенный пак
    (дубли), blind_provenance 5/6 и уберёт стимул путать evidence_links
-   с dependencies (выдуманные id).
+   с dependencies (выдуманные id). — **сделано в T7.43** (curator-v7,
+   config-v11).
 2. **(Высокий, Д2) Промпт: правило 7 — негативный пример + случай
    слабого claim'а.** «перепроверка БЕЗ existing_claim_id — это новый
    claim» + «существующий claim hypothesis/E0–E1 и есть свежий evidence
    → перепроверка со supports поднимет оценку». Улика: `9ec3807f` seq 17.
+   — **сделано в T7.43** (curator-v7, config-v11).
 3. **(Средний) Мягкая нормализация `complete_reason`** (host-фикс,
    SMOKE-V8-K2 п.3) — 3/7 partial из-за точного равенства.
 4. **(Средний) Teardown hostctl CLI** (SMOKE-V8-K2 п.4): dispose в том

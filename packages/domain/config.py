@@ -74,10 +74,16 @@ BOOTSTRAP_PAYLOAD: dict[str, Any] = {
         # example quoted a REAL claim id from SMOKE-V8-K2, which the
         # host would reject on a fresh DB and kill the whole proposal
         # (T7.34); guard: test_prompt_example_no_real_data.py
+        # T7.43 (SMOKE-V10B-K2): v7 — mandatory evidence binding
+        # (every claim >= 1 evidence_link, 0 evidence never passes the
+        # rules engine; evidence_links vs dependencies contrast) and
+        # the rule-7 negative example (existing_claim_id: null +
+        # «перепроверка» in summary = a duplicate claim) + the weak
+        # (E0/E1) existing-claim reverify case.
         "curator": {
-            "version": "curator-v6",
-            "path": "prompts/curator/curator-v6.md",
-            "sha256": "a3dbccdcc6c911fc58c8e7339478fd8938cf8291f2d5bd5a9aff02340e046635",
+            "version": "curator-v7",
+            "path": "prompts/curator/curator-v7.md",
+            "sha256": "19d6c6e8e2d890ae4cf5c42e5e0ec6bd864a2c6ef12fdb2766e01f977bc89a3a",
         },
         # T5.2 (stage 4): the planner role (multi-step planning)
         "planner": {

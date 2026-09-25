@@ -14,11 +14,14 @@ General protection (any future prompt version is covered):
    so an intersection is a leaked real id. Sole exception: curator-v5,
    frozen (content-pinned by config-v9) with its known leak pinned to
    the exact (uuid, doc) pairs — see ``FROZEN_KNOWN_LEAKS``;
-2. the reverify example statement of every curator prompt (parsed out
-   of the rule-7 ```` ```json ```` block) must not occur in any
-   question-set corpus — if the example were a corpus question's fact,
-   the model could recognize the example in its own question and copy
-   the example's ids/``as_of``.
+2. the reverify example statements of every curator prompt (ALL
+   ```` ```json ```` blocks parsed out of the prompt) must not occur in
+   any question-set corpus — if the example were a corpus question's
+   fact, the model could recognize the example in its own question and
+   copy the example's ids/``as_of``. T7.43: rule 7 carries a second
+   (negative) JSON example, so EVERY block is checked, not just the
+   first; the ids inside the examples are full UUIDs of the prompt and
+   are covered by check 1 (prompt UUIDs ∩ docs UUIDs = ∅).
 """
 
 from __future__ import annotations
@@ -96,22 +99,74 @@ def test_prompt_uuids_do_not_intersect_docs(prompt_file: Path) -> None:
     )
 
 
+def _example_blocks(text: str) -> list[dict]:
+    """ALL ```` ```json ```` blocks of the prompt, in file order. T7.43:
+    rule 7 carries two examples (the positive reverify and the negative
+    ``existing_claim_id: null`` one), so EVERY block is checked —
+    ``re.search`` would return the first only."""
+    return [json.loads(block) for block in EXAMPLE_JSON.findall(text)]
+
+
+def _rule7_section(text: str) -> str:
+    """The reverify rule (``7. Перепроверка``) — the last rule of the
+    prompt; its example ids live in the ``[c:<uuid>]`` context lines
+    and the ```` ```json ```` blocks from that line to the end."""
+    idx = text.find("7. Перепроверка")
+    return text[idx:] if idx != -1 else ""
+
+
 @pytest.mark.unit
 @pytest.mark.parametrize("prompt_file", _curator_prompts(), ids=lambda p: p.name)
 def test_reverify_example_statement_not_in_any_corpus(prompt_file: Path) -> None:
-    """The example statement is the only thing a model can match its
-    own question against. It must name a topic absent from every
+    """The example statements are the only things a model can match its
+    own question against. Every statement of every JSON example
+    (positive AND negative, T7.43) must name a topic absent from every
     question-set corpus (v1–v4 in the repo, the smoke set when
-    present), so the example can never be recognized as a corpus
+    present), so no example can ever be recognized as a corpus
     question."""
     text = prompt_file.read_text(encoding="utf-8")
-    m = EXAMPLE_JSON.search(text)
-    if m is None:
+    blocks = _example_blocks(text)
+    if not blocks:
         pytest.skip(f"{prompt_file.name}: no rule-7 JSON example")
-    example = json.loads(m.group(1))
-    statement = example["claims"][0]["statement"]
-    for corpus in _corpora():
-        assert statement not in corpus.read_text(encoding="utf-8"), (
-            f"{prompt_file.name}: example statement {statement!r} "
-            f"appears in {corpus.name}"
-        )
+    corpora = [(c, c.read_text(encoding="utf-8")) for c in _corpora()]
+    for i, example in enumerate(blocks):
+        for j, claim in enumerate(example.get("claims", [])):
+            statement = claim["statement"]
+            for corpus, content in corpora:
+                assert statement not in content, (
+                    f"{prompt_file.name}: example[{i}].claims[{j}] "
+                    f"statement {statement!r} appears in {corpus.name}"
+                )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("prompt_file", _curator_prompts(), ids=lambda p: p.name)
+def test_rule7_example_ids_do_not_intersect_docs(prompt_file: Path) -> None:
+    """T7.43: the ids of BOTH rule-7 examples must not be real run ids —
+    the positive one (full UUID inside the JSON block) and the negative
+    one (UUID of the ``[c:…]`` context line). A UUID that also appears
+    in docs/ is a leaked id: on a fresh DB the host rejects the copied
+    reference and the whole proposal fails (T7.34). File-level check 1
+    covers every UUID of the file; this test pins the rule-7 examples
+    explicitly."""
+    section = _rule7_section(prompt_file.read_text(encoding="utf-8"))
+    if not section:
+        pytest.skip(f"{prompt_file.name}: no rule 7")
+    section_uuids = _uuids(section)
+    if not section_uuids:
+        pytest.skip(f"{prompt_file.name}: rule 7 carries no UUIDs")
+    leaked: set[tuple[str, str]] = set()
+    for doc in sorted(DOCS_DIR.rglob("*")):
+        if not doc.is_file():
+            continue
+        try:
+            text = doc.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+        for uuid in section_uuids & _uuids(text):
+            leaked.add((uuid, doc.relative_to(REPO_ROOT).as_posix()))
+    expected = FROZEN_KNOWN_LEAKS.get(prompt_file.name, set())
+    assert leaked <= expected, (
+        f"{prompt_file.name}: rule-7 example UUIDs present in docs "
+        f"(leaked real run ids): {sorted(leaked - expected)}"
+    )

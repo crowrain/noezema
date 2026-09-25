@@ -12,6 +12,14 @@ pair-by-pair with the payload's ``claim_type_rules.<type>.allowed_kinds``
 T7.39: extended to curator-v6 / config-v10 — the v5→v6 diff is the
 reverify example only (a safe, corpus-free example), the matrix must
 stay pair-identical.
+
+T7.43: extended to curator-v7 / config-v11 — the v6→v7 diff is the
+mandatory evidence binding (every claim ≥ 1 evidence link) and the
+rule-7 negative example / weak-claim case; the matrix stays
+pair-identical, and the prompt's one numeric evidence claim (a claim
+with 0 evidence never passes the rules engine) is pinned against the
+payload's min_support_evidence (single source of truth — the prompt
+deliberately names no per-type numbers).
 """
 
 from __future__ import annotations
@@ -58,6 +66,10 @@ def _load_payload(name: str) -> dict:
         # T7.39: the v5→v6 diff is the example of rule 7 only — the
         # matrix must remain pair-identical to config-v10's rules.
         ("curator-v6.md", "config-v10-payload.json"),
+        # T7.43: the v6→v7 diff is the evidence-binding rule and the
+        # rule-7 negative example — the matrix must remain
+        # pair-identical to config-v11's rules.
+        ("curator-v7.md", "config-v11-payload.json"),
     ],
 )
 def test_curator_matrix_matches_claim_type_rules(
@@ -81,3 +93,30 @@ def test_curator_matrix_matches_claim_type_rules(
         f"prompt-only pairs: {sorted(prompt_pairs - rule_pairs)}; "
         f"rules-only pairs: {sorted(rule_pairs - prompt_pairs)}"
     )
+
+
+@pytest.mark.unit
+def test_min_support_evidence_floor_matches_prompt_claim() -> None:
+    """T7.43 single source of truth for the evidence minimums.
+
+    curator-v7 makes exactly ONE numeric claim about evidence minimums:
+    a claim with 0 evidence never passes the rules engine. It states the
+    floor in words («минимум одну запись», «минимум одно evidence
+    допустимого для типа вида; минимум два, где требуется») and
+    deliberately names NO per-type numbers — because
+    ``claim_type_rules`` sets ``min_support_evidence = 2`` for FOUR
+    types (external_fact, temporal_fact, empirical_conjecture,
+    procedural), not just external_fact/temporal_fact, so a per-type
+    enumeration in the prompt would desync on the next rule change. The
+    floor it does assert — ``min_support_evidence >= 1`` for every claim
+    type — must hold in the payload v7 pins to (config-v11), or the
+    prompt's «0 evidence никогда не проходит» claim becomes false.
+    """
+    rules = _load_payload("config-v11-payload.json")["claim_type_rules"]
+    assert rules, "no claim_type_rules in payload"
+    bad = {
+        t: r["min_support_evidence"]
+        for t, r in rules.items()
+        if r["min_support_evidence"] < 1
+    }
+    assert not bad, f"claim types with min_support_evidence < 1: {bad}"

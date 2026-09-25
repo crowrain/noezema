@@ -120,3 +120,22 @@ def test_config_v10_pins_curator_v6_and_differs_from_v9_only_there() -> None:
     assert resolved[Role.EXPLORER].version == "explorer-v4"
     budgets = TokenBudgets.from_snapshot(v10["model"], v10["token_budgets"])
     assert budgets.validate() == []
+
+
+@pytest.mark.unit
+def test_config_v11_pins_curator_v7_and_differs_from_v10_only_there() -> None:
+    """T7.43 (SMOKE-V10B-K2 proposals 1/2 — mandatory evidence binding
+    + rule 7 negative example/weak-claim case): config-v11 = v10 with
+    the single change ``prompts.curator`` → curator-v7. v10 stays as
+    committed (payloads are never rewritten)."""
+    v10 = _load("config-v10-payload.json")
+    v11 = _load("config-v11-payload.json")
+    assert {k for k in v11 if v11[k] != v10[k]} == {"prompts"}
+    assert {r for r in v11["prompts"] if v11["prompts"][r] != v10["prompts"][r]} == {"curator"}
+    assert v11["prompts"]["curator"]["version"] == "curator-v7"
+    assert v11["prompts"]["curator"]["path"] == "prompts/curator/curator-v7.md"
+    resolved = resolve_prompts(v11["prompts"], REPO_ROOT)
+    assert resolved[Role.CURATOR].version == "curator-v7"
+    assert resolved[Role.EXPLORER].version == "explorer-v4"
+    budgets = TokenBudgets.from_snapshot(v11["model"], v11["token_budgets"])
+    assert budgets.validate() == []
