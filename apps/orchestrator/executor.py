@@ -16,6 +16,7 @@ from pathlib import Path
 
 from packages.domain.canonical import canonical_sha256
 from packages.domain.models.base import JsonDict
+from packages.domain.sanitization import mask_nul
 from packages.domain.schemas.observation import Observation
 
 # re-exported for backward compatibility (M1 tests import from here)
@@ -105,7 +106,14 @@ class StubToolExecutor:
         return Observation(
             "workspace.read",
             ok=True,
-            data={"path": str(path.relative_to(self.workspace_dir)), "content": data.decode("utf-8", "replace")},
+            # T7.46a: mask NUL at the capture (the SOURCE layer) — a NUL
+            # in an observation used to reach the evidence payload and
+            # the report audit (JSONB) and roll back the whole session
+            # transaction (SMOKE-V12-K2 §3)
+            data={
+                "path": str(path.relative_to(self.workspace_dir)),
+                "content": mask_nul(data.decode("utf-8", "replace")),
+            },
         )
 
     async def _workspace_list(self, arguments: JsonDict) -> Observation:
@@ -143,10 +151,13 @@ class StubToolExecutor:
         return Observation(
             "python.execute",
             ok=proc.returncode == 0,
+            # T7.46a: mask NUL at the capture (the SOURCE layer, SMOKE-
+            # V12-K2 §3) — the mask runs BEFORE the cap so the marker
+            # (4 chars) is what spends the cap budget
             data={
                 "exit_code": proc.returncode,
-                "stdout": stdout.decode("utf-8", "replace")[:MAX_OUTPUT_BYTES],
-                "stderr": stderr.decode("utf-8", "replace")[:MAX_OUTPUT_BYTES],
+                "stdout": mask_nul(stdout.decode("utf-8", "replace"))[:MAX_OUTPUT_BYTES],
+                "stderr": mask_nul(stderr.decode("utf-8", "replace"))[:MAX_OUTPUT_BYTES],
             },
             error=None if proc.returncode == 0 else f"exit code {proc.returncode}",
         )

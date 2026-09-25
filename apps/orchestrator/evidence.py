@@ -54,6 +54,7 @@ from apps.orchestrator.executor import Observation
 from packages.domain.canonical import canonical_sha256
 from packages.domain.models.base import JsonDict
 from packages.domain.models.enums import EvidenceKind
+from packages.domain.sanitization import mask_nul, mask_nul_deep
 from packages.domain.schemas.evidence import EvidenceRecord
 from packages.memory.evidence import source_assertion_identity
 
@@ -81,6 +82,15 @@ SOURCE_ASSERTION_MAX_WINDOWS = 2
 _FRAGMENT_SEPARATOR = "\n[…]\n"
 
 
+def _finalize(record: EvidenceRecord) -> EvidenceRecord:
+    """T7.46a: the EVIDENCE boundary invariant — no NUL byte in any
+    string of the durable payload. The source strings are already masked
+    above (idempotent); this is the defense-in-depth pass so a future
+    payload field cannot carry a NUL into the JSONB (SMOKE-V12-K2 §3)."""
+    record.payload = mask_nul_deep(record.payload)
+    return record
+
+
 def observation_to_evidence(observation: Observation, arguments: JsonDict) -> EvidenceRecord | None:
     if not observation.ok:
         return None
@@ -88,46 +98,61 @@ def observation_to_evidence(observation: Observation, arguments: JsonDict) -> Ev
     tool = observation.tool
     if tool == "python.execute":
         data = observation.data
+        # T7.46a: mask BEFORE the caps — the identity and the payload are
+        # computed from the SAME masked value, so the stored value and the
+        # hash input cannot diverge (the trusted host recomputes the
+        # durable identity from the payload at the commit boundary). The
+        # source (executor) already masks at capture; this covers every
+        # other capture path (SMOKE-V12-K2 §3.4).
+        stdout = mask_nul(str(data.get("stdout", "")))
+        code = mask_nul(str(arguments.get("code", "")))
         identity = canonical_sha256(
-            {
-                "tool": tool,
-                "code": str(arguments.get("code", "")),
-                "exit_code": data.get("exit_code"),
-                "stdout": str(data.get("stdout", ""))[:4000],
-            }
+            {"tool": tool, "code": code, "exit_code": data.get("exit_code"), "stdout": stdout[:4000]}
         )
-        return EvidenceRecord(
-            kind=EvidenceKind.COMPUTATION,
-            identity_hash=identity,
-            payload={
-                "exit_code": data.get("exit_code"),
-                "stdout": str(data.get("stdout", ""))[:2000],
-                # the exact input (M3: the trusted host recomputes the
-                # durable identity from result + inputs + tool fingerprint)
-                "code": str(arguments.get("code", ""))[:4000],
-            },
-            note="python.execute (M1 stub executor)",
+        return _finalize(
+            EvidenceRecord(
+                kind=EvidenceKind.COMPUTATION,
+                identity_hash=identity,
+                payload={
+                    "exit_code": data.get("exit_code"),
+                    "stdout": stdout[:2000],
+                    # the exact input (M3: the trusted host recomputes the
+                    # durable identity from result + inputs + tool fingerprint)
+                    "code": code[:4000],
+                },
+                note="python.execute (M1 stub executor)",
+            )
         )
 
     if tool == "workspace.read":
-        content = str(observation.data.get("content", ""))
+        # T7.46a: mask before the caps (same rule as python.execute)
+        content = mask_nul(str(observation.data.get("content", "")))
+        path = mask_nul(str(arguments.get("path", "")))
         identity = canonical_sha256(
-            {"tool": tool, "path": str(arguments.get("path", "")), "content": content[:4000]}
+            {"tool": tool, "path": path, "content": content[:4000]}
         )
-        return EvidenceRecord(
-            kind=EvidenceKind.LOCAL_OBSERVATION,
-            identity_hash=identity,
-            payload={"path": str(observation.data.get("path", "")), "content": content[:2000]},
+        return _finalize(
+            EvidenceRecord(
+                kind=EvidenceKind.LOCAL_OBSERVATION,
+                identity_hash=identity,
+                payload={"path": mask_nul(str(observation.data.get("path", ""))), "content": content[:2000]},
+            )
         )
 
     if tool == "workspace.list":
+        # T7.46a: mask the entry names (defensive — POSIX filenames
+        # cannot carry NUL, but the boundary invariant covers all)
+        entries = mask_nul_deep(observation.data.get("entries", []))
+        path = mask_nul(str(arguments.get("path", "")))
         identity = canonical_sha256(
-            {"tool": tool, "path": str(arguments.get("path", "")), "entries": observation.data.get("entries")}
+            {"tool": tool, "path": path, "entries": entries}
         )
-        return EvidenceRecord(
-            kind=EvidenceKind.LOCAL_OBSERVATION,
-            identity_hash=identity,
-            payload={"entries": observation.data.get("entries", [])[:100]},
+        return _finalize(
+            EvidenceRecord(
+                kind=EvidenceKind.LOCAL_OBSERVATION,
+                identity_hash=identity,
+                payload={"entries": entries[:100]},
+            )
         )
 
     if tool == "research.fetch":
@@ -139,11 +164,13 @@ def observation_to_evidence(observation: Observation, arguments: JsonDict) -> Ev
         # the truncated context text is NOT part of the identity (the
         # assertion is the source's, not the truncation's).
         data = observation.data or {}
-        osha = str(data.get("original_sha256", ""))
-        source_id = str(data.get("source_id", ""))
+        # T7.46a: mask the provenance strings (defensive — the hashes are
+        # hex and the id is a UUID, but the boundary invariant covers all)
+        osha = mask_nul(str(data.get("original_sha256", "")))
+        source_id = mask_nul(str(data.get("source_id", "")))
         if not osha or not source_id or len(source_id) != 36:
             return None  # no durable source reference → no provenance
-        chunk_id = str(data.get("chunk_id", "chunk-0"))
+        chunk_id = mask_nul(str(data.get("chunk_id", "chunk-0")))
         identity = source_assertion_identity(osha, chunk_id, EvidenceKind.SOURCE_ASSERTION.value)
         # T7.8 (§6.4): the fragment of the normalized chunk text the
         # assertion is read from — bounded by SOURCE_ASSERTION_TEXT_BUDGET,
@@ -163,7 +190,7 @@ def observation_to_evidence(observation: Observation, arguments: JsonDict) -> Ev
         # showed the single term window misses the assertion in 7 of 12
         # cases (lead/infobox, first paragraph, data widget). The joined
         # text is NOT part of the identity (as the single window was).
-        normalized_text = str(data.get("normalized_text", ""))
+        normalized_text = mask_nul(str(data.get("normalized_text", "")))
         windows = select_assertion_windows(
             normalized_text,
             f"{data.get('question', '')}\n{data.get('plan', '')}",
@@ -171,22 +198,24 @@ def observation_to_evidence(observation: Observation, arguments: JsonDict) -> Ev
             max_windows=SOURCE_ASSERTION_MAX_WINDOWS,
         )
         assertion_text = _FRAGMENT_SEPARATOR.join(w.text for w in windows)
-        return EvidenceRecord(
-            kind=EvidenceKind.SOURCE_ASSERTION,
-            identity_hash=identity,
-            payload={
-                "url": str(data.get("url", ""))[:500],
-                "original_sha256": osha,
-                "normalized_sha256": str(data.get("normalized_sha256", "")),
-                "chunk_id": chunk_id,
-                "assertion_text": assertion_text,
-                # the exact input (the trusted host recomputes identity
-                # from the provenance, not from this payload)
-                "url_arg": str(arguments.get("url", ""))[:500],
-            },
-            source_id=source_id,
-            chunk_id=chunk_id,
-            note="research.fetch (untrusted external source)",
+        return _finalize(
+            EvidenceRecord(
+                kind=EvidenceKind.SOURCE_ASSERTION,
+                identity_hash=identity,
+                payload={
+                    "url": mask_nul(str(data.get("url", "")))[:500],
+                    "original_sha256": osha,
+                    "normalized_sha256": mask_nul(str(data.get("normalized_sha256", ""))),
+                    "chunk_id": chunk_id,
+                    "assertion_text": assertion_text,
+                    # the exact input (the trusted host recomputes identity
+                    # from the provenance, not from this payload)
+                    "url_arg": mask_nul(str(arguments.get("url", "")))[:500],
+                },
+                source_id=source_id,
+                chunk_id=chunk_id,
+                note="research.fetch (untrusted external source)",
+            )
         )
 
     return None  # memory.search / question.create / message.reply / failures

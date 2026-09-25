@@ -67,6 +67,38 @@ async def test_memory_search_without_db(tmp_path: Path) -> None:
 
 
 @pytest.mark.unit
+async def test_python_execute_masks_nul_in_output(tmp_path: Path) -> None:
+    """T7.46a (SMOKE-V12-K2 §3): a NUL byte in the tool output must not
+    survive capture — it used to ride into the evidence payload and the
+    report audit (JSONB), where asyncpg rejected it and the whole
+    phase-1 transaction rolled back. NUL is replaced by the visible
+    marker, never dropped silently."""
+    from packages.domain.sanitization import NUL_MARKER
+
+    ex = StubToolExecutor(tmp_path)
+    obs = await ex.execute(
+        "python.execute",
+        {"code": "import sys; sys.stdout.write('a\\x00b'); sys.stderr.write('e\\x00f')"},
+    )
+    assert obs.ok and obs.data["exit_code"] == 0
+    assert "\x00" not in obs.data["stdout"]
+    assert obs.data["stdout"] == f"a{NUL_MARKER}b"
+    assert obs.data["stderr"] == f"e{NUL_MARKER}f"
+
+
+@pytest.mark.unit
+async def test_workspace_read_masks_nul_in_content(tmp_path: Path) -> None:
+    """T7.46a: the same decode("utf-8", "replace") capture in
+    workspace.read kept NUL too — the marker replaces it."""
+    from packages.domain.sanitization import NUL_MARKER
+
+    (tmp_path / "n.bin").write_bytes(b"x\x00y")
+    ex = StubToolExecutor(tmp_path)
+    obs = await ex.execute("workspace.read", {"path": "n.bin"})
+    assert obs.ok and obs.data["content"] == f"x{NUL_MARKER}y"
+
+
+@pytest.mark.unit
 def test_arguments_hash_is_canonical() -> None:
     a: JsonDict = {"b": 1, "a": [1, 2]}
     b: JsonDict = {"a": [1, 2], "b": 1}

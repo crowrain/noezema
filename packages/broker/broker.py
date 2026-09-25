@@ -33,6 +33,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.domain.models.base import JsonDict
 from packages.domain.models.enums import ActionState, AuditEventType, IdempotencyClass
+from packages.domain.sanitization import mask_nul
 from packages.domain.schemas.observation import Observation
 from packages.policy.profiles import CapabilityProfile
 from packages.policy.tools import get_tool
@@ -230,10 +231,12 @@ class SandboxToolBroker:
         else:
             cmd = ["python3", "-I", "-c", str(arguments["code"])]
         result = await self.runtime.exec(self.handle, cmd)
+        # T7.46a: mask NUL at the capture (the SOURCE layer for the M2
+        # path, the same principle as the stub executor, SMOKE-V12-K2 §3)
         data: JsonDict = {
             "exit_code": result.exit_code,
-            "stdout": result.stdout[:MAX_OUTPUT],
-            "stderr": result.stderr[:MAX_OUTPUT],
+            "stdout": mask_nul(result.stdout)[:MAX_OUTPUT],
+            "stderr": mask_nul(result.stderr)[:MAX_OUTPUT],
         }
         if result.timed_out:
             return Observation(tool=tool, ok=False, data=data, error="timeout")
@@ -275,7 +278,8 @@ class SandboxToolBroker:
                 path = resolve(str(arguments["path"]))
                 if not path.is_file():
                     return Observation(tool=tool, ok=False, error="not found")
-                content = path.read_bytes()[:MAX_OUTPUT].decode("utf-8", "replace")
+                # T7.46a: mask NUL at the capture (SOURCE layer)
+                content = mask_nul(path.read_bytes()[:MAX_OUTPUT].decode("utf-8", "replace"))
                 return Observation(
                 tool=tool, ok=True, data={"path": path.relative_to(root).as_posix(), "content": content}
             )
