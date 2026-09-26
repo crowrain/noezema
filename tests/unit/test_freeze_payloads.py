@@ -139,3 +139,26 @@ def test_config_v11_pins_curator_v7_and_differs_from_v10_only_there() -> None:
     assert resolved[Role.EXPLORER].version == "explorer-v4"
     budgets = TokenBudgets.from_snapshot(v11["model"], v11["token_budgets"])
     assert budgets.validate() == []
+
+
+@pytest.mark.unit
+def test_config_v12_pins_explorer_v5_and_differs_from_v11_only_there() -> None:
+    """T7.50 (ADR-0022 option A — the class-D fix at the source: the
+    model wrote free text into ``decision.reason`` in 15 of 20 partial
+    smoke sessions): config-v12 = v11 with the single change
+    ``prompts.explorer`` → explorer-v5 (``reason`` is exactly one token
+    from the closed CompleteReason list; the explanation goes to
+    ``public_rationale``; rule 5 maps stopping conditions to tokens;
+    a correct/incorrect example pair). v11 stays as committed
+    (payloads are never rewritten)."""
+    v11 = _load("config-v11-payload.json")
+    v12 = _load("config-v12-payload.json")
+    assert {k for k in v12 if v12[k] != v11[k]} == {"prompts"}
+    assert {r for r in v12["prompts"] if v12["prompts"][r] != v11["prompts"][r]} == {"explorer"}
+    assert v12["prompts"]["explorer"]["version"] == "explorer-v5"
+    assert v12["prompts"]["explorer"]["path"] == "prompts/explorer/explorer-v5.md"
+    resolved = resolve_prompts(v12["prompts"], REPO_ROOT)
+    assert resolved[Role.EXPLORER].version == "explorer-v5"
+    assert resolved[Role.CURATOR].version == "curator-v7"
+    budgets = TokenBudgets.from_snapshot(v12["model"], v12["token_budgets"])
+    assert budgets.validate() == []

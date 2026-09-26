@@ -88,7 +88,10 @@ async def test_model_runs_record_prompt_version_and_content_hash(
     from packages.llm_gateway.roles import Role
 
     for _, version, sha, _ in explorer_rows:
-        assert version == "explorer-v4"
+        # T7.50: the bootstrap pin is explorer-v5 (pattern
+        # T7.14/T7.35/T7.38/T7.39/T7.43: the pin follows the current
+        # explorer prompt)
+        assert version == "explorer-v5"
         assert sha == pins[Role.EXPLORER]
     for _, version, sha, _ in curator_rows:
         # T7.43: the bootstrap pin is curator-v7 (pattern T7.14/T7.35/

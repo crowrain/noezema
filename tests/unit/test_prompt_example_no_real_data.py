@@ -9,11 +9,12 @@ is indistinguishable from "the model copied the example".
 
 General protection (any future prompt version is covered):
 
-1. no full UUID that appears in ANY prompt file may also appear in
-   ``docs/`` — the reports and analyses there contain the real run ids,
-   so an intersection is a leaked real id. Sole exception: curator-v5,
-   frozen (content-pinned by config-v9) with its known leak pinned to
-   the exact (uuid, doc) pairs — see ``FROZEN_KNOWN_LEAKS``;
+1. no full UUID that appears in ANY prompt file (curator AND explorer,
+   T7.50) may also appear in ``docs/`` — the reports and analyses there
+   contain the real run ids, so an intersection is a leaked real id.
+   Sole exception: curator-v5, frozen (content-pinned by config-v9)
+   with its known leak pinned to the exact (uuid, doc) pairs — see
+   ``FROZEN_KNOWN_LEAKS``;
 2. the reverify example statements of every curator prompt (ALL
    ```` ```json ```` blocks parsed out of the prompt) must not occur in
    any question-set corpus — if the example were a corpus question's
@@ -21,7 +22,14 @@ General protection (any future prompt version is covered):
    copy the example's ids/``as_of``. T7.43: rule 7 carries a second
    (negative) JSON example, so EVERY block is checked, not just the
    first; the ids inside the examples are full UUIDs of the prompt and
-   are covered by check 1 (prompt UUIDs ∩ docs UUIDs = ∅).
+   are covered by check 1 (prompt UUIDs ∩ docs UUIDs = ∅);
+3. T7.50: the explorer completion examples (the positive and the
+   negative pair of explorer-v5) carry free text a model can match its
+   own question against: every free-text field of every JSON example
+   (``public_rationale``, ``expected_information``, the free-text
+   ``decision.reason`` of the negative example) and the example topic
+   itself must not occur in any question-set corpus (v1–v4 in the
+   repo, the smoke set when present).
 """
 
 from __future__ import annotations
@@ -66,6 +74,19 @@ def _curator_prompts() -> list[Path]:
     return files
 
 
+def _explorer_prompts() -> list[Path]:
+    files = sorted((PROMPTS_DIR / "explorer").glob("explorer-v*.md"))
+    assert files, "no explorer prompt versions found"
+    return files
+
+
+def _all_prompts() -> list[Path]:
+    """T7.50: the guard covers every prompt role — the curator examples
+    carry claim ids, the explorer completion examples carry free text;
+    both are model-matchable run data."""
+    return _curator_prompts() + _explorer_prompts()
+
+
 def _corpora() -> list[Path]:
     corpora = sorted((DOCS_DIR / "eval").glob("question-set-*.jsonl"))
     assert corpora, "no question-set corpora found in docs/eval"
@@ -75,11 +96,13 @@ def _corpora() -> list[Path]:
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("prompt_file", _curator_prompts(), ids=lambda p: p.name)
+@pytest.mark.parametrize("prompt_file", _all_prompts(), ids=lambda p: p.name)
 def test_prompt_uuids_do_not_intersect_docs(prompt_file: Path) -> None:
     """A prompt example UUID that also appears in docs/ is a leaked
     real run id: on a DB where that claim does not exist the host
-    rejects the copied reference (fail-closed, T7.34)."""
+    rejects the copied reference (fail-closed, T7.34). T7.50: the
+    explorer files are checked too (explorer-v5's examples carry no
+    UUIDs — the check passes and pins that for the future)."""
     prompt_uuids = _uuids(prompt_file.read_text(encoding="utf-8"))
     leaked: set[tuple[str, str]] = set()
     for doc in sorted(DOCS_DIR.rglob("*")):
@@ -137,6 +160,59 @@ def test_reverify_example_statement_not_in_any_corpus(prompt_file: Path) -> None
                     f"{prompt_file.name}: example[{i}].claims[{j}] "
                     f"statement {statement!r} appears in {corpus.name}"
                 )
+
+
+# T7.50: the topic of the explorer completion examples (both the
+# positive and the negative JSON example of explorer-v5). Deliberately
+# a fact absent from every question-set corpus (v1–v4 + the smoke set)
+# — the same property the curator examples are pinned to.
+EXPLORER_EXAMPLE_TOPIC = "столица Новой Зеландии — Веллингтон"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("prompt_file", _explorer_prompts(), ids=lambda p: p.name)
+def test_explorer_example_topics_not_in_any_corpus(prompt_file: Path) -> None:
+    """T7.50: the completion examples are free text a model can match
+    its own question against. Every free-text field of every JSON
+    example (``public_rationale``, ``expected_information``, and the
+    free-text ``decision.reason`` of the negative example) and the
+    example topic itself must not occur in any question-set corpus
+    (v1–v4 in the repo, the smoke set when present) — if the example
+    were a corpus question's fact, the model could recognize it in its
+    own question and copy the example. The UUID side is covered by
+    test_prompt_uuids_do_not_intersect_docs (T7.50: the explorer files
+    are checked too)."""
+    text = prompt_file.read_text(encoding="utf-8")
+    blocks = _example_blocks(text)
+    if not blocks:
+        pytest.skip(f"{prompt_file.name}: no JSON example")
+    corpora = [(c, c.read_text(encoding="utf-8")) for c in _corpora()]
+    for i, example in enumerate(blocks):
+        fields = [example.get("public_rationale"), example.get("expected_information")]
+        decision = example.get("decision")
+        if isinstance(decision, dict):
+            fields.append(decision.get("reason"))
+        for value in fields:
+            if not isinstance(value, str):
+                continue
+            for corpus, content in corpora:
+                assert value not in content, (
+                    f"{prompt_file.name}: example[{i}] free-text field "
+                    f"{value!r} appears in {corpus.name}"
+                )
+    # the topic itself (a short fact, not the full example sentences):
+    # the prompt still carries it (the constant tracks the prompt), and
+    # no corpus contains it
+    assert EXPLORER_EXAMPLE_TOPIC in text, (
+        f"{prompt_file.name}: the pinned example topic "
+        f"{EXPLORER_EXAMPLE_TOPIC!r} is no longer in the prompt — "
+        f"update EXPLORER_EXAMPLE_TOPIC"
+    )
+    for corpus, content in corpora:
+        assert EXPLORER_EXAMPLE_TOPIC not in content, (
+            f"{prompt_file.name}: example topic {EXPLORER_EXAMPLE_TOPIC!r} "
+            f"appears in {corpus.name}"
+        )
 
 
 @pytest.mark.unit

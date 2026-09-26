@@ -159,3 +159,25 @@ structured output.
 (explorer-v4/curator-v7 и пины), payload'ы config-v2…v11 и их хэши,
 схемы БД (миграций нет), `rules_hash`, пороги, корпуса, данные прошлых
 прогонов (SELECT only), существующие тесты.
+
+## Дополнение (T7.50)
+
+Вариант A реализован в T7.50: `prompts/explorer/explorer-v5.md`
+(diff v4→v5 = строка версии + точечные правки ТОЛЬКО про завершение:
+`reason` — ровно один токен из `goal_reached | budget_exhausted |
+no_progress | blocked`, пояснение — в `public_rationale`; правило 5 —
+сопоставление условий с токенами + «goal_reached только на
+подтверждённый результатами инструментов ответ»; пара примеров
+правильный/неправильный — паттерн безопасности примеров T7.39/T7.43:
+тема вне всех корпусов, без реальных id),
+`docs/eval/config-v12-payload.json` (= config-v11 с ЕДИНСТВЕННЫМ
+изменением `prompts.explorer` → explorer-v5) и пин BOOTSTRAP_PAYLOAD
+(explorer-v4 → explorer-v5, `BOOTSTRAP_SNAPSHOT_ID` не меняется).
+Стражи: токены промпта = `CompleteReason` минус `operator_stop` (токен
+хоста, его не выбирает модель — `test_explorer_prompt_completion.py`),
+правильный пример → `GOAL_REACHED`, неправильный → `None` (связь с
+T7.49); страж примеров `test_prompt_example_no_real_data.py`
+распространён на explorer. Проверка эффекта на модели (класс D, 15/20
+partial) — отдельный контрольный смоук (V14); решение о запуске и
+разрешение на 192.168.1.48 — за пользователем. Вариант B не
+реализован (схема модели не изменена).

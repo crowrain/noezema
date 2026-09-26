@@ -56,10 +56,20 @@ BOOTSTRAP_PAYLOAD: dict[str, Any] = {
         # prompts/<role>/<version>.md are the single source of truth.
         # T7.21 (ADR-0010): v4 — rule 7 (fetch every question-named
         # source before completing; backstop for the host coverage gate)
+        # T7.50 (ADR-0022, option A — class D of SMOKE-V8…V13, 15/20 of
+        # the partials): v5 — the completion protocol: `reason` is
+        # EXACTLY one token from the closed CompleteReason list
+        # (goal_reached | budget_exhausted | no_progress | blocked),
+        # lowercase, no explanation — the explanation (what is
+        # established, on which sources, why stop) goes to
+        # public_rationale of the same response; rule 5 maps each
+        # stopping condition to its token (goal_reached only on
+        # tool-confirmed answers) + a correct/incorrect JSON example
+        # pair (T7.39 pattern: corpus-free topic, no real ids).
         "explorer": {
-            "version": "explorer-v4",
-            "path": "prompts/explorer/explorer-v4.md",
-            "sha256": "5829a55c4e5d92762c2d9909dd7ced9614c389448a813d52496e9d46e4b5e87e",
+            "version": "explorer-v5",
+            "path": "prompts/explorer/explorer-v5.md",
+            "sha256": "3b1fd49d687a39ab88809ac208cc9dfc4f0390b0da3a9ea848f888cf22a69c3c",
         },
         # T7.34 (ADR-0018): v4 — the reverify operation
         # (`existing_claim_id`: re-check an existing claim without
