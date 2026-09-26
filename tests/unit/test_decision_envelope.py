@@ -30,6 +30,27 @@ def test_complete_with_unknown_reason_stays_open() -> None:
 
 
 @pytest.mark.unit
+def test_normalized_reason_delegates_to_token_rule() -> None:
+    """T7.49 (ADR-0022): the property recognizes an explicit token at the
+    start of the reason (token + separator + suffix) and stays None on
+    free text — the single host rule, no exact-match relic."""
+    assert (
+        Decision(kind=DecisionKind.COMPLETE, reason="goal_reached — утверждение: Go 1.27.1").normalized_reason
+        is CompleteReason.GOAL_REACHED
+    )
+    assert Decision(kind=DecisionKind.COMPLETE, reason="GOAL_REACHED").normalized_reason is CompleteReason.GOAL_REACHED
+    # free text with the token only inside: still None
+    assert (
+        Decision(kind=DecisionKind.COMPLETE, reason="Вопрос отвечен и подтверждён (goal_reached)").normalized_reason
+        is None
+    )
+    # kind=tool never normalizes
+    assert (
+        Decision(kind=DecisionKind.TOOL, tool="web.search", reason=None).normalized_reason is None
+    )
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize(
     "payload",
     [

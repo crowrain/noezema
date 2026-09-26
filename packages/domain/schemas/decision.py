@@ -17,6 +17,52 @@ from packages.domain.models.enums import CompleteReason, DecisionKind
 
 _TOOL_NAME_RE = r"^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$"  # namespace.name
 
+# T7.49 (ADR-0022): the host must NEVER derive a session SUCCESS from free
+# text by meaning or keywords (a false succeeded is worse than a false
+# partial — the safe direction is partial, like unknown_action_outcome →
+# failed). Only a completion reason in which the model EXPLICITLY names a
+# CompleteReason token at the START of the string is recognized:
+#  - trim; case-insensitive;
+#  - surrounding quotes / backticks / a period are allowed;
+#  - the token must end at a word boundary: end of string or a separator
+#    (space, em/en dash, hyphen, ':', ';', ',', '.', '(');
+#  - ``goal_reachedX``, ``not goal_reached`` and text where the token is
+#    only mentioned (not at the start) do NOT match (None);
+#  - the first token wins (if the suffix mentions another token);
+#  - non-string / empty → None.
+_COMPLETE_TOKENS = frozenset(member.value for member in CompleteReason)
+_REASON_SEPARATORS = frozenset(" \u2014\u2013-:;,.( ")
+_REASON_OPENERS = frozenset("\"'`")
+_REASON_CLOSERS = frozenset("\"'`.")
+
+
+def normalize_complete_reason(reason: str | None) -> CompleteReason | None:
+    """Map a raw model completion reason to the closed CompleteReason enum.
+
+    The single host-side recognition rule (T7.49, ADR-0022, T7.37b): an
+    explicit enum token at the START of the string, up to a word boundary.
+    Free-form reasons that merely describe the outcome (class D of the
+    SMOKE measurement) and token mentions inside the text stay None —
+    the host treats them exactly as before (succeeded_partial), never as
+    success. No Russian-phrase dictionaries, no heuristics, no LLM.
+    """
+    if not isinstance(reason, str):
+        return None
+    s = reason.strip()
+    while s and s[0] in _REASON_OPENERS:
+        s = s[1:].lstrip()
+    while s and s[-1] in _REASON_CLOSERS:
+        s = s[:-1].rstrip()
+    s = s.lower()
+    if not s:
+        return None
+    for token in _COMPLETE_TOKENS:
+        if s == token:
+            return CompleteReason(token)
+        if s.startswith(token) and s[len(token)] in _REASON_SEPARATORS:
+            return CompleteReason(token)
+    return None
+
 
 class Decision(BaseModel):
     """A single typed decision: one tool call or completion."""
@@ -60,13 +106,15 @@ class Decision(BaseModel):
 
     @property
     def normalized_reason(self) -> CompleteReason | None:
-        """Map reason to the closed enum; unknown reasons stay open strings."""
+        """Map reason to the closed enum (T7.49, ADR-0022).
+
+        Delegates to :func:`normalize_complete_reason`: only an explicit
+        token at the start of the string is recognized; unknown reasons
+        stay open strings (None).
+        """
         if self.kind is not DecisionKind.COMPLETE or self.reason is None:
             return None
-        try:
-            return CompleteReason(self.reason)
-        except ValueError:
-            return None
+        return normalize_complete_reason(self.reason)
 
 
 class ModelResponse(BaseModel):

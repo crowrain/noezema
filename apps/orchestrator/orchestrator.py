@@ -73,7 +73,7 @@ from packages.domain.models.sessions import ORMAction, ORMModelRun, ORMSession
 from packages.domain.repositories.inbox import MessageRepository
 from packages.domain.repositories.questions import QuestionRepository
 from packages.domain.repositories.sessions import ActionRepository, ModelRunRepository, SessionRepository
-from packages.domain.schemas.decision import ModelResponse
+from packages.domain.schemas.decision import ModelResponse, normalize_complete_reason
 from packages.domain.schemas.evidence import EvidenceRecord
 from packages.domain.schemas.extraction import (
     ExtractionError,
@@ -823,7 +823,15 @@ class Orchestrator:
             )
         ).scalars().all()
 
-        if ctx.complete_reason == CompleteReason.GOAL_REACHED.value and not unknown_actions:
+        # T7.49 (ADR-0022): success is derived from the NORMALIZED reason,
+        # not from an exact string match. The model often appends free text
+        # to the explicit token (T7.37b: "goal_reached — <text>",
+        # "goal_reached: <text>") or wraps it in quotes; normalization
+        # recognizes exactly those cases — and only those. A success from
+        # free text alone is still impossible (normalized = None →
+        # succeeded_partial, the safe direction).
+        normalized_reason = normalize_complete_reason(ctx.complete_reason)
+        if normalized_reason is CompleteReason.GOAL_REACHED and not unknown_actions:
             final = SessionState.SUCCEEDED
         elif not unknown_actions:
             final = SessionState.SUCCEEDED_PARTIAL
@@ -854,7 +862,21 @@ class Orchestrator:
             evidence_count=len(ctx.evidence),
             claims=claims,
             questions_created=questions_created,
-            termination_reason=ctx.complete_reason if final is not SessionState.FAILED else "unknown_action_outcome",
+            # T7.49 (ADR-0022): sessions.termination_reason gets the
+            # CANONICAL token for recognized reasons (a "goal_reached —
+            # <text>" session now stores "goal_reached") and the RAW string
+            # when unrecognizable (previous behavior); failed sessions keep
+            # "unknown_action_outcome". The raw model text is preserved in
+            # the complete audit event (complete_reason + normalized_reason).
+            termination_reason=(
+                normalized_reason.value
+                if normalized_reason is not None and final is not SessionState.FAILED
+                else (
+                    ctx.complete_reason
+                    if final is not SessionState.FAILED
+                    else "unknown_action_outcome"
+                )
+            ),
             max_claims=int(limits.get("max_claims_assessed_per_session", 32)),
             max_new_claims=int(limits.get("max_new_claims_per_session", 16)),
             max_evidence=int(limits.get("max_evidence_items_per_session", 64)),
@@ -1466,11 +1488,18 @@ class Orchestrator:
                     )
                     continue
                 ctx.complete_reason = decision.reason
+                # T7.49 (ADR-0022): the RAW model text is kept in
+                # complete_reason as before; normalized_reason carries the
+                # canonical token (or null when the reason is free-form /
+                # unrecognizable) so the audit shows BOTH and the raw text
+                # is never lost.
+                _norm_reason = normalize_complete_reason(decision.reason)
                 await audit.record(
                     AuditEventType.SESSION_STATE_CHANGED,
                     session_id=session.id,
                     payload={
                         "complete_reason": decision.reason,
+                        "normalized_reason": _norm_reason.value if _norm_reason is not None else None,
                         "rationale": response.public_rationale[:500],
                     },
                     public_summary=f"explorer complete: {decision.reason}",
