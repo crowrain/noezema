@@ -390,6 +390,23 @@ async def test_cross_lingual_search_and_staging(migrated_db, fake_llm: FakeLLM, 
     assert list(row2[0]) == ["Caching reduces response time on repeated requests."]
 
 
+# T7.51 (the `pytest -n auto` flake: LeaseLost "lease lost during long
+# operation" — starvation, NOT the T7.47b cancel-mid-execute race):
+# LeaseHeartbeatGuard renews every ttl/3 and LeaseService.heartbeat REFUSES a
+# renewal whose UPDATE actually executes after the TTL has elapsed, so one
+# renewal may be late by at most ttl - ttl/3 = 2·ttl/3 of wall clock before the
+# lease is genuinely lost. At TTL 1 s that margin was 0.67 s — measured: under
+# xdist contention (6 workers migrating scratch DBs against one PostgreSQL;
+# a pure CPU burn does NOT reproduce it) the heartbeat lands later than that,
+# the guard raises LeaseLost and the session aborts. The product behaviour is
+# exactly §5.2.3 (abort + fenced commit), so only the test's absolute scale is
+# fragile: it is scaled 3x with every ratio preserved — renewal interval
+# ttl/3 = 1 s, model delay 2.5×TTL (a call stays >2 TTL long), ≈7 renewals per
+# call; only the jitter margin grows, 0.67 s → 2.0 s.
+LEASE_TTL_SECONDS = 3.0
+MODEL_DELAY_SECONDS = 2.5 * LEASE_TTL_SECONDS  # a model call is 2.5x the TTL long
+
+
 @pytest.mark.asyncio
 async def test_slow_llm_does_not_lose_commit_lease(migrated_db, fake_llm: FakeLLM, tmp_path: Path) -> None:
     """T3.30 regression (first real MVP session, qwen36-35b-a3b-q6-mtp):
@@ -397,21 +414,25 @@ async def test_slow_llm_does_not_lose_commit_lease(migrated_db, fake_llm: FakeLL
     a model call longer than the lease TTL must not starve the fenced
     commit — the background guard renews the lease mid-call (§5.2.3).
     Without the guard this session ends commit_lease_lost → reconciled_abort.
+
+    T7.51: LEASE_TTL_SECONDS / MODEL_DELAY_SECONDS keep the same relations as
+    before (delay = 2.5×TTL, renewal every TTL/3) at a 3x larger absolute
+    scale — see the constants above for the measured xdist margin.
     """
     scratch_url, _engine = migrated_db
     question_id = await _seed_question(scratch_url)
 
-    # every model call takes 2.5 s — more than 2x the 1 s lease TTL below
+    # every model call takes 2.5× the lease TTL (T7.51 constants above)
     fake_llm.script(
         [
-            {"content": TOOL_PYTHON, "delay_seconds": 2.5},
-            {"content": TOOL_WRITE, "delay_seconds": 2.5},
-            {"content": COMPLETE, "delay_seconds": 2.5},
-            {"content": CURATOR_OK, "delay_seconds": 2.5},
+            {"content": TOOL_PYTHON, "delay_seconds": MODEL_DELAY_SECONDS},
+            {"content": TOOL_WRITE, "delay_seconds": MODEL_DELAY_SECONDS},
+            {"content": COMPLETE, "delay_seconds": MODEL_DELAY_SECONDS},
+            {"content": CURATOR_OK, "delay_seconds": MODEL_DELAY_SECONDS},
         ]
     )
     orch, gateway, engine = _make_orchestrator(
-        scratch_url, fake_llm, tmp_path / "ws", lease_ttl=timedelta(seconds=1)
+        scratch_url, fake_llm, tmp_path / "ws", lease_ttl=timedelta(seconds=LEASE_TTL_SECONDS)
     )
     try:
         outcome = await orch.run_session(question_id)
