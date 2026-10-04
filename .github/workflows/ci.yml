@@ -1,5 +1,10 @@
 name: CI
 
+# T7.55: runners pinned to ubuntu-24.04 (ubuntu-latest migrates to Ubuntu 26 in a rollout from
+# 2026-10-19 to 2026-11-19 — GitHub changelog 2026-09-17); actions/checkout@v5 and
+# actions/setup-python@v6 are the Node 24 majors (checkout v5: "Updated to the node24 runtime",
+# requires runner >= v2.327.1; setup-python v6: "Upgraded action from node20 to node24").
+
 on:
   push:
     branches: [main, develop, impl/from-scratch]
@@ -8,10 +13,10 @@ on:
 
 jobs:
   lint:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
           cache: pip
@@ -21,10 +26,10 @@ jobs:
         run: ruff check .
 
   types:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
           cache: pip
@@ -34,7 +39,7 @@ jobs:
         run: mypy packages apps hostctl
 
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     services:
       postgres:
         image: postgres:15-alpine
@@ -52,8 +57,8 @@ jobs:
     env:
       NOEZEMA_TEST_DATABASE_URL: postgresql+asyncpg://noezema:noezema_dev@localhost:5432/noezema
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
           cache: pip
@@ -65,11 +70,14 @@ jobs:
       - name: Build sandbox image
         run: docker image inspect noezema-sandbox:test >/dev/null 2>&1 || docker build -f sandbox/Containerfile -t noezema-sandbox:test sandbox/
       - name: Run tests
-        run: python -m pytest -v --tb=short
+        # T7.55: xdist parallel — ubuntu-24.04 hosted runner has 4 vCPU; the sandbox image is built
+        # in the step above (one tag for all workers, T7.41/T7.54) and scratch DBs are cloned from
+        # per-worker session templates (one alembic run per worker, T7.55).
+        run: python -m pytest -v --tb=short -n auto
 
   docker:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Build dev image
         run: docker build -f Dockerfile -t noezema-dev:ci .

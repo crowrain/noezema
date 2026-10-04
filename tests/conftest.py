@@ -10,11 +10,13 @@ anywhere.
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import os
 import secrets
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import warnings
 from collections.abc import AsyncIterator, Iterator
@@ -172,44 +174,55 @@ def migrated_db_template() -> Iterator[str]:
     tpl_name = f"noezema_tpl_{os.getpid()}_{secrets.token_hex(4)}"
     tpl_url = parts._replace(path=f"/{tpl_name}").geturl()
 
-    _admin_exec_sync(url, f'CREATE DATABASE "{tpl_name}"')
     try:
-        env = dict(os.environ)
-        env["NOEZEMA_DATABASE_URL"] = tpl_url
-        proc = subprocess.run(
-            [sys.executable, "-m", "alembic", "-c", "alembic.ini", "upgrade", "head"],
-            cwd=REPO_ROOT,
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=180,
-        )
-        if proc.returncode != 0:
-            raise RuntimeError(f"template migration failed (alembic upgrade head):\n{proc.stdout}\n{proc.stderr}")
-
-        deadline = time.monotonic() + 20.0
-        while True:
-            backends = _count_backends(url, tpl_name)
-            if backends == 0:
-                break
-            if time.monotonic() >= deadline:
-                raise RuntimeError(f"template {tpl_name} still has {backends} connection(s); cannot clone safely")
-            time.sleep(0.2)
-
-        last_exc: Exception | None = None
-        for _attempt in range(3):
-            try:
-                _admin_exec_sync(
-                    url,
-                    "SET lock_timeout TO '10s'",
-                    f'ALTER DATABASE "{tpl_name}" WITH ALLOW_CONNECTIONS false',
+        # Template BUILDS are serialized across every pytest process on this machine (all xdist
+        # workers at session start AND nested pytest runs mid-suite). Six concurrent `alembic
+        # upgrade head` subprocesses are exactly the DDL-storm pattern T7.51 named as a flake
+        # source: the old fixture hit it randomly per test, while a session-scope template makes
+        # all workers collide at the same instant. The lock covers only the ~1-2 s build; clones
+        # run freely outside it, and the lock is always released before any cross-process wait
+        # (a worker never holds it while waiting on another process), so no deadlock is possible.
+        with open(os.path.join(tempfile.gettempdir(), "noezema_tpl_build.lock"), "w") as build_lock:
+            fcntl.flock(build_lock, fcntl.LOCK_EX)
+            _admin_exec_sync(url, f'CREATE DATABASE "{tpl_name}"')
+            env = dict(os.environ)
+            env["NOEZEMA_DATABASE_URL"] = tpl_url
+            proc = subprocess.run(
+                [sys.executable, "-m", "alembic", "-c", "alembic.ini", "upgrade", "head"],
+                cwd=REPO_ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    f"template migration failed (alembic upgrade head):\n{proc.stdout}\n{proc.stderr}"
                 )
-                break
-            except Exception as exc:  # transient lock race (e.g. a passing autovacuum worker)
-                last_exc = exc
-                time.sleep(0.5)
-        else:
-            raise RuntimeError(f"cannot seal template {tpl_name}: {last_exc}")
+
+            deadline = time.monotonic() + 20.0
+            while True:
+                backends = _count_backends(url, tpl_name)
+                if backends == 0:
+                    break
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(f"template {tpl_name} still has {backends} connection(s); cannot clone safely")
+                time.sleep(0.2)
+
+            last_exc: Exception | None = None
+            for _attempt in range(3):
+                try:
+                    _admin_exec_sync(
+                        url,
+                        "SET lock_timeout TO '10s'",
+                        f'ALTER DATABASE "{tpl_name}" WITH ALLOW_CONNECTIONS false',
+                    )
+                    break
+                except Exception as exc:  # transient lock race (e.g. a passing autovacuum worker)
+                    last_exc = exc
+                    time.sleep(0.5)
+            else:
+                raise RuntimeError(f"cannot seal template {tpl_name}: {last_exc}")
 
         yield tpl_name
     finally:
