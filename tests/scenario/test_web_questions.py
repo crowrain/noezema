@@ -229,7 +229,11 @@ def ids_of(rows: list[dict]) -> list[str]:
 @pytest.mark.asyncio
 async def test_main_page_carries_the_ask_form_and_the_queue_table(migrated_db, tmp_path: Path) -> None:
     """§13.3: the main page is a thin viewer over the same JSON API — no new
-    JS dependencies, only the form + the queue table over §13.1/§13.2 routes."""
+    JS dependencies, only the form + the queue table over §13.1/§13.2 routes.
+
+    T7.59(b) adds the «wake now» control: it posts the closed `wake_now` command to the
+    existing command route (T3.18/T3.29), so the marker check covers the route too.
+    """
     scratch_url, _ = migrated_db
     app, engine, _factory = await _make(scratch_url, tmp_path / "host", tmp_path / "unit-state.json")
     _healthy_host(tmp_path / "host", tmp_path / "unit-state.json")
@@ -248,6 +252,9 @@ async def test_main_page_carries_the_ask_form_and_the_queue_table(migrated_db, t
         "/api/v1/questions",
         "X-Admin-Token",
         "sessionStorage",  # the token is remembered for the session, not on disk
+        'id="wake-now"',  # T7.59(b): wake_now button over the existing command route
+        "/api/v1/commands",
+        "wake now",
     ):
         assert marker in html
     await engine.dispose()

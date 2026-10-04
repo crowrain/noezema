@@ -2084,3 +2084,149 @@ host-словесному множеству, `rephrase_threshold` и `no_progre
 Остаётся непроверенным после этой части: приём на живой ВМ стенда и прохождение вопроса через
 wake tick с реальным LLM (часть (б) — ниже), близкие формулировки (см. п. 1(e)), позиция глубже
 `QUEUE_WINDOW` сообщается как `None`.
+
+## T7.59(б) — пакет dev-стенда `deploy/dev-stand/`: bootstrap, dev-юниты, status/reset, web bind из env и fail-closed
+
+### 1. Что собрано
+
+| файл | назначение |
+|---|---|
+| `deploy/dev-stand/bootstrap.sh` | идемпотентная установка стенда (7 шагов), флаги `--dry-run`, `--no-docker-install`, `--no-units`, `--stub-executor`, `--force`, `--web-host/--web-port/--user` |
+| `deploy/dev-stand/systemd/*` (8 файлов) | `noezema-dev.target`, `noezema-dev-web.service`, `noezema-dev-tick.service/.timer`, `noezema-dev-maint.service/.timer`, `noezema-dev-unit-state.service/.timer` — **свои dev-юниты, не копии `infra/systemd/*`** |
+| `deploy/dev-stand/status.sh` | юниты и периоды, docker (Postgres, образ, число сессионных контейнеров), очередь вопросов и последняя сессия из БД, wake-книга, доступность LLM через `/v1/models`, версия кода, режим исполнителя; флаги `--no-llm`, `--no-web` |
+| `deploy/dev-stand/reset-db.sh` | пересоздание dev-базы с подтверждением вписыванием имени базы (или `--yes`), миграции, повторная активация config-v12; отказ при незавершённой сессии |
+| `deploy/dev-stand/README.md` | деплой, цикл пользования (UI → вопрос → wake now → лента → стоп → reset), пути и порты, логи, безопасность, границы |
+
+Целевая ВМ — 192.168.1.92 (Ubuntu 24.04, один пользователь, без GPU): разворачивает менеджер по ssh;
+агент пакет готовил и проверял только локально, к `.92` (как и к `.42`/`.48`) не обращался.
+
+### 2. bootstrap.sh: порядок шагов и почему именно такой
+
+1. пакеты: python ≥ 3.11 (probe `python3.12/3.11/3`), docker при отсутствии (`apt-get install -y docker.io`
+   + `systemctl enable --now docker`; `--no-docker-install` — не ставить), uv (`apt-get install -y uv`,
+   fallback — официальный установщик в `/usr/local/bin`); при `NOEZEMA_TOOL_EXECUTOR=sandbox` пользователь
+   стенда добавляется в группу `docker`.
+2. venv + зависимости **только через uv** (`uv venv` затем `uv pip install --python .venv/bin/python -e .`,
+   prod-extras без dev) — как AGENTS §6; существующий venv не пересоздаётся без `--force`.
+3. env-файл `/etc/noezema/dev.env` (0600, владелец — пользователь стенда): секреты генерируются **до**
+   Postgres, иначе повторный запуск не совпал бы с паролем уже созданного контейнера; существующий
+   `NOEZEMA_ADMIN_TOKEN` сохраняется (ротация — только `--force`). Ключи: `DATABASE_URL`, `DB_PASSWORD`,
+   `DATA_ROOT`, `HOST_LIB`, `UNIT_STATE`, `NODE_OWNER`, `ADMIN_TOKEN`, `LLM_BASE_URL/MODEL/SCHEMA_PROFILE/
+   MAX_OUTPUT_TOKENS/TIMEOUT_SECONDS` (EXL3 192.168.1.42:8080, модель `qwen38-exl3-3bpw-128k`, профиль
+   `none`, 8192/600), `TOOL_EXECUTOR=sandbox`, `SANDBOX_IMAGE/ENGINE/WORK_ROOT`, `WEB_HOST/PORT`.
+4. каталоги данных `/var/lib/noezema-dev` (+ `sandbox`, `host`, владелец — пользователь стенда) и сборка
+   образа из `sandbox/Containerfile` с **одной закреплённой меткой** `noezema-sandbox:dev-stand` →
+   `NOEZEMA_SANDBOX_IMAGE` (дефолт `SandboxSettings.image = noezema-sandbox:dev` и тестовый `:test` не
+   тронуты; поля проверены по коду: `engine=docker`, `work_root=$DATA_ROOT/sandbox`).
+5. Postgres 15 в docker: том `noezema-dev-pgdata`, healthcheck `pg_isready`, публикация **только
+   `127.0.0.1:5432`**; существующий контейнер не пересоздаётся.
+6. база `noezema-dev` (`createdb` если её нет) → `alembic upgrade head` → активация
+   `docs/eval/config-v12-payload.json` через `hostctl activate-online --drain-wait-seconds 120`, **если**
+   активный head — bootstrap/none (иначе шаг пропускается).
+7. юниты: шаблоны рендерятся плейсхолдерами `@REPO@ @USER@ @GROUP@ @ENVFILE@ @DATA@ @UNITSTATE@` в
+   `/etc/systemd/system`, `daemon-reload`, `enable` трёх таймеров и web-сервиса; запуск — вручную
+   (`systemctl start noezema-dev.target`).
+
+Границы, проверенные кодом скриптов, а не договорённостью: имя базы вне `noezema-dev*` (и любое
+`*eval*`/`*smoke*`) — отказ; путь `/var/lib/noezema`, `/run/noezema` или их подкаталог — отказ. Секреты
+не печатаются, а в `--dry-run` планируемые команды маскируются (`POSTGRES_PASSWORD=<masked>`,
+`asyncpg://<creds>@…`).
+
+### 3. Юниты стенда и поведение wake на ВМ без GPU / при пустой очереди
+
+tick — `Type=oneshot`, `TimeoutStartSec=3600` (сессия имеет право отработать бюджет снапшота; преждевременный
+kill дал бы ровно ту неопределённость коммит-границы, которую разбирает reconciliation), таймер 60 с —
+заметно чаще расписания (`interval_seconds=3600`, `min_session_interval_seconds=600`), поэтому большинство
+тиков печатает `wait`: эффективное время решает снапшот, а не период (§5.2.1). `maint` = два ExecStart
+подряд: `reassessment-tick` затем `reconcile-tick`. Все сервисы `PartOf=noezema-dev.target`, таймеры
+`WantedBy=noezema-dev.target`, target в загрузку не ставится (после reboot стенда нет, пока не запустили).
+
+- **ВМ без GPU:** в config-v12 `wake_schedule.gpu_required = false` ⇒ шлюз GPU не срабатывает и сессии
+  идут. Если значение станет `true`, тик даст `skip (gpu)` и код 0 — штатная работа шлюза, не ошибка
+  (`hostctl` возвращает 78 только на ConfigError/admission-ошибках).
+- **Пустая очередь:** admitted-сессия доходит до выбора вопроса, кандидата не находит и завершается
+  `FAILED` с `termination_reason="no_question"` (`apps/orchestrator/orchestrator.py`); `record_session_result`
+  считает это неудачей → backoff 60/120/240 (потолок 86400) → после `max_consecutive_failures=3` узел в
+  `paused`, и дальнейшие тики дают `skip`. Выход — задать вопрос и снять паузу (`hostctl resume-runtime`
+  или `POST /api/v1/commands {"type":"resume", …}`). Поведение закреплено тестом
+  `test_dev_stand_flow.py::test_wake_with_an_empty_queue_is_a_recorded_no_question_not_an_error`: именно так
+  стенд ведёт себя до первого вопроса, и это не ошибка конфигурации.
+- **`noezema-dev-unit-state.timer` (5 с) обязателен:** на стенде `/var/lib/noezema-dev/host` существует,
+  значит `HostStatusAdapter` считает host-протокол активным и требует свежий снимок юнитов (TTL 15 с);
+  без публикации Command API и приём вопроса отвечают 423 (`unit_state_stale`), GET продолжают работать
+  (T3.24/§13.1). Альтернатива — указать несуществующие `NOEZEMA_HOST_LIB`/`NOEZEMA_UNIT_STATE`
+  (healthy-by-default), но тогда на стенде не действует fail-closed защита.
+
+### 4. Web: NOEZEMA_WEB_HOST/PORT, fail-closed и находка про data root
+
+- `apps/web/bind.py` — чистый резолвер (AGENTS §4): хост/порт из env, дефолты исторические
+  (`127.0.0.1:8321`, поведение не изменилось), отказ при нецелом/вне-диапазона порте и при **не-loopback
+  bind с пустым `NOEZEMA_ADMIN_TOKEN`** (текст ошибки называет оба охраняемых POST-эндпоинта). Exit — 78,
+  как у конфигурационных отказов hostctl. Отказ происходит на импорте `apps/web/main.py`, поэтому покрыт
+  и запуск `python -m apps.web.main`, и `uvicorn apps.web.main:app`.
+- Находка локальной проверки: `build_standalone_app` строил stub-исполнитель в **хардкодном**
+  `/var/lib/noezema/workspace`; под `User=<пользователь стенда>` импорт падал на `PermissionError` —
+  юнит уходил в restart-loop. Исправлено тем же порядком, что у wake tick: workspace =
+  `resolve_standalone_workspace(data_root_from_env())`, то есть `<NOEZEMA_DATA_ROOT>/workspace`, дефолт
+  прежний; в режиме sandbox путь не используется (host-overlay берётся из `NOEZEMA_SANDBOX_WORK_ROOT`).
+- Граница доступа зафиксирована в README: на стенде GET (`/api/v1/status`, `/api/v1/questions`,
+  `/api/v1/messages`, `/api/v1/timeline`, страницы сессий) открыты (§13.1 — читать могут все в LAN),
+  команды и `POST /api/v1/questions` требуют admin-токен (401, T3.18); наружу (WAN) стенд не выставляется.
+
+### 5. Локальная проверка (`.87`, без реального LLM, без `.92`)
+
+- `bash -n` — чисто; `shellcheck 0.11.0` (`-S warning`) — 0 замечаний по трём скриптам; при `-S info` был
+  один SC2012 (`ls` → `find` в подсчёте юнитов), исправлено. shellcheck ставился в `.venv` через uv только
+  для проверки и удалён (в `pyproject.toml` не добавлялся).
+- `bootstrap.sh --dry-run` — exit 0, печатает весь план (7 шагов + резюме по-русски); в выводе нет ни
+  пароля, ни токена (`POSTGRES_PASSWORD=<masked>`, `postgresql+asyncpg://<creds>@127.0.0.1:5432/noezema-dev`);
+  после прогона `docker ps -a` не изменился, `/etc/noezema` не создан.
+- 8 юнитов проверены `systemd-analyze verify --man=no` (systemd 255) на отрендеренных копиях с реальными
+  путями/пользователем — ни одной строки вывода, то есть ни parse-ошибок, ни неизвестных ключей; проверка
+  плейсхолдеров (`grep @…@`) чистая.
+- Startup формы стенда: `NOEZEMA_DATA_ROOT=<одноразовый каталог> NOEZEMA_TOOL_EXECUTOR=stub` импорт
+  `apps.web.main` завершился успешно от обычного пользователя, создал `<data root>/workspace` и показал
+  bind `127.0.0.1:8321`; временный каталог удалён.
+- Fail-closed руками: `NOEZEMA_WEB_HOST=0.0.0.0 NOEZEMA_ADMIN_TOKEN=` → exit 78 + текст про открытые GET и
+  охраняемые POST; `NOEZEMA_WEB_HOST=192.168.1.50` без токена → exit 78; `NOEZEMA_WEB_PORT=70000` →
+  exit 78 (`is outside 1..65535`). Ничего не слушало 8321, процессов не осталось.
+- Сквозной прогон на scratch-БД (фикстура `migrated_db`, FakeLLM вместо модели, stub-исполнитель):
+  `tests/scenario/test_dev_stand_flow.py` — **2 passed**: вопрос через `POST /api/v1/questions` (priority 9,
+  позиция 1) → `GET /api/v1/questions` → команда `wake_now` (202 completed) → сессия наблюдалась в
+  `/api/v1/status` (`session` ≠ None до возврата узла в idle), `counts.sessions == 1`, в ленте
+  `session_started` и `session_committed`, вопрос после коммита `state=verified`, позиция снята, к строке
+  очереди привязана сессия; второй тест — пустая очередь ⇒ `termination_reason="no_question"`,
+  `consecutive_failures ≥ 1`, приём вопроса после этого работает (позиция 1). Одноразовые БД удалены
+  фикстурой, контейнеров и процессов не осталось.
+
+### 6. Что НЕ проверено до реального развёртывания (список рисков)
+
+1. apt-путь на конкретной сборке 24.04: `docker.io`, наличие пакета `uv` в репозитории (fallback —
+   официальный установщик — локально не проверялся), поведение при отсутствии `curl`.
+2. Юниты под живым systemd: проверен только синтаксис; фактический порядок запуска (после `docker.service`,
+   пока Postgres-контейнер не healthy), `Restart=always` при отказе БД, остановка target'ом — нет.
+3. Доступ `User=` юнита к `/var/run/docker.sock` после `usermod -aG docker` без перелогина (юниту группа
+   видна, интерактивной сессии — нет): проверится только на ВМ.
+4. Реальный LLM (`192.168.1.42`, профиль `none`, 8192 выходных токенов, 600 с) и длина reasoning у этой
+   модели — локально весь путь шёл через FakeLLM; обращение к `.42` запрещалось задачей.
+5. Sandbox-сессии под пользователем юнита: overlay в `NOEZEMA_SANDBOX_WORK_ROOT`, лимиты
+   `sandbox/policy/<profile>.yaml`, отказ preflight при отсутствующем образе (exit 78) — на ВМ.
+6. Время и объём первой настоящей сессии, disk_quota 1024 MiB из снапшота, поведение при нехватке места.
+7. Первый запуск Postgres: скачивание образа `postgres:15` (таймаут ожидания healthy — 90 с в скрипте).
+8. `activate-online` на живой базе с ненулевым drain-окном (локально шаг наблюдался только в сухом прогоне;
+   активный head стенда был bootstrap ⇒ активация обязательна).
+9. Перезагрузка ВМ: target в загрузку не ставится — после reboot стенда нет, это осознанное решение, но оно
+   означает «никто не поднимает стенд сам».
+10. admin-токен в `sessionStorage` браузера и открытые GET: LAN-чтение принято как компромисс стенда;
+    выход стенда в WAN документом запрещён.
+
+### 7. Не изменено / остаётся
+
+`infra/systemd/*` (прод-юниты не тронуты и не копировались), дефолтный web bind `127.0.0.1:8321`,
+дефолтный исполнитель (stub), существующие CLI-команды, enum'ы, миграции (ни одной), `config-v*`
+payload'ы, промпты и пины, `tool_schema_hash`, пороги, корпуса, staging-путь модели. Матрица §22.1 не
+расширяется; тесты части (б) — дополнительные продюсеры пункта 20 («FIFO полный минимальный путь»):
+`test_dev_stand_flow.py` кладёт кандидата оператором и ведёт его через командный wake до коммита.
+
+Проверка §6 перед этим коммитом: ruff чисто, mypy strict — **132 файла**, `-n auto -m "not timing"` и
+`-m timing` — см. числа в отчёте (новые тесты: `tests/unit/test_web_bind.py` 20, `tests/scenario/test_dev_stand_flow.py` 2).

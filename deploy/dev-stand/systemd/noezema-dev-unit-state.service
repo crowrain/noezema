@@ -1,0 +1,27 @@
+# NOEZEMA dev stand unit-state publisher (T7.59(b)) — the reason the stand's Command API works.
+#
+# On this VM /var/lib/noezema-dev/host exists, so HostStatusAdapter treats the host protocol as
+# active (§13.2, T3.24): it then REQUIRES a fresh unit-state snapshot. Without this publisher every
+# mutating endpoint — POST /api/v1/questions (T7.59) and POST /api/v1/commands (T3.18) — answers 423
+# host_not_healthy while GET keeps working. Publishing the snapshot is what makes the stand usable;
+# a dead publisher degrades it within 15 s, exactly as intended.
+#
+# The unit writes to NOEZEMA_UNIT_STATE (@UNITSTATE@ below), i.e. inside @DATA@ — not /run/noezema:
+# production paths are never touched by a dev stand. If you prefer the "no host protocol at all"
+# mode, point NOEZEMA_HOST_LIB and NOEZEMA_UNIT_STATE at paths that do not exist: the adapter then
+# treats the node healthy by default (dev/tests behaviour) — but you lose the fail-closed protection.
+[Unit]
+Description=NOEZEMA dev stand unit-state snapshot publisher (keeps Command API open)
+Documentation=file:@REPO@/deploy/dev-stand/README.md
+PartOf=noezema-dev.target
+
+[Service]
+Type=oneshot
+User=@USER@
+Group=@GROUP@
+WorkingDirectory=@REPO@
+EnvironmentFile=-@ENVFILE@
+TimeoutStartSec=30
+NoNewPrivileges=yes
+UMask=0077
+ExecStart=@REPO@/.venv/bin/python -m hostctl.cli publish-unit-state --path @UNITSTATE@

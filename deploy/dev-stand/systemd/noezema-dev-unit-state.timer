@@ -1,0 +1,21 @@
+# NOEZEMA dev stand unit-state timer (T7.59(b)).
+#
+# Snapshot TTL is 15 s (hostctl/unit_state.py UNIT_STATE_TTL_SECONDS), and the web treats an older
+# snapshot as unhealthy. With OnUnitActiveSec=5s + AccuracySec=1s the worst-case age (~2 periods)
+# stays under the TTL with headroom — same arithmetic as the prod 1 s timer, just cheaper on a VM
+# where nobody is watching continuously.
+[Unit]
+Description=NOEZEMA dev stand unit-state publish every 5 s (TTL 15 s)
+Documentation=file:@REPO@/deploy/dev-stand/README.md
+Requires=noezema-dev-unit-state.service
+Before=noezema-dev-unit-state.service
+
+[Timer]
+OnBootSec=5s
+OnUnitActiveSec=5s
+AccuracySec=1s
+Persistent=false
+Unit=noezema-dev-unit-state.service
+
+[Install]
+WantedBy=noezema-dev.target

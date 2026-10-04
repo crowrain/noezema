@@ -1,0 +1,38 @@
+# NOEZEMA dev stand web (T7.59(b)) — the human-facing UI/API on the stand VM.
+#
+# NOT a copy of infra/systemd/noezema-web.service: own data root, own EnvironmentFile, runs as
+# the stand user (no dedicated system user), no PartOf=noezema-runtime.target chain, and no
+# degraded-observer contract — on a stand this process is the whole node surface.
+#
+# Bind comes from NOEZEMA_WEB_HOST/NOEZEMA_WEB_PORT in @ENVFILE@. A non-loopback host without
+# NOEZEMA_ADMIN_TOKEN is refused at startup (apps/web/bind.py, T7.59) — exit 78, Restart keeps
+# the journal honest about why it will not come up.
+#
+# Host health: with NOEZEMA_HOST_LIB/NOEZEMA_UNIT_STATE pointing into @DATA@ (which exists),
+# the fail-closed host gate is live. If noezema-dev-unit-state.timer stops publishing, the
+# snapshot ages past its 15 s TTL and GET /api/v1/status shows unit_state_stale while POST
+# questions/commands answer 423 (T3.24). Queries stay readable — that is by design (§13.1).
+[Unit]
+Description=NOEZEMA dev stand web UI/API (not the production web)
+Documentation=file:@REPO@/deploy/dev-stand/README.md
+PartOf=noezema-dev.target
+After=network-online.target docker.service
+# Postgres comes from the docker container noezema-dev-db (--restart unless-stopped), i.e. with
+# docker.service above; if it is not yet accepting connections the web still starts and reports
+# db_reachable=false instead of pretending the node is healthy.
+
+[Service]
+Type=simple
+User=@USER@
+Group=@GROUP@
+WorkingDirectory=@REPO@
+EnvironmentFile=-@ENVFILE@
+ExecStart=@REPO@/.venv/bin/python -m apps.web.main
+Restart=always
+RestartSec=3
+NoNewPrivileges=yes
+PrivateTmp=yes
+UMask=0077
+
+[Install]
+WantedBy=noezema-dev.target

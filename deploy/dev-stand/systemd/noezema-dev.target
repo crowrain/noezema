@@ -1,0 +1,14 @@
+# NOEZEMA dev stand target (T7.59(b)).
+#
+# Groups the STAND units only: web, wake tick, maintenance (reassessment + reconcile),
+# unit-state publisher. It is deliberately NOT noezema-runtime.target and NOT pulled in at
+# boot: a stand starts when the operator starts it (systemctl start noezema-dev.target) and
+# everything in it stops together with `systemctl stop noezema-dev.target` (PartOf below).
+#
+# Production units in infra/systemd are not reused here on purpose: different data root
+# (/var/lib/noezema-dev), different config file, different user, no admission/resume chain.
+[Unit]
+Description=NOEZEMA dev stand (single-user VM): web UI + wake tick + maintenance ticks
+Documentation=file:@REPO@/deploy/dev-stand/README.md
+After=network-online.target docker.service
+Wants=network-online.target

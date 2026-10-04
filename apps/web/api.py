@@ -46,6 +46,7 @@ from apps.orchestrator.scheduler import WakeScheduler, data_root_from_env, node_
 from apps.web import diagnostics as diagnostics_queries
 from apps.web import knowledge as knowledge_queries
 from apps.web import metrics as metrics_queries
+from apps.web.bind import resolve_standalone_workspace
 from apps.web.host_status import HostStatus, HostStatusAdapter
 from packages.domain.db.engine import DatabaseSettings
 from packages.domain.db.uow import transaction
@@ -121,6 +122,10 @@ _MAIN_HTML = """<!doctype html>
   <th>origin</th><th>сессия</th><th>created_at</th></tr></thead><tbody></tbody></table>
  <p id="queue-error" class="warn"></p>
 </div>
+<div class="card"><b>Узел</b> · <button id="wake-now" type="button">wake now</button>
+ <span>§5.2.1: обходит тайминг расписания, шлюзы admission остаются</span>
+ <p id="wake-result" class="warn"></p>
+</div>
 <script>
 async function tick(){
   try{
@@ -190,6 +195,27 @@ document.getElementById('ask-form').addEventListener('submit', async (ev)=>{
   else out.textContent=`отклонено (${r.status}): ${d.detail||d.error||''}`;
   loadQueue();
 });
+ function idemKey(){
+   // crypto.randomUUID exists only in a secure context; on a LAN stand over http it does not.
+   const c = window.crypto && typeof crypto.randomUUID === 'function' ? crypto.randomUUID() : null;
+   return c || ('web-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10));
+ }
+ document.getElementById('wake-now').addEventListener('click', async ()=>{
+   const out = document.getElementById('wake-result'); out.textContent='запуск…';
+   let r;
+   try{
+     r = await fetch('/api/v1/commands', {method:'POST',
+       headers:{'Content-Type':'application/json','X-Admin-Token':adminToken()},
+       body:JSON.stringify({type:'wake_now', idempotency_key:idemKey(), reason='web: wake now'})});
+   }catch(err){ out.textContent='ошибка отправки'; return; }
+   const d = await r.json().catch(()=>({}));
+   if(r.status===202) out.textContent = `${d.state||''}: `+
+     (d.result&&d.result.reason ? d.result.reason : (d.result&&d.result.node_state)||'');
+   else if(r.status===401) out.textContent='нужен admin token (заголовок X-Admin-Token)';
+   else if(r.status===423) out.textContent='хост деградирован: команды закрыты';
+   else out.textContent=`отклонено (${r.status}): ${d.detail||d.error||''}`;
+   tick(); loadQueue();
+ });
 tick(); setInterval(tick, 3000);
 loadQueue(); setInterval(loadQueue, 5000);
 </script></body></html>
@@ -1320,8 +1346,6 @@ def create_app(
 
 def build_standalone_app() -> FastAPI:
     """Entry helper: build the app with an orchestrator from env config."""
-    from pathlib import Path
-
     from apps.orchestrator.tool_executors import build_tool_executor
     from packages.llm_gateway.client import LLMMiddleware
     from packages.llm_gateway.config import LLMGatewayConfig, ModelProfile
@@ -1338,7 +1362,11 @@ def build_standalone_app() -> FastAPI:
         profile=ModelProfile(model_alias=llm_config.model, backend_name="local"),
         # T7.58 (ADR-0023): the same NOEZEMA_TOOL_EXECUTOR switch as the wake tick
         # and the eval run; the default ("stub") keeps the previous behavior.
-        executor=build_tool_executor(Path("/var/lib/noezema/workspace")),
+        # T7.59(b): the workspace follows NOEZEMA_DATA_ROOT (the env the wake tick uses) instead
+        # of a hardcoded production path — same value when the env is unset, but a stand that runs
+        # as an ordinary user can actually create it. Sandbox mode ignores this path: its host
+        # overlay lives in NOEZEMA_SANDBOX_WORK_ROOT.
+        executor=build_tool_executor(resolve_standalone_workspace(data_root_from_env())),
     )
     app.state.orchestrator = orchestrator
     return app

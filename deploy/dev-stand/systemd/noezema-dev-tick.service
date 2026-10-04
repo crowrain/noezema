@@ -1,0 +1,31 @@
+# NOEZEMA dev stand wake tick (T7.59(b), §5.2.1) — NOT a copy of infra/systemd/noezema-wake.service.
+#
+# One `hostctl wake-tick` per timer firing: schedule, admission gates and backoff live in the
+# effective config snapshot (config-v12 activated by bootstrap.sh), not in this unit.
+#
+# On a GPU-less stand VM with config-v12 (wake_schedule.gpu_required = false) admission passes and
+# nothing is skipped for GPU reasons. If gpu_required were true the tick would print "skip (gpu)"
+# and exit 0 — that is NOT an error, it is the gate doing its job (§5.2.1).
+#
+# With an EMPTY question queue an admitted session still has to pick a candidate: it terminates
+# FAILED with termination_reason="no_question", consecutive_failures grows (backoff 60/120/240 s,
+# cap from the snapshot) and after max_consecutive_failures = 3 the node goes paused; `hostctl
+# resume-runtime --reason ...` or the resume command is then needed before ticks wake again. That
+# is the designed behaviour of a stand with nothing to ask about, not a bug — status.sh shows it.
+[Unit]
+Description=NOEZEMA dev stand wake tick (not the production runtime admission chain)
+Documentation=file:@REPO@/deploy/dev-stand/README.md
+PartOf=noezema-dev.target
+
+[Service]
+Type=oneshot
+User=@USER@
+Group=@GROUP@
+WorkingDirectory=@REPO@
+EnvironmentFile=-@ENVFILE@
+# A session may legitimately run for its whole snapshot budget; killing the unit earlier would
+# produce exactly the kind of commit-boundary ambiguity reconciliation has to clean up.
+TimeoutStartSec=3600
+NoNewPrivileges=yes
+UMask=0077
+ExecStart=@REPO@/.venv/bin/python -m hostctl.cli wake-tick

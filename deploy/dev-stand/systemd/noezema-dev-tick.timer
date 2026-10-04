@@ -1,0 +1,25 @@
+# NOEZEMA dev stand wake timer (T7.59(b)).
+#
+# Fires every 60 s — far finer than the snapshot schedule (config-v12: interval_seconds=3600,
+# min_session_interval_seconds=600), so most ticks print "wait" and exit 0. The effective wake time
+# is decided by wake_schedule in the config snapshot, not by this period (§5.2.1).
+#
+# OnBootSec is deliberately late: on a stand that has just booted the queue is usually empty, an
+# admitted session with no candidate ends FAILED "no_question", and after max_consecutive_failures=3
+# the node pauses (see noezema-dev-tick.service). Give the operator time to ask a question first;
+# for an immediate run use `systemctl start noezema-dev-tick.service` or the «wake now» button.
+[Unit]
+Description=NOEZEMA dev stand wake probe every 60 s (schedule decides, not the timer)
+Documentation=file:@REPO@/deploy/dev-stand/README.md
+Requires=noezema-dev-tick.service
+Before=noezema-dev-tick.service
+
+[Timer]
+OnBootSec=10m
+OnUnitActiveSec=60s
+AccuracySec=5s
+Persistent=false
+Unit=noezema-dev-tick.service
+
+[Install]
+WantedBy=noezema-dev.target

@@ -136,6 +136,22 @@ origin всегда существующий `message` (нового enum-зна
 смоуков после контрольного прогона рекомендован `sandbox` (`EnvironmentFile` unit'а + пин образа
 `NOEZEMA_SANDBOX_IMAGE`, пока не включён по умолчанию — решение пользователя).
 
+Dev-стенд (T7.59(б), `deploy/dev-stand/`, целевая ВМ 192.168.1.92 — её разворачивает менеджер по ssh,
+агент к `.92` не обращается и пакет только готовит): идемпотентный `bootstrap.sh` (`--dry-run`,
+`--no-docker-install`, `--no-units`, `--stub-executor`, `--force`, `--web-host/--web-port/--user`) ставит
+пакеты, venv+prod-зависимости **только через uv**, образ с одной закреплённой меткой
+`noezema-sandbox:dev-stand` → `NOEZEMA_SANDBOX_IMAGE` (дефолт `:dev` и тестовый `:test` не трогаем),
+Postgres 15 в docker **только на 127.0.0.1** с томом и healthcheck, базу `noezema-dev`, миграции, активацию
+config-v12 (пропуск, если head уже не bootstrap), env-файл `/etc/noezema/dev.env` (0600, секреты не
+печатаются и в `--dry-run` маскируются) и dev-юниты `deploy/dev-stand/systemd/*` — **не копии**
+`infra/systemd/*`: `User=` = пользователь стенда, данные `/var/lib/noezema-dev`, группа
+`noezema-dev.target` (в загрузку не ставится), tick 60 с (`TimeoutStartSec=3600`), maint 60 с
+(reassessment+reconcile), unit-state 5 с. Bind веб-сервиса: `NOEZEMA_WEB_HOST`/`NOEZEMA_WEB_PORT` (дефолт
+`127.0.0.1:8321`, поведение прежнее); не-loopback bind при пустом `NOEZEMA_ADMIN_TOKEN` — отказ запуска с
+кодом 78 (`apps/web/bind.py`). Скрипты отказываются работать с базой вне `noezema-dev*` (в том числе
+`*eval*`/`*smoke*`) и с путями `/var/lib/noezema`, `/run/noezema`. Состояние — `status.sh`, сброс dev-базы —
+`reset-db.sh` (подтверждение вписыванием имени базы). Разбор и риски развёртывания: STATUS.md T7.59(б).
+
 ## 7. Известные ловушки
 
 - Docker 29.8: `docker kill -s KILL` (не `-9`); `docker cp` не видит tmpfs — использовать
@@ -196,6 +212,24 @@ origin всегда существующий `message` (нового enum-зна
   свой event loop, поэтому в синхронном тесте нельзя брать `AsyncEngine` из фикстуры `migrated_db` —
   второй `asyncio.run` на нём даёт «Event loop is closed» (+ ошибка на teardown). Паттерн: каждый
   read/write теста — свой engine из scratch-URL с `dispose()`; саму фикстуру использовать для URL.
+- Standalone-веб раньше строил stub-исполнитель в хардкодном `/var/lib/noezema/workspace` (`build_standalone_app`):
+  при запуске от непрод-пользователя (dev-стенд, `User=<user>`) импорт `apps.web.main` падал на `PermissionError`,
+  и юнит уходил в restart-loop. С T7.59(б) путь = `<NOEZEMA_DATA_ROOT>/workspace` через
+  `apps/web/bind.resolve_standalone_workspace(data_root_from_env())` — тот же env и дефолт, что у wake tick;
+  в режиме `sandbox` этот путь не используется (host-overlay берётся из `NOEZEMA_SANDBOX_WORK_ROOT`).
+- Стенд (и любой узел, где существует каталог `NOEZEMA_HOST_LIB`) воспринимается `HostStatusAdapter` как узел с
+  активным host-протоколом: без свежего снимка юнитов (TTL 15 с) Command API и `POST /api/v1/questions` отвечают
+  423, GET работают. Поэтому у `deploy/dev-stand` есть `noezema-dev-unit-state.timer` (5 с); «healthy by default»
+  достигается только если ни каталог `NOEZEMA_HOST_LIB`, ни файл `NOEZEMA_UNIT_STATE` не существуют — так делать
+  не надо: это выключает fail-closed защиту.
+- Юниты стенда с `NOEZEMA_TOOL_EXECUTOR=sandbox` требуют от пользователя `User=` доступа к `/var/run/docker.sock`
+  (владелец root:docker, 0660): bootstrap добавляет пользователя в группу `docker`; юниту группа видна сразу,
+  интерактивной сессии нужен перелогин. Без группы preflight sandbox отказывает до старта сессии (exit 78).
+- Пустая очередь вопросов на стенде — не ошибка: admitted wake доходит до выбора, кандидата нет, сессия
+  `FAILED termination_reason="no_question"` (`apps/orchestrator/orchestrator.py`), дальше backoff
+  (config-v12: 60/120/240, cap 86400) и пауза узла после `max_consecutive_failures=3`; дальнейшие тики дают `skip`.
+  Снимать паузу нужно явно (`hostctl resume-runtime` или команда `resume`). Проверено тестом
+  `tests/scenario/test_dev_stand_flow.py`.
 - CI (GitHub Actions) ставит `.[dev]` БЕЗ закрепления версий и в job `test` требует отдельной
   сборки sandbox-образа до pytest (шаг §6; с T7.41 фикстура образ не собирает) — расхождение с
   локальной средой даёт красные прогоны (T7.53b разбор: ruff 0.16.10 на раннере против 0.16.7 в
