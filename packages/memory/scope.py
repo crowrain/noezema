@@ -128,7 +128,17 @@ _DATE_FORMS: tuple[tuple[re.Pattern[str], str, dict[str, int]], ...] = (
     (_YMD, "ymd", {}),
 )
 
-_URL_RE = re.compile(r"https?://[^\s\"'<>)\]]+", re.IGNORECASE)
+#: start of a named-source URL candidate; the token after the scheme is
+#: scanned with a parenthesis-balance counter (``_scan_url_token``,
+#: T7.57 — the old single regex cut every URL at its first ``)``, which
+#: broke Wikipedia-style titles ``…/Go_(язык_программирования)``)
+_URL_START_RE = re.compile(r"https?://", re.IGNORECASE)
+
+#: characters that always end a URL candidate — unchanged from T7.17:
+#: whitespace, quotes, ``<``, ``>``, ``]``; the only terminator with a
+#: condition is ``)`` (an unmatched closer belongs to the surrounding
+#: text, not to the URL — see ``_scan_url_token``)
+_URL_STOP_CHARS = frozenset("\"'<>]")
 
 #: the closed deterministic set of RELATIVE reference-date forms
 #: (T7.18, ADR-0007). The question names its anchor as "now" rather
@@ -195,13 +205,56 @@ def _date_from_match(m: re.Match[str], form: str, months: dict[str, int]) -> dat
         return None
 
 
+def _scan_url_token(text: str, start: int) -> int | None:
+    """End (exclusive) of the URL candidate that starts at ``start``
+    (the first character after the ``http(s)://`` scheme), or None when
+    nothing follows the scheme.
+
+    Balanced-parenthesis rule (T7.57): a ``(`` is part of the URL, and a
+    ``)`` belongs to it only while it closes a ``(`` already seen inside
+    the token — so a Wikipedia-style title ``…/Go_(язык_программирования)``
+    is extracted whole (arbitrary nesting via the counter). An unmatched
+    ``)`` — the enclosing parenthesis of the sentence («(см. url)»), the
+    closing paren of markdown link syntax «[текст](url)», a stray closer
+    — ends the URL and stays OUTSIDE it. The other terminators are the
+    T7.17 set: whitespace, quotes, ``<``, ``>``, ``]``."""
+    depth = 0
+    pos = start
+    while pos < len(text):
+        ch = text[pos]
+        if ch.isspace() or ch in _URL_STOP_CHARS:
+            break
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            if depth == 0:
+                break
+            depth -= 1
+        pos += 1
+    return pos if pos > start else None
+
+
 def extract_question_urls(text: str) -> tuple[str, ...]:
     """The http(s) URLs named in a question (deduplicated, order kept).
-    Trailing punctuation is stripped."""
+    Trailing punctuation is stripped; URL paths with balanced parentheses
+    — Wikipedia-style ``…/Go_(язык_программирования)`` — are extracted
+    whole, while an enclosing ``)`` of the sentence never rides into the
+    URL (T7.57: the old regex cut at the first ``)``, which made the
+    coverage gate demand an unfetchable truncated URL and eventually
+    cost the Go question its claim — SMOKE-V14 §4.3)."""
     urls: list[str] = []
-    for m in _URL_RE.finditer(text):
-        url = m.group(0).rstrip(".,;:!?")
-        if url not in urls:
+    consumed_to = 0
+    for m in _URL_START_RE.finditer(text):
+        if m.start() < consumed_to:
+            # the scheme starts INSIDE an already-consumed URL token —
+            # not a new URL (the same semantics as the old contiguous regex)
+            continue
+        end = _scan_url_token(text, m.end())
+        if end is None:
+            continue  # nothing after "://" — not a URL (same as the old [..]+ )
+        consumed_to = end
+        url = text[m.start():end].rstrip(".,;:!?")
+        if url and url not in urls:
             urls.append(url)
     return tuple(urls)
 

@@ -89,6 +89,14 @@ B+C (хост не выпускает сессию в консолидацию �
    `extract_question_urls` (T7.17, тот же экстрактор, что деривирует
    `source_domains` claim-scope) в `_run_to_committing` после выбора
    вопроса; список в audit (`named_sources`) и в SessionContext.
+   Уточнение T7.57: `extract_question_urls` сохраняет URL-пути со
+   сбалансированными скобками — Wikipedia-заголовки вида
+   `…/Go_(язык_программирования)` извлекаются целиком и покрываются
+   канонической загрузкой (percent-encoded Cyrillic + скобки сходятся в
+   `coverage_key`); прежняя версия обрезала на первой «)», делая названный
+   источник неисчислимым — SMOKE-V14 §4.3. Тесты:
+   `test_extract_question_urls_balanced_parentheses` (tests/unit/test_scope.py),
+   Go-тесты в tests/{unit,scenario}/test_source_coverage.py.
 2. **Хост трекает покрытие**: на каждый ИСПОЛНЕННЫЙ `research.fetch`
    (прошедший policy engine и повтор-гард) — `mark(url, ok)`: успех →
    `fetched`, ошибка → `errored`. Совпадение названного URL и

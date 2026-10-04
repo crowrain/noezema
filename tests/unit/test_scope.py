@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from datetime import UTC, date, datetime, timedelta, timezone
 
+import pytest
+
 from packages.domain.models.enums import ClaimDateAnchor
 from packages.memory.scope import (
     DATE_ANCHOR_KEY,
@@ -128,6 +130,75 @@ def test_extract_question_urls() -> None:
         "https://a.example/x",
     )
     assert extract_question_urls("без ссылок") == ()
+
+
+# ── URL extraction: parenthesis-balanced URLs (T7.57) ──────────────────
+
+#: the Go source as the smoke corpus names it (question-set-smoke.jsonl,
+#: byte-identical — the case SMOKE-V14 §4.3 turned fatal: the old extractor
+#: cut it at the first «)», the coverage gate then demanded an unfetchable
+#: truncated URL and the Go question lost its claim)
+GO_QUESTION = (
+    "Какой номер носит последняя стабильная версия Go на текущую дату? "
+    "Установи это утверждение строго по этим двум источникам: "
+    "https://go.dev/dl/ и https://ru.wikipedia.org/wiki/Go_(язык_программирования)"
+)
+GO_WIKI = "https://ru.wikipedia.org/wiki/Go_(язык_программирования)"
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        # the corpus case: a Wikipedia-style title with parentheses at the
+        # end of the question is extracted WHOLE (T7.57)
+        pytest.param(GO_QUESTION, ("https://go.dev/dl/", GO_WIKI), id="go-corpus-question"),
+        # the same URL wrapped in the sentence's own parentheses: exactly one
+        # balanced copy — the enclosing «)» never rides into the URL
+        pytest.param(f"Источники: ({GO_WIKI}) и другие.", (GO_WIKI,), id="enclosed-wiki-url"),
+        # enclosing parentheses without inner ones («(см. url)»)
+        pytest.param("см. (https://a.example/x)", ("https://a.example/x",), id="enclosed-plain"),
+        # markdown link syntax: the closing paren belongs to the text
+        pytest.param("[текст](https://a.example/x)", ("https://a.example/x",), id="markdown-link"),
+        # trailing punctuation AFTER a balanced closer is stripped as before
+        pytest.param(f"источник — {GO_WIKI}.", (GO_WIKI,), id="dot-after-closer"),
+        pytest.param(f"{GO_WIKI}, дата из него", (GO_WIKI,), id="comma-after-closer"),
+        # several URLs in one text (the question-set-v3/v4 Rust/R pair)
+        pytest.param(
+            "Сравните https://ru.wikipedia.org/wiki/Rust_(язык_программирования) и "
+            "https://ru.wikipedia.org/wiki/R_(язык_программирования).",
+            (
+                "https://ru.wikipedia.org/wiki/Rust_(язык_программирования)",
+                "https://ru.wikipedia.org/wiki/R_(язык_программирования)",
+            ),
+            id="two-wiki-urls",
+        ),
+        # query + fragment with a balanced title stay intact
+        pytest.param(
+            f"ссылка {GO_WIKI}?action=raw#section.",
+            (f"{GO_WIKI}?action=raw#section",),
+            id="query-and-fragment",
+        ),
+        # nesting beyond one level — the balance counter is general, not a
+        # single-pair special case
+        pytest.param(
+            "см. https://x.example/a(b(c)d)e далее", ("https://x.example/a(b(c)d)e",), id="nested-parens"
+        ),
+        # regression (must stay byte-identical to the old extraction): the
+        # v2 corpus shape — two URLs wrapped in one «(…)», the closer and the
+        # comma after it never ride into either URL
+        pytest.param(
+            "Сколько, согласно этим двум страницам (https://un.org/en/about-us и "
+            "https://ru.wikipedia.org/wiki/Список_государств_—_членов_ООН), государств-членов "
+            "в ООН на текущую дату?",
+            ("https://un.org/en/about-us", "https://ru.wikipedia.org/wiki/Список_государств_—_членов_ООН"),
+            id="v2-enclosed-pair",
+        ),
+        # no URL at all
+        pytest.param("вопрос без ссылок", (), id="no-url"),
+    ],
+)
+def test_extract_question_urls_balanced_parentheses(text: str, expected: tuple[str, ...]) -> None:
+    assert extract_question_urls(text) == expected
 
 
 # ── claim scope derivation ─────────────────────────────────────────────

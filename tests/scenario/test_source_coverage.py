@@ -25,8 +25,10 @@ proxy, the rules engine — is the real code.
 from __future__ import annotations
 
 import copy
+import hashlib
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
+from urllib.parse import quote
 
 import pytest
 from sqlalchemy import text
@@ -516,4 +518,116 @@ async def test_errored_named_source_covers_and_claim_stays_e1(
     assert coverage is not None
     assert coverage["fetched"] == [URL_A]
     assert coverage["errored"] == [URL_B]
+    assert coverage["uncovered"] == []
+
+
+# ── 6. T7.57: a parenthesis-URL (Wikipedia-style) is fetchable ──────────
+
+#: the corpus Go pair's shape on example hosts: a Wiki title with balanced
+#: parentheses in the path. Before T7.57 the extractor cut it at the first
+#: «)», so no canonical download could ever cover it — SMOKE-V14 §4.3.
+URL_PAREN_DL = "http://alpha.example/wiki/Go_(dl)"
+URL_PAREN_WIKI = "http://beta.example/wiki/Go_(язык_программирования)"
+#: the same wiki page as a browser/proxy actually requests it: Cyrillic
+#: percent-encoded, parentheses literal
+URL_PAREN_WIKI_ENCODED = (
+    "http://beta.example/wiki/Go_(" + quote("язык_программирования") + ")"
+)
+
+QUESTION_PAREN_URLS = (
+    "Какой номер носит последняя стабильная версия Go на текущую дату? "
+    "Установи это утверждение строго по этим двум источникам: "
+    + URL_PAREN_DL
+    + " и "
+    + URL_PAREN_WIKI
+)
+
+PAGE_GO_DL = "Свежие релизы Go: последняя стабильная версия Go 1.99"
+PAGE_GO_WIKI = "Текущая стабильная версия языка Go — 1.99 (тестовая страница)"
+
+
+class ParenSourceFetchClient(FakeFetchClient):
+    """Serves the parenthesis-URL pages (the generic FakeFetchClient only
+    knows its own PAGES)."""
+
+    _PAGES: ClassVar[dict[str, str]] = {
+        URL_PAREN_DL: PAGE_GO_DL,
+        URL_PAREN_WIKI_ENCODED: PAGE_GO_WIKI,
+    }
+
+    async def fetch(self, url: str) -> FetchResult:
+        body = self._PAGES.get(url)
+        if body is None:
+            return await super().fetch(url)
+        data = f"<html><body><p>{body}</p></body></html>".encode()
+        return FetchResult(
+            url=url,
+            final_url=url,
+            content_type="text/html",
+            data=data,
+            sha256=hashlib.sha256(data).hexdigest(),
+            redirects=0,
+            elapsed_ms=1,
+        )
+
+
+@pytest.mark.asyncio
+async def test_parenthesized_named_source_covered_by_canonical_fetch(
+    migrated_db: tuple[str, Any],
+    fake_llm: FakeLLM,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The question names a Wikipedia-style URL with balanced parentheses;
+    the model downloads both canonical sources (the wiki one percent-encoded).
+    The host gate closes on the FIRST complete — no rejection, no need to
+    fetch a broken truncated literal (the accidental escape route of
+    SMOKE-V13/V14B). The claim reaches E3 from two independent groups."""
+    import apps.research_proxy.service as svc
+
+    monkeypatch.setattr(svc, "FetchClient", ParenSourceFetchClient)
+
+    scratch_url, engine = migrated_db
+    script = [
+        _fetch_response(URL_PAREN_DL),
+        _fetch_response(URL_PAREN_WIKI_ENCODED),
+        _complete_response(),  # → passes on the FIRST try (coverage 2/2)
+        _curator_response(
+            "Последняя стабильная версия Go — 1.99",
+            [
+                {"evidence_index": 0, "claim_index": 0, "relation": "supports"},
+                {"evidence_index": 1, "claim_index": 0, "relation": "supports"},
+            ],
+        ),
+    ]
+    outcome = await _run_session(
+        scratch_url, engine, fake_llm, tmp_path, script, question_text=QUESTION_PAREN_URLS
+    )
+
+    assert outcome.final_state.value == "succeeded"
+    assert outcome.evidence_count == 2, "both canonical downloads produce evidence"
+    assert await _complete_rejections(scratch_url) == [], (
+        "the named parenthesis-URL must be coverable by its canonical fetch"
+    )
+
+    row = await _scalar(
+        scratch_url,
+        "SELECT a.effective_grade, a.epistemic_status, "
+        "       count(DISTINCT e.source_id) AS srcs "
+        "FROM claim_assessments a "
+        "JOIN claims c ON c.id = a.claim_id "
+        "LEFT JOIN evidence e ON e.claim_id = c.id "
+        "WHERE c.statement LIKE 'Последняя стабильная версия Go%' "
+        "GROUP BY a.effective_grade, a.epistemic_status",
+    )
+    assert row is not None, "no assessment for the Go claim"
+    assert row[0] == "E3", f"expected E3 from two groups, got {row[0]}"
+    assert row[1] == "supported"
+    assert row[2] == 2
+
+    # the report audit carries the FULL parenthesized spellings (the question's)
+    coverage = await _report_coverage(scratch_url)
+    assert coverage is not None
+    assert coverage["named"] == [URL_PAREN_DL, URL_PAREN_WIKI]
+    assert sorted(coverage["fetched"]) == sorted([URL_PAREN_DL, URL_PAREN_WIKI])
     assert coverage["uncovered"] == []
