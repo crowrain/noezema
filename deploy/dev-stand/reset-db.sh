@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # NOEZEMA dev stand database reset (T7.59(b)): recreate the DEV database from scratch, migrate it,
-# re-activate config-v12. Nothing else is touched: the Postgres container and its volume stay,
+# re-activate config-v13. Nothing else is touched: the Postgres container and its volume stay,
 # no production path and no eval/smoke database is ever a target (checked below, not by convention).
 #
 #   ./reset-db.sh            interactive: prints what will be lost and asks for the DB name
@@ -14,7 +14,7 @@ DB_CONTAINER="${NOEZEMA_DEV_DB_CONTAINER:-noezema-dev-db}"
 DB_NAME="${NOEZEMA_DEV_DB_NAME:-noezema-dev}"
 DB_USER=noezema
 DB_PORT="${NOEZEMA_DEV_DB_PORT:-5432}"
-CONFIG_PAYLOAD="${NOEZEMA_DEV_CONFIG_PAYLOAD:-$REPO_ROOT/docs/eval/config-v12-payload.json}"
+CONFIG_PAYLOAD="${NOEZEMA_DEV_CONFIG_PAYLOAD:-$REPO_ROOT/docs/eval/config-v13-payload.json}"
 ASSUME_YES=false
 
 while [[ $# -gt 0 ]]; do
@@ -69,7 +69,7 @@ psql_as postgres "CREATE DATABASE \"$DB_NAME\" OWNER \"$DB_USER\""
 url="postgresql+asyncpg://$DB_USER:$db_password@127.0.0.1:$DB_PORT/$DB_NAME"
 (cd "$REPO_ROOT" && env NOEZEMA_DATABASE_URL="$url" "$REPO_ROOT/.venv/bin/python" -m alembic upgrade head)
 
-echo "активация конфигурации (config-v12)…"
+echo "активация конфигурации (config-v13)…"
 (cd "$REPO_ROOT" && env NOEZEMA_DATABASE_URL="$url" "$REPO_ROOT/.venv/bin/python" -m hostctl.cli activate-online \
   --payload "$CONFIG_PAYLOAD" --reason "T7.59 dev-stand: reset-db re-activation" --drain-wait-seconds 120)
 

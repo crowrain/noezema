@@ -142,7 +142,8 @@ Dev-стенд (T7.59(б), `deploy/dev-stand/`, целевая ВМ 192.168.1.92
 пакеты, venv+prod-зависимости **только через uv**, образ с одной закреплённой меткой
 `noezema-sandbox:dev-stand` → `NOEZEMA_SANDBOX_IMAGE` (дефолт `:dev` и тестовый `:test` не трогаем),
 Postgres 15 в docker **только на 127.0.0.1** с томом и healthcheck, базу `noezema-dev`, миграции, активацию
-config-v12 (пропуск, если head уже не bootstrap), env-файл `/etc/noezema/dev.env` (0600, секреты не
+config-v13 (T7.59(в): = config-v12, но `model.context_window`/`backend_context_limit` = 131072 под окно EXL3;
+пропуск, если head уже не bootstrap), env-файл `/etc/noezema/dev.env` (0600, секреты не
 печатаются и в `--dry-run` маскируются) и dev-юниты `deploy/dev-stand/systemd/*` — **не копии**
 `infra/systemd/*`: `User=` = пользователь стенда, данные `/var/lib/noezema-dev`, группа
 `noezema-dev.target` (в загрузку не ставится), tick 60 с (`TimeoutStartSec=3600`), maint 60 с
@@ -245,7 +246,8 @@ config-v12 (пропуск, если head уже не bootstrap), env-файл `
   интерактивной сессии нужен перелогин. Без группы preflight sandbox отказывает до старта сессии (exit 78).
 - Пустая очередь вопросов на стенде — не ошибка: admitted wake доходит до выбора, кандидата нет, сессия
   `FAILED termination_reason="no_question"` (`apps/orchestrator/orchestrator.py`), дальше backoff
-  (config-v12: 60/120/240, cap 86400) и пауза узла после `max_consecutive_failures=3`; дальнейшие тики дают `skip`.
+  (wake_schedule в config-v12 = config-v13: 60/120/240, cap 86400) и пауза узла после
+  `max_consecutive_failures=3`; дальнейшие тики дают `skip`.
   Снимать паузу нужно явно (`hostctl resume-runtime` или команда `resume`). Проверено тестом
   `tests/scenario/test_dev_stand_flow.py`.
 - CI (GitHub Actions) ставит `.[dev]` БЕЗ закрепления версий и в job `test` требует отдельной
@@ -266,3 +268,9 @@ config-v12 (пропуск, если head уже не bootstrap), env-файл `
 - Найденный инвариант — закреплять тестом; найденную ловушку окружения — дописывать в §7.
 - Отвечать пользователю по-русски; выполнять план без лишних вопросов, но пункты из §4
   «требует решения пользователя» — только после явного подтверждения.
+- Новый номер конфигурации = НОВЫЙ файл в `docs/eval/` (config-v13), прежние payload'ы не переписываются
+  никогда. Два разных хеша, их путают: хеш ФАЙЛА (байты JSON) и canonical-хеш payload'а
+  (`canonical_sha256(json.loads(...))`) — в БД в `config_snapshots.payload_sha256` попадает **canonical**
+  (`packages/memory/activation.py:374`), поэтому проверить активный снапшот по хешу файла нельзя;
+  `input_budget = min(context_window, backend_context_limit) − max_output_tokens − safety_margin_tokens`
+  (связь `context_window == backend_context_limit` нигде не проверяется — менять надо оба).

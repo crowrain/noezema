@@ -22,7 +22,7 @@
 | `bootstrap.sh` | идемпотентная установка: пакеты → venv/зависимости → env-файл с секретами → каталоги + sandbox-образ → Postgres 15 в docker (127.0.0.1) → база + миграции + активация конфигурации → юниты |
 | `systemd/*` | 8 файлов стенда: target, web, tick+timer, maint+timer, unit-state+timer |
 | `status.sh` | состояние: юниты, docker, очередь вопросов, последняя сессия, доступность LLM, версия кода, режим исполнителя инструментов |
-| `reset-db.sh` | пересоздание dev-базы с явным подтверждением + миграции + повторная активация config-v12 |
+| `reset-db.sh` | пересоздание dev-базы с явным подтверждением + миграции + повторная активация config-v13 |
 | `README.md` | этот файл |
 
 ## Деплой (делает менеджер)
@@ -48,7 +48,7 @@ systemctl start noezema-dev.target            # web + три таймера
 | приложение | репозиторий как есть (`$APP_DIR`), venv в `$APP_DIR/.venv`, зависимости **только через uv** и только prod-extras (AGENTS §6) |
 | база | docker-контейнер `noezema-dev-db` (образ `postgres:15`), том `noezema-dev-pgdata`, публикация **только `127.0.0.1:5432`**, база `noezema-dev`, пользователь `noezema` |
 | миграции | `alembic upgrade head` из venv (URL из env-файла) |
-| конфигурация | активация `docs/eval/config-v12-payload.json` через `hostctl activate-online` (пропускается, если снапшот уже активен) |
+| конфигурация | активация `docs/eval/config-v13-payload.json` через `hostctl activate-online` (окно EXL3 131072; пропускается, если снапшот уже активен; переход v12→v13 — STATUS.md T7.59(в)) |
 | данные сессий | `/var/lib/noezema-dev` (+ `sandbox` — work_root контейнерного исполнителя) |
 | host-контур стенда | `/var/lib/noezema-dev/host`, снимок юнитов: `/var/lib/noezema-dev/host/unit-state.json` |
 | секреты/настройки | `/etc/noezema/dev.env`, режим **0600**, владелец — пользователь стенда; в отчёты и чат не попадают (AGENTS §5) |
@@ -91,7 +91,7 @@ systemctl start noezema-dev.target            # web + три таймера
    Postgres остаётся: `docker stop noezema-dev-db`).
 9. **Сброс:** `./deploy/dev-stand/reset-db.sh` — просит вписать имя базы (защита от «а вдруг это
    прод-база»), останавливает таймеры, пересоздаёт `noezema-dev`, накатывает миграции, заново
-   активирует config-v12, поднимает таймеры. С защитой по состоянию: если в базе есть незавершённая
+   активирует config-v13, поднимает таймеры. С защитой по состоянию: если в базе есть незавершённая
    сессия, reset откажется — сначала дождаться её терминации (или остановить tick-таймер).
 
 ## Юниты стенда (8 файлов)
@@ -111,7 +111,7 @@ target останавливает wakes, публикацию и web разом.
 
 ## VM без GPU и пустая очередь — это не ошибка
 
-- В `config-v12` стоит `wake_schedule.gpu_required = false`, поэтому на VM без GPU admission
+- В `config-v13` стоит `wake_schedule.gpu_required = false`, поэтому на VM без GPU admission
   проходит и сессии запускаются. Если бы значение было `true`, тик напечатал бы `skip (gpu)` и вышел
   с кодом 0: шлюз работает, а не ломается (§5.2.1).
 - Расписание — `interval_seconds=3600`, `min_session_interval_seconds=600`; таймер тикает каждые

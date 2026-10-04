@@ -47,8 +47,14 @@ LLM_SCHEMA_PROFILE="${NOEZEMA_DEV_LLM_SCHEMA_PROFILE:-none}"
 LLM_MAX_OUTPUT_TOKENS="${NOEZEMA_DEV_LLM_MAX_OUTPUT_TOKENS:-8192}"
 LLM_TIMEOUT_SECONDS="${NOEZEMA_DEV_LLM_TIMEOUT_SECONDS:-600}"
 
-CONFIG_PAYLOAD="${NOEZEMA_DEV_CONFIG_PAYLOAD:-$REPO_ROOT/docs/eval/config-v12-payload.json}"
-CONFIG_REASON="${NOEZEMA_DEV_CONFIG_REASON:-T7.59 dev-stand: activate config-v12}"
+# Activated config (T7.59(в)): config-v13 = config-v12 with model.context_window /
+# model.backend_context_limit lowered to 131072 — the physical window of the EXL3 engine the stand
+# talks to (qwen38-exl3-3bpw-128k). v12 advertised 262144 (input_budget 251904 > the engine window,
+# observed in SMOKE-V14B); v13 keeps every other byte of v12 (prompts and pins, budgets Σ=26624,
+# schedule, thresholds) so stand sessions stay comparable with the smoke series. Override with
+# NOEZEMA_DEV_CONFIG_PAYLOAD; config-v12 stays in the repo for that series and is never rewritten.
+CONFIG_PAYLOAD="${NOEZEMA_DEV_CONFIG_PAYLOAD:-$REPO_ROOT/docs/eval/config-v13-payload.json}"
+CONFIG_REASON="${NOEZEMA_DEV_CONFIG_REASON:-T7.59(в) dev-stand: activate config-v13 (EXL3 context window 131072)}"
 NODE_OWNER="${NOEZEMA_DEV_NODE_OWNER:-dev-stand}"
 
 DRY_RUN=false
@@ -319,7 +325,9 @@ step_database() {
   mode="unknown"
   if ! $DRY_RUN; then mode="$(active_config_mode)"; mode="${mode:-none}"; fi
   if [[ "$mode" == "bootstrap" || "$mode" == "none" || "$mode" == "unknown" ]]; then
-    note "effective config is still the bootstrap snapshot -> activating $CONFIG_PAYLOAD (config-v12)"
+    note "effective config is still the bootstrap snapshot -> activating $CONFIG_PAYLOAD"
+    note "  (online change, §8.7.2: drain window up to 120 s; to change the config later use"
+    note "   .venv/bin/python -m hostctl.cli activate-online --payload <file> --reason '…')"
     run_secret env NOEZEMA_DATABASE_URL="$url" "$VENV/bin/python" -m hostctl.cli activate-online \
       --payload "$CONFIG_PAYLOAD" --reason "$CONFIG_REASON" --drain-wait-seconds 120
   else

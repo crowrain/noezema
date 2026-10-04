@@ -162,3 +162,92 @@ def test_config_v12_pins_explorer_v5_and_differs_from_v11_only_there() -> None:
     assert resolved[Role.CURATOR].version == "curator-v7"
     budgets = TokenBudgets.from_snapshot(v12["model"], v12["token_budgets"])
     assert budgets.validate() == []
+
+
+@pytest.mark.unit
+def test_config_v12_bytes_and_hashes_are_untouched() -> None:
+    """T7.59(в): config-v13 was ADDED; config-v12 is not rewritten and keeps the hashes it has in
+    the smoke-series records (SMOKE-V14/V14B ran on this payload). The file is byte-stable under the
+    serialization all frozen payloads use (indent=2, sorted keys, trailing newline)."""
+    import hashlib
+
+    from packages.domain.config import canonical_sha256
+
+    raw = (REPO_ROOT / "docs" / "eval" / "config-v12-payload.json").read_text(encoding="utf-8")
+    payload = json.loads(raw)
+    assert json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True) + "\n" == raw
+    assert hashlib.sha256(raw.encode()).hexdigest() == (
+        "493970d8ac845e3a2ca559180314592b7becdfbac404d1d530bfa85b6364057e"
+    )
+    assert canonical_sha256(payload) == "c23005bdec51bd9182c9000cd2d59a1a33bdbd311229cc52df58d608f3447db0"
+
+
+@pytest.mark.unit
+def test_config_v13_differs_from_v12_only_in_the_context_window_pair() -> None:
+    """T7.59(в): the dev stand runs EXL3 (qwen38-exl3-3bpw-128k) with a 131072-token window, while
+    config-v12 advertises 262144 — the node therefore plans context it cannot get from this engine.
+    config-v13 = config-v12 with the single change ``model.context_window`` and its mirror
+    ``model.backend_context_limit`` → 131072. Everything else (prompts and their pins, sampling,
+    structured output, token_budgets Σ=26624, wake_schedule, policy, thresholds, session/activation
+    limits) is byte-identical to v12: the switch changes only how much context fits the engine, so
+    sessions stay comparable with the v12 smoke series.
+
+    Budget recompute on the same rule as v12 (ContextBuilder / TokenBudgets):
+    input_budget = min(context_window, backend_context_limit) − max_output_tokens − safety_margin
+    = 131072 − 8192 − 2048 = 120832 ≥ Σ section limits 26624 — the payload is STARTABLE, which is
+    exactly the fail-closed check `_validate_payload_budgets` applies before publishing (§5.4.1)."""
+    v12 = _load("config-v12-payload.json")
+    v13 = _load("config-v13-payload.json")
+
+    assert {k for k in v13 if v13[k] != v12[k]} == {"model"}
+    model13, model12 = v13["model"], v12["model"]
+    assert {k for k in model13 if model13[k] != model12[k]} == {"context_window", "backend_context_limit"}
+    assert model13["context_window"] == 131072 and model13["backend_context_limit"] == 131072
+    # unchanged parts of the same section: output budget, sampling, structured output, safety margin
+    for key in (
+        "max_output_tokens",
+        "safety_margin_tokens",
+        "model_alias",
+        "provider",
+        "sampling",
+        "structured_output",
+    ):
+        assert model13[key] == model12[key], key
+
+    # prompts and their pins are untouched (no new prompt version was introduced)
+    assert v13["prompts"] == v12["prompts"]
+    resolved = resolve_prompts(v13["prompts"], REPO_ROOT)
+    assert resolved[Role.EXPLORER].version == "explorer-v5"
+    assert resolved[Role.CURATOR].version == "curator-v7"
+
+    budgets13 = TokenBudgets.from_snapshot(model13, v13["token_budgets"])
+    budgets12 = TokenBudgets.from_snapshot(model12, v12["token_budgets"])
+    assert budgets13.section_limits == budgets12.section_limits == EVAL2_SECTIONS
+    assert sum(budgets13.section_limits.values()) == 26624
+    assert budgets13.input_budget == 131072 - model13["max_output_tokens"] - model13["safety_margin_tokens"] == 120832
+    assert budgets13.validate() == []
+    assert sum(budgets13.section_limits.values()) <= budgets13.input_budget
+
+    # everything else in the payload is byte-identical to v12
+    for section in ("wake_schedule", "policy", "session_limits", "activation_limits", "claim_type_rules",
+                    "curiosity", "embeddings", "extraction", "planning", "reassessment_admission",
+                    "repair_admission", "repetition", "research_proxy", "schema_version", "verification",
+                    "token_budgets"):
+        assert v13[section] == v12[section], section
+
+
+@pytest.mark.unit
+def test_config_v13_file_is_byte_stable_and_pinned() -> None:
+    """The new payload keeps the frozen-payload file form (indent=2, sorted keys, trailing newline)
+    and its identity is pinned so a later edit cannot pass as the same config."""
+    import hashlib
+
+    from packages.domain.config import canonical_sha256
+
+    raw = (REPO_ROOT / "docs" / "eval" / "config-v13-payload.json").read_text(encoding="utf-8")
+    payload = json.loads(raw)
+    assert json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True) + "\n" == raw
+    assert hashlib.sha256(raw.encode()).hexdigest() == (
+        "fe931c15a34fe71e670c29a2aacc6e63ba3defd54b5db88923201f6342e1a0ed"
+    )
+    assert canonical_sha256(payload) == "0260fcd2f79035e634d49fe8304e44a3784b63dc0a81566687cbe52aa7f94ce0"

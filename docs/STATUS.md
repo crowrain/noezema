@@ -2295,3 +2295,102 @@ FakeLLM и stub-исполнителем; требует «не orchestrator not
 изменён, `_run` реально вызывает хелпер (env задан/не задан), артефакты в том же data root.
 Существующие тесты (`test_web_api.py`, `test_dev_stand_flow.py`, `test_wake_scheduler.py`,
 `test_web_bind.py`) не ослаблены и не изменены.
+
+### Коммит 2 — config-v13: окно EXL3 131072 вместо выдуманного 262144; стенд активирует v13
+
+**Зачем.** Стенд говорит с `qwen38-exl3-3bpw-128k` (EXL3, физическое окно 131072), а `config-v12`
+объявляет `model.context_window = model.backend_context_limit = 262144`. Планировщик контекста берёт
+бюджет из снапшота (`packages/cognition/tokenizer.py`: `input_budget = min(context_window,
+backend_context_limit) − max_output_tokens − safety_margin_tokens`), то есть узел планирует упаковку
+до 251904 оценочных токенов — вдвое больше окна движка. Это уже наблюдалось: SMOKE-V14B (замер в
+STATUS выше) зафиксировал `packing-бюджет 251904 > физического окна EXL3 (131072)`; в том прогоне
+риска не было (max input 30617), но на стенде с реальными длинными сессиями это источник отказов
+`finish_reason=length`/перерасхода. Новый снапшот — `docs/eval/config-v13-payload.json`.
+
+**Что изменено.** Ровно два поля: `model.context_window` и его зеркало `model.backend_context_limit`
+→ 131072. `max_output_tokens` остаётся 8192 (это верхняя граница вывода шлюза, к окну отношения не
+имеет), `safety_margin_tokens` — 2048. Всё остальное побайтово равно v12: промпты и их пины
+(explorer-v5/curator-v7), sampling, structured_output, `token_budgets` (Σ = 26624, те же восемь
+секций), wake_schedule, policy, session/activation limits, claim_type_rules, verification, extraction,
+embeddings, curiosity, repetition, research_proxy, schema_version. Формат файла — тот же, что у всех
+замороженных payload'ов (`indent=2`, сортировка ключей, ensure_ascii=false, перевод строки в конце);
+v12 не переписан.
+
+**Хеши (посчитаны, не переписаны из отчёта) и бюджеты.**
+- v12: file `493970d8ac845e3a2ca559180314592b7becdfbac404d1d530bfa85b6364057e`,
+  canonical `c23005bdec51bd9182c9000cd2d59a1a33bdbd311229cc52df58d608f3447db0` (не изменились);
+- v13: file `fe931c15a34fe71e670c29a2aacc6e63ba3defd54b5db88923201f6342e1a0ed`,
+  canonical `0260fcd2f79035e634d49fe8304e44a3784b63dc0a81566687cbe52aa7f94ce0`;
+- `input_budget(v13) = min(131072, 131072) − 8192 − 2048 = 120832` против `Σ token_budgets = 26624`
+  (запас ×4,5); `TokenBudgets.from_snapshot(v13.model, v13.token_budgets).validate() == []`; та же
+  проверка, что делает активация fail-closed (`_validate_payload_budgets`, §5.4.1); промпты
+  резолвятся (`resolve_prompts(v13["prompts"], REPO_ROOT)` → explorer-v5/curator-v7).
+  Правило «`context_window` обязан равняться `backend_context_limit`» в коде отсутствует: отдельной
+  связи нет, считается минимум двух значений (поэтому зеркало изменено тоже — иначе смысл окна
+  сохранился бы в большем из двух).
+
+**Тесты.** `tests/unit/test_freeze_payloads.py`: `test_config_v13_differs_from_v12_only_in_the_context_window_pair`
+(отличие ровно в этих двух полях, всё остальное секция-за-секцией равно v12, бюджеты пересчитаны и
+валидны), `test_config_v13_file_is_byte_stable_and_pinned` (форма файла + закреплённые file/canonical
+хеши), `test_config_v12_bytes_and_hashes_are_untouched` (v12 не переписан: байты стабильны при той же
+сериализации, хеши совпадают с записанными в отчётах смоук-серии).
+
+**`BOOTSTRAP_PAYLOAD` не тронут — и не должен быть.** Это не «ещё один config-файл», а код, из
+которого migration 0001 (`migrations/versions/0001_bootstrap.py:39-40`) собирает bootstrap-снапшот и
+сверяет его канонический хеш с закреплённым `BOOTSTRAP_PAYLOAD_SHA256`; миграции 0005/0009/0014/0016/0017
+додписывают к нему секции. Любая правка `model` там изменила бы идентичность bootstrap-снапшота во
+всех freshly migrated базах (включая тестовые шаблоны и eval/smoke-базы) и ломает инвариант §3
+«effective config»/пин хеша. К тому же задача про окно стенда — это задача активного снапшота, а не
+начального: bootstrap-снапшот держит `context_window 32768 / max_output_tokens 4096`, его input_budget
+(26624) ровно равен Σ секций, и он предназначен для «узла без активаций», а не для боёв с EXL3.
+
+**Онлайн или оффлайн (что именно активирует v13 на живом стенде).** Смена `model` — часть payload'а
+(`config_snapshots.model`), поэтому она идёт тем же путём, что и смена правил: **онлайн-активация
+§8.7.2** — `.venv/bin/python -m hostctl.cli activate-online --payload docs/eval/config-v13-payload.json
+--reason "…" --drain-wait-seconds N`. Оффлайн-контур (§8.7.1, `hostctl offline-rules`) требуется только
+там, где runtime останавливают: он предполагает « competing knowledge writers нет» и работает через
+maintenance unit с host-transition journal. На стенде reassessment/maint-таймеры работают (60 с), то
+есть конкуренция за heads есть — ровно та причина, по которой §8.7.2 существует; потому bootstrap.sh и
+использует activate-online. drain (§8.7.2, T7.26/ADR-0013) публикует намерение и ждёт окно между
+сессиями (ноль активных сессий/admission records/unresolved attempts), затем freeze cohort → prepare
+heads → seal → publish (pointer + questions в одной транзакции) → post_publish; слот активации
+кворует wake на всё время, при таймауте drain намерение снимается, candidate остаётся `draft`, повтор
+команды продолжает с того же состояния. Ожидаемый вывод успешной команды:
+`activate-online: state=active published=True resumed=False pending=… questions=…` (exit 0); exit 1 —
+drain-таймаут или pre-publish отказ.
+
+**Процедура перехода v12 → v13 на стенде (именно так, по шагам).**
+1. `cd ~/noezema && git pull` (файл `docs/eval/config-v13-payload.json` должен быть в рабочем дереве).
+2. Что активно сейчас — читаем head (имя снапшота в БД = canonical-хеш payload'а, колонка
+   `payload_sha256`; хеш файла в репо от него отличается, см. выше):
+   ```bash
+   docker exec noezema-dev-db psql -U noezema -d noezema-dev -Atc \
+     "SELECT s.activation_mode, s.payload_sha256, s.model->>'context_window'
+        FROM runtime_config_heads h JOIN config_snapshots s ON s.id = h.active_config_snapshot_id
+       WHERE h.scope = 'global'"
+   ```
+   (для v12 третья колонка — `262144`). `status.sh` показывает это же одной строкой (пункт 14, коммит 3).
+3. Смена на живом узле (web и tick не останавливаются):
+   ```bash
+   set -a; . /etc/noezema/dev.env; set +a          # креды в env, не в командной строке и не в отчёт
+   .venv/bin/python -m hostctl.cli activate-online \
+     --payload docs/eval/config-v13-payload.json \
+     --reason "T7.59(в): EXL3 context window 131072" \
+     --drain-wait-seconds 120
+   ```
+   Если в этот момент идёт сессия, команда ждёт окно (до 120 с) и может выйти с `activation failed: …`
+   и кодом 1 — это не повреждённое состояние: повторить команду (она resume-идемпотентна) или увеличить
+   `--drain-wait-seconds`. Альтернатива с остановкой runtime: `sudo systemctl stop noezema-dev.target`,
+   затем `sudo env NOEZEMA_DATABASE_URL=… .venv/bin/python -m hostctl.cli offline-rules --payload
+   docs/eval/config-v13-payload.json --reason "…" --host-lib /var/lib/noezema-dev/host`, затем старт.
+4. Проверка: тот же SELECT из шага 2 должен дать `online | 0260fcd2… | 131072` — в колонке
+   `payload_sha256` лежит canonical-хеш payload'а (`canonical_sha256(requested_payload)`,
+   `packages/memory/activation.py:374`), а не хеш файла (`fe931c15…`); `GET /api/v1/status`
+   (`config.snapshot_id`) и карточка «Узел» показывают новый снапшот; начатая до активации сессия
+   дорабатывает на своём снапшоте (effective config фиксируется на старте сессии), новая возьмёт v13.
+5. `reset-db.sh` пересоздаёт базу и активирует v13 по умолчанию (как и bootstrap).
+
+**Стенд по умолчанию теперь на v13:** `CONFIG_PAYLOAD` в `bootstrap.sh` и `reset-db.sh` указывает на
+`docs/eval/config-v13-payload.json` (`NOEZEMA_DEV_CONFIG_PAYLOAD` переопределяет), README обновлён.
+`config-v12` остаётся в репо и не переписывается: на нём идут смоук-серии SMOKE-V14/V14B, и его хеш
+упомянут в их отчётах.

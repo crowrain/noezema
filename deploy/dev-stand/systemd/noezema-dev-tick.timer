@@ -1,6 +1,6 @@
 # NOEZEMA dev stand wake timer (T7.59(b)).
 #
-# Fires every 60 s — far finer than the snapshot schedule (config-v12: interval_seconds=3600,
+# Fires every 60 s — far finer than the snapshot schedule (config-v13: interval_seconds=3600,
 # min_session_interval_seconds=600), so most ticks print "wait" and exit 0. The effective wake time
 # is decided by wake_schedule in the config snapshot, not by this period (§5.2.1).
 #
