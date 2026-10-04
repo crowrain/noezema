@@ -1501,3 +1501,66 @@ Partial всего 20 (класс B — 3; класс D — 15; 2 `budget_exhaus
 - mypy/pytest в CI остаются незакреплёнными (`>=`): если очередной релиз mypy сломает зелёный прежде `types`-job — закрепить аналогично ruff; `cache: pip` в setup-python при установке через uv фактически не используется (кандидат на будущую оптимизацию).
 
 **Не тронуто:** код продукта (`packages/`, `apps/`, `hostctl/`), схемы БД (миграций нет), payload'ы/промпты/пины и их хэши, корпуса, `ARCHITECTURE.md`, пороги, данные прогонов; тесты — только `tests/unit/test_lease.py` (стиль `with`) и число тестов не изменилось (+0); к БД noezema-eval*/noezema-smoke* обращений не было вообще (задача — SELECT only, SELECT не выполнялись); eval-run/смоук/NOEZEMA-сессии не запускались; к LLM на 192.168.1.42/.48 обращений не было; llama-swap не тронут; пуша не было, история не переписывалась; фоновых процессов нет (одноразовые вспомогательные venv вне репозитория — `.ruff-ci`/`.ci-sim*` — в git не входят).
+
+### T7.55 (часть 1, коммит с фикстурой) — migrated_db: клон scratch-БД из шаблона вместо `alembic upgrade head` на каждый тест
+
+**Основание.** Замер менеджера (2026-10-04): `alembic upgrade head` в фикстуре `migrated_db`
+(отдельный Python-процесс на каждый тест; фикстура запрашивается 369 тестами по collect-only) =
+0,8–1,2 с; `CREATE DATABASE ... TEMPLATE` готового шаблона = 0,08–0,19 с. Побочно: 6 xdist-воркеров
+мигрировали по одному Postgres одновременно — конкуренция, воспроизводившая flake T7.51.
+
+**Замеры ДО** (чистое дерево `1e4d691`, idle-старт, §6 ×3 подряд, pytest c `--durations=0`):
+pytest-часть 263,73 / 227,17 / 281,82 с (медиана 263,73); сумма setup фикстуры migrated_db по
+отчёту durations: 988,5 / 793,9 / 947,9 с (медиана 947,9; средний setup на тест под xdist
+2,15–2,68 с — выше одиночного замера менеджера из-за конкуренции воркеров). Остатки scratch-БД после
+каждого прогона: baseline без изменений.
+
+**Эмпирическая проверка семантики перед реализацией** (одноразовый бенч вне репо, порты/БД только
+свои `noezema_bench_*`, удалены): CREATE шаблона → alembic head 0,71–0,72 с → подключений к шаблону
+0 → `ALTER DATABASE ... WITH ALLOW_CONNECTIONS false` (запечатанный шаблон отказывает подключениями
+даже суперпользователю — проверено); клон `CREATE DATABASE ... TEMPLATE` даёт полную схему (46
+таблиц, alembic_version=0025_prompt_content_pin), флаг коннектабельности клонами НЕ
+наследуется; клон 0,084–0,102 с против старого пути 0,75–0,79 с (idle) ≈ ×9; 4 параллельных клона
+одного шаблона сериализуются ACCESS EXCLUSIVE (~0,15 с каждый) — гонок нет.
+
+**Реализация (tests/conftest.py):** session-scope фикстура `migrated_db_template` — по одному
+шаблону `noezema_tpl_<pid>_<hex>` на воркер (и на одиночный запуск): CREATE → `alembic upgrade head`
+подпроцессом (как старый путь) → ожидание нуля подключений (engine.dispose + pg_stat_activity, до
+20 с) → запечатывание ALLOW_CONNECTIONS false → yield имени; DROP шаблона в finalizer'е сессии
+(try/finally; при неудаче — явный UserWarning с именем БД). Session-фикстура читает
+`NOEZEMA_TEST_DATABASE_URL` напрямую (function-scope `test_db_url` session-фикстуре недоступен —
+ScopeMismatch), без env — skip как раньше. `migrated_db`: контракт не изменён — те же yields
+(scratch_url, engine), имена `noezema_mig_<hex>`, teardown dispose+DROP; создание заменено на клон
+из шаблона (lock_timeout 20 с + до 3 попыток против transient ACCESS EXCLUSIVE). Отката на старый
+путь нет: сломанный/отсутствующий шаблон роняет все зависимые тесты явной ошибкой фикстуры
+(fail-closed). Тестов, которые мигрируют сами или полагаются на «пустую БД до миграции», в tests/
+не обнаружено (grep по CREATE DATABASE/alembic: единственный создатель БД — conftest.py).
+
+**Новый тест:** `tests/unit/test_fixture_template_clone.py` (+2 теста, unit-маркер): (1) клон
+идентичен свежей миграции — совпадение alembic version_num, списков таблиц, колонок (тип/nullable),
+pg_indexes (indexdef), pg_constraint с клоном шаблона и с БД, мигрированной напрямую `alembic
+upgrade head` (тест воспроизводит старый путь фикстуры, свои scratch удаляет в teardown); (2) два
+клона одного шаблона изолированы — таблица+строка, созданные в clone A, отсутствуют в clone B.
+
+**Замеры ПОСЛЕ** (то же дерево кода, §6 ×3 подряд): pytest-часть 105,33 / 154,59 / 103,00 с
+(медиана 105,33 — против 263,73 ⇒ −60,0%, ×2,5); сумма setup migrated_db: 146,9 / 260,2 / 102,0 с
+(медиана 146,9 против 947,9 ⇒ −84,5%; средний setup 0,28–0,70 с). Итог прогонов: **1050 passed, 12
+skipped** (1048 + 2 новых теста; ни один тест не ослаблен/не удалён). Остатки БД в noezema-test-db
+до и после обоих блоков identical: 53 × `noezema_mig_*`, 19 dbg-family (18 × `noezema_dbg_*` + 1
+`noezema_dbg8*`), 2 × `noezema_clismoke_*`, новых нет, `noezema_tpl_*` = 0 после прогонов.
+Легаси-мусор не удалял (фактические числа: mig=53, менеджер называл 54; dbg-family=19 ✓). Команда
+очистки по решению менеджера: `docker exec noezema-test-db psql -U noezema -d noezema -c "DROP DATABASE <имя>"` для каждого имени из `SELECT datname FROM pg_database WHERE datname LIKE 'noezema_mig_%' OR datname LIKE 'noezema_dbg%' OR datname LIKE 'noezema_clismoke_%';` (`noezema-smoke-*/noezema-eval*` — не трогать никогда).
+
+**Эксперимент fsync (только замер, проект не изменён):** одноразовый контейнер
+`noezema-fsync-bench` (postgres:15-alpine, порт 54330, данные на tmpfs, `-c fsync=off -c
+synchronous_commit=off -c full_page_writes=off`, SHOW подтвердил off/off/off) — одна полная
+pytest-проверка (`-n auto`) против него: **58,51 с, 1050 passed, 12 skipped** (setup migrated_db в
+сумме 49,0 с). Сравнение: на обычном noezema-test-db тот же код — медиана 105,33 с ⇒ цена
+fsync/журналирования на этой ВМ ≈ 45–50% pytest-времени даже после перехода на клоны. Контейнер
+удалён (`docker rm -f`); noezema-test-db (54329) не перенастраивался и не трогался.
+
+**Не тронуто (коммит 1):** код продукта (`packages/`, `apps/`, `hostctl/`), миграции/схемы,
+payload'ы/промпты/пины, `ARCHITECTURE.md`, пороги, данные прогонов; из tests/ изменены только
+`conftest.py` и новый тест; eval-run/смоук/NOEZEMA-сессии не запускались; к
+noezema-eval*/noezema-smoke* обращений не было (SELECT тоже); к LLM .42/.48 обращений не было; пуша
+не было; фоновых процессов после работы не остаётся.

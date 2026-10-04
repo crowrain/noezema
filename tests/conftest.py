@@ -9,18 +9,23 @@ anywhere.
 
 from __future__ import annotations
 
+import asyncio
 import os
+import secrets
 import socket
 import subprocess
 import sys
 import time
+import warnings
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import urlparse
 
 import httpx
 import pytest
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from packages.sandbox.runtime import ContainerSandboxRuntime, SandboxProfile, sandbox_available
 
@@ -106,34 +111,71 @@ def test_db_url() -> str:
     return url
 
 
-@pytest.fixture()
-async def migrated_db(test_db_url: str) -> AsyncIterator[tuple[str, AsyncEngine]]:
-    """Scratch database with `alembic upgrade head` applied.
+async def _admin_exec(url: str, *statements: str) -> None:
+    """Run DDL against the admin DB on a short-lived AUTOCOMMIT engine.
 
-    Yields (scratch_url, engine). The engine is disposed and the database
-    dropped on teardown.
+    The engine is fully disposed before returning — nothing may keep a
+    connection open to the template while it is sealed or cloned.
     """
-    import secrets
-    import subprocess
-    from urllib.parse import urlparse
+    engine = create_async_engine(url, isolation_level="AUTOCOMMIT")
+    try:
+        async with engine.connect() as conn:
+            for stmt in statements:
+                await conn.execute(text(stmt))
+    finally:
+        await engine.dispose()
 
-    from sqlalchemy.ext.asyncio import create_async_engine
 
-    parts = urlparse(test_db_url)
-    dbname = f"noezema_mig_{secrets.token_hex(4)}"
-    scratch_url = parts._replace(path=f"/{dbname}").geturl()
+def _admin_exec_sync(url: str, *statements: str) -> None:
+    """Sync wrapper of `_admin_exec` for session-scope (non-async) fixtures."""
+    asyncio.run(_admin_exec(url, *statements))
 
-    admin = create_async_engine(test_db_url, isolation_level="AUTOCOMMIT")
-    from sqlalchemy import text
 
-    async with admin.connect() as conn:
-        await conn.execute(text(f'CREATE DATABASE "{dbname}"'))
-    await admin.dispose()
+def _count_backends(url: str, dbname: str) -> int:
+    """Number of backends currently connected to `dbname`."""
 
-    engine = None
+    async def go() -> int:
+        engine = create_async_engine(url)
+        try:
+            async with engine.connect() as conn:
+                result = await conn.execute(
+                    text("SELECT count(*) FROM pg_stat_activity WHERE datname = :db"),
+                    {"db": dbname},
+                )
+                return int(result.scalar_one())
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(go())
+
+
+@pytest.fixture(scope="session")
+def migrated_db_template() -> Iterator[str]:
+    """Fully migrated template scratch DB per pytest session/xdist worker (T7.55).
+
+    Reads `NOEZEMA_TEST_DATABASE_URL` directly (a session fixture must not
+    depend on the function-scoped `test_db_url`; both read the same env once
+    per run). Built ONCE: CREATE DATABASE `noezema_tpl_<pid>_<hex>` -> `alembic
+    upgrade head` subprocess (the step the old fixture repeated on every test)
+    -> wait until no connections remain -> ALLOW_CONNECTIONS false (nothing may
+    attach while the template is cloned; autovacuum visits are blocked too).
+    Dropped in the session finalizer. A broken or missing template fails every
+    dependent test with an explicit error — there is no silent fallback to
+    per-test migration. Each xdist worker builds its own template, so clones
+    never race across workers.
+    """
+    url = os.environ.get("NOEZEMA_TEST_DATABASE_URL", "")
+    if not url:
+        pytest.skip("NOEZEMA_TEST_DATABASE_URL is not set")
+
+    parts = urlparse(url)
+    tpl_name = f"noezema_tpl_{os.getpid()}_{secrets.token_hex(4)}"
+    tpl_url = parts._replace(path=f"/{tpl_name}").geturl()
+
+    _admin_exec_sync(url, f'CREATE DATABASE "{tpl_name}"')
     try:
         env = dict(os.environ)
-        env["NOEZEMA_DATABASE_URL"] = scratch_url
+        env["NOEZEMA_DATABASE_URL"] = tpl_url
         proc = subprocess.run(
             [sys.executable, "-m", "alembic", "-c", "alembic.ini", "upgrade", "head"],
             cwd=REPO_ROOT,
@@ -142,19 +184,82 @@ async def migrated_db(test_db_url: str) -> AsyncIterator[tuple[str, AsyncEngine]
             text=True,
             timeout=180,
         )
-        assert proc.returncode == 0, f"alembic failed:\n{proc.stdout}\n{proc.stderr}"
+        if proc.returncode != 0:
+            raise RuntimeError(f"template migration failed (alembic upgrade head):\n{proc.stdout}\n{proc.stderr}")
 
+        deadline = time.monotonic() + 20.0
+        while True:
+            backends = _count_backends(url, tpl_name)
+            if backends == 0:
+                break
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"template {tpl_name} still has {backends} connection(s); cannot clone safely")
+            time.sleep(0.2)
+
+        last_exc: Exception | None = None
+        for _attempt in range(3):
+            try:
+                _admin_exec_sync(
+                    url,
+                    "SET lock_timeout TO '10s'",
+                    f'ALTER DATABASE "{tpl_name}" WITH ALLOW_CONNECTIONS false',
+                )
+                break
+            except Exception as exc:  # transient lock race (e.g. a passing autovacuum worker)
+                last_exc = exc
+                time.sleep(0.5)
+        else:
+            raise RuntimeError(f"cannot seal template {tpl_name}: {last_exc}")
+
+        yield tpl_name
+    finally:
+        try:
+            _admin_exec_sync(url, f'DROP DATABASE IF EXISTS "{tpl_name}"')
+        except Exception as exc:  # teardown must not mask test results; the leak stays named for manual cleanup
+            warnings.warn(f"leaked scratch template {tpl_name}: {exc}", stacklevel=2)
+
+
+@pytest.fixture()
+async def migrated_db(
+    test_db_url: str, migrated_db_template: str
+) -> AsyncIterator[tuple[str, AsyncEngine]]:
+    """Scratch database cloned from the session template via CREATE DATABASE ... TEMPLATE (T7.55).
+
+    Contract unchanged: yields (scratch_url, engine), the name stays
+    `noezema_mig_<hex>`, teardown disposes the engine and drops the database.
+    Only creation changed — cloning the pre-migrated template is ~8-10x
+    cheaper than an empty DB plus a per-test `alembic upgrade head` subprocess,
+    and it removes the concurrent-DDL storm against the shared test Postgres
+    (the T7.51 flake source). Retries only cover transient ACCESS EXCLUSIVE
+    contention; there is no fallback to per-test migration.
+    """
+    parts = urlparse(test_db_url)
+    dbname = f"noezema_mig_{secrets.token_hex(4)}"
+    scratch_url = parts._replace(path=f"/{dbname}").geturl()
+
+    last_exc: Exception | None = None
+    for _attempt in range(3):
+        try:
+            await _admin_exec(
+                test_db_url,
+                "SET lock_timeout TO '20s'",
+                f'CREATE DATABASE "{dbname}" TEMPLATE "{migrated_db_template}"',
+            )
+            break
+        except Exception as exc:  # transient contention — retried on the template path only
+            last_exc = exc
+            await asyncio.sleep(0.5)
+    else:
+        pytest.fail(f"cannot clone scratch DB from template {migrated_db_template}: {last_exc}")
+
+    engine: AsyncEngine | None = None
+    try:
         engine = create_async_engine(scratch_url)
         yield scratch_url, engine
     finally:
         if engine is not None:
             await engine.dispose()
-        admin = create_async_engine(test_db_url, isolation_level="AUTOCOMMIT")
-        try:
-            async with admin.connect() as conn:
-                await conn.execute(text(f'DROP DATABASE "{dbname}"'))
-        finally:
-            await admin.dispose()
+        await _admin_exec(test_db_url, f'DROP DATABASE "{dbname}"')
 
 
 @asynccontextmanager

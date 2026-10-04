@@ -87,7 +87,10 @@
 - uv: `/home/denis/.local/bin/uv`; venv без pip; `UV_CACHE_DIR="$PWD/.uv-cache"`
   (запись в `~/.cache` запрещена sandbox'ом).
 - Тестовая БД: контейнер `noezema-test-db`, порт 54329, `noezema/noezema_dev`. Тесты создают
-  одноразовые БД через fixture `migrated_db`; admin-БД `noezema` таблиц приложения не содержит.
+  одноразовые БД через fixture `migrated_db` — с T7.55 scratch (`noezema_mig_<hex>`) клонируется из
+  session-шаблона `noezema_tpl_<pid>_<hex>` (`CREATE DATABASE ... TEMPLATE`; шаблон запечатан
+  ALLOW_CONNECTIONS false), `alembic upgrade head` — один раз на воркер, не на тест; admin-БД
+  `noezema` таблиц приложения не содержит.
 - Образ sandbox: `noezema-sandbox:test`.
 
 Полная проверка (запускать перед каждым коммитом):
@@ -145,6 +148,9 @@ pytest — параллельно через pytest-xdist `-n auto` (T7.41: на
   `alembic upgrade head` scratch-БД (профиль `-n auto`) воспроизводят flake сами по себе, а
   12 busy CPU-процессов — нет. Абсолютные времена таких тестов держать в масштабе, дающем запас
   ≥ нескольких интервалов продления (сейчас TTL 3 с); продукт при этом менять нельзя.
+- Дополнение к предыдущему пункту (T7.55): «6 одновременных alembic upgrade head» — профиль нагрузки
+  СТАРОЙ фикстуры; теперь scratch-БД клонируются из session-шаблонов и параллельных миграций по
+  одному Postgres нет.
 - Проект русскоязычный: RUF001–RUF003 отключены намеренно.
 - CI (GitHub Actions) ставит `.[dev]` БЕЗ закрепления версий и в job `test` требует отдельной
   сборки sandbox-образа до pytest (шаг §6; с T7.41 фикстура образ не собирает) — расхождение с
