@@ -121,6 +121,13 @@ pytest — параллельно через pytest-xdist `-n auto` (T7.41: на
 
 Маркеры pytest: `unit`, `scenario` (postgres + fake LLM), `security`, `compat`, `timing` (T7.56).
 
+Исполнитель инструментов сессий (wake tick, eval-run, смоуки) выбирается env
+`NOEZEMA_TOOL_EXECUTOR`: не задан или `stub` — dev-подставка `StubToolExecutor` (ДЕФОЛТ, поведение
+прежнее); `sandbox` — одноразовый контейнер на сессию через `SandboxToolBroker` (T7.58, ADR-0023; образ и
+движок проверяются до старта сессии, отсутствие = отказ exit 78, тихого отката на stub нет). Для реальных
+смоуков после контрольного прогона рекомендован `sandbox` (`EnvironmentFile` unit'а + пин образа
+`NOEZEMA_SANDBOX_IMAGE`, пока не включён по умолчанию — решение пользователя).
+
 ## 7. Известные ловушки
 
 - Docker 29.8: `docker kill -s KILL` (не `-9`); `docker cp` не видит tmpfs — использовать
@@ -170,6 +177,13 @@ pytest — параллельно через pytest-xdist `-n auto` (T7.41: на
   снапшота при этом живут и неисполнимые в stub: shell.execute → Observation `tool_not_supported:` (T7.57(b),
   раньше был безликий `unreachable`), artifact.create → `unknown tool`. Фильтровать offered-список под исполнителя
   нельзя молча: это меняет `tool_schema_hash` шагов и ломает байт-сопоставимость прогонов (STATUS T7.57, разбор А/Б/В).
+- Дополнение к предыдущему пункту (T7.58, ADR-0023): в режиме `sandbox` контейнер открывается и уничтожается
+  самим `run_session` (имена `noezema-sb-<session_id[:12]>`, host-overlay `NOEZEMA_SANDBOX_WORK_ROOT/<session_id>`);
+  сеть контейнера ВСЕГДА `none` — даже у curated/open_lab (`research_proxy` из снапшота egress контейнеру не даёт:
+  research.fetch, memory.search и staging-инструменты остаются host-side); пакетов проекта и хостовой ФС в
+  контейнере нет, лимиты команды берутся из `sandbox/policy/<profile>.yaml` (sealed 60 с/512 MiB/32 PID), а не из
+  stub-константы 15 с. Утечка контейнера возможна только если отказал `docker rm -f` — тогда в логе процесса
+  строка `LEAKED container`; тихого отката на stub при недоступном движке/образе нет (отказ до старта сессии).
 - CI (GitHub Actions) ставит `.[dev]` БЕЗ закрепления версий и в job `test` требует отдельной
   сборки sandbox-образа до pytest (шаг §6; с T7.41 фикстура образ не собирает) — расхождение с
   локальной средой даёт красные прогоны (T7.53b разбор: ruff 0.16.10 на раннере против 0.16.7 в

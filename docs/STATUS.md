@@ -24,7 +24,7 @@
 | 1 | пробуждение по расписанию, pause/backoff | MVP | ✅ | T3.29 (задача добавлена ретроспективно — пропуск плана): `apps/orchestrator/scheduler.py` + миграция 0005 (`wake_schedule` в snapshot, `wake_scheduler_state`), `noezemactl wake-tick` + `noezema-wake.timer`. Тесты: test_wake_schedule.py (unit: fail-closed-валидация `wake_schedule`, timing: первый tick/интервал/мин. gap/backoff-окно, экспоненциальный backoff + cap) + test_wake_scheduler.py (scenario: каждый admission gate — paused/nonterminal/unresolved commit/activation slot/disk quota/GPU fail-closed → skip с точной причиной + audit `wake_skipped`; backoff после failed; авто-pause после 3 неудач (sticky); success/cancel/partial сбрасывают; operator pause не сбивается; битый `wake_schedule` → fail-closed) + test_web_api.py (wake_now обходит timing но не admission — REJECTED с reason; resume сбрасывает failure-бухгалтерию; /status.wake) |
 | 2 | локальная LLM с fingerprint | MVP | ✅ | test_llm_gateway.py (OpenAI-compatible gateway для локальных бэкендов llama.cpp/Ollama/vLLM, retries только транзиентные, token/latency/finish_reason, test_fingerprint_is_deterministic_and_versioned) + test_compat_and_roles.py (compat suite T1.11, versioned prompts, tool schema hash). Fingerprint (профиль модели + prompt version + tool schema hash + policy version → canonical sha256) пишется в `model_runs.model_fingerprint` (NOT NULL) на каждом explorer/curator-вызове (T1.7–T1.8). Оговорка MVP: artifact/tokenizer-хэши опциональны (None до пиннинга артефакта); ModelProfile собирается в коде из gateway-settings — секция `model` снапшота не подключена (T1.7 «через config snapshot» — частично) |
 | 3 | causal/idempotency ID в trusted host | MVP | ✅ | test_orchestrator.py (turn_id/action_id/idempotency_key генерирует хост) |
-| 4 | typed actions в sandbox | MVP | ✅ | test_sandbox_runtime.py + test_tool_broker_sandbox.py (одноразовый контейнер, cap-drop/network/ro-rootfs, shell/python в sandbox, overlay) + test_sandbox_security.py |
+| 4 | typed actions в sandbox | MVP | ✅ | test_sandbox_runtime.py + test_tool_broker_sandbox.py (одноразовый контейнер, cap-drop/network/ro-rootfs, shell/python в sandbox, overlay) + test_sandbox_security.py + test_orchestrator_sandbox_executor.py (T7.58: продуктивный путь `NOEZEMA_TOOL_EXECUTOR=sandbox`, контейнер на сессию в `run_session`) |
 | 5 | claim только с согласованным lifecycle | MVP | ✅ | test_memory_service.py (head current ⇔ assessment+epistemic_status NOT NULL, CHECK §14.1; dedup claim+evidence; supersede) + test_orchestrator.py (apply в fenced tx: claim→evidence→assessment→head одной транзакцией) |
 | 6 | один fenced commit attempt | MVP | ✅ | test_orchestrator.py (prepared-строка до финального tx; fencing predicate: lease+revision+attempt=prepared; partial unique §14.2) + test_reconciler.py |
 | 7 | lost COMMIT → reconciliation | MVP | ✅ | test_reconciler.py (kill before COMMIT→aborted; after commit→accepted; open final tx→finalizer_in_progress; stale finalizer→fenced) + reconcile_with_retries (backoff+jitter, fresh conn) |
@@ -1811,3 +1811,158 @@ wall-clock стоимости; А не делать; В не делать. До 
 **Не тронуто (b):** payload'ы/промпты/schemas/пины/корпуса/pins, tool-списки снапшотов, повтор-гард,
 `tool_schema_hash`, прошлые прогоны; shell.execute в stub не реализован. eval-run/смоуки не запускались;
 LLM .42/.48 не трогались; к noezema-eval*/noezema-smoke* только SELECT (в части a).
+
+## T7.58 — инструментарный исполнитель сессий: переключатель stub | sandbox, одноразовый контейнер в жизненном цикле `run_session` (реализация рекомендации «Б» T7.57; ADR-0023)
+
+**Основание.** Задача менеджера: подготовить и проверить режим реального
+инструментарного исполнителя для eval/смоуков, НЕ меняя дефолтное поведение
+(в T7.57 это была рекомендация «Б» с явной просьбой замерить wall-clock стоимость).
+Красных тестов не было — задача дизайнерско-инженерная; критерий остановки (согласован с
+менеджером): если интеграция требует менять контракт `run_session`/семантику сессии сильнее
+небольшого хука, менять схемы/хэши/промпты/пины/model schemas или ARCHITECTURE.md — остановиться
+на документационном разборе. **Критерий не сработал** (дельта orchestrator.py — +52 строки, из них
+исполняемого кода ~20: два хука по 6 строк и два вызова в phase 1; схемы/промпты/
+пины/ARCHITECTURE.md не тронуты).
+
+### 1. Дизайнерский разбор (шаг 1)
+
+**(а) Где создавать и гарантированно уничтожать контейнер.** `build_orchestrator`
+(`apps/orchestrator/main.py:53`) вызывается **на сессию** во всех host-путях: wake tick — один orchestrator
+на тик = одна сессия (`hostctl/cli.py::_tick` → `orchestrator.run_session(question_id)`), eval-run —
+per-session цикл `for i in range(args.sessions)` со своей сборкой и своим scratch-URL
+(`hostctl/cli.py::_run_sessions`), web app — один orchestrator в standalone-app. Профиль
+(`cap_profile`) и `session.id` известны только **внутри** phase 1, поэтому lifecycle вынесен в
+`Orchestrator.run_session`, а не в CLI:
+
+- открытие — `_run_to_committing`, сразу после audit `SESSION_STARTED` (`apps/orchestrator/orchestrator.py:606`):
+  durable `session.id` (имя контейнера детерминировано: `noezema-sb-<session_id[:12]>`) и эффективный
+  `cap_profile` уже есть; до этого ни один инструмент не исполнялся, отказа модели ещё нет;
+- закрытие — `finally` вокруг phase-1 транзакции (`orchestrator.py:378–384`): покрывает нормальное
+  завершение, ранний терминальный `_finish` (budget/admission/stop), поднявшийся `LeaseLost`,
+  infra-исключение и rollback phase 1; `close_session()` не бросает и не меняет исход сессии.
+
+Контракт `run_session` (сигнатура, `CommitPlan`, `SessionOutcome`, транзакции, fenced commit, аудит)
+не изменён: хуки опциональны и объявлены отдельным Protocol `SessionScopedExecutor`
+(`apps/orchestrator/tool_executors.py`), оркестратор зовёт их через `getattr`
+(`_open_tool_sandbox`/`_close_tool_sandbox`, orchestrator.py:2380–2404). У `StubToolExecutor` и у всех
+тестовых doubles хуков нет → stub-путь исполняется дословно как раньше (в unit-тесте закреплено
+`not hasattr(executor, "open_session")`). Деструктор/контекстный менеджер не подошли: `run_session` —
+не async-CM, а failure-обработка вызывающего CLI должна была остаться прежней.
+
+**(б) Consistency workspace.** Stub держит общую директорию `root/"workspace"` (`StubToolExecutor.workspace_dir`,
+одна на orchestrator; оркестратор делает «freeze» в снапшот-манифест, схватывая `executor.workspace_dir`
+— orchestrator.py:863–870) и использует её как staging-dir artifact store. Sandbox берёт per-session overlay
+`work_root/<session_id>/work`, смонтированный в контейнер (`packages/sandbox/runtime.py::start`), — это ровно
+«session overlay» спеки §5.7. Freeze работает в обоих режимах без правок: в sandbox он видит overlay (в
+scenario-тесте записано `notes.md` → `workspace_entries` + `committed_workspace_manifest_id`), после
+`close_session()` каталог удалён, а манифест остаётся durable-артефактом. Развязка обязательна: общий
+host-workspace на несколько сессий = перенос состояния между сессиями (в eval это скрытый канал).
+
+**(в) Чем среда контейнера отличается от хоста и что это меняет в смоуках.** См. таблицу п. 4 ниже:
+`python:3.11-slim` (замер образа: Python 3.11.16, `/usr/local/bin/python`), из пакетов — только
+pip/setuptools/wheel/packaging базы, сторонних нет; network none; на хосте python 3.11.15 из `.venv`, тот же
+интерпретатор, что у оркестратора (хотя и с `-I`), есть пакетный набор проекта, есть сеть, есть вся
+файловая система пользователя. Следствие для смоуков: `python.execute` в контейнере не сможет
+`import httpx/numpy/bs4` (в stub мог) и не сможет достать URL из sandbox (`requests`); это сужает
+то, что модель реально делает, — но делает это предсказуемым и изолированным.
+
+**(г) Пути `research.fetch`, `memory.search`, `question.create`, `artifact.create`.** Проверено по коду:
+`research.fetch` перехватывается оркестратором host-side в обоих режимах (orchestrator.py:1667–1676 →
+`self._research_fetch`, §M6 proxy; в broker он вообще unreachable) — режим его не касается; `memory.search`
+в broker идёт через runtime-хранилище с host-generated scope, session-scoped storage подключается оркестратором
+(`session_storage.attach`, snapshot_id pinned); `question.create`/`message.reply` deferred (staging writer) и
+применяются host-side (`_apply_host_side`) — детерминированный эффект идентичен. Отличается одно: в stub эти
+вызовы исполняет `StubToolExecutor`, а не broker, поэтому retry-policy Tool Broker (§5.7) продуктивно не жил;
+в sandbox он включается. Набор инструментов модели **не изменён ни в одном режиме**: offered-список и
+`tool_schema_hash` считаются из снапшота (`sorted(cap_profile.tools)`), `artifact.create` отсутствует в реестре
+и даёт `unknown tool` одинаково в обоих режимах (unit-тест паритета).
+
+**(д) Переходные отказы broker и повтор-гард.** Broker ретраит только transient infra по классам §5.7
+(`RETRY_POLICY`: pure 2, idempotent 1, observation/non_idempotent 0 — python/shell не ретраятся); `SandboxError`
+→ `transient=True`, «контейнер исчез» → `result_unknown=True` → ветка T2.21 (outcome unknown). Повтор-гард
+оркестратора считает **исполнение шага**, а не попытки broker: счётчик увеличивается до вызова
+(orchestrator.py:1665) и независим от исполнителя → transient-ретраи broker не раздувают счётчик. Session status
+от этого не меняется (неудачное наблюдение = обычный failed-step, как показал разбор T7.57); риск новый — рост
+доли failed-шагов при проблемах docker, что в eval видно по `actions.state`.
+
+**(е) Нужен ли docker eval-run процессу на `.87`.** Да: пользователь `denis` состоит в группе `docker`
+(проверено `id`), docker 29.x доступен, образ `noezema-sandbox:test` собран §6-шагом; unit'ы systemd могут
+задавать `NOEZEMA_TOOL_EXECUTOR=sandbox` и `NOEZEMA_SANDBOX_IMAGE=<pin>` через EnvironmentFile. Никаких
+новых привилегий не требуется (root-less контейнер, bind-mount только на свой work_root в /tmp).
+
+### 2. Что сделано
+
+- env-switch `NOEZEMA_TOOL_EXECUTOR` (`stub` по умолчанию | `sandbox`), разбор — чистая функция
+  `resolve_tool_executor_mode(raw)` в новом модуле `apps/orchestrator/tool_executors.py`; неизвестное значение →
+  `ToolExecutorConfigError` с именем переменной, значением и списком известных режимов (тихого отката на stub нет;
+  тот же fail-closed паттерн, что у `NOEZEMA_LLM_SCHEMA_PROFILE`).
+- `build_tool_executor(workspace_root)` — единственная точка сборки; её используют все входы:
+  `apps/orchestrator/main.py:53`, `apps/web/api.py:1186` (иначе web-slice молча остался бы на stub при общем
+  `EnvironmentFile`). CLI (`hostctl/cli.py`) передаёт режим в journal и отказывается ДО записи
+  `node_state='session_running'`: wake tick → `exit 78`, eval-run → fail-closed без `_finish` (серия не считается).
+- sandbox-режим: preflight движка и образа (`ensure_sandbox_available`, понятная ошибка с командой сборки),
+  контейнер на сессию, профиль = YAML-потолок access-профиля снапшота с network `none`
+  (`sandbox_runtime_profile`: curated/open_lab `research_proxy` контейнеру не выдаётся никогда — egress host-side;
+  инструменты вне потолка и неизвестный профиль → отказ), гарантированное уничтожение + удаление overlay,
+  идемпотентный close (утечка называется в логе процесса).
+- Новые тесты: `tests/unit/test_tool_executor_switch.py` (25) + `tests/scenario/test_orchestrator_sandbox_executor.py`
+  (5, docker; без маркера `timing` — wall-clock ассертов нет, чтобы не нагружать lease-тесты). Существующие тесты
+  и фикстуры не изменены; ни один ассерт не ослаблен.
+- Логи: только процесс (`logger = noezema.tool_executor`, метки CLI), audit/`model_fingerprint`/CommitPlan — без новых полей.
+
+### 3. Замеры стоимости (шаг 4; скрипт вне репо `../t758_bench.py`, fake-движка нет)
+
+| операция | N | median | p95 |
+|---|---|---|---|
+| `runtime.start` + `destroy` (контейнер на сессию) | 10 | **1,524 мс** | 2 058 мс |
+| preflight `docker image inspect` | 10 | 22 мс | 28 мс |
+| `python.execute print(1)` в контейнере | 20 | **48,6 мс** | 51,0 мс |
+| `shell.execute echo 1` в контейнере | 20 | 38,1 мс | 40,9 мс |
+| `python.execute print(1)` через Stub (хост) | 20 | 8,9 мс | 11,5 мс |
+| `python execute sum(range(1e5))` контейнер / stub | 5 | 51,3 мс / 9,7 мс | — |
+
+Дельта одного вызова ≈ +40 мс (запуск интерпретатора внутри контейнера против хостового `-I`).
+Экстраполяция на типовой смоук (7 сессий × ~8 шагов): **+10,8 с** при 0 python-вызовах на сессию,
+**+11,1 с** при 1, **+11,7 с** при 3 — т.е. цена почти целиком в старте контейнера (≈1,5 с × 7), а не в
+инструментах; это ≈1 % wall-clock смоука V14B-EXL3 (eval-run 18,4 мин —
+`docs/eval/SMOKE-V14B-EXL3-report.md`, сводная таблица прогонов). `docker ps -a` после прогона: ноль
+контейнеров с проектым префиксом.
+
+### 4. Python-среда: stub vs контейнер и влияние на смоуки
+
+| | Stub (default) | sandbox-контейнер |
+|---|---|---|
+| интерпретатор | `sys.executable` = python проекта (3.11.15) с `-I`, та же среда, что у оркестратора | CPython 3.11.16 из `python:3.11-slim` (`/usr/local/bin/python`), только stdlib |
+| pip-пакеты | доступны пакеты `.venv` (httpx, sqlalchemy, pydantic, click…; нет numpy/pandas/bs4/lxml/PIL) | нет сторонних (`pip list`: pip 24.0, setuptools, wheel, packaging); сам pip в образе есть, но поставить ничего не может: network none + read-only rootfs |
+| сеть | есть (хостовая) — stub может достать любой URL | `--network none`: ни DNS, ни интерфейсов (проверено тестом: `gaierror`, `/proc/net/dev` = только `lo`) |
+| ФС | вся ФС хоста + общий `root/"workspace"` | read-only rootfs, запись только в overlay сессии (+tmpfs /tmp 64M), UID 10001, cap-drop ALL |
+| лимиты команды | жёстко 15 с (`TOOL_TIMEOUT_SECONDS`), cap 10 000 байт | из профиля снапшота: sealed 60 с/512 MiB/32 PID/CPU 1.0; curated 120 с (timeout, pids, cpu — из YAML) |
+| `shell.execute` | не реализован → `tool_not_supported:` (T7.57(b)) | работает (`/bin/sh -c`) и в sealed-профиле разрешён |
+
+Практический эффект для смоуков: в sandbox модель потеряет сетевые «заходы» через python (в stub они
+работали — дыра (ii) из разбора T7.57) и потеряет хостовые пакеты; взамен получает рабочий `shell.execute`
+и одинаковый с eval-инвариантом изолирующий контур. Ожидать стоит роста шагов `web.search`/`research.fetch`
+(единственные легальные источники) и появления failed-наблюдений вида «ModuleNotFoundError» — это сигнал модели,
+а не ошибка хоста.
+
+### 5. Не сделано / остаётся для T7.59
+
+- Реальный смоук в sandbox-режиме (с живой моделью) не запускался — по условию задачи это отдельная задача
+  T7.59 с решением пользователя; проверено только fake-LLM + реальные контейнеры.
+- Не сделано сознательно: фильтрация offered-списка инструментов по возможностям исполнителя
+  (меняется `tool_schema_hash` → ломает сопоставимость серий), shell.execute в stub, миграции/аудит-поля режима,
+  docker-in-docker и per-step контейнеры.
+- Дрейф образа: прод-дефолт `SandboxSettings.image = noezema-sandbox:dev`, тесты и §6 пинят
+  `noezema-sandbox:test`; для замороженной eval-серии тег надо пинить явно (как пины LLM) — решение за пользователем.
+- Рекомендация по включению дефолта: **пока нет** — оставить `stub` как значение по умолчанию (существующие
+  прогоны и тесты остаются байтово сопоставимыми), включить `NOEZEMA_TOOL_EXECUTOR=sandbox` в EnvironmentFile
+  eval/смоук-юнитов `.87` после одного контрольного смоука T7.59 (замер wall-clock ≈+1 %, риск — новая доля
+  failed-шагов из-за отсутствия пакетов/сети и зависимость от доступности docker на хосте eval'а).
+
+**Остатки.** `docker ps -a`: контейнеров с префиксом `noezema-sb-` — 0 (до и после); всего контейнеров 41, как
+до задачи (новых не создано: ни один контейнер не пережил teardown тестов). Scratch-БД: `noezema_mig_%`=53,
+`noezema_dbg%`=19, `noezema_clismoke_%`=2, `noezema_tpl_%`=0, storm=0 — идентично baseline до задачи.
+К `noezema-eval*`/`noezema-smoke-*`/`noezema_mvp` обращений не было; eval-run/смоуки не запускались; LLM .42/.48
+не трогались; фоновых процессов не осталось. Полная проверка §6 (ruff + mypy strict 130 файлов + образ +
+pytest `-n auto -m "not timing"` **1094 passed, 12 skipped** (baseline 1064 + 30 новых) за 132 с; затем
+`-m timing` **4 passed** за 47 с) — зелёная.
