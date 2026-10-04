@@ -972,6 +972,80 @@ def blind_sample(run_ref: str, out_file: str | None, fragment_chars: int) -> Non
     sys.exit(code)
 
 
+@main.command("ask")
+@click.argument("text")
+@click.option(
+    "--priority",
+    default=0,
+    show_default=True,
+    type=int,
+    help="FIFO rank (higher is served earlier, §5.3.2): the operator's way to put a question forward.",
+)
+def ask(text: str, priority: int) -> None:
+    """T7.59: put an operator question into the FIFO queue (origin 'message').
+
+    Thin wrapper over the same intake service as POST /api/v1/questions
+    (packages/domain/services/question_intake.py): validation (non-empty
+    stripped text, length and priority bounds), exact-text dedup — a repeat
+    returns the id already in the queue instead of creating a duplicate — and
+    the queue position, i.e. the place the FIFO selector will actually serve
+    it from (§5.3.2). Needs NOEZEMA_DATABASE_URL; exit 2 on a rejected
+    formulation. No LLM and no session are started: the next wake takes the
+    question (or `wake-tick` runs immediately if the schedule is due).
+    """
+    import asyncio
+    import os
+
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    url = os.environ.get("NOEZEMA_DATABASE_URL", "")
+    if not url:
+        click.echo("NOEZEMA_DATABASE_URL is not set", err=True)
+        sys.exit(EXIT_USAGE_ERROR)
+
+    from packages.domain.db.uow import transaction
+    from packages.domain.services.question_intake import (
+        QuestionIntakeError,
+        put_operator_question,
+        queue_position,
+    )
+
+    engine = create_async_engine(url)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    async def _run() -> int:
+        try:
+            async with factory() as db, transaction(db):
+                question, created = await put_operator_question(
+                    db, raw_text=text, raw_priority=priority
+                )
+                position = await queue_position(db, question)
+        except QuestionIntakeError as exc:
+            click.echo(f"ask: {exc}", err=True)
+            return EXIT_USAGE_ERROR
+        label = "question accepted" if created else "already in the queue (idempotent replay)"
+        click.echo(f"ask: {label}")
+        click.echo(f"  id       {question.id}")
+        click.echo(
+            f"  origin   {question.origin} · state {question.state} · priority {question.priority}"
+        )
+        click.echo(
+            "  position "
+            + (
+                str(position)
+                if position is not None
+                else "— (not a candidate, or deeper than the queue window)"
+            )
+        )
+        return 0
+
+    try:
+        code = asyncio.run(_run())
+    finally:
+        asyncio.run(engine.dispose())
+    sys.exit(code)
+
+
 @main.command("eval-run")
 @click.option("--label", required=True, help="Run label (e.g. EVAL-1).")
 @click.option(

@@ -1966,3 +1966,121 @@ pip/setuptools/wheel/packaging базы, сторонних нет; network none
 не трогались; фоновых процессов не осталось. Полная проверка §6 (ruff + mypy strict 130 файлов + образ +
 pytest `-n auto -m "not timing"` **1094 passed, 12 skipped** (baseline 1064 + 30 новых) за 132 с; затем
 `-m timing` **4 passed** за 47 с) — зелёная.
+
+## T7.59(а) — приём вопроса оператором: CLI `ask`, `POST/GET /api/v1/questions`, форма на главной странице (ADR-0024)
+
+**Основание.** Задача менеджера: дать живому человеку возможность «потрогать MVP» —
+задать вопрос из браузера и увидеть его в очереди и в сессии. Критерий остановки (предварительный
+анализ до правок): если приём требует миграции схемы, нового значения закрытого `QuestionOrigin`
+с правкой hash/payload или изменения семантики выборки сильнее priority — остановиться на
+документационном разборе. **Критерий не сработал** (обоснование в п. 1), реализация сделана.
+
+### 1. Анализ исходного пути (что было в коде до задачи)
+
+**(а) Продюсеров вопроса было два, оператора среди них не было.** `questions` заполняли:
+сидинг корпусом (`hostctl/cli.py::eval-run`, прямой `INSERT … origin='seeded'` с проверкой
+`SELECT 1 FROM questions WHERE text = :t`) и модель через staging
+(`packages/domain/services/staging.py::apply_staging` по `new_questions` куратора, origin из
+схемы proposals, default `'model_proposal'`, `parent_id=session.question_id`). Ни CLI, ни web
+вопрос не создавали.
+
+**(б) Сообщения человека в очередь не превращались.** `POST /api/v1/messages` пишет `ORMMessage`
+(state `created`), оркестратор доставляет недоставленные сообщения в `ctx.messages` на orienting
+(недоверенный текст контекста, плюс offered-инструмент `message.reply`) — очередь FIFO при этом
+не меняется: §13.6 (жизненный цикл сообщений) и priority «влияет только на порядок доставки».
+Так что путь «сообщение → вопрос» в коде отсутствовал физически.
+
+**(c) Но спека под него место уже отвела, и оно свободно.** `QuestionOrigin.MESSAGE` есть в enum
+(`packages/domain/models/enums.py`), а CHECK `questions.origin` построен из
+enum (`migrations/versions/0002_core.py`, `_in_check(QuestionOrigin)`) — т.е. значение допущено
+схемой; §5.3 в источниках кандидатов перечисляет «сообщения человека», §5.3.2 — «seeded/message
+question → FIFO selection»; `FIFOQuestionSelector.is_eligible` уже пропускает origin `message`.
+Продюсера у значения не было ни одного. **Вывод: приём оператора = первый продюсер существующего
+origin**, а не новый вид строки: миграций нет, enum не расширяется, payload'ы и пины не тронуты,
+селектор не меняется. Именно поэтому критерий остановки не сработал; он бы сработал на любом из
+трёх вариантов: новая CHECK/колонка, новое значение `QuestionOrigin` (→ пересчёт снапшотов) или
+иная семантика отбора (например «операторские вопросы всегда раньше» вне priority).
+
+**(d) Состояния и приоритеты.** `QuestionState`: candidate → selected → researching →
+partially_answered / verified / rejected / deferred; приём создаёт `candidate` (то, что читает
+FIFO), дальше состояниями владеет цикл сессии. `questions.priority` — integer NOT NULL DEFAULT 0,
+CHECK на него нет (это вход ранжирования, §5.3.1), поэтому bounds держит сервис приёма.
+UNIQUE только по `id` → дедуп уровня приложения, осознанно (иначе model-вопросы, truncate'ящиеся
+до 2000 символов, схлопывались бы с чужими формулировками).
+
+**(e) dedup vs близкие дубликаты (T5.4/T7.9).** На приёме — точное совпадение текста после strip,
+по всему реестру (любой origin/state), прецедент — сидинг `eval-run`. Семантические близкие
+формулировки на приёме НЕ сливаются: за этим §9 (`packages/cognition/repetition.py`: Jaccard по
+host-словесному множеству, `rephrase_threshold` и `no_progress_limit` из снапшота — в config-v12
+0.6 и 2; `_INVESTIGATED_STATES` — только уже исследованные состояния) и работает на отборе: такой
+кандидат получает стратегию §9 и исключение через `exclude_ids` в `list_candidates`. Два разных
+вопроса («Сколько будет 6*7?» и «шесть умножить на семь») — два кандидата; решит их цикл, а не приём.
+
+**(f) Как FIFO использует priority.** `QuestionRepository.list_candidates` =
+`ORDER BY priority DESC, created_at ASC, id` среди `state='candidate'`; `FIFOQuestionSelector.select`
+берёт голову списка и проверяет eligibility (§6.2 «первый eligible question»). Операторский priority
+пишется в то же поле → «ВПЕРЁД очереди» = большее число без правки селектора; при равных
+приоритетах действует обычный FIFO по возрасту (привилегии «потому что оператор» нет). Позиция для
+оператора считается тем же запросом, который читает селектор (в окне `QUEUE_WINDOW = 500`), поэтому
+показанное число не может разойтись с фактическим порядком обслуживания.
+
+### 2. Реализация
+
+- `packages/domain/services/question_intake.py` (новый сервис): `validate_operator_question`
+  (чистая функция: strip, непустой текст, ≤ 2000 = ceiling оператора того же `MessageIn.body`,
+  priority — настоящий int в [-100, 100], bool отвергается), `find_question_by_text`,
+  `put_operator_question` (дедуп → `(question, created)`, реплей не меняет priority; origin фиксирован
+  `message`, state — `candidate`), `queue_position`, `question_queue` (вид очереди: кандидаты в порядке
+  FIFO с позициями, затем уже проработанные, к каждой — последняя сессия), `intake_error_payload`.
+- `apps/web/api.py`: `QuestionIn` (bounds из сервиса); **GET `/api/v1/questions?limit=`** — открытый
+  query: `{id, text, origin, state, priority, created_at, position, session:{id,state}|null}` + `count`;
+  **POST `/api/v1/questions`** — Command-API семейство (тот же `X-Admin-Token`, что у команд):
+  201 при создании (`position` в ответе), 200 + `replayed=true` при повторе (тот же id, дубликата нет),
+  400 `{error:"invalid_question", detail}` при отказе валидации, 401 без/с неверным токеном,
+  423 с идентичным командам телом `host_not_healthy` на деградированном хосте. Свободный текст не
+  парсится как команда: closed-enum `operator_command` в пути не участвует (§13.2).
+- Главная страница (`_MAIN_HTML`): карточка «Задать вопрос» (textarea, number priority, поле admin
+  токена) + таблица очереди с автообновлением; токен после первой отправки хранится в
+  `sessionStorage` браузера (в UI нет серверальной сессии). Никаких новых JS-зависимостей: тот же
+  vanilla `fetch`, что на страницах knowledge/metrics/evaluation.
+- `hostctl/cli.py::ask TEXT [--priority N]`: печатает id, origin/state/priority и позицию в очереди;
+  exit 2 при отказе валидации и без `NOEZEMA_DATABASE_URL`; опций `--origin/--state` нет (provenance
+  не выбирается оператором, §3.4). Сессий не запускает: вопрос берёт следующий wake tick (или
+  `wake-tick`/web wake_now).
+- Аудит: нового `AuditEventType` не появилось (закрытый реестр; типы `MESSAGE_CREATED` и
+  `OPERATOR_COMMAND_RECEIVED` в enum есть, но не производятся ни одним продюсером — поднимать их
+  отдельная задача). Долговременная запись приёма — сама строка `questions`.
+
+### 3. Тесты (новые)
+
+- `tests/unit/test_question_intake.py` (unit) — bounds точно (`MAX`, ±1), strip/whitespace, не-строка,
+  bool-priority, вне диапазона; guard «operator question FIFO-eligible без правки селектора».
+- `tests/scenario/test_operator_question_intake.py` (scenario) — candidate с origin `message`; реплей
+  по точному тексту (другие обрамляющие пробелы и другой priority → id тот же, priority не изменился,
+  строка одна); реплей против засеянного корпуса; позиция FIFO и «priority ставит вперёд»; ties по
+  возрасту; вид очереди с аннотацией сессии.
+- `tests/scenario/test_web_questions.py` (scenario) — 401 без/с неверным токеном (и что очередь не
+  изменилась), 201+очередь, реплей (тот же id, `count` тот же), GET открыт на деградированном хосте +
+  POST 423 с телом `host_not_healthy`, 400 (whitespace-only) и 422 (priority вне диапазона, неизвестное
+  поле `origin`), маркеры формы/таблицы в HTML главной страницы.
+- `tests/scenario/test_cli_ask.py` (scenario) — CliRunner: id+позиция в выводе, строка БД с
+  origin/state/priority и FIFO-головой, реплей тем же id, «ВПЕРЁД FIFO» относительно засеянного
+  кандидата, exit 2 на пустом тексте/вне диапазона/без URL, отсутствие `--origin`.
+
+Ни один существующий тест не изменён и не ослаблен; новых wall-clock тестов нет (в `timing`-пул
+ничего не добавлялось, AGENTS §7). Полная проверка §6 перед этим коммитом: ruff чисто, mypy strict —
+**131 файл** (новое покрытие сервисом), pytest `-n auto -m "not timing"` **1137 passed, 12 skipped**
+(baseline 1094 + 43 новых) и затем `-m timing` **4 passed**.
+
+### 4. Не изменено / остаётся
+
+`ARCHITECTURE.md`, enum'ы (`QuestionOrigin`/`QuestionState`/`AuditEventType`), миграции (ни одной),
+`config-v*` payload'ы, промпты и пины, `tool_schema_hash`, пороги, дефолтный web bind
+(`127.0.0.1:8321`) и default executor (stub), staging-путь модели, lifecycle сообщений (§13.6),
+остальные CLI-команды. Матрицу §22.1 новая возможность не меняет (новый пункт в список критериев
+спеки не добавляем); покрытие пункта 20 «FIFO полный минимальный путь» получило продюсера кандидата
+от оператора — `test_cli_ask.py` + `test_web_questions.py`.
+
+Остаётся непроверенным после этой части: приём на живой ВМ стенда и прохождение вопроса через
+wake tick с реальным LLM (часть (б) — ниже), близкие формулировки (см. п. 1(e)), позиция глубже
+`QUEUE_WINDOW` сообщается как `None`.

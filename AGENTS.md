@@ -121,6 +121,14 @@ pytest — параллельно через pytest-xdist `-n auto` (T7.41: на
 
 Маркеры pytest: `unit`, `scenario` (postgres + fake LLM), `security`, `compat`, `timing` (T7.56).
 
+Приём вопроса оператором (T7.59, ADR-0024): `noezemactl ask "<текст>" [--priority N]` или
+`POST /api/v1/questions` (заголовок `X-Admin-Token` — тот же токен, что у команд); вид очереди —
+открытый `GET /api/v1/questions`. Правила держит один сервис `packages/domain/services/question_intake.py`:
+origin всегда существующий `message` (нового enum-значения и миграции нет), дедуп по точному тексту
+(повтор возвращает тот же id, приоритет повтором не меняется), text ≤ 2000, priority — int в [-100, 100]
+и поднимает вопрос в начало FIFO (`priority DESC, created_at ASC`) без правки селектора. Аудит-типа
+приёма нет: закрытый `AuditEventType` не расширяем, долговременная запись — сама строка `questions`.
+
 Исполнитель инструментов сессий (wake tick, eval-run, смоуки) выбирается env
 `NOEZEMA_TOOL_EXECUTOR`: не задан или `stub` — dev-подставка `StubToolExecutor` (ДЕФОЛТ, поведение
 прежнее); `sandbox` — одноразовый контейнер на сессию через `SandboxToolBroker` (T7.58, ADR-0023; образ и
@@ -184,6 +192,10 @@ pytest — параллельно через pytest-xdist `-n auto` (T7.41: на
   контейнере нет, лимиты команды берутся из `sandbox/policy/<profile>.yaml` (sealed 60 с/512 MiB/32 PID), а не из
   stub-константы 15 с. Утечка контейнера возможна только если отказал `docker rm -f` — тогда в логе процесса
   строка `LEAKED container`; тихого отката на stub при недоступном движке/образе нет (отказ до старта сессии).
+- CliRunner-тесты хостовых команд (T7.59, `tests/scenario/test_cli_ask.py`): команда CLI сама поднимает
+  свой event loop, поэтому в синхронном тесте нельзя брать `AsyncEngine` из фикстуры `migrated_db` —
+  второй `asyncio.run` на нём даёт «Event loop is closed» (+ ошибка на teardown). Паттерн: каждый
+  read/write теста — свой engine из scratch-URL с `dispose()`; саму фикстуру использовать для URL.
 - CI (GitHub Actions) ставит `.[dev]` БЕЗ закрепления версий и в job `test` требует отдельной
   сборки sandbox-образа до pytest (шаг §6; с T7.41 фикстура образ не собирает) — расхождение с
   локальной средой даёт красные прогоны (T7.53b разбор: ruff 0.16.10 на раннере против 0.16.7 в

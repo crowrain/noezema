@@ -4,6 +4,8 @@ M1 slice:
   - GET  /api/v1/status     — node state, config head, active session, counts;
   - GET  /api/v1/timeline   — audit events for a session (sequence order);
   - POST /api/v1/messages   — inbox message (created/queued);
+  - GET  /api/v1/questions  — the FIFO question queue view (T7.59);
+  - POST /api/v1/questions  — operator question intake, admin-token guarded (T7.59);
   - POST /api/v1/commands   — closed operator commands with idempotency key.
 
 M1 command semantics: pause/resume (node state), wake_now (run one session
@@ -61,6 +63,15 @@ from packages.domain.models.sessions import ORMSession
 from packages.domain.repositories.inbox import MessageRepository, OperatorCommandRepository
 from packages.domain.repositories.sessions import SessionRepository
 from packages.domain.services.config import ConfigError, ConfigService
+from packages.domain.services.question_intake import (
+    MAX_QUESTION_TEXT_CHARS,
+    PRIORITY_MAX,
+    PRIORITY_MIN,
+    QuestionIntakeError,
+    put_operator_question,
+    question_queue,
+    queue_position,
+)
 
 NODE_STATE_KEY = "node_state"
 NODE_STATES = ("idle", "paused", "session_running")
@@ -77,6 +88,12 @@ _MAIN_HTML = """<!doctype html>
  .ok{color:#7bd88f}.bad{color:#e06c75}.warn{color:#e5c07b}
  #banner{padding:.6rem 1rem;border-radius:6px;font-weight:600}
  .none{background:#1c2a22}.retry{background:#2a2a1c}.degraded{background:#2a2416}.blocked{background:#2a1616}
+ table{border-collapse:collapse;width:100%;font-size:.92rem;margin-top:.5rem}
+ th,td{border-bottom:1px solid #2a3142;padding:.3rem .45rem;text-align:left;vertical-align:top}
+ td.wrap{overflow-wrap:anywhere;max-width:40rem}
+ textarea, input[type=number], input[type=password]{background:#0b0e13;border:1px solid #2a3142;
+   border-radius:5px;padding:.35rem;color:#e6e6e6}
+ button{background:#2a3142;color:#e6e6e6;border:1px solid #3d4658;border-radius:5px;padding:.35rem .7rem;cursor:pointer}
  code{background:#0b0e13;padding:.1rem .3rem;border-radius:4px}
  ul{margin:.3rem 0 .3rem 1.2rem}
 </style></head><body>
@@ -89,6 +106,21 @@ _MAIN_HTML = """<!doctype html>
 <div class="card"><b>Сессия:</b> <span id="sess">—</span></div>
 <div class="card"><b>Ресурсы:</b> <span id="counts">—</span></div>
 <div class="card"><b>Предупреждения:</b> <ul id="warns"></ul></div>
+<div class="card"><b>Задать вопрос</b> (operator intake, T7.59)
+ <form id="ask-form">
+  <p><textarea id="ask-text" rows="3" cols="64" maxlength="2000"
+    placeholder="Вопрос NOEZEMA: origin message, priority поднимает его в начало очереди"></textarea></p>
+  <p><label>priority <input id="ask-priority" type="number" min="-100" max="100" step="1" value="0"></label>
+     <label>admin token <input id="ask-token" type="password" size="18" placeholder="X-Admin-Token"></label>
+     <button type="submit">Задать вопрос</button></p>
+ </form>
+ <p id="ask-result" class="warn"></p>
+</div>
+<div class="card"><b>Очередь вопросов</b> (FIFO: priority ↓, затем возраст)
+ <table id="queue"><thead><tr><th>#</th><th>id</th><th>текст</th><th>state</th><th>pr</th>
+  <th>origin</th><th>сессия</th><th>created_at</th></tr></thead><tbody></tbody></table>
+ <p id="queue-error" class="warn"></p>
+</div>
 <script>
 async function tick(){
   try{
@@ -112,7 +144,54 @@ async function tick(){
       li.textContent=x; li.className='warn'; w.appendChild(li); }
   }catch(e){ document.getElementById('banner').textContent='ошибка чтения статуса'; }
 }
+const TOKEN_KEY='noezema.admin.token';
+function esc(v){return String(v===null||v===undefined?'':v);}
+function adminToken(){
+  const el=document.getElementById('ask-token');
+  const t=(el.value||'').trim() || (sessionStorage.getItem(TOKEN_KEY)||'');
+  if(t) sessionStorage.setItem(TOKEN_KEY,t);
+  return t;
+}
+(function(){ const t=sessionStorage.getItem(TOKEN_KEY); if(t) document.getElementById('ask-token').value=t; })();
+async function loadQueue(){
+  try{
+    const r = await fetch('/api/v1/questions?limit=25'); const d = await r.json();
+    const tb = document.querySelector('#queue tbody'); tb.innerHTML='';
+    for(const q of d.questions){
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td>${q.position===null||q.position===undefined?'':q.position}</td>`+
+        `<td>${esc(q.id).slice(0,8)}</td><td class="wrap">${esc(q.text)}</td>`+
+        `<td>${esc(q.state)}</td><td>${q.priority}</td><td>${esc(q.origin)}</td>`+
+        `<td>${q.session?`<a href="/session/${esc(q.session.id)}">${esc(q.session.state)}</a>`:'—'}</td>`+
+        `<td>${new Date(q.created_at).toLocaleString()}</td>`;
+      tb.appendChild(tr);
+    }
+    document.getElementById('queue-error').textContent =
+      d.questions.length ? '' : 'очередь пуста: задай вопрос или дождись новых кандидатов';
+  }catch(err){ document.getElementById('queue-error').textContent='очередь недоступна'; }
+}
+document.getElementById('ask-form').addEventListener('submit', async (ev)=>{
+  ev.preventDefault();
+  const out = document.getElementById('ask-result');
+  const body = {text:document.getElementById('ask-text').value,
+                priority:Number(document.getElementById('ask-priority').value||0)};
+  let r;
+  try{
+    r = await fetch('/api/v1/questions', {method:'POST',
+      headers:{'Content-Type':'application/json','X-Admin-Token':adminToken()},
+      body:JSON.stringify(body)});
+  }catch(err){ out.textContent='ошибка отправки'; return; }
+  const d = await r.json().catch(()=>({}));
+  if(r.status===201) out.textContent=`вопрос принят: id ${d.id}`+
+    ` · позиция в очереди ${d.position===null?'—':d.position}`;
+  else if(r.status===200) out.textContent=`такой текст уже в очереди: id ${d.id} · state ${d.state}`;
+  else if(r.status===401) out.textContent='нужен admin token (заголовок X-Admin-Token)';
+  else if(r.status===423) out.textContent='хост деградирован: mutating endpoints закрыты';
+  else out.textContent=`отклонено (${r.status}): ${d.detail||d.error||''}`;
+  loadQueue();
+});
 tick(); setInterval(tick, 3000);
+loadQueue(); setInterval(loadQueue, 5000);
 </script></body></html>
 """
 
@@ -478,6 +557,17 @@ class MessageIn(BaseModel):
     body: str = Field(min_length=1, max_length=2000)
     priority: int = Field(default=0, ge=-100, le=100)
     sender: str = Field(default="owner", min_length=1, max_length=100)
+
+
+class QuestionIn(BaseModel):
+    """T7.59: operator question intake. The bounds are the intake service's
+    (one source for CLI + API); the service re-validates them itself, so a
+    hand-built request that skips pydantic still cannot bypass them."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    text: str = Field(min_length=1, max_length=MAX_QUESTION_TEXT_CHARS)
+    priority: int = Field(default=0, ge=PRIORITY_MIN, le=PRIORITY_MAX)
 
 
 class CommandIn(BaseModel):
@@ -878,6 +968,71 @@ def create_app(
                     for m in rows
                 ]
             }
+
+    # ── T7.59: operator question intake (§5.3, §5.3.2, §13.6) ─────────────
+    #
+    # The read half (the queue view) is open like every other GET. The
+    # mutating half belongs to the Command API family: admin token (T3.18) +
+    # the host fail-closed gate (T3.24), i.e. the identical 423 body as
+    # /api/v1/commands. It does not touch memory directly: it appends a
+    # candidate row to the question registry that the FIFO selector serves
+    # (§5.3.2).
+
+    @app.get("/api/v1/questions")
+    async def list_questions(limit: int = 100) -> JsonDict:
+        """The question queue: candidates in FIFO order with their position,
+        then already-worked questions, each annotated with the newest session
+        that took it (id + state) when there is one."""
+        async with factory() as db:
+            rows = await question_queue(db, limit=max(1, min(limit, 200)))
+            return {"questions": rows, "count": len(rows)}
+
+    @app.post("/api/v1/questions", status_code=201)
+    async def post_question(body: QuestionIn, request: Request) -> JSONResponse:
+        """Accept one operator question (origin 'message', state 'candidate').
+
+        Idempotent by exact text: a repeated formulation returns the existing
+        question with 200 and ``replayed=True`` — no duplicate candidate, no
+        silent priority mutation. Validation failure is 400 with the intake
+        reason; a missing or wrong token is 401; a degraded host closes the
+        mutating endpoint with 423 (the same rule as commands).
+        """
+        _check_admin(request)
+        # T3.24 rule, applied to intake: while the host is not fully healthy
+        # the web drops to read-only and every mutating endpoint refuses.
+        host = host_adapter.read()
+        if not host.healthy:
+            return JSONResponse(
+                status_code=423,
+                content={
+                    "rejected": True,
+                    "reason": "host_not_healthy",
+                    "recovery_state": host.recovery_state,
+                    "warnings": host.warnings,
+                },
+            )
+        try:
+            async with factory() as db, transaction(db):
+                question, created = await put_operator_question(
+                    db, raw_text=body.text, raw_priority=body.priority
+                )
+                position = await queue_position(db, question)
+                payload: JsonDict = {
+                    "id": str(question.id),
+                    "text": question.text,
+                    "origin": question.origin,
+                    "state": question.state,
+                    "priority": question.priority,
+                    "created_at": question.created_at.isoformat(),
+                    "position": position,
+                    "replayed": not created,
+                }
+        except QuestionIntakeError as exc:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "invalid_question", "detail": str(exc)},
+            )
+        return JSONResponse(status_code=201 if created else 200, content=payload)
 
     # ── T3.19: SSE timeline (committed outbox + host notifications) ───────
 
