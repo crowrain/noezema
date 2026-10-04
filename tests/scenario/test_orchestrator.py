@@ -406,8 +406,16 @@ async def test_cross_lingual_search_and_staging(migrated_db, fake_llm: FakeLLM, 
 LEASE_TTL_SECONDS = 3.0
 MODEL_DELAY_SECONDS = 2.5 * LEASE_TTL_SECONDS  # a model call is 2.5x the TTL long
 
+# T7.56 (measured): this test alone survived N=20 under the PostgreSQL DDL storm, the clone storm
+# (the T7.55 template-fixture profile) and 12 CPU burns at the T7.51 scale above — that scale stays.
+# What it does NOT survive is multi-worker contention in full `-n auto` runs (flake history: T7.51
+# acceptance, T7.55 red windows). It is therefore marked `timing`: full checks and CI run it in a
+# dedicated SERIAL stage after the parallel pool (AGENTS.md §6), where no pytest neighbors hammer the
+# shared Postgres while the heartbeat guard awaits its renewals. Timing values unchanged.
+
 
 @pytest.mark.asyncio
+@pytest.mark.timing
 async def test_slow_llm_does_not_lose_commit_lease(migrated_db, fake_llm: FakeLLM, tmp_path: Path) -> None:
     """T3.30 regression (first real MVP session, qwen36-35b-a3b-q6-mtp):
 

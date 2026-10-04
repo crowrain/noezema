@@ -103,17 +103,23 @@ cd /home/denis/dsh1/noezema-src && export UV_CACHE_DIR="$PWD/.uv-cache" \
   && { docker image inspect noezema-sandbox:test >/dev/null 2>&1 \
        || docker build -f sandbox/Containerfile -t noezema-sandbox:test sandbox/; } \
   && NOEZEMA_TEST_DATABASE_URL="postgresql+asyncpg://noezema:noezema_dev@127.0.0.1:54329/noezema" \
-     .venv/bin/pytest -n auto -q
+     .venv/bin/pytest -n auto -q -m "not timing" \
+  && NOEZEMA_TEST_DATABASE_URL="postgresql+asyncpg://noezema:noezema_dev@127.0.0.1:54329/noezema" \
+     .venv/bin/pytest -q -m timing
 ```
 
 pytest — параллельно через pytest-xdist `-n auto` (T7.41: на `.87` это 6 воркеров).
+Тесты с маркером `timing` из этого пула ИСКЛЮЧЕНЫ и догоняются вторым ПОСЛЕДОВАТЕЛЬНЫМ прогоном
+без xdist (T7.56 — lease/heartbeat-тесты, чья корректность зависит от wall-clock часов БД; при
+конкуренции нескольких воркеров за общий Postgres их продление аренды опаздывает за запас).
+Оба прогона обязательны: суммарно они дают полный набор тестов.
 Образ sandbox собирается ОДИН РАЗ до запуска pytest: под xdist каждый воркер — отдельный
 процесс со своим session-scope, параллельный `docker build` одного тега — гонка, поэтому
 фикстура `sandbox_image` только проверяет наличие образа (иначе — понятная ошибка).
 `DOCKER_CONFIG` должен указывать на writable-каталог (sandbox агента запрещает запись
 в `~/.config`; по умолчанию — `.docker-config` в репо, та же логика, что в фикстуре).
 
-Маркеры pytest: `unit`, `scenario` (postgres + fake LLM), `security`, `compat`.
+Маркеры pytest: `unit`, `scenario` (postgres + fake LLM), `security`, `compat`, `timing` (T7.56).
 
 ## 7. Известные ловушки
 
@@ -152,6 +158,12 @@ pytest — параллельно через pytest-xdist `-n auto` (T7.41: на
   СТАРОЙ фикстуры; теперь scratch-БД клонируются из session-шаблонов и параллельных миграций по
   одному Postgres нет, а сборки шаблонов сериализованы flock'ом. При внешнем load на машине lease-тесты
   могут флакать на любом пути фикстур — разбор в STATUS.md (T7.55 часть 3).
+- Дополнение к двум предыдущим пунктам (T7.56): unit guard-тесты `tests/unit/test_lease.py` масштабированы
+  с TTL 0,6 до 3,0 с (кратности сохранены; запас на опоздавшее продление 2,0 с) — на старом масштабе flake
+  воспроизводился 1/20 под DDL-штормом Postgres. Стенные lease-тесты помечены маркером `timing` и в полной
+  проверке (§6, ci.yml) идут ОТДЕЛЬНЫМ последовательным прогоном после `-n auto -m "not timing"`: источник
+  flake — конкуренция нескольких xdist-воркеров за общий PostgreSQL, а не CPU; новые wall-clock тесты в
+  параллельный пул не добавлять. Замеры и разбор: STATUS.md T7.56.
 - Проект русскоязычный: RUF001–RUF003 отключены намеренно.
 - CI (GitHub Actions) ставит `.[dev]` БЕЗ закрепления версий и в job `test` требует отдельной
   сборки sandbox-образа до pytest (шаг §6; с T7.41 фикстура образ не собирает) — расхождение с

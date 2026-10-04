@@ -66,4 +66,5 @@ markers = [
     "scenario: multi-step session scenarios (postgres + fake LLM required)",
     "security: invariant and failpoint tests",
     "compat: LLM model compatibility suite",
+    "timing: wall-clock lease/heartbeat tests — run serially after the parallel suite (T7.56, AGENTS.md §6)",
 ]

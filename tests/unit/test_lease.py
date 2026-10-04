@@ -131,15 +131,33 @@ async def test_heartbeat_refused_after_phase_deadline(migrated_db: Any) -> None:
 
 # ── T3.30: background heartbeat guard ───────────────────────────────────────
 
+# T7.56 (flake `test_guard_keeps_lease_alive_across_long_operation`, measured): at TTL 0.6 s this
+# family runs with a one-late-renewal margin of 2·ttl/3 = 0.4 s — and the SAME 0.6 s TTL covers not
+# only renewals inside the long operation but the post-guard chain (state read + COMMIT + fresh
+# connection + is_live). The PostgreSQL DDL-storm cycle (6 concurrent CREATE/alembic-upgrade/DROP,
+# the T7.51 methodology) reproduced it 1/20: renewals during the operation were fine (the
+# `st1.expires_at > st0.expires_at` assert passed), but by the final is_live check the lease had
+# already expired — the commit/reconnect tail exceeded the 0.4 s slack. Full `-n auto` runs flaked
+# the same test with the same LeaseLost/expiry mechanics (T7.55). Re-scaled exactly like T7.51 did
+# for test_orchestrator.py::test_slow_llm_does_not_lose_commit_lease: every ratio preserved, only
+# the absolute scale raised to the proven scenario scale — TTL 3.0 s, renewal interval ttl/3 = 1.0 s,
+# one late heartbeat tolerated by 2.0 s (was 0.4 s; ×5). Marked `timing`: run serially after the
+# parallel suite so xdist neighbors do not add wall-clock jitter on top (see STATUS T7.56).
+GUARD_TTL_SECONDS = 3.0  # same lease scale as the T7.51 scenario test constants
+LONG_OP_SECONDS = 2.5 * GUARD_TTL_SECONDS  # was sleep 1.5 s at TTL 0.6 s — ratio 2.5×TTL preserved
+NOT_PROGRESS_OP_SECONDS = 1.5 * GUARD_TTL_SECONDS  # was 0.9 s at TTL 0.6 s — ratio preserved
+REFUSED_RENEWAL_OP_SECONDS = 2.5 * GUARD_TTL_SECONDS / 3  # was 0.5 s vs interval 0.2 s — 2.5 intervals
+
 
 @pytest.mark.asyncio
+@pytest.mark.timing
 async def test_guard_keeps_lease_alive_across_long_operation(migrated_db: Any) -> None:
     """A model call (here: a sleep) longer than the TTL must not expire the
     lease: the guard renews every ttl/3 (§5.2.3). The extension is part of
     the caller's transaction and becomes durable with its commit."""
     _url, engine = migrated_db
     factory, sid = await _seed(engine)
-    lease = LeaseService(ttl=timedelta(seconds=0.6))
+    lease = LeaseService(ttl=timedelta(seconds=GUARD_TTL_SECONDS))
 
     async with factory() as db, db.begin():
         await lease.acquire(db, sid, "node-a")
@@ -147,7 +165,7 @@ async def test_guard_keeps_lease_alive_across_long_operation(migrated_db: Any) -
         assert st0 is not None
 
         async with LeaseHeartbeatGuard(lease, db, sid, "node-a"):
-            await asyncio.sleep(1.5)  # 2.5x the TTL — without the guard the lease dies
+            await asyncio.sleep(LONG_OP_SECONDS)  # 2.5x the TTL — without the guard the lease dies
 
         st1 = await lease.state(db, sid)
         assert st1 is not None
@@ -158,12 +176,13 @@ async def test_guard_keeps_lease_alive_across_long_operation(migrated_db: Any) -
 
 
 @pytest.mark.asyncio
+@pytest.mark.timing
 async def test_guard_renewal_is_not_progress(migrated_db: Any) -> None:
     """Mid-step renewals are health confirmations: last_progress_at (the
     progress watchdog) advances only at the step boundary (progress=True)."""
     _url, engine = migrated_db
     factory, sid = await _seed(engine)
-    lease = LeaseService(ttl=timedelta(seconds=0.6))
+    lease = LeaseService(ttl=timedelta(seconds=GUARD_TTL_SECONDS))
 
     async with factory() as db, db.begin():
         await lease.acquire(db, sid, "node-a")
@@ -171,7 +190,7 @@ async def test_guard_renewal_is_not_progress(migrated_db: Any) -> None:
         assert st0 is not None
 
         async with LeaseHeartbeatGuard(lease, db, sid, "node-a"):
-            await asyncio.sleep(0.9)
+            await asyncio.sleep(NOT_PROGRESS_OP_SECONDS)
 
         st1 = await lease.state(db, sid)
         assert st1 is not None
@@ -180,12 +199,13 @@ async def test_guard_renewal_is_not_progress(migrated_db: Any) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.timing
 async def test_guard_raises_when_renewal_refused(migrated_db: Any) -> None:
     """A refused renewal (phase deadline passed) surfaces as LeaseLost at
     guard exit — the caller aborts; the reconciler resolves the session."""
     _url, engine = migrated_db
     factory, sid = await _seed(engine)
-    lease = LeaseService(ttl=timedelta(seconds=0.6))
+    lease = LeaseService(ttl=timedelta(seconds=GUARD_TTL_SECONDS))
 
     with pytest.raises(LeaseLost):
         async with factory() as db, db.begin():
@@ -196,7 +216,9 @@ async def test_guard_raises_when_renewal_refused(migrated_db: Any) -> None:
                 {"id": sid},
             )
             async with LeaseHeartbeatGuard(lease, db, sid, "node-a"):
-                await asyncio.sleep(0.5)  # > ttl/3 (0.2 s) — one refused renewal
+                # 2.5 intervals (ttl/3 = 1.0 s): at least one refused renewal lands well before
+                # the guard exits — slack to the first attempt is now 1.5 intervals (was 0.3 s)
+                await asyncio.sleep(REFUSED_RENEWAL_OP_SECONDS)
 
 
 @pytest.mark.asyncio

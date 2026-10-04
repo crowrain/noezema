@@ -69,11 +69,18 @@ jobs:
       # the pre-built tag exists (T7.41) — without this step it fails closed.
       - name: Build sandbox image
         run: docker image inspect noezema-sandbox:test >/dev/null 2>&1 || docker build -f sandbox/Containerfile -t noezema-sandbox:test sandbox/
-      - name: Run tests
+      - name: Run tests (parallel, timing-sensitive tests excluded)
         # T7.55: xdist parallel — ubuntu-24.04 hosted runner has 4 vCPU; the sandbox image is built
         # in the step above (one tag for all workers, T7.41/T7.54) and scratch DBs are cloned from
         # per-worker session templates (one alembic run per worker, T7.55).
-        run: python -m pytest -v --tb=short -n auto
+        # T7.56: lease/heartbeat timing tests (`-m timing`) are excluded here — they flake under
+        # multi-worker Postgres contention, not CPU load (measured, STATUS T7.56).
+        run: python -m pytest -v --tb=short -n auto -m "not timing"
+      - name: Run timing tests (serial)
+        # T7.56: dedicated serial stage after the parallel pool — no xdist neighbors hammering the
+        # service Postgres while a lease guard awaits its clock_timestamp() renewals (~4 tests, tens
+        # of seconds). See AGENTS.md §6 and STATUS.md T7.56.
+        run: python -m pytest -v --tb=short -m timing
 
   docker:
     runs-on: ubuntu-24.04
