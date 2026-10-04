@@ -1739,3 +1739,75 @@ named-набор Go-вопроса содержит ПОЛНЫЙ адрес; н�
 несёт полные написания). ADR-0010 §3 п.1 — уточнение T7.57 (без переписывания истории).
 
 Существующие ассерты test_scope.py/test_source_coverage.py не ослаблены и прошли без изменений.
+
+#### Часть (b): shell.execute в eval — дыра конфигурации и «unreachable» без диагностики
+
+**Факты анализа (до правки, код HEAD ca5fc9a):**
+(i) Исполнитель во всех прогонах — `StubToolExecutor`: `build_orchestrator`
+(apps/orchestrator/main.py:45) используется и wake-тиком (hostctl/cli.py:273), и
+`eval-run`/смоуками (тот же builder в цикле серии внутри `eval_run`, hostctl/cli.py:1193, def с :979);
+Web API — тоже stub (apps/web/api.py). `SandboxToolBroker` (packages/broker/broker.py)
+инстанцируется только в тестах (`tests/scenario/test_tool_broker_sandbox.py`,
+test_sandbox_security*). Реального исполнения shell.execute в eval нет: ветки в stub
+не было, был финальный `Observation(ok=False, error="unreachable")` с `# pragma: no cover`
+(executor.py:71) при существовании ToolSpec shell.execute (packages/policy/tools.py:91,
+NON_IDEMPOTENT, ShellExecuteArgs command≤10000) и его присутствии в списке инструментов
+всех замороженных payload'ов config-v2…v12 (и BOOTSTRAP). Тот же разрыв касается
+artifact.create — того нет даже в реестре (`unknown tool`).
+(ii) `_python_execute` stub: `asyncio.create_subprocess_exec(sys.executable, "-I", "-c", code,
+cwd=workspace)` — код модели исполняется НА ХОСТЕ (.87) от имени пользователя сервиса;
+`-I` (isolated: без env/cwd-импортов) и 15 с timeout c kill прямого ребёнка, вывод ≤10 кБ
+с маскированием NUL. Сети/ФС-изоляции НЕТ: честный уровень риска — полный доступ к хосту
+на правах пользователя сервиса; допустимо только потому, что модели локальные/полудоверенные
+и прогоны закрытые (docstring модуля: DEV ONLY, «never run in production with an untrusted model»).
+(iii) Модель видит инструменты из per-step `filter_offered_tools` (orchestrator.py:151,
+секция «# Доступные инструменты … Только этот список существует») над capabilities снапшота —
+shell.execute и artifact.create там есть; хэш `tool_schema_hash(allowed_tools)` пишется в
+model_runs каждого шага (orchestrator.py:1448, plan-этап :851/:887) и входит в fingerprint
+(`toolchain_hash`). Любое изменение offered-списка меняет байт-хэши и ломает сопоставимость
+с прошлыми прогонами V13–V14B (сверка идёт по этим значениям).
+(iv) `Observation(ok=False, error="unreachable")` для оркестратора — обычный НЕудачный шаг:
+action FAILED + ACTION_FAILED audit + observation-строка модели (orchestrator.py:1702–1741),
+evidence не создаётся (`observation_to_evidence`: not ok → None, apps/orchestrator/evidence.py:95);
+transient учитывается только ретраями ToolBroker (broker.py RETRY_POLICY) — на stub-пути не
+используется; result_unknown=False → ветка T2.21 не включается; статус сессии не меняется
+(потому в V14B shell.execute ×1 дал FAILED «без последствий»). Повтор-гард считает и неудачные
+исполненные вызовы (инкремент до исполнения, orchestrator.py:1644): третий идентичный — deny.
+
+**Правка (минимальная безопасная).** Финальный fallback stub'а вместо `unreachable`/no-cover:
+`tool_not_supported: <tool> is not available in this executor (dev/eval stub); use python.execute
+or workspace.* instead`, transient=False. shell.execute в stub НЕ реализован. Списки инструментов,
+payload'ы, схемы, tool_schema_hash — не тронуты (диагностика видна модели только как текст неудачного
+наблюдения; повтор-гард и лимиты прежние).
+
+**Тесты:** unit `test_policy_tool_without_stub_impl_gives_explicit_diagnosis`
+(tests/unit/test_stub_executor.py: shell.execute → tool_not_supported/не transient/не unknown-tool;
+research.fetch на прямом вызове; artifact.create остаётся unknown tool) + guard
+`test_stub_python_execute_documented_host_risk_stays_explicit` (DEV ONLY/-I/timeout видимы в модуле);
+scenario `test_stub_unsupported_tool_is_a_normal_step_failure` (tests/scenario/test_orchestrator.py:
+полная сессия с shell.execute → action failed c диагностикой, action_failed audit ×1, evidence 0,
+сессия SUCCEEDED).
+
+**Предложения (не реализованы):**
+- **А. Фильтровать список инструментов модели по возможностям исполнителя.** Плюсы: модель
+  перестанет дергать неисполнимые инструменты; минус: меняются `tool_schema_hash` каждого шага и
+  offered-строка промпта → ломается байт-сопоставимость eval-прогонов V13–V14B и будущих замороженных
+  серий (сравнение по toolchain_hash/model_runs); кроме того фильтровать надо по снапшоту, а не по
+  коду — иначе нарушен §Effective config. Цена/риск выше пользы на текущем этапе.
+- **Б. Перевести eval-run/смоуки на реальный SandboxToolBroker (docker на .87 есть).** Плюсы: shell/python
+  исполняются в одноразовом контейнере (network none, cap-drop ALL) — закрывает главный дырявый участок
+  (ii); соответствие §Sandbox инварианту; Model-facing список не меняется → хэши сопоставимы внутри
+  новых заморозок. Оценка: умеренная — в `build_orchestrator` добавить жизненный цикл контейнера на
+  сессию (runtime+handle уже готовы из тестов), mount workspace, таймауты/ретраи broker'а (§5.7) включатся
+  фактически; риски: +секунды на старт контейнера за шаг (среднее влияние на wall-clock смоуков), drift
+  образа при пересборке между прогонами (пин `noezema-sandbox:test` — тот же, что в тестах), ошибки
+  инфраструктуры станут transient-ретраями (изменит статистику шагов). Это рекомендуемое направление.
+- **В. Реализовать shell.execute в Stub.** Не рекомендуется: `/bin/sh -c` прямо на хосте усилит (ii)
+  вместо изоляции; stub по замыслу — временная подставка M1.
+
+**Рекомендация:** Б (eval/smoke на реальном sandbox-исполнителе), как отдельная задача с замером
+wall-clock стоимости; А не делать; В не делать. До решения пользователя ничего из этого не внедрено.
+
+**Не тронуто (b):** payload'ы/промпты/schemas/пины/корпуса/pins, tool-списки снапшотов, повтор-гард,
+`tool_schema_hash`, прошлые прогоны; shell.execute в stub не реализован. eval-run/смоуки не запускались;
+LLM .42/.48 не трогались; к noezema-eval*/noezema-smoke* только SELECT (в части a).

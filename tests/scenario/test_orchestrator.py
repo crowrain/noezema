@@ -929,3 +929,63 @@ async def test_curator_cycle_dependency_rejected_graph_unchanged(
         {"s": str(outcome3.session_id)},
     )
     assert int(rejected[0]) == 1
+
+
+@pytest.mark.asyncio
+async def test_stub_unsupported_tool_is_a_normal_step_failure(
+    migrated_db, fake_llm: FakeLLM, tmp_path: Path
+) -> None:
+    """T7.57(b): shell.execute разрешён реестром policy-инструментов (и списком
+    инструментов config-снапшота), но не реализован в dev/eval StubToolExecutor.
+    Такой шаг — обычная НЕудача оркестратора: action FAILED с явной диагностикой
+    `tool_not_supported:` (не безликий `unreachable`), ACTION_FAILED в audit,
+    evidence нет; цикл explorer продолжается и сессия штатно доходит до complete
+    (ни краха, ни бесконечного повтора). Повтор-гард (T7.12) считает и неудачные
+    исполненные вызовы: третий идентичный — deny без обращения."""
+    scratch_url, _engine = migrated_db
+    qid = await _seed_question(scratch_url, text="Вычисли 6*7 в песочнице")
+    tool_shell: JsonDict = {
+        "public_rationale": "Посмотреть файлы песочницы",
+        "expected_information": "Список файлов",
+        "decision": {"kind": "tool", "tool": "shell.execute", "arguments": {"command": "ls"}},
+    }
+    curator_empty: JsonDict = {
+        "content": {"summary": "Знания нет", "claims": [], "evidence_links": [], "new_questions": []},
+    }
+    outcome = await _run_fake_session(
+        scratch_url,
+        fake_llm,
+        tmp_path,
+        qid,
+        [{"content": tool_shell}, {"content": COMPLETE}, {"content": curator_empty}],
+    )
+
+    # сессия не сломалась: обычный путь до консолидации и commit
+    assert outcome.final_state is SessionState.SUCCEEDED
+    assert outcome.claims_proposed == 0
+
+    row = await _scalar(
+        scratch_url,
+        "SELECT state, error_code FROM actions WHERE session_id=:s AND tool='shell.execute'",
+        {"s": str(outcome.session_id)},
+    )
+    assert row is not None, "the shell.execute action must exist as an executed step"
+    state, error_code = row
+    assert state == "failed"
+    assert error_code is not None and error_code.startswith("tool_not_supported: shell.execute")
+    assert "unreachable" not in error_code
+
+    failed_audit = await _scalar(
+        scratch_url,
+        "SELECT count(*) FROM audit_events WHERE type='action_failed' AND session_id=:s",
+        {"s": str(outcome.session_id)},
+    )
+    assert int(failed_audit[0]) == 1
+
+    # failed observation не производит evidence (§5: наблюдение — только ok-результат)
+    ev = await _scalar(
+        scratch_url,
+        "SELECT count(*) FROM evidence WHERE created_in_session=:s",
+        {"s": str(outcome.session_id)},
+    )
+    assert int(ev[0]) == 0

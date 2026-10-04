@@ -68,7 +68,22 @@ class StubToolExecutor:
                 # Host-side effects are applied by the orchestrator, which
                 # owns the DB transaction.
                 return Observation(tool=tool, ok=True, data={"deferred": True, "arguments": arguments})
-            return Observation(tool=tool, ok=False, error="unreachable")  # pragma: no cover
+            # T7.57(b): a tool that IS in the policy registry but is not implemented
+            # by this dev/eval stub (e.g. shell.execute — only the sandboxed ToolBroker
+            # runs it; research.fetch is host-side via the research proxy). The old
+            # opaque "unreachable" gave the model no diagnosis and hid the config gap
+            # (SMOKE-V14B §5: shell.execute -> FAILED `unreachable`, no consequences,
+            # but no explanation either). Normal step failure: ok=False, non-transient
+            # (repeatability classes unchanged; the orchestrator records FAILED and
+            # the loop continues).
+            return Observation(
+                tool=tool,
+                ok=False,
+                error=(
+                    f"tool_not_supported: {tool} is not available in this executor "
+                    "(dev/eval stub); use python.execute or workspace.* instead"
+                ),
+            )
         except Exception as exc:
             return Observation(tool=tool, ok=False, error=str(exc)[:500])
 
