@@ -138,10 +138,17 @@ origin всегда существующий `message` (нового enum-зна
 
 Dev-стенд (T7.59(б), `deploy/dev-stand/`, целевая ВМ 192.168.1.92 — её разворачивает менеджер по ssh,
 агент к `.92` не обращается и пакет только готовит): идемпотентный `bootstrap.sh` (`--dry-run`,
-`--no-docker-install`, `--no-units`, `--stub-executor`, `--force`, `--web-host/--web-port/--user`) ставит
-пакеты, venv+prod-зависимости **только через uv**, образ с одной закреплённой меткой
-`noezema-sandbox:dev-stand` → `NOEZEMA_SANDBOX_IMAGE` (дефолт `:dev` и тестовый `:test` не трогаем),
-Postgres 15 в docker **только на 127.0.0.1** с томом и healthcheck, базу `noezema-dev`, миграции, активацию
+`--no-docker-install`, `--no-units`, `--stub-executor`, `--force`, `--rotate-secrets`,
+`--web-host/--web-port/--user`) ставит
+пакеты (в 24.04 apt-пакета `uv` нет → официальный установщик от root: `sudo env
+UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh <скачанный файл>`, затем проверка `uv --version`),
+venv+prod-зависимости **только через uv** (`--force` пересоздаёт venv: `uv venv --clear`), образ с одной
+закреплённой меткой `noezema-sandbox:dev-stand` → `NOEZEMA_SANDBOX_IMAGE` (дефолт `:dev` и тестовый
+`:test` не трогаем), Postgres 15 в docker **только на 127.0.0.1** с томом и healthcheck
+`pg_isready -U noezema -d postgres` (без `-d` — спам «database does not exist»), порт выбирается ДО
+записи env-файла и пишется в него (`NOEZEMA_DEV_DB_PORT`; 5432, занят → первый свободный 5433..5440;
+повторный запуск переиспользует порт существующего контейнера), готовность ждётся по эндпоинту приложения
+(TCP + `SELECT 1` на `127.0.0.1:<порт>`, ≤120 с), базу `noezema-dev`, миграции, активацию
 config-v13 (T7.59(в): = config-v12, но `model.context_window`/`backend_context_limit` = 131072 под окно EXL3;
 пропуск, если head уже не bootstrap), env-файл `/etc/noezema/dev.env` (0600, секреты не
 печатаются и в `--dry-run` маскируются) и dev-юниты `deploy/dev-stand/systemd/*` — **не копии**
@@ -244,6 +251,16 @@ config-v13 (T7.59(в): = config-v12, но `model.context_window`/`backend_contex
 - Юниты стенда с `NOEZEMA_TOOL_EXECUTOR=sandbox` требуют от пользователя `User=` доступа к `/var/run/docker.sock`
   (владелец root:docker, 0660): bootstrap добавляет пользователя в группу `docker`; юниту группа видна сразу,
   интерактивной сессии нужен перелогин. Без группы preflight sandbox отказывает до старта сессии (exit 78).
+- Развёртывание стенда на Ubuntu 24.04 (T7.59(в), `deploy/dev-stand/bootstrap.sh`): apt-пакета `uv` там нет,
+  поэтому установщик исполняется от root (`UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1`) и результат
+  проверяется `uv --version`. Порт Postgres смотрим по `ss -ltn` ДО записи env-файла: занят 5432 (нативный
+  PG) → первый свободный 5433..5440, он же пишется в env как `NOEZEMA_DEV_DB_PORT` и его читают status.sh и
+  reset-db.sh; повторный запуск берёт порт существующего контейнера. `--force` пересоздаёт venv только через
+  `uv venv --clear` и НЕ ротирует секреты, пока контейнер/том есть (ротация — `--rotate-secrets`). Готовность БД
+  ждём `SELECT 1` на опубликованном `127.0.0.1:<порт>` (внутренний healthcheck обязан иметь `-d postgres`,
+  иначе спам «database does not exist»), ufw только диагностируется — правил скрипт не добавляет.
+  Проверка скриптов без реальной ВМ: `bash -n`, `shellcheck -S warning` и
+  `tests/unit/test_dev_stand_scripts.py` (настоящие скрипты с подставными docker/ss/uv/sudo, только `--dry-run`).
 - Пустая очередь вопросов на стенде — не ошибка: admitted wake доходит до выбора, кандидата нет, сессия
   `FAILED termination_reason="no_question"` (`apps/orchestrator/orchestrator.py`), дальше backoff
   (wake_schedule в config-v12 = config-v13: 60/120/240, cap 86400) и пауза узла после

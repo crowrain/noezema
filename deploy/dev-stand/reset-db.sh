@@ -11,9 +11,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 ENV_FILE="${NOEZEMA_DEV_ENV_FILE:-/etc/noezema/dev.env}"
 DB_CONTAINER="${NOEZEMA_DEV_DB_CONTAINER:-noezema-dev-db}"
+DB_VOLUME="${NOEZEMA_DEV_DB_VOLUME:-noezema-dev-pgdata}"
 DB_NAME="${NOEZEMA_DEV_DB_NAME:-noezema-dev}"
 DB_USER=noezema
-DB_PORT="${NOEZEMA_DEV_DB_PORT:-5432}"
+DB_PORT="${NOEZEMA_DEV_DB_PORT:-}"   # empty -> taken from the env file / the container (bootstrap may have auto-picked 5433+)
 CONFIG_PAYLOAD="${NOEZEMA_DEV_CONFIG_PAYLOAD:-$REPO_ROOT/docs/eval/config-v13-payload.json}"
 ASSUME_YES=false
 
@@ -41,9 +42,18 @@ if [[ -r "$ENV_FILE" ]]; then ENV_TEXT="$(cat "$ENV_FILE")"; elif have sudo; the
 db_password="$(printf '%s\n' "$ENV_TEXT" | sed -n 's/^NOEZEMA_DB_PASSWORD=//p' | tail -1)"
 [[ -n "$db_password" ]] || die "NOEZEMA_DB_PASSWORD not readable from $ENV_FILE"
 
+# Порт БД: явный env > записанный bootstrap'ом в env-файле > опубликованный портом контейнера.
+if [[ -z "$DB_PORT" ]]; then
+  DB_PORT="$(printf '%s\n' "$ENV_TEXT" | sed -n 's/^NOEZEMA_DEV_DB_PORT=//p' | tail -1)"
+fi
+if [[ -z "$DB_PORT" ]]; then
+  DB_PORT="$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}}{{end}}{{end}}' "$DB_CONTAINER" 2>/dev/null | head -1)"
+fi
+[[ -n "$DB_PORT" ]] || die "не понять, на каком порту опубликован $DB_CONTAINER: задайте NOEZEMA_DEV_DB_PORT=<порт>"
+
 counts="$(psql_as "$DB_NAME" "SELECT 'questions='||count(*) FROM questions" 2>/dev/null || true)"
 sessions="$(psql_as "$DB_NAME" "SELECT 'sessions='||count(*) FROM sessions" 2>/dev/null || true)"
-nonterminal="$(psql_as "$DB_NAME" "SELECT count(*) FROM sessions WHERE state IN ('selected','running','committing','reconciling_commit')" 2>/dev/null || echo 0)"
+nonterminal="$(psql_as "$DB_NAME" "SELECT count(*) FROM sessions WHERE state NOT IN ('succeeded','succeeded_partial','failed','cancelled')" 2>/dev/null || echo 0)"
 
 echo "Это уничтожит в БД '$DB_NAME' (контейнер $DB_CONTAINER, том $DB_VOLUME не трогается):"
 echo "  ${counts:-questions=0}, ${sessions:-sessions=0}, знания, сообщения, аудит-события, снапшоты конфигурации."

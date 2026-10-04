@@ -1,19 +1,34 @@
 #!/usr/bin/env bash
 # NOEZEMA dev stand bootstrap (T7.59(b)) — target: single-user Ubuntu 24.04 VM, no GPU.
 #
-# Idempotent by construction: every step first looks at the current state and skips what is
-# already in place; existing secrets/config are never overwritten without --force.
+# Idempotent by construction: every step first looks at the current state and skips what is already
+# in place; secrets are never rotated implicitly (see --rotate-secrets below).
 #   ./bootstrap.sh --dry-run             print the plan, change nothing
 #   ./bootstrap.sh                       do it (sudo is used where the OS requires it)
 #   ./bootstrap.sh --no-docker-install   skip apt installs (docker already present)
 #   ./bootstrap.sh --no-units            skip installing/activating systemd units
 #   ./bootstrap.sh --stub-executor       sessions use the dev stub instead of containers
-#   ./bootstrap.sh --force               regenerate env file / venv even if they exist
+#   ./bootstrap.sh --force               rebuild venv (--clear) / units / env file; secrets are KEPT
+#                                        as long as the Postgres container or its volume exists
+#   ./bootstrap.sh --rotate-secrets      deliberately rotate the admin token (and the DB password,
+#                                        only when no cluster exists — see step 3)
+#
+#
+# Env knobs (all optional): NOEZEMA_DEV_USER / _APP_DIR / _DATA_ROOT / _ENV_FILE,
+#   NOEZEMA_DEV_DB_CONTAINER / _DB_VOLUME / _DB_NAME / _DB_PORT (порт публикации на 127.0.0.1; если не
+#   задан — выбирается сам: 5432, а занят → первый свободный из 5433..5440, и он записывается в env-файл),
+#   NOEZEMA_DEV_DB_READY_TIMEOUT (секунд ожидания SELECT 1 на этом порту, по умолчанию 120),
+#   NOEZEMA_DEV_SANDBOX_IMAGE / _TOOL_EXECUTOR / _WEB_HOST / _WEB_PORT / _LLM_* / _CONFIG_PAYLOAD /
+#   _CONFIG_REASON / _NODE_OWNER.
+# The firewall is never touched: if ufw is active the script only prints the rules you need (README).
 #
 # The stand NEVER touches the production contour paths (/var/lib/noezema, /run/noezema) and
 # never works on a database that is not noezema-dev* — enforced below, not by convention.
 # Secrets (DB password, admin token) are generated into $ENV_FILE with mode 0600, are never
-# printed, and are masked in every --dry-run line (AGENTS §5).
+# printed, and are masked in every --dry-run line (AGENTS §5). Decision recorded in T7.59(в): a
+# rerun with --force does NOT rotate them while the Postgres container/volume exist — the password
+# already lives in that volume, and rotating it would desync the cluster from $ENV_FILE. Rotation
+# is an explicit act (--rotate-secrets) and only for a stand without an existing cluster.
 
 set -euo pipefail
 
@@ -33,7 +48,15 @@ DB_VOLUME="${NOEZEMA_DEV_DB_VOLUME:-noezema-dev-pgdata}"
 DB_IMAGE="postgres:15"
 DB_NAME="${NOEZEMA_DEV_DB_NAME:-noezema-dev}"
 DB_USER=noezema
-DB_PORT="${NOEZEMA_DEV_DB_PORT:-5432}"            # published on 127.0.0.1 ONLY
+# Published on 127.0.0.1 ONLY. Empty = resolve it below (T7.59(в): a VM may already hold 5432 —
+# e.g. a native postgresql.service — and `docker run -p 127.0.0.1:5432:5432` then dies with
+# "port is already allocated", which looks like a broken stand rather than a busy port).
+DB_PORT="${NOEZEMA_DEV_DB_PORT:-}"
+DB_PORT_EXPLICIT=false
+[[ -n "$DB_PORT" ]] && DB_PORT_EXPLICIT=true
+DB_PORT_DEFAULT=5432
+DB_PORT_ALTERNATIVES="5433 5434 5435 5436 5437 5438 5439 5440"
+DB_READY_TIMEOUT="${NOEZEMA_DEV_DB_READY_TIMEOUT:-120}"   # endpoint wait, seconds (never > 120)
 
 SANDBOX_IMAGE="${NOEZEMA_DEV_SANDBOX_IMAGE:-noezema-sandbox:dev-stand}"
 TOOL_EXECUTOR="${NOEZEMA_DEV_TOOL_EXECUTOR:-sandbox}"
@@ -60,6 +83,7 @@ NODE_OWNER="${NOEZEMA_DEV_NODE_OWNER:-dev-stand}"
 DRY_RUN=false
 DOCKER_INSTALL=true
 FORCE=false
+ROTATE_SECRETS=false
 WITH_UNITS=true
 
 # ── helpers ───────────────────────────────────────────────────────────────────────────
@@ -88,6 +112,93 @@ assert_dev_db_name() {
     *eval*|*smoke*) die "refusing to use DB '$DB_NAME': eval/smoke databases are off-limits (SELECT only)" ;;
   esac
 }
+
+# Is anything already listening on this TCP port (host side)? Checked with ss BEFORE we ask docker
+# to publish it: a VM may run a native postgresql.service on 127.0.0.1:5432, and the old behaviour
+# was a `docker run` that died with "port is already allocated" after secrets had been written.
+listening_ports() {
+  have ss || return 1
+  ss -ltn 2>/dev/null | awk 'NR > 1 {print $4}' | sed -E 's/.*:([0-9]+)$/\1/' | sort -u
+}
+
+port_is_taken() {
+  local port="$1"
+  have ss || return 1            # cannot check -> treat as free, the docker error will be explicit
+  listening_ports | grep -qx "$port"
+}
+
+container_published_port() {
+  docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostPort}} {{end}}{{end}}' \
+    "$DB_CONTAINER" 2>/dev/null | awk '{print $1}' | head -1
+}
+
+resolve_db_port() {
+  local existing taken candidate
+  if have docker && docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$DB_CONTAINER"; then
+    existing="$(container_published_port)"
+    if [[ -n "$existing" ]]; then
+      DB_PORT="$existing"
+      note "порт БД: переиспользуем опубликованный порт существующего контейнера $DB_CONTAINER = 127.0.0.1:$DB_PORT"
+      [[ "$DB_PORT_EXPLICIT" != true ]] || note "  (NOEZEMA_DEV_DB_PORT игнорирован: контейнер уже занят другим портом — так повторный запуск не разъезжается с реальностью)"
+      return 0
+    fi
+  fi
+  taken="$(read_env_value NOEZEMA_DEV_DB_PORT)"
+  if $DB_PORT_EXPLICIT; then
+    port_is_taken "$DB_PORT" || { note "порт БД: $DB_PORT (задан явно, свободен)"; return 0; }
+    die "NOEZEMA_DEV_DB_PORT=$DB_PORT уже занят на этом хосте (ss -ltn). Освободите его или укажите другой: NOEZEMA_DEV_DB_PORT=5433 ./bootstrap.sh"
+  fi
+  if [[ -n "$taken" ]] && ! port_is_taken "$taken"; then
+    DB_PORT="$taken"
+    note "порт БД: $DB_PORT (как записано в $ENV_FILE при прошлом запуске)"
+    return 0
+  fi
+  if ! port_is_taken "$DB_PORT_DEFAULT"; then
+    DB_PORT="$DB_PORT_DEFAULT"
+    note "порт БД: $DB_PORT_DEFAULT (свободен)"
+    return 0
+  fi
+  for candidate in $DB_PORT_ALTERNATIVES; do
+    port_is_taken "$candidate" || {
+      DB_PORT="$candidate"
+      note "порт БД: $DB_PORT_DEFAULT занят (нативный postgresql.service?), выбрали свободный $DB_PORT — он записан в $ENV_FILE как NOEZEMA_DEV_DB_PORT"
+      return 0
+    }
+  done
+  die "127.0.0.1:$DB_PORT_DEFAULT и $DB_PORT_ALTERNATIVES заняты: освободите порт или задайте явно NOEZEMA_DEV_DB_PORT=<порт>"
+}
+
+# ufw diagnostics ONLY — the script never changes the firewall (AGENTS §5 discipline about the host
+# contour; a deploy script must not silently open the VM). Printed before any docker action.
+ufw_required_rules() {
+  note "  sudo ufw allow out on docker0 to 172.17.0.0/16                # пулл образа и трафик контейнера"
+  note "  sudo ufw allow out to any port $(printf '%s' "$LLM_BASE_URL" | sed -E 's#.*:##; s#/.*##') proto tcp   # $LLM_BASE_URL"
+  note "  sudo ufw allow in from 192.168.1.0/24 to any port $WEB_PORT proto tcp   # если UI открывают из LAN"
+  note "  обычно нужны и исходящие: DNS (53), NTP (123), 80/443 (apt и пулл образов)"
+  note "полные команды для 192.168.1.92 — README, раздел «ВМ с deny-by-default UFW»"
+}
+
+firewall_diagnostics() {
+  if ! have ufw; then note "ufw не установлен: проверку deny-by-default сделать нельзя"; return 0; fi
+  if $DRY_RUN; then
+    say "диагностика фаервола (dry-run: состояние ufw не читаем, меня его менять никто не будет)"
+    note "если на ВМ включён deny-by-default ufw, без этих правил стенд не поднимется:"
+    ufw_required_rules
+    return 0
+  fi
+  # -n (non-interactive): diagnostics must never hang on a password prompt in the middle of bootstrap.
+  local reader=(ufw) status=""
+  [[ $EUID -eq 0 ]] || reader=(sudo -n ufw)
+  status="$("${reader[@]}" status 2>/dev/null | head -1 || true)"
+  if [[ "$status" == *"active"* ]]; then
+    say "диагностика фаервола: ufw активен — скрипт НИЧЕГО не меняет, правила применяете вы сами"
+    note "без этих правил стенд не поднимется (пулл образа, доступ контейнера к LLM, доступ к вебу из LAN):"
+    ufw_required_rules
+  else
+    note "ufw: ${status:-состояние недоступно без пароля} — если он активен, правила см. в README («ВМ с deny-by-default UFW»)"
+  fi
+}
+
 assert_dev_path() {
   case "$1" in
     /var/lib/noezema|/run/noezema|/var/lib/noezema/*|/run/noezema/*)
@@ -100,12 +211,13 @@ while [[ $# -gt 0 ]]; do
     --dry-run) DRY_RUN=true ;;
     --no-docker-install) DOCKER_INSTALL=false ;;
     --force) FORCE=true ;;
+    --rotate-secrets) ROTATE_SECRETS=true ;;
     --no-units) WITH_UNITS=false ;;
     --stub-executor) TOOL_EXECUTOR=stub ;;
     --web-host) WEB_HOST="${2:?--web-host needs a value}"; shift ;;
     --web-port) WEB_PORT="${2:?--web-port needs a value}"; shift ;;
     --user) STAND_USER="${2:?--user needs a value}"; shift ;;
-    -h|--help) sed -n '2,18p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,/^[^#]/p' "$0" | sed '$d'; exit 0 ;;
     *) die "unknown flag: $1" ;;
   esac
   shift
@@ -125,6 +237,10 @@ ADMIN_TOKEN=""
 read_env_value() {
   if [[ -f "$ENV_FILE" ]]; then sed -n "s/^$1=//p" "$ENV_FILE" | tail -1; fi
 }
+
+# The port is decided BEFORE the env file is written: $NOEZEMA_DATABASE_URL carries it, and a rerun
+# must land on the same port the existing container publishes instead of failing on 5432.
+resolve_db_port
 
 say "NOEZEMA dev stand bootstrap (T7.59(b))"
 note "repo=$REPO_ROOT app=$APP_DIR user=$STAND_USER:$STAND_GROUP data_root=$DATA_ROOT"
@@ -162,16 +278,37 @@ step_packages() {
   fi
 
   if ! have uv; then
-    note "uv missing -> apt install uv; if the distro has no uv, fall back to the official installer"
+    note "uv missing"
     if $DRY_RUN; then
-      printf '   [dry-run] %s apt-get install -y uv   (fallback: astral installer -> /usr/local/bin)\n' "${SUDO[*]}"
-    elif ! "${SUDO[@]}" apt-get install -y uv; then
-      have curl || run "${SUDO[@]}" apt-get install -y curl
-      run sh -c 'curl -fsSL https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin CARGO_HOME=/tmp/uv-cargo sh'
-      have uv || die "uv is still not on PATH after both attempts"
+      printf '   [dry-run] %s apt-get install -y uv   (Ubuntu 24.04 has no uv package -> expect failure)\n' "${SUDO[*]}"
+      printf '   [dry-run] download https://astral.sh/uv/install.sh, then: sudo env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh <installer>\n'
+      printf '   [dry-run] verify uv --version\n'
+    else
+      # Ubuntu 24.04 ships NO apt package named uv (on .92: "Unable to locate package uv"). The
+      # official installer writes into /usr/local/bin, which the stand user cannot write to, so the
+      # fallback runs it as root with the install dir pinned — then the binary is VERIFIED, not
+      # assumed (a half-installed uv on PATH used to fail later, in step 2, with a cryptic error).
+      if ! "${SUDO[@]}" apt-get install -y uv >/dev/null 2>&1; then
+        note "apt has no uv package (Ubuntu 24.04) -> official installer as root into /usr/local/bin"
+        have curl || run "${SUDO[@]}" apt-get install -y curl
+        local installer="/tmp/noezema-uv-installer.sh"
+        run curl -fsSL https://astral.sh/uv/install.sh -o "$installer"
+        if ! "${SUDO[@]}" env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh "$installer"; then
+          note "root install failed -> installing into ~/.local/bin and adding it to PATH for this run"
+          run env HOME="$HOME" sh "$installer"
+          export PATH="$HOME/.local/bin:$PATH"
+        fi
+        rm -f "$installer"
+      fi
+      hash -r 2>/dev/null || true
+      have uv || die "uv is still not on PATH after both attempts: install it manually and re-run"
     fi
   fi
-  note "uv: $(command -v uv || echo 'not installed')"
+  if $DRY_RUN; then
+    note "uv: $(command -v uv || echo 'not installed yet')"
+  else
+    note "uv: $(uv --version 2>&1)"
+  fi
 
   # Units run as $STAND_USER and must reach /var/run/docker.sock (root:docker) in sandbox mode.
   if [[ "$TOOL_EXECUTOR" == "sandbox" && "$STAND_USER" != "root" ]] && getent group docker >/dev/null 2>&1; then
@@ -187,6 +324,10 @@ step_venv() {
   pybin="$(command -v python3.12 || command -v python3.11 || command -v python3)"
   if [[ -x "$VENV/bin/python" ]] && ! $FORCE; then
     note "venv exists: $VENV (kept; --force recreates it)"
+  elif [[ -d "$VENV" ]]; then
+    # uv refuses to overwrite an existing venv without --clear: `--force` used to die right here.
+    run uv venv "$VENV" --python "$pybin" --clear
+    note "venv recreated (--clear): uv otherwise refuses an existing directory"
   else
     run uv venv "$VENV" --python "$pybin"
   fi
@@ -195,23 +336,49 @@ step_venv() {
 }
 
 # ── 3. secrets + env file, before anything needs them ────────────────────────────────
+# Does the Postgres this stand would connect to already exist (container or its data volume)?
+cluster_exists() {
+  have docker || return 1
+  docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$DB_CONTAINER" && return 0
+  docker volume inspect "$DB_VOLUME" >/dev/null 2>&1
+}
+
 step_env_file() {
   say "3. $ENV_FILE"
   DB_PASSWORD="$(read_env_value NOEZEMA_DB_PASSWORD)"
   ADMIN_TOKEN="$(read_env_value NOEZEMA_ADMIN_TOKEN)"
+  local cluster=false
+  cluster_exists && cluster=true
+
   if [[ -z "$DB_PASSWORD" ]]; then
+    if $cluster; then
+      # The password already lives inside the existing volume; inventing a new one here would write an
+      # env file that cannot connect. That recovery is a human decision, not a side effect of a rerun.
+      die "Postgres-кластер ($DB_CONTAINER/$DB_VOLUME) существует, а NOEZEMA_DB_PASSWORD в $ENV_FILE не найден: восстановите env-файл либо удалите том осознанно (docker volume rm $DB_VOLUME)"
+    fi
     DB_PASSWORD="$(openssl rand -hex 16)"; note "generated the DB password (never printed)"
   else
     note "NOEZEMA_DB_PASSWORD already present: kept"
   fi
-  if [[ -n "$ADMIN_TOKEN" ]] && ! $FORCE; then
-    note "NOEZEMA_ADMIN_TOKEN already present: kept (--force regenerates it)"
+
+  # Decision recorded in T7.59(в): --force rebuilds venv/units/env file but does NOT rotate secrets
+  # while a cluster exists — rotating the DB password would desync it from the volume, and rotating the
+  # admin token would silently invalidate every already-open UI session. Rotation is an explicit act:
+  # --rotate-secrets (for the DB password only when there is no cluster at all).
+  if [[ -n "$ADMIN_TOKEN" ]] && ! $ROTATE_SECRETS; then
+    note "NOEZEMA_ADMIN_TOKEN already present: kept (--force его НЕ ротирует; для ротации — --rotate-secrets)"
+  elif [[ -n "$ADMIN_TOKEN" ]]; then
+    ADMIN_TOKEN="$(openssl rand -hex 32)"
+    note "rotated the admin token (--rotate-secrets, never printed): сессии UI придётся открыть заново"
   else
     ADMIN_TOKEN="$(openssl rand -hex 32)"
     note "generated an admin token (never printed): it is the X-Admin-Token of the UI and of commands"
   fi
-  if [[ -f "$ENV_FILE" ]] && ! $FORCE; then
-    note "env file exists: rewritten with the SAME secrets (--force would rotate the token)"
+  if $ROTATE_SECRETS && $cluster; then
+    note "пароль БД НЕ ротирован: он закреплён в томе $DB_VOLUME — ротация возможна только после его удаления"
+  fi
+  if [[ -f "$ENV_FILE" ]] && ! $ROTATE_SECRETS; then
+    note "env file exists: rewritten with the SAME secrets"
   fi
 
   local url="postgresql+asyncpg://$DB_USER:$DB_PASSWORD@127.0.0.1:$DB_PORT/$DB_NAME"
@@ -219,7 +386,8 @@ step_env_file() {
     printf '   [dry-run] write %s (mode 0600, owner %s:%s) with NOEZEMA_DATABASE_URL=%s\n' \
       "$ENV_FILE" "$STAND_USER" "$STAND_GROUP" "$(printf '%s' "$url" | mask_creds)"
     note "            and NODE_OWNER, ADMIN_TOKEN, LLM_BASE_URL/MODEL/SCHEMA_PROFILE/MAX_OUTPUT_TOKENS/TIMEOUT,"
-    note "            TOOL_EXECUTOR, SANDBOX_IMAGE/ENGINE/WORK_ROOT, HOST_LIB, UNIT_STATE, DATA_ROOT, WEB_HOST/PORT"
+    note "            TOOL_EXECUTOR, SANDBOX_IMAGE/ENGINE/WORK_ROOT, HOST_LIB, UNIT_STATE, DATA_ROOT, WEB_HOST/PORT,"
+    note "            NOEZEMA_DEV_DB_PORT=$DB_PORT (выбранный порт: его же читают status.sh и reset-db.sh)"
     return
   fi
 
@@ -230,6 +398,9 @@ step_env_file() {
     echo "# mode 0600 owner $STAND_USER:$STAND_GROUP; contains secrets (AGENTS §5): never paste into chat or commits."
     echo "NOEZEMA_DATABASE_URL=$url"
     echo "NOEZEMA_DB_PASSWORD=$DB_PASSWORD"
+    # The published host port of the dev container: chosen here (5432 or an auto-picked fallback) and
+    # reused by status.sh / reset-db.sh so a rerun never "loses" the stand's database.
+    echo "NOEZEMA_DEV_DB_PORT=$DB_PORT"
     echo "NOEZEMA_DATA_ROOT=$DATA_ROOT"
     echo "NOEZEMA_HOST_LIB=$HOST_LIB"
     echo "NOEZEMA_UNIT_STATE=$UNIT_STATE"
@@ -269,32 +440,71 @@ step_dirs_and_image() {
   note "pinned for the stand as NOEZEMA_SANDBOX_IMAGE=$SANDBOX_IMAGE (dev/test tags stay untouched)"
 }
 
+db_endpoint_ok() {  # TCP handshake + SELECT 1 on the published endpoint — what the APPLICATION does
+  env NOEZEMA_DATABASE_URL="postgresql://$DB_USER:$DB_PASSWORD@127.0.0.1:$DB_PORT/postgres" \
+    "$VENV/bin/python" - >/dev/null 2>&1 <<'PY'
+import asyncio
+import os
+
+import asyncpg
+
+
+async def main() -> None:
+    conn = await asyncpg.connect(os.environ["NOEZEMA_DATABASE_URL"], timeout=5)
+    try:
+        assert (await conn.fetchval("SELECT 1")) == 1
+    finally:
+        await conn.close()
+
+
+asyncio.run(main())
+PY
+}
+
 # ── 5. Postgres 15 in docker, published on 127.0.0.1 only ────────────────────────────
 step_postgres() {
   say "5. Postgres 15 (docker, 127.0.0.1 only)"
-  local exists running
+  firewall_diagnostics                     # diagnostics only: the script never touches the firewall
+  local exists running status waited probe_ok=false
   exists="$(docker ps -a --format '{{.Names}}' 2>/dev/null | grep -c "^${DB_CONTAINER}$" || true)"
   if [[ "${exists:-0}" -gt 0 ]]; then
     note "container $DB_CONTAINER exists: kept (data volume $DB_VOLUME is reused)"
     running="$(docker inspect -f '{{.State.Running}}' "$DB_CONTAINER" 2>/dev/null || echo false)"
     [[ "$running" == "true" ]] || run "${SUDO[@]}" docker start "$DB_CONTAINER"
   else
+    note "публикуем 127.0.0.1:$DB_PORT (порт выбран на шаге 0; в контейнере Postgres слушает 5432 как обычно)"
     run_secret "${SUDO[@]}" docker run -d --name "$DB_CONTAINER" --restart unless-stopped \
       -e POSTGRES_USER="$DB_USER" -e POSTGRES_PASSWORD="$DB_PASSWORD" -e POSTGRES_DB=postgres \
       -v "$DB_VOLUME:/var/lib/postgresql/data" \
       -p "127.0.0.1:$DB_PORT:5432" \
-      --health-cmd "pg_isready -U $DB_USER" --health-interval 5s --health-timeout 5s --health-retries 12 \
-      "$DB_IMAGE"
+      --health-cmd "pg_isready -U $DB_USER -d postgres" \
+      --health-interval 5s --health-timeout 5s --health-retries 12 "$DB_IMAGE"
   fi
-  if $DRY_RUN; then note "(dry-run: healthcheck wait skipped)"; return; fi
-  local status="unknown"
-  for _ in $(seq 1 90); do
-    status="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$DB_CONTAINER" 2>/dev/null || echo missing)"
-    [[ "$status" == "healthy" ]] && break
-    sleep 1
+  if $DRY_RUN; then note "(dry-run: ожидание эндпоинта пропущено)"; return; fi
+
+  # Readiness is measured on the endpoint the application actually uses (127.0.0.1:$DB_PORT, SELECT 1),
+  # not only on the container's internal healthcheck: an unpublished/blocked port otherwise shows up
+  # much later as a mysterious session failure. -d postgres matters: without it pg_isready asks for a
+  # database "noezema" that does not exist and the container reports unhealthy spam every 5 s.
+  waited=0
+  while (( waited < DB_READY_TIMEOUT )); do
+    db_endpoint_ok && { probe_ok=true; break; }
+    sleep 3
+    waited=$((waited + 3))
   done
-  [[ "$status" == "healthy" ]] || die "container $DB_CONTAINER is '$status', not healthy: journalctl/docker logs explain why"
-  note "postgres healthy on 127.0.0.1:$DB_PORT (never published outside the VM)"
+  if ! $probe_ok; then
+    status="$(docker inspect -f 'state={{.State.Status}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$DB_CONTAINER" 2>/dev/null || echo missing)"
+    note "Postgres не ответил на 127.0.0.1:$DB_PORT за ${DB_READY_TIMEOUT} с. Диагностика:"
+    note "  контейнер: $status"
+    if have ss; then
+      note "  слушатели на :$DB_PORT -> $(ss -ltn 2>/dev/null | awk -v port=":$DB_PORT" '$4 ~ port "$"' | head -3 | tr '\n' ' ')"
+    fi
+    "${SUDO[@]}" docker logs --tail 20 "$DB_CONTAINER" 2>&1 | mask_creds | sed 's/^/   log: /' || true
+    note "  если контейнер healthy, а порт не отвечает: deny-by-default фаервол/ufw (правило out на docker0,"
+    note "   README «ВМ с deny-by-default UFW») или чужой процесс занял 127.0.0.1:$DB_PORT"
+    die "postgres недоступен на 127.0.0.1:$DB_PORT: см. диагностику выше"
+  fi
+  note "postgres отвечает на 127.0.0.1:$DB_PORT (TCP + SELECT 1) за ${waited} с; наружу порт не опубликован"
 }
 
 # ── 6. database, migrations, effective config ────────────────────────────────────────
@@ -366,7 +576,9 @@ step_summary() {
   note "старт/стоп:   systemctl start|stop noezema-dev.target"
   note "UI:           http://$WEB_HOST:$WEB_PORT (token = NOEZEMA_ADMIN_TOKEN из $ENV_FILE)"
   note "вопрос:       форма «Задать вопрос», или $VENV/bin/python -m hostctl.cli ask \"...\" --priority 9"
-  note "wake now:      кнопка «wake now» на странице, или systemctl start noezema-dev-tick.service"
+  note "wake now:      ТОЛЬКО кнопка «wake now» на странице или POST /api/v1/commands (wake_now): они обходят интервал,"
+  note "                но не admission. systemctl start noezema-dev-tick.service сессию НЕ запускает — тик"
+  note "                посмотрит на интервал из снапшота и выведет wait (interval_not_elapsed)"
   note "лента событий: ссылка из таблицы очереди (/session/<id>) или curl http://127.0.0.1:$WEB_PORT/api/v1/timeline"
   note "состояние:    ./status.sh · сброс: ./reset-db.sh"
   if $DRY_RUN; then note "(dry-run: ничего не изменено)"; fi

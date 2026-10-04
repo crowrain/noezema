@@ -48,8 +48,34 @@ LLM_BASE_URL="$(env_get NOEZEMA_LLM_BASE_URL)"
 EXECUTOR="$(env_get NOEZEMA_TOOL_EXECUTOR)"; EXECUTOR="${EXECUTOR:-stub (default)}"
 SANDBOX_IMAGE="$(env_get NOEZEMA_SANDBOX_IMAGE)"
 DATA_ROOT="$(env_get NOEZEMA_DATA_ROOT)"
+DB_PORT="$(env_get NOEZEMA_DEV_DB_PORT)"
 
 PY="$REPO_ROOT/.venv/bin/python"; have "$PY" || PY=python3
+
+payload_name() {  # canonical-хеш payload'а -> имя файла снапшота (в БД canonical, а не хеш файла)
+  local want="$1"
+  [[ -z "$want" ]] && { printf '?'; return; }
+  "$PY" - "$REPO_ROOT/docs/eval" "$want" <<'PY' 2>/dev/null || printf '?'
+import json
+import pathlib
+import sys
+
+docs = pathlib.Path(sys.argv[1])
+want = sys.argv[2]
+sys.path.insert(0, str(docs.parent.parent))
+from packages.domain.canonical import canonical_sha256
+
+for path in sorted(docs.glob("config-v*-payload.json")):
+    try:
+        if canonical_sha256(json.loads(path.read_text(encoding="utf-8"))) == want:
+            print(f"{path.name}")
+            break
+    except (OSError, ValueError):
+        continue
+else:
+    print("? (снапшот не совпадает ни с одним payload из docs/eval)")
+PY
+}
 
 say "код"
 if have git; then
@@ -70,6 +96,8 @@ if have systemctl; then
     printf '   %-34s next=%s\n' "$timer" "${next:-n/a}"
   done
   note "последний код: $(for u in noezema-dev-tick.service noezema-dev-maint.service; do printf '%s=%s ' "$u" "$(systemctl show -p ExecMainStatus --value "$u" 2>/dev/null || true)"; done)"
+  note "«wake now» — кнопка на странице или POST /api/v1/commands (wake_now): они обходят интервал, но не admission."
+  note "systemctl start noezema-dev-tick.service сессию НЕ запускает: тик увидит interval_not_elapsed и выведет wait"
 else
   note "systemctl недоступен (стенд живёт без systemd?)"
 fi
@@ -81,6 +109,7 @@ if have docker; then
       "$(docker inspect -f '{{.State.Status}}' "$DB_CONTAINER")" \
       "$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$DB_CONTAINER")" \
       "$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{(index $conf 0).HostIp}}:{{(index $conf 0).HostPort}} {{end}}' "$DB_CONTAINER")"
+    note "порт БД: из $ENV_FILE -> ${DB_PORT:-не записан}; фактически опубликованный см. строкой выше (127.0.0.1)"
   else
     note "контейнер $DB_CONTAINER не создан (запусти bootstrap.sh)"
   fi
@@ -95,8 +124,15 @@ fi
 say "БД: очередь вопросов и последняя сессия"
 if have docker && docker ps --format '{{.Names}}' | grep -qx "$DB_CONTAINER"; then
   q() { docker exec "$DB_CONTAINER" psql -U "$DB_USER" -d "$DB_NAME" -Atc "$1" 2>/dev/null || true; }
-  note "миграции: $(q 'SELECT version FROM alembic_version') | БД: $DB_NAME | data_root: ${DATA_ROOT:-?}"
-  note "конфиг: active=$(q "SELECT s.activation_mode||'/'||s.activation_state FROM runtime_config_heads h JOIN config_snapshots s ON s.id=h.active_config_snapshot_id WHERE h.scope='global'")"
+  note "миграции: $(q 'SELECT version FROM alembic_version') | БД: $DB_NAME | порт (env): ${DB_PORT:-не записан} | data_root: ${DATA_ROOT:-?}"
+  cfg="$(q "SELECT s.activation_mode||'/'||s.activation_state||'|'||s.sha256||'|'||s.payload_sha256 FROM runtime_config_heads h JOIN config_snapshots s ON s.id=h.active_config_snapshot_id WHERE h.scope='global'")"
+  note "конфиг: active=${cfg:-нет активного head}"
+  if [[ -n "$cfg" ]]; then
+    # Имя снапшота подбирается по canonical-хешу payload'а: в БД лежит canonical, а не хеш файла (AGENTS §7).
+    payload="$(printf '%s' "$cfg" | cut -d'|' -f3)"
+    note "  snapshot=$(printf '%s' "$cfg" | cut -d'|' -f2 | cut -c1-12) payload(canonical)=$(printf '%s' "$payload" | cut -c1-12)"
+    note "  context_window=$(q "SELECT s.model->>'context_window' FROM runtime_config_heads h JOIN config_snapshots s ON s.id=h.active_config_snapshot_id WHERE h.scope='global'") max_output=$(q "SELECT s.model->>'max_output_tokens' FROM runtime_config_heads h JOIN config_snapshots s ON s.id=h.active_config_snapshot_id WHERE h.scope='global'") файл=$(payload_name "$payload")"
+  fi
   note "вопросы по состояниям:"
   q "SELECT '   - '||state||': '||count(*) FROM questions GROUP BY state ORDER BY state" | sed 's/^/ /'
   note "(из них origin='message' — принятых оператором: $(q "SELECT count(*) FROM questions WHERE origin='message'"))"
@@ -106,6 +142,8 @@ if have docker && docker ps --format '{{.Names}}' | grep -qx "$DB_CONTAINER"; th
   q "SELECT '   '||left(s.id::text,8)||'  '||s.state||'  reason='||coalesce(s.termination_reason,'-')||'  вопрос='||coalesce(left(q.text,50),'-') FROM sessions s LEFT JOIN questions q ON q.id=s.question_id ORDER BY s.created_at DESC NULLS LAST LIMIT 1" | sed 's/^/ /'
   note "нерешённые commit_attempts (блокируют wake): $(q "SELECT count(*) FROM commit_attempts WHERE state NOT IN ('committed','rolled_back')")"
   note "wake-состояние: $(q "SELECT coalesce(paused_reason,'not paused')||', consecutive_failures='||consecutive_failures FROM wake_scheduler_state LIMIT 1")"
+  node_state="$(q "SELECT value FROM system_constants WHERE key='node_state'")"
+  note "node_state (БД — источник истины, T7.59(в)): ${node_state:-не задан} | непустых сессий в БД: $(q "SELECT count(*) FROM sessions WHERE state NOT IN ('succeeded','succeeded_partial','failed','cancelled')")"
 else
   note "Postgres недоступен — пропущено"
 fi
