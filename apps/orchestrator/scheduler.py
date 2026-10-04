@@ -87,6 +87,19 @@ def data_root_from_env() -> Path:
     return Path(os.environ.get(DATA_ROOT_ENV) or DEFAULT_DATA_ROOT)
 
 
+#: Session workspace directory relative to the data root. Every host session entry point puts its
+#: stub-executor workspace here — the wake tick (`root / WORKSPACE_SUBDIR`), the manual orchestrator
+#: entry (`python -m apps.orchestrator`) and the standalone web (apps/web/bind.py resolves the same
+#: layout). An unset env keeps the historical `/var/lib/noezema/workspace`; a node with its own data
+#: root (dev stand) gets its own instead of failing on a production path it cannot write (T7.59(в)).
+WORKSPACE_SUBDIR = "workspace"
+
+
+def workspace_root_from_env() -> Path:
+    """`<NOEZEMA_DATA_ROOT>/workspace` — the session workspace of THIS process (T7.59(в))."""
+    return data_root_from_env() / WORKSPACE_SUBDIR
+
+
 @dataclass(frozen=True)
 class WakeSchedule:
     """Validated wake_schedule section of the config snapshot (§5.2.1)."""

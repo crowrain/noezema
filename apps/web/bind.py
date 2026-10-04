@@ -21,7 +21,7 @@ from __future__ import annotations
 import ipaddress
 from pathlib import Path
 
-from apps.orchestrator.scheduler import DATA_ROOT_ENV, DEFAULT_DATA_ROOT
+from apps.orchestrator.scheduler import DATA_ROOT_ENV, DEFAULT_DATA_ROOT, WORKSPACE_SUBDIR
 
 WEB_HOST_ENV = "NOEZEMA_WEB_HOST"
 WEB_PORT_ENV = "NOEZEMA_WEB_PORT"
@@ -30,8 +30,10 @@ ADMIN_TOKEN_ENV = "NOEZEMA_ADMIN_TOKEN"
 DEFAULT_WEB_HOST = "127.0.0.1"
 DEFAULT_WEB_PORT = 8321
 
-# Stub-executor workspace of the standalone web, relative to the data root (as before).
-STANDALONE_WORKSPACE_SUBDIR = "workspace"
+# Stub-executor workspace of the standalone web, relative to the data root (as before). The name
+# is owned by the scheduler (apps/orchestrator/scheduler.py) so the web, the wake tick and the
+# manual orchestrator entry cannot drift apart (T7.59(в)).
+STANDALONE_WORKSPACE_SUBDIR = WORKSPACE_SUBDIR
 
 # Same fail-closed exit code hostctl uses for a configuration refusal (AGENTS §6).
 EXIT_CONFIG_ERROR = 78

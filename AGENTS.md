@@ -217,6 +217,24 @@ config-v12 (пропуск, если head уже не bootstrap), env-файл `
   и юнит уходил в restart-loop. С T7.59(б) путь = `<NOEZEMA_DATA_ROOT>/workspace` через
   `apps/web/bind.resolve_standalone_workspace(data_root_from_env())` — тот же env и дефолт, что у wake tick;
   в режиме `sandbox` этот путь не используется (host-overlay берётся из `NOEZEMA_SANDBOX_WORK_ROOT`).
+- Ручной вход `python -m apps.orchestrator` до T7.59(в) хардкодил `/var/lib/noezema/workspace` так же; теперь
+  корень берётся из env (`apps/orchestrator/scheduler.workspace_root_from_env()`, постоянная
+  `WORKSPACE_SUBDIR` — одна на веб-бинд, wake tick и manual entry, литералы «workspace» сведены в неё).
+  Артефакты остаются sibling'ом workspace ⇒ `<NOEZEMA_DATA_ROOT>/artifacts`; env не задан → прежний путь.
+- «wake now» на standalone-входе (T7.59(в)): `build_standalone_app` не может построить оркестратор до создания
+  приложения (оркестратор живёт на его factory), поэтому присваивает `app.state.orchestrator` ПОСЛЕ `create_app`.
+  Командный обработчик обязан читать `app.state.orchestrator` в момент команды, а не замыкаться на аргументе
+  `create_app(orchestrator=…)` — иначе на реальном стенде wake отвечает `rejected: orchestrator not attached`.
+  Тесты, передающие оркестратор аргументом, этого пути не видят: нужен отдельный тест через
+  `build_standalone_app()` с env (`NOEZEMA_DATABASE_URL`, `NOEZEMA_DATA_ROOT`, `NOEZEMA_HOST_LIB`/
+  `NOEZEMA_UNIT_STATE` + свежий `publish_unit_state`, иначе Command API отвечает 423, `NOEZEMA_LLM_BASE_URL` =
+  FakeLLM) и явным `async with app.router.lifespan_context(app)` — `httpx.ASGITransport` lifespan не запускает.
+- Состояние узла (`system_constants.node_state`) — источник истины в БД: читать при каждой команде и при каждом
+  `GET /api/v1/status` (T7.59(в)). Копировать его в память на время процесса нельзя — веб, стартовавший рядом с
+  внешним wake tick, навсегда остаётся с неверным `session_running` (wake отвергается, статус врёт). В памяти
+  держится только то, чем владеет сам процесс (`node.session_task`); остаточный маркер разрешает чистая
+  `apps/web.api.effective_node_state`, статус показывает сырое значение БД + булев `node_state_stale_marker`.
+  Гонка тика (маркер пишется до строки сессии) осознанна и этой правкой не закрыта.
 - Стенд (и любой узел, где существует каталог `NOEZEMA_HOST_LIB`) воспринимается `HostStatusAdapter` как узел с
   активным host-протоколом: без свежего снимка юнитов (TTL 15 с) Command API и `POST /api/v1/questions` отвечают
   423, GET работают. Поэтому у `deploy/dev-stand` есть `noezema-dev-unit-state.timer` (5 с); «healthy by default»

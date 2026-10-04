@@ -607,11 +607,19 @@ class CommandIn(BaseModel):
 
 
 class _Node:
-    """M1 node state: in-memory, persisted to system_constants across
-    restarts (the host transition protocol lands in M2)."""
+    """What the web process owns IN MEMORY (T7.59(в)).
+
+    The node STATE is deliberately not here. `system_constants.node_state` in the DB is the single
+    source of truth (AGENTS §3 "effective config/Host-контур": the state is a host fact, and an
+    external `hostctl wake-tick` — a different process — writes it). Reading it once in the
+    lifespan made the copy stale forever: a dev stand whose web started while an external tick held
+    a session remembered `session_running`, answered every later «wake now» with "a session is
+    already running" and showed the wrong node_state in /api/v1/status even though the DB said
+    `idle`. Only what no other process can know stays in memory: the session task THIS process
+    started, and its last error.
+    """
 
     def __init__(self) -> None:
-        self.state: str = "idle"
         self.session_task: asyncio.Task[SessionOutcome] | None = None
         self.last_error: str | None = None
         self._resets: set[asyncio.Task[None]] = set()
@@ -622,11 +630,49 @@ def _now() -> datetime:
 
 
 async def _load_node_state(db: AsyncSession) -> str:
+    """The DB truth about the node state (also what /api/v1/status reports)."""
     stmt = select(ORMSystemConstant).where(ORMSystemConstant.key == NODE_STATE_KEY)
     row = (await db.execute(stmt)).scalar_one_or_none()
     if row is None:
         return "idle"
     return row.value if row.value in NODE_STATES else "idle"
+
+
+def _owns_live_session(node: _Node) -> bool:
+    """True while this web process runs a session it started itself (wake_now)."""
+    return node.session_task is not None and not node.session_task.done()
+
+
+def effective_node_state(
+    raw: str, *, web_owns_session: bool, db_has_nonterminal_session: bool
+) -> str:
+    """The state a command is decided on (§5.2.1, T7.59(в)).
+
+    `session_running` is a marker written by whoever started the session — the web or an external
+    tick — and it only means something while a session really runs. When the marker is
+    `session_running`, no session row is nonterminal and this process owns no session task, the
+    marker is left over from an external tick that has since ended (a killed/timed-out unit, a
+    crash before the session row existed): honouring it would wedge the node — every «wake now»
+    refused forever. Everything else (`idle`, `paused`) is taken from the DB as is: an operator
+    pause is sticky until the operator resume.
+
+    Invariant kept: while an external tick really holds a session (the DB says `session_running`
+    AND a nonterminal session exists), wake_now is refused; after that session terminates it is
+    accepted again.
+    """
+    if raw == "session_running" and not web_owns_session and not db_has_nonterminal_session:
+        return "idle"
+    return raw
+
+
+async def _effective_state(db: AsyncSession, node: _Node) -> str:
+    """Read the DB truth for this request and resolve a leftover external-tick marker."""
+    active = await SessionRepository.list_nonterminal(db)
+    return effective_node_state(
+        await _load_node_state(db),
+        web_owns_session=_owns_live_session(node),
+        db_has_nonterminal_session=bool(active),
+    )
 
 
 async def _save_node_state(db: AsyncSession, state: str) -> None:
@@ -668,8 +714,8 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-        async with factory() as db:
-            node.state = await _load_node_state(db)
+        # T7.59(в): no state is cached here — the node state is read from the DB on every command
+        # and every status query, so an external tick (or another writer) cannot desynchronise us.
         yield
         if node.session_task is not None and not node.session_task.done():
             node.session_task.cancel()
@@ -697,6 +743,23 @@ def create_app(
             raise HTTPException(status_code=401, detail="invalid admin token")
         # no token configured: local single-operator, allow (MVP)
 
+    def _command_orchestrator() -> Orchestrator | None:
+        """The orchestrator that answers a command is the one ATTACHED AT COMMAND TIME.
+
+        T7.59(в) defect of the real stand: `build_standalone_app` — the entry every stand and every
+        production web unit uses — cannot build the orchestrator before the app owns its session
+        factory (the orchestrator shares that factory), so it attaches the orchestrator to
+        `app.state.orchestrator` AFTER create_app returned. The command handler closed over the
+        create_app argument instead, which is None in that path, so every «wake now» answered
+        `rejected: orchestrator not attached`. Tests never caught it because they passed the
+        orchestrator as a create_app argument.
+
+        `create_app(orchestrator=…)` behaviour is unchanged — it seeds app.state.orchestrator;
+        reading app.state at command time simply also honours what was attached later.
+        """
+        attached: Orchestrator | None = app.state.orchestrator
+        return attached
+
     # ── queries ───────────────────────────────────────────────────────────
 
     @app.get("/api/v1/status")
@@ -708,13 +771,21 @@ def create_app(
                 raise HTTPException(status_code=503, detail=str(exc)) from exc
             active = await SessionRepository.list_nonterminal(db)
             session = active[0] if active else None
+            node_state = await _load_node_state(db)
             counts = {
                 "questions": (await db.execute(select(func.count(ORMQuestion.id)))).scalar_one(),
                 "sessions": (await db.execute(select(func.count(ORMSession.id)))).scalar_one(),
                 "messages": (await db.execute(select(func.count(ORMMessage.id)))).scalar_one(),
             }
             out = {
-                "node_state": node.state,
+                # T7.59(в): the node state in the view is the DB value, not a copy made at startup.
+                # `node_state_stale_marker` names the one case where the marker no longer describes
+                # a running session (session_running without any nonterminal session and without a
+                # session this web started) — commands are decided on the resolved state instead.
+                "node_state": node_state,
+                "node_state_stale_marker": node_state == "session_running"
+                and not active
+                and not _owns_live_session(node),
                 "last_error": node.last_error,
                 "config": {
                     "snapshot_id": str(snapshot.id),
@@ -852,23 +923,25 @@ def create_app(
         db: AsyncSession, command: ORMOperatorCommand, body: CommandIn
     ) -> tuple[OperatorCommandState, JsonDict]:
         ctype = OperatorCommandType(command.type)
+        # T7.59(в): the node state for THIS command comes from the DB — an external tick writes
+        # system_constants.node_state, and a copy taken at startup goes stale (that was the stand
+        # defect: «wake now» answered "a session is already running" while the DB said idle).
+        state = await _effective_state(db, node)
 
         if ctype is OperatorCommandType.PAUSE:
-            if node.state in ("paused",):
+            if state == "paused":
                 return OperatorCommandState.COMPLETED, {"node_state": "paused", "noop": True}
-            if node.state == "session_running":
+            if state == "session_running":
                 return OperatorCommandState.REJECTED, {"reason": "session is running; stop_gracefully instead"}
-            node.state = "paused"
-            await _save_node_state(db, node.state)
+            await _save_node_state(db, "paused")
             # T3.29: explain the pause for the wake admission audit
             await _set_pause_reason(db, "operator")
             return OperatorCommandState.COMPLETED, {"node_state": "paused"}
 
         if ctype is OperatorCommandType.RESUME:
-            if node.state != "paused":
+            if state != "paused":
                 return OperatorCommandState.REJECTED, {"reason": "node is not paused"}
-            node.state = "idle"
-            await _save_node_state(db, node.state)
+            await _save_node_state(db, "idle")
             # T3.29: the operator resume clears the failure bookkeeping, so
             # the node is eligible for the next scheduled tick immediately.
             await db.execute(
@@ -882,11 +955,12 @@ def create_app(
             return OperatorCommandState.COMPLETED, {"node_state": "idle"}
 
         if ctype is OperatorCommandType.WAKE_NOW:
-            if node.state == "paused":
+            if state == "paused":
                 return OperatorCommandState.REJECTED, {"reason": "node is paused"}
-            if node.state == "session_running":
+            if state == "session_running":
                 return OperatorCommandState.REJECTED, {"reason": "a session is already running"}
-            if orchestrator is None:
+            orchestrator_ref = _command_orchestrator()
+            if orchestrator_ref is None:
                 return OperatorCommandState.REJECTED, {"reason": "orchestrator not attached"}
             # T3.29 (§5.2.1): wake_now bypasses the schedule timing (interval,
             # minimum gap, backoff) but NOT admission. Evaluated on a fresh
@@ -900,8 +974,7 @@ def create_app(
                     "reason": decision.reason,
                     "paused_reason": decision.detail,
                 }
-            node.state = "session_running"
-            await _save_node_state(db, node.state)
+            await _save_node_state(db, "session_running")
 
             def _reset(task: asyncio.Task[SessionOutcome]) -> None:
                 # runs on the event loop after the session task settles
@@ -911,7 +984,7 @@ def create_app(
                 node._resets.add(reset_task)
                 reset_task.add_done_callback(node._resets.discard)
 
-            node.session_task = asyncio.create_task(orchestrator.run_session())
+            node.session_task = asyncio.create_task(orchestrator_ref.run_session())
             node.session_task.add_done_callback(_reset)
             return OperatorCommandState.COMPLETED, {"node_state": "session_running"}
 
@@ -951,10 +1024,12 @@ def create_app(
         else:
             final_state = task.result().final_state.value
         async with factory() as db:
-            new_state = await WakeScheduler(db, node_owner=_node_owner, data_root=_data_root).record_session_result(
+            # T3.29 (§5.2.1): the resulting state is written by the scheduler into
+            # system_constants.node_state — and read back from there by /api/v1/status and by the
+            # next command (T7.59(в)); nothing is mirrored in memory.
+            await WakeScheduler(db, node_owner=_node_owner, data_root=_data_root).record_session_result(
                 final_state=final_state, now=_now()
             )
-        node.state = new_state
 
     # ── T3.22: message lifecycle (lazy TTL -> expired) ────────────────────
 
@@ -1345,7 +1420,14 @@ def create_app(
 
 
 def build_standalone_app() -> FastAPI:
-    """Entry helper: build the app with an orchestrator from env config."""
+    """Entry helper: build the app with an orchestrator from env config.
+
+    The app is created first (it owns the engine + session factory), the orchestrator is built on
+    THAT factory and attached to `app.state.orchestrator`. A command reads the attachment at
+    command time (`_command_orchestrator` in create_app) — this is the path a real stand uses, and
+    the order here is exactly why an argument-only lookup used to answer "orchestrator not
+    attached" on the stand while tests that passed the orchestrator as an argument stayed green.
+    """
     from apps.orchestrator.tool_executors import build_tool_executor
     from packages.llm_gateway.client import LLMMiddleware
     from packages.llm_gateway.config import LLMGatewayConfig, ModelProfile

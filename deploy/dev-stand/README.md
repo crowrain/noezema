@@ -68,10 +68,17 @@ systemctl start noezema-dev.target            # web + три таймера
    `priority DESC, created_at ASC` (§5.3.2), то есть вопрос оператора с приоритетом обгоняет
    остальные кандидаты, а среди равных приоритетов решает возраст. Эквивалент из консоли:
    `.venv/bin/python -m hostctl.cli ask "почему падает X?" --priority 9`.
-4. **wake now:** кнопка «wake now» в карточке «Узел» (это `POST /api/v1/commands` с
-   `{"type":"wake_now", "idempotency_key": ...}`) либо `.venv/bin/python -m hostctl.cli wake-tick`,
-   либо `sudo systemctl start noezema-dev-tick.service`. Команда обходит только тайминг расписания;
-   шлюзы admission (§5.2.1) остаются и могут ответить «skip» — это нормальный ответ планировщика.
+4. **wake now — это кнопка/команда Command API, а не systemctl.** Кнопка «wake now» в карточке «Узел»
+   (это `POST /api/v1/commands` с `{"type":"wake_now", "idempotency_key": ...}`) — **единственный**
+   способ запустить сессию прямо сейчас: она обходит только тайминг расписания (интервал, минимальный
+   интервал, backoff), шлюзы admission (§5.2.1) остаются и могут ответить «rejected» с причиной — это
+   нормальный ответ планировщика. `sudo systemctl start noezema-dev-tick.service` и
+   `.venv/bin/python -m hostctl.cli wake-tick` сессию **не форсируют**: это тот же тик, что делает
+   таймер, он подчиняется снапшоту конфигурации. После завершившейся сессии действует
+   `wake_schedule.interval_seconds = 3600`, поэтому ручной старт тика напечатает в журнал
+   `wake-tick: wait (interval_not_elapsed)` и выйдет с кодом 0 — сессии не будет (проверка:
+   `journalctl -u noezema-dev-tick.service -n 20 --no-pager`). У `wake-tick` нет флага «сейчас»;
+   форсированный wake есть только в Command API.
 5. **Лента событий:** ссылка из таблицы очереди ведёт на `/session/<id>` (состояние, события,
    коммит). Общий поток: `GET /api/v1/timeline`, поток SSE: `GET /api/v1/timeline/sse`, метрики: `/metrics`.
 6. **Очередь:** карточка «Очередь вопросов» = `GET /api/v1/questions` (открытый запрос): id, текст,

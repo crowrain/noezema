@@ -11,6 +11,7 @@ from pathlib import Path
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from apps.orchestrator.orchestrator import Orchestrator
+from apps.orchestrator.scheduler import workspace_root_from_env
 from apps.orchestrator.tool_executors import build_tool_executor
 from apps.research_proxy.service import ResearchProxyService
 from packages.artifacts.store import FilesystemArtifactStore
@@ -38,7 +39,9 @@ def build_orchestrator(
     — "stub" (default, unchanged: the DEV ONLY in-process stand-in) or
     "sandbox" (the one-shot container per session, opened/closed by
     ``Orchestrator.run_session``). An unknown value fails closed. The artifact
-    store stays host-side in both modes.
+    store stays host-side in both modes: it sits next to the workspace root
+    (``<data root>/artifacts``), so whoever picks the data root moves artifacts
+    with it (T7.59(в) — the manual entry no longer pins ``/var/lib/noezema``).
     """
     llm_config = LLMGatewayConfig()
     profile = ModelProfile(model_alias=llm_config.model, backend_name="local")
@@ -60,7 +63,12 @@ async def _run() -> int:
     settings = DatabaseSettings()
     engine = create_async_engine(settings.database_url)
     factory = async_sessionmaker(engine, expire_on_commit=False)
-    orchestrator, gateway = build_orchestrator(factory, Path("/var/lib/noezema/workspace"))
+    # T7.59(в): the workspace/artifacts root comes from NOEZEMA_DATA_ROOT exactly like the wake tick
+    # does (`hostctl wake-tick` builds `data_root_from_env() / "workspace"`), instead of a hardcoded
+    # production path. Unset env → the historical /var/lib/noezema/workspace (behaviour unchanged);
+    # a stand running as an ordinary user gets `<its data root>/workspace` + `/artifacts` and no
+    # PermissionError at startup. In sandbox mode the stub workspace is not used at all.
+    orchestrator, gateway = build_orchestrator(factory, workspace_root_from_env())
     try:
         outcome = await orchestrator.run_session()
     finally:

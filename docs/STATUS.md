@@ -2230,3 +2230,68 @@ payload'ы, промпты и пины, `tool_schema_hash`, пороги, кор
 
 Проверка §6 перед этим коммитом: ruff чисто, mypy strict — **132 файла**, `-n auto -m "not timing"` и
 `-m timing` — см. числа в отчёте (новые тесты: `tests/unit/test_web_bind.py` 20, `tests/scenario/test_dev_stand_flow.py` 2).
+
+## T7.59(в) — дефекты, найденные при развёртывании dev-стенда на 192.168.1.92
+
+Три независимых дефекта, найденных менеджером на живой ВМ; исправлены тремя отдельными коммитами
+(каждый revert-able независимо). Тесты: локально, fake-LLM и подставные команды; `.92`/`.168` и
+`.42`/`.48` не трогались, реальных сессий с живым LLM не запускалось.
+
+### Коммит 1 — web: «wake now» на standalone-входе, node_state из БД, workspace ручного входа
+
+**Дефект 1 (web, `apps/web/api.py`).** `build_standalone_app()` — вход, под которым живёт и стенд
+(`python -m apps.web.main`), и прод-веб: сначала создаётся приложение (оно владеет engine и
+session factory), затем на этой factory строится оркестратор и присваивается
+`app.state.orchestrator`. Обработчик `POST /api/v1/commands` читал оркестратор из **замыкания**
+аргумента `create_app(orchestrator=…)`, который на этом пути `None` ⇒ каждая команда `wake_now`
+отвечала `rejected: {"reason": "orchestrator not attached"}`, сессия не начиналась. Тесты этого не
+видели, потому что все они передавали оркестратор аргументом в `create_app`.
+Фикс: команда берёт оркестратор из `app.state.orchestrator` **в момент выполнения**
+(`_command_orchestrator()`); семантика `create_app(orchestrator=…)` не изменена — она по-прежнему
+заполняет `app.state.orchestrator`, просто присвоение, сделанное после `create_app`, теперь тоже
+виден). Текст отказа
+`orchestrator not attached` сохранён (его проверяет существующий тест).
+
+**Дефект 2 (web, sticky node state).** Веб читал состояние узла из `system_constants.node_state`
+один раз в lifespan и держал его в памяти. Если веб стартовал, пока внешний `hostctl wake-tick`
+держит сессию, копия навсегда оставалась `session_running`: «wake now» отвечала «a session is already
+running», а `/api/v1/status` показывал состояние, которого в БД давно нет.
+Фикс: источник истины — БД. Состояние читается из `system_constants` на каждую команду
+(`PAUSE`/`RESUME`/`WAKE_NOW`) и на каждый `GET /api/v1/status`; в памяти остаётся только то, чем
+владеет сам веб (`node.session_task`). Чистая часть вынесена в `effective_node_state(raw,
+web_owns_session, db_has_nonterminal_session)` (AGENTS §4): `idle`/`paused` берутся как есть;
+`session_running` сохраняется, если за ним реально стоит сессия — незавершённая строка `sessions`
+или задача этого веб-процесса; остаточный маркер (ни того, ни другого) разрешается в `idle`, чтобы
+сдохший тик не клинил узел навсегда. Инвариант сохранён и закреплён тестом: пока внешний тик держит
+сессию (`session_running` + незавершённая сессия), `wake_now` отвергается; после её терминации —
+принимается тем же процессом без перезапуска. `/api/v1/status` честен: поле `node_state` — сырое
+значение из БД, плюс новый булев `node_state_stale_marker` (маркер есть, сессии за ним нет).
+Остаточная гонка осознанна и не изменена: тик пишет маркер до создания своей строки сессии
+(`hostctl/cli.py`), поэтому в узком окне между этими двумя записями wake возможен — ровно та же
+экспозиция, что была до T7.59(в); полная защита — единая транзакция «маркер + строка сессии» на
+стороне тика, это отдельная задача.
+
+**Дефект 3 (orchestrator, `apps/orchestrator/main.py::_run`).** Ручной вход `python -m
+apps.orchestrator` хардкодил `/var/lib/noezema/workspace`, а artifact store — рядом с ним; на стенде
+(`User=<user>`, `NOEZEMA_DATA_ROOT=/var/lib/noezema-dev`) это PermissionError до начала сессии.
+Фикс: корень берётся из env тем же способом, что и у wake tick — новый общий хелпер
+`apps/orchestrator/scheduler.workspace_root_from_env()` = `<NOEZEMA_DATA_ROOT>/workspace`
+(постоянная `WORKSPACE_SUBDIR`; `apps/web/bind.resolve_standalone_workspace` теперь использует ту же
+постоянную, `hostctl wake-tick`/`run-sessions` — тоже, литералы «workspace» в трёх местах сведены к
+одному). Артефакты остаются sibling'ом workspace ⇒ `<NOEZEMA_DATA_ROOT>/artifacts`. Env не задан →
+прежний `/var/lib/noezema/workspace`, поведение прежнее.
+
+**Новые тесты.** `tests/scenario/test_web_standalone_wake.py` (1) — путь самого стенда: env →
+`build_standalone_app()` → lifespan → `POST /api/v1/commands {"type":"wake_now"}` против scratch-БД с
+FakeLLM и stub-исполнителем; требует «не orchestrator not attached», прохождение admission, полный
+сессионный цикл и то, что workspace вырос из `NOEZEMA_DATA_ROOT`.
+`tests/unit/test_web_node_state.py` (4) — чистая `effective_node_state` на всех четырёх комбинациях.
+`tests/scenario/test_web_node_state_db_truth.py` (3) — состояние пишет **второе** подключение (как
+другой процесс): (а+б) веб стартует при внешнем `session_running` + незавершённой сессии → wake
+отвергнут; после терминации и `idle` в БД → принят тем же приложением; (в) `/api/v1/status` отражает
+БД (`paused`, затем `idle`) и отказ по состояния из БД; остаточный маркер показан честно
+(`node_state_stale_marker: true`) и не клинит узел.
+`tests/unit/test_orchestrator_entry_workspace.py` (5) — workspace/артефакты из env, дефолт не
+изменён, `_run` реально вызывает хелпер (env задан/не задан), артефакты в том же data root.
+Существующие тесты (`test_web_api.py`, `test_dev_stand_flow.py`, `test_wake_scheduler.py`,
+`test_web_bind.py`) не ослаблены и не изменены.

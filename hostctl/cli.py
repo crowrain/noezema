@@ -224,6 +224,7 @@ def wake_tick(node_owner: str | None, data_root: str | None) -> None:
 
     from apps.orchestrator.main import build_orchestrator
     from apps.orchestrator.scheduler import (
+        WORKSPACE_SUBDIR,
         ReassessmentAdmissionError,
         RepairAdmissionError,
         WakeScheduleError,
@@ -274,7 +275,7 @@ def wake_tick(node_owner: str | None, data_root: str | None) -> None:
         # node state and never falls back to the unisolated dev stub.
         try:
             executor_mode = tool_executor_mode_from_env()
-            orchestrator, gateway = build_orchestrator(factory, root / "workspace")
+            orchestrator, gateway = build_orchestrator(factory, root / WORKSPACE_SUBDIR)
         except (ToolExecutorConfigError, ToolExecutorUnavailableError) as exc:
             click.echo(f"wake-tick: tool executor fail-closed ({exc})", err=True)
             return 78
@@ -1101,6 +1102,7 @@ def eval_run(
         sys.exit(EXIT_USAGE_ERROR)
     from apps.orchestrator.main import build_orchestrator
     from apps.orchestrator.scheduler import (
+        WORKSPACE_SUBDIR,
         ReassessmentAdmissionError,
         RepairAdmissionError,
         WakeScheduleError,
@@ -1299,7 +1301,7 @@ def eval_run(
                     click.echo(
                         f"session {i + 1}: tool executor=sandbox (one container per session)"
                     )
-                orchestrator, gateway = build_orchestrator(factory, root / "workspace")
+                orchestrator, gateway = build_orchestrator(factory, root / WORKSPACE_SUBDIR)
                 await _node_state_set("session_running")
                 t0 = _time.monotonic()
                 outcome_steps = 0
