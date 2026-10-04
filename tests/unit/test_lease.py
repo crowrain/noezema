@@ -56,15 +56,13 @@ async def test_acquire_and_heartbeat(migrated_db: Any) -> None:
 
     # heartbeat by a WRONG owner is refused
     with pytest.raises(LeaseLost):
-        async with factory() as db:
-            async with db.begin():
-                await lease.heartbeat(db, sid, "node-b")
+        async with factory() as db, db.begin():
+            await lease.heartbeat(db, sid, "node-b")
 
     # a second acquire by another owner is refused while the lease is live
     with pytest.raises(LeaseLost):
-        async with factory() as db:
-            async with db.begin():
-                await lease.acquire(db, sid, "node-b")
+        async with factory() as db, db.begin():
+            await lease.acquire(db, sid, "node-b")
 
     async with factory() as db:
         assert await lease.is_live(db, sid, "node-a")
@@ -102,9 +100,8 @@ async def test_terminal_session_refuses_lease(migrated_db: Any) -> None:
     lease = LeaseService()
 
     with pytest.raises(LeaseLost):
-        async with factory() as db:
-            async with db.begin():
-                await lease.acquire(db, sid, "node-a")
+        async with factory() as db, db.begin():
+            await lease.acquire(db, sid, "node-a")
 
 
 @pytest.mark.asyncio
@@ -128,9 +125,8 @@ async def test_heartbeat_refused_after_phase_deadline(migrated_db: Any) -> None:
 
     # the watchdog refuses to keep a stuck session alive
     with pytest.raises(LeaseLost):
-        async with factory() as db:
-            async with db.begin():
-                await lease.heartbeat(db, sid, "node-a", progress=True)
+        async with factory() as db, db.begin():
+            await lease.heartbeat(db, sid, "node-a", progress=True)
 
 
 # ── T3.30: background heartbeat guard ───────────────────────────────────────

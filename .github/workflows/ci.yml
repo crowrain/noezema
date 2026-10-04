@@ -59,6 +59,11 @@ jobs:
           cache: pip
       - run: pip install --upgrade uv
       - run: uv pip install --system ".[dev]"
+      # Build the sandbox image BEFORE pytest (AGENTS.md §6, T7.54): under xdist every
+      # worker is a separate process, so the `sandbox_image` fixture only verifies that
+      # the pre-built tag exists (T7.41) — without this step it fails closed.
+      - name: Build sandbox image
+        run: docker image inspect noezema-sandbox:test >/dev/null 2>&1 || docker build -f sandbox/Containerfile -t noezema-sandbox:test sandbox/
       - name: Run tests
         run: python -m pytest -v --tb=short
 
