@@ -1167,7 +1167,7 @@ def build_standalone_app() -> FastAPI:
     """Entry helper: build the app with an orchestrator from env config."""
     from pathlib import Path
 
-    from apps.orchestrator.executor import StubToolExecutor
+    from apps.orchestrator.tool_executors import build_tool_executor
     from packages.llm_gateway.client import LLMMiddleware
     from packages.llm_gateway.config import LLMGatewayConfig, ModelProfile
 
@@ -1181,7 +1181,9 @@ def build_standalone_app() -> FastAPI:
         session_factory=factory,
         gateway=gateway,
         profile=ModelProfile(model_alias=llm_config.model, backend_name="local"),
-        executor=StubToolExecutor(Path("/var/lib/noezema/workspace")),
+        # T7.58 (ADR-0023): the same NOEZEMA_TOOL_EXECUTOR switch as the wake tick
+        # and the eval run; the default ("stub") keeps the previous behavior.
+        executor=build_tool_executor(Path("/var/lib/noezema/workspace")),
     )
     app.state.orchestrator = orchestrator
     return app

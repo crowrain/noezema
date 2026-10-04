@@ -231,6 +231,12 @@ def wake_tick(node_owner: str | None, data_root: str | None) -> None:
         data_root_from_env,
         node_owner_from_env,
     )
+    from apps.orchestrator.tool_executors import (
+        SANDBOX_MODE,
+        ToolExecutorConfigError,
+        ToolExecutorUnavailableError,
+        tool_executor_mode_from_env,
+    )
     from packages.domain.services.config import ConfigError
     from packages.memory.activation import ActivationInFlightError
 
@@ -261,6 +267,21 @@ def wake_tick(node_owner: str | None, data_root: str | None) -> None:
             click.echo(f"wake-tick: {decision.action} ({decision.reason})")
             return 0
 
+        # T7.58 (ADR-0023): the tool executor is resolved at build time
+        # (NOEZEMA_TOOL_EXECUTOR). Sandbox mode refuses to start a session when
+        # the engine/image is unusable — that refusal happens BEFORE the node is
+        # marked session_running and before any tool runs, so it leaves no wedged
+        # node state and never falls back to the unisolated dev stub.
+        try:
+            executor_mode = tool_executor_mode_from_env()
+            orchestrator, gateway = build_orchestrator(factory, root / "workspace")
+        except (ToolExecutorConfigError, ToolExecutorUnavailableError) as exc:
+            click.echo(f"wake-tick: tool executor fail-closed ({exc})", err=True)
+            return 78
+        if executor_mode == SANDBOX_MODE:
+            # process-log label only: no new audit/fingerprint fields (T7.58, ADR-0023)
+            click.echo("wake-tick: tool executor=sandbox (one container per session)")
+
         async with factory() as db, db.begin():
             await db.execute(
                 text(
@@ -270,7 +291,6 @@ def wake_tick(node_owner: str | None, data_root: str | None) -> None:
                 {"v": "session_running"},
             )
 
-        orchestrator, gateway = build_orchestrator(factory, root / "workspace")
         try:
             outcome = await orchestrator.run_session()
         except ActivationInFlightError as exc:
@@ -1014,6 +1034,12 @@ def eval_run(
         data_root_from_env,
         node_owner_from_env,
     )
+    from apps.orchestrator.tool_executors import (
+        SANDBOX_MODE,
+        ToolExecutorConfigError,
+        ToolExecutorUnavailableError,
+        tool_executor_mode_from_env,
+    )
     from packages.domain.services.config import ConfigError, ConfigService
     from packages.evaluation.gates import compute_gates
     from packages.evaluation.service import (
@@ -1189,8 +1215,18 @@ def eval_run(
                     aborted = True
                     break
 
-                await _node_state_set("session_running")
+                # T7.58 (ADR-0023): NOEZEMA_TOOL_EXECUTOR is resolved here per
+                # session (the same builder as the wake tick); sandbox mode means
+                # one container per session for this whole series. The build runs
+                # BEFORE the node is marked session_running: an unavailable
+                # engine/image refuses the whole eval-run (exit 78) and must not
+                # leave a wedged node_state behind.
+                if tool_executor_mode_from_env() == SANDBOX_MODE:
+                    click.echo(
+                        f"session {i + 1}: tool executor=sandbox (one container per session)"
+                    )
                 orchestrator, gateway = build_orchestrator(factory, root / "workspace")
+                await _node_state_set("session_running")
                 t0 = _time.monotonic()
                 outcome_steps = 0
                 in_flight = False
@@ -1352,6 +1388,10 @@ def eval_run(
         WakeScheduleError,
         ReassessmentAdmissionError,
         RepairAdmissionError,
+        # T7.58 (ADR-0023): a bad executor switch or an unusable sandbox engine/image
+        # refuses the eval-run before any session is counted (no _finish, exit 78).
+        ToolExecutorConfigError,
+        ToolExecutorUnavailableError,
     ) as exc:
         click.echo(f"eval-run: fail-closed ({type(exc).__name__}: {exc})", err=True)
         sys.exit(78)

@@ -237,6 +237,11 @@ class Orchestrator:
         self.gateway = gateway
         self.profile = profile
         self.executor = executor
+        # T7.58 (ADR-0023): an executor may additionally implement the
+        # session-scoped lifecycle (`open_session`/`close_session`, see
+        # apps.orchestrator.tool_executors.SessionScopedExecutor). run_session
+        # drives it around phase 1; executors without it (the dev stub) are used
+        # exactly as before.
         # T6.3 (stage 5): the host-side research proxy. The research.fetch
         # tool is profile-gated (curated/open_lab only); when the profile
         # grants it but no service is wired, the fetch fails closed.
@@ -370,6 +375,13 @@ class Orchestrator:
             with contextlib.suppress(Exception):
                 await self._release_session_admission(session_id)
             raise
+        finally:
+            # T7.58 (ADR-0023): the sandboxed executor's one-shot container is
+            # destroyed on EVERY path out of phase 1 — a normal finish, an early
+            # terminal `_finish`, a raised LeaseLost, any infra error. An
+            # executor without the close hook (the dev stub, test doubles) does
+            # nothing here: the stub path is byte-identical to before.
+            await self._close_tool_sandbox()
         if isinstance(result, SessionOutcome):
             # early finish (no question, operator abort) — already terminal
             return result
@@ -583,6 +595,15 @@ class Orchestrator:
         await audit.record(
             AuditEventType.SESSION_STARTED, session_id=session.id, public_summary="session started"
         )
+        # T7.58 (ADR-0023): a session-scoped executor (sandbox mode) opens its
+        # one-shot container HERE — the effective capability profile is known,
+        # the durable session id exists (the container is named after it), and
+        # nothing has been executed yet: an unusable engine/image raises before
+        # the first tool call, the transaction rolls back and run_session's
+        # except releases the admission record (the session simply does not
+        # start — no silent fallback to the unisolated stub). The dev stub
+        # executor has no open hook: nothing happens for it.
+        await self._open_tool_sandbox(session.id, cap_profile)
         # T2.16: take the lease before any real work (T3.30: shared instance)
         lease = self.lease
         await lease.acquire(
@@ -2353,6 +2374,37 @@ class Orchestrator:
             questions_created=questions_created,
             termination_reason=termination_reason,
         )
+
+    # ── T7.58 (ADR-0023): sandboxed tool executor lifecycle ───────────────
+
+    async def _open_tool_sandbox(
+        self, session_id: uuid.UUID, cap_profile: CapabilityProfile
+    ) -> None:
+        """Open the one-shot container of a session-scoped executor (sandbox mode).
+
+        Duck-typed on purpose: `StubToolExecutor` and the test doubles have no
+        `open_session`, so every existing stub run/test is untouched. Called
+        from phase 1 before any tool call: an unusable engine or image raises
+        here — the phase-1 transaction rolls back and `run_session` releases
+        the admission record, i.e. the session does not start; there is no
+        fallback to the unisolated dev executor (§3 "Sandbox", fail-closed).
+        """
+        opener = getattr(self.executor, "open_session", None)
+        if opener is None:
+            return
+        await opener(session_id, cap_profile)
+
+    async def _close_tool_sandbox(self) -> None:
+        """Destroy the container opened for this session (no-op without the hook).
+
+        Runs in the `finally` around phase 1: it never raises and never replaces
+        the durable session outcome — a cleanup it could not complete is named
+        by the executor's own log line (`LEAKED container …`), not swallowed.
+        """
+        closer = getattr(self.executor, "close_session", None)
+        if closer is None:
+            return
+        await closer()
 
     async def _release_session_admission(self, session_id: uuid.UUID) -> None:
         """T7.20 (ADR-0009): drop the admission record when phase 1 ends
