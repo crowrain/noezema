@@ -28,6 +28,10 @@ _EFF_SNAP = (
     "(SELECT active_config_snapshot_id FROM runtime_config_heads WHERE scope = 'global')"
 )
 
+#: Тот же указатель наружу (T7.65): приложение ответа читает головы утверждений по
+#: действующему снимку правил — одному и тому же, который читает рантайм.
+EFFECTIVE_SNAPSHOT_SQL = _EFF_SNAP
+
 HEAD_STATES = ("current", "pending", "invalid", "none")
 
 

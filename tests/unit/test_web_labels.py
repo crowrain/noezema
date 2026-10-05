@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import re
 from pathlib import Path
 from typing import get_args
@@ -20,10 +21,13 @@ from typing import get_args
 import pytest
 
 import apps.orchestrator.scheduler as scheduler
+import apps.web.answer as web_answer
 import apps.web.api as web_api
 import apps.web.host_status as host_status
+import packages.policy.tools as policy_tools
 from apps.web import labels
 from apps.web.labels import LABELS, MAX_ACTION_CHARS, MAX_HINT_CHARS, MAX_LABEL_CHARS
+from packages.domain.config import BOOTSTRAP_PAYLOAD
 from packages.domain.models.enums import (
     AssessmentEvidenceRole,
     AssessmentState,
@@ -112,6 +116,15 @@ def _sources() -> dict[str, list[str]]:
         "message_state": [e.value for e in MessageState],
         "recovery_state": _RECOVERY_CONSTANTS,
         "paused_reason": list(_PAUSED_REASONS),
+        # T7.65: названия ВЫПОЛНЕННЫХ действий берутся из реестра инструментов —
+        # новый инструмент без подписи краснит тест полноты (ловушка AGENTS §7:
+        # снапшот предлагает инструменты, которых нет у исполнителя).
+        "action_tool": [spec.name for spec in policy_tools.all_tools()],
+        # T7.65: закрытые наборы ключей построителя ответа объявлены в его коде.
+        "answer_step": list(web_answer.STEP_KEYS),
+        "answer_result": list(web_answer.RESULT_KINDS),
+        "honesty_note": list(web_answer.HONESTY_KEYS),
+        "verification_lead": list(web_answer.VERIFICATION_LEAD_KEYS),
     }
 
 
@@ -177,6 +190,53 @@ def test_audit_event_labels_cover_every_audit_type() -> None:
     table = LABELS["audit_event_type"]
     uncovered = [e.value for e in AuditEventType if e.value not in table]
     assert not uncovered, f"события ленты без подписи: {uncovered}"
+
+
+def test_action_names_come_from_the_tool_registry_and_snapshots() -> None:
+    """Названия выполненных действий (T7.65): источник — код и снапшот, не тест.
+
+    Реестр `packages/policy/tools.py` — это то, что исполнитель умеет выполнить;
+    снапшот правил предлагает свой список возможностей. Расхождение между ними и
+    есть ловушка AGENTS §7 (в снапшоте был `artifact.create`, которого в реестре
+    нет), поэтому словарь обязан покрывать объединение обоих списков.
+    """
+    registry = {spec.name for spec in policy_tools.all_tools()}
+    snapshot_offered = set(BOOTSTRAP_PAYLOAD["policy"]["capabilities"]["tools"])
+    unlabeled = [
+        name
+        for name in sorted(registry | snapshot_offered)
+        if not labels.describe("action_tool", name)["hint"]
+    ]
+    assert not unlabeled, f"действия без подписи: {unlabeled}"
+
+
+def test_new_tool_without_a_label_reddens_the_completeness_check(monkeypatch) -> None:
+    """Проверка красная по построению: источник значений читается из реестра.
+
+    Временный инструмент добавляется в реестр — и тот же механизм полноты
+    (`_sources()` → `test_every_source_value_has_a_label`) находит дыру. Если бы
+    источник был списком, переписанным в тесте, эта проверка осталась бы зелёной.
+    """
+    extra = dataclasses.replace(policy_tools.all_tools()[0], name="brand.new_tool")
+    monkeypatch.setitem(policy_tools._TOOLS, "brand.new_tool", extra)
+
+    values = _sources()["action_tool"]
+    assert "brand.new_tool" in values, "источник названий не читается из реестра"
+    missing = [name for name in values if not labels.describe("action_tool", name)["hint"]]
+    assert missing == ["brand.new_tool"]
+
+
+def test_answer_builder_keys_are_all_labelled() -> None:
+    """Ключи построителя ответа — закрытые наборы из его кода (T7.65)."""
+    for category, keys in (
+        ("answer_step", web_answer.STEP_KEYS),
+        ("answer_result", web_answer.RESULT_KINDS),
+        ("honesty_note", web_answer.HONESTY_KEYS),
+        ("verification_lead", web_answer.VERIFICATION_LEAD_KEYS),
+    ):
+        assert keys, f"пустой набор ключей: {category}"
+        unlabeled = [key for key in keys if not labels.describe(category, key)["hint"]]
+        assert not unlabeled, f"{category}: ключи без подписи: {unlabeled}"
 
 
 # ─── тексты подписей ──────────────────────────────────────────────────────

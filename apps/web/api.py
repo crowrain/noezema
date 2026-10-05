@@ -6,8 +6,15 @@ M1 slice:
   - POST /api/v1/messages   — inbox message (created/queued);
   - GET  /api/v1/questions  — the FIFO question queue view (T7.59);
   - POST /api/v1/questions  — operator question intake, admin-token guarded (T7.59);
+  - GET  /api/v1/questions/{question_id}/answer — one question's answer card:
+    result, live claims, steps of work built from the session's event feed (T7.65);
   - POST /api/v1/commands   — closed operator commands with idempotency key;
   - GET  /api/v1/glossary   — human labels for every enum value the web shows (T7.64).
+
+Pages (T7.65): `/` is the simple operator view «Вопросы и ответы», `/answer/<id>`
+shows one question's answer, and the previous full main page moved verbatim to
+`/engineer`. `/session`, `/knowledge`, `/claim`, `/diagnostics`, `/metrics` and
+`/evaluation` are unchanged.
 
 M1 command semantics: pause/resume (node state), wake_now (run one session
 through the attached orchestrator), stop_gracefully / abort_session (set the
@@ -52,6 +59,7 @@ from apps.orchestrator.scheduler import (
     data_root_from_env,
     node_owner_from_env,
 )
+from apps.web import answer as answer_queries
 from apps.web import diagnostics as diagnostics_queries
 from apps.web import knowledge as knowledge_queries
 from apps.web import labels as ui_labels
@@ -149,7 +157,11 @@ def annotate_question(row: object) -> JsonDict:
 
 # T3.20/T3.21: minimal HTML shell. The page is a thin viewer over the JSON
 # API; all invariants live server-side, the HTML only renders them.
-_MAIN_HTML = """<!doctype html>
+#
+# T7.65 (UI simplification, stage 2): this full engineer view is NOT removed and
+# NOT weakened — it moved verbatim to `/engineer` (only one link line was added).
+# The simple operator view (`_HOME_HTML`, «Вопросы и ответы») now answers `/`.
+_ENGINEER_HTML = """<!doctype html>
 <html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>NOEZEMA — узел</title>
@@ -169,6 +181,7 @@ _MAIN_HTML = """<!doctype html>
  ul{margin:.3rem 0 .3rem 1.2rem}
 </style></head><body>
 <h1>NOEZEMA — узел</h1>
+<p><a href="/">← простой режим</a></p>
 <p><a href="/knowledge">Знание (граф)</a> · <a href="/diagnostics">Диагностика</a></p>
 <p><a href="/metrics">Метрики (§16)</a> · <a href="/evaluation">Evaluation (§22.2)</a></p>
 <div id="banner" class="none">загрузка…</div>
@@ -288,6 +301,350 @@ document.getElementById('ask-form').addEventListener('submit', async (ev)=>{
  });
 tick(); setInterval(tick, 3000);
 loadQueue(); setInterval(loadQueue, 5000);
+</script></body></html>
+"""
+
+# T7.65 (упрощение интерфейса, этап 2): простая страница оператора «Вопросы и
+# ответы». Она смотрит те же JSON-маршруты, что и инженерная, и не знает ни одного
+# кода состояния: все подписи состояний, этапов и итогов приходят от сервера из
+# единого словаря (`apps/web/labels.py`), поэтому словарь не задублирован в JS.
+_HOME_HTML = """<!doctype html>
+<html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NOEZEMA — вопросы и ответы</title>
+<style>
+ body{font-family:system-ui,sans-serif;margin:2rem;background:#0e1116;color:#e6e6e6}
+ h1{font-size:1.35rem} h2{font-size:1.1rem}
+ .card{background:#171c26;border:1px solid #2a3142;border-radius:8px;padding:1rem;margin:0.7rem 0}
+ .ok{color:#7bd88f}.bad{color:#e06c75}.warn{color:#e5c07b}.muted{color:#98a2b3;font-size:.9rem}
+ #banner{padding:.6rem 1rem;border-radius:6px;font-weight:600;background:#1c2a22}
+ #banner.warn{background:#2a2a1c}#banner.bad{background:#2a1616}
+ table{border-collapse:collapse;width:100%;font-size:.95rem;margin-top:.5rem}
+ th,td{border-bottom:1px solid #2a3142;padding:.4rem .5rem;text-align:left;vertical-align:top}
+ td.wrap{overflow-wrap:anywhere;max-width:40rem}
+ textarea, input[type=number], input[type=password], select{background:#0b0e13;
+   border:1px solid #2a3142;border-radius:5px;padding:.35rem;color:#e6e6e6}
+ button{background:#2a3142;color:#e6e6e6;border:1px solid #3d4658;border-radius:5px;
+   padding:.4rem .8rem;cursor:pointer;margin-right:.35rem}
+ details{margin-top:.4rem} a{color:#8ab4f8}
+ label{margin-right:.7rem;display:inline-block;margin-bottom:.35rem}
+</style></head><body>
+<h1>NOEZEMA — вопросы и ответы</h1>
+<p><a href="/knowledge">Все знания</a> · <a href="/diagnostics">Диагностика</a>
+ · <a href="/engineer">Для инженера</a></p>
+<div id="banner">загрузка…</div>
+<div class="card"><b>Узел сейчас:</b> <span id="node">—</span>
+ <div class="muted" id="node-hint"></div>
+ <div class="muted" id="queue-count"></div>
+ <div class="muted" id="last-work"></div></div>
+
+<div class="card"><b>Задать вопрос</b>
+ <form id="ask-form">
+  <p><textarea id="ask-text" rows="3" cols="64" maxlength="2000"
+    placeholder="Спросите NOEZEMA: например, «сколько будет 6×7?»"></textarea></p>
+  <p><label>Насколько срочно <select id="ask-urgency">
+    <option value="0" selected>Обычный</option>
+    <option value="9">Срочно (вперёд очереди)</option>
+    <option value="-5">Потом</option>
+   </select></label>
+   <label>Пароль оператора <input id="ask-token" type="password" size="18"
+     placeholder="нужен, чтобы задать вопрос"></label>
+   <button type="submit">Отправить</button></p>
+  <details><summary>дополнительно</summary>
+   <p><label>Число в очереди (обычно не нужно)
+    <input id="ask-priority" type="number" min="-100" max="100" step="1" value=""></label></p>
+   <p class="muted">Если заполнено это число, оно важнее выбора срочности.</p>
+  </details>
+  <p id="ask-result" class="warn"></p>
+ </form>
+</div>
+
+<div class="card"><b>Обработка очереди</b>
+ <p><button id="wake-now" type="button">Запустить обработку</button>
+    <button id="resume-node" type="button">Возобновить</button>
+    <button id="pause-node" type="button">Пауза</button></p>
+ <p class="muted">Один запуск обрабатывает один вопрос из очереди, обычно 30–60 секунд.
+    Пауза останавливает плановые запуски узла, возобновление её снимает.</p>
+ <p id="wake-result" class="warn"></p>
+</div>
+
+<div class="card"><b>Мои вопросы</b>
+ <p class="muted">Очередь вопросов: сначала срочные, затем по времени.</p>
+ <table id="queue"><thead><tr><th>Вопрос</th><th>Статус</th><th>Когда</th><th></th></tr></thead>
+  <tbody></tbody></table>
+ <p id="queue-error" class="muted"></p>
+</div>
+
+<script>
+const TOKEN_KEY='noezema.admin.token';
+function esc(v){return String(v===null||v===undefined?'':v);}
+function setText(id,value){document.getElementById(id).textContent=esc(value);}
+function adminToken(){
+  const el=document.getElementById('ask-token');
+  const t=(el.value||'').trim() || (sessionStorage.getItem(TOKEN_KEY)||'');
+  if(t) sessionStorage.setItem(TOKEN_KEY,t);
+  return t;
+}
+(function(){ const t=sessionStorage.getItem(TOKEN_KEY); if(t) document.getElementById('ask-token').value=t; })();
+(function(){ const q=new URLSearchParams(window.location.search).get('ask');
+  if(q) document.getElementById('ask-text').value=q; })();
+async function tick(){
+  try{
+    const r=await fetch('/api/v1/status'); const s=await r.json();
+    const h=s.host||{}; const b=document.getElementById('banner');
+    b.textContent=(h.recovery_state_label||'состояние служебного контура неизвестно')+
+      ' · '+(h.recovery_state_hint||'попробуйте обновить страницу');
+    b.className=(h.healthy===false)?'bad':((h.warnings&&h.warnings.length)?'warn':'');
+    setText('node', s.node_state_label||'состояние узла неизвестно');
+    setText('node-hint', s.node_state_hint||'');
+    const c=s.counts||{};
+    setText('queue-count','задано вопросов: '+(c.questions===undefined?'—':c.questions));
+  }catch(e){
+    const b=document.getElementById('banner');
+    b.textContent='не удалось прочитать состояние узла'; b.className='bad';
+    setText('node-hint','страница попробует обновиться через несколько секунд');
+  }
+}
+async function loadQueue(){
+  try{
+    const r=await fetch('/api/v1/questions?limit=50'); const d=await r.json();
+    const rows=d.questions||[]; const tb=document.querySelector('#queue tbody'); tb.innerHTML='';
+    let last=null;
+    for(const q of rows){
+      const s=q.session;
+      if(s && (!last || String(q.created_at)>String(last.created_at))) last=q;
+      const status=[q.state_label,(s&&s.state_label)?('сессия: '+s.state_label):'']
+        .filter(Boolean).join(' · ');
+      const tr=document.createElement('tr');
+      tr.innerHTML='<td class="wrap">'+esc(q.text)+'</td><td>'+esc(status)+'</td>'+
+        '<td>'+new Date(q.created_at).toLocaleString()+'</td>'+
+        '<td><a href="/answer/'+esc(q.id)+'">Открыть ответ</a></td>';
+      tb.appendChild(tr);
+    }
+    setText('queue-error', rows.length?'':'Очередь пуста. Задайте вопрос выше.');
+    if(last){
+      const s=last.session||{};
+      setText('last-work','последняя работа узла: '+
+        [s.state_label,last.state_label].filter(Boolean).join(' · '));
+    } else { setText('last-work',''); }
+  }catch(err){ setText('queue-error','очередь сейчас недоступна'); }
+}
+document.getElementById('ask-form').addEventListener('submit', async (ev)=>{
+  ev.preventDefault();
+  const out=document.getElementById('ask-result'); out.textContent='отправляю…';
+  const extra=(document.getElementById('ask-priority').value||'').trim();
+  const priority=(extra==='')?Number(document.getElementById('ask-urgency').value||0):Number(extra);
+  let r;
+  try{
+    r=await fetch('/api/v1/questions',{method:'POST',
+      headers:{'Content-Type':'application/json','X-Admin-Token':adminToken()},
+      body:JSON.stringify({text:document.getElementById('ask-text').value,priority:priority})});
+  }catch(err){ out.textContent='не удалось отправить вопрос'; return; }
+  const d=await r.json().catch(()=>({}));
+  const pos=(d.position===null||d.position===undefined)?'—':d.position;
+  if(r.status===201) out.textContent='вопрос принят · позиция в очереди '+pos+
+    ' · ответ появится, когда узел его обработает';
+  else if(r.status===200) out.textContent='такой вопрос уже задан · позиция в очереди '+pos;
+  else if(r.status===401) out.textContent='нужен пароль оператора (поле «Пароль оператора»)';
+  else if(r.status===423) out.textContent=
+    [d.reason_label,d.reason_action].filter(Boolean).join(' — ')||
+    'служебный контур нездоров: изменять ничего нельзя';
+  else out.textContent='вопрос не принят ('+r.status+'): '+(d.detail||d.error||'');
+  loadQueue(); tick();
+});
+function idemKey(){
+  // crypto.randomUUID существует только в secure context; на стенде по http его нет.
+  const c=window.crypto && typeof crypto.randomUUID==='function'?crypto.randomUUID():null;
+  return c || ('web-'+Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,10));
+}
+async function runCommand(type, note){
+  const out=document.getElementById('wake-result'); out.textContent='выполняю…';
+  let r;
+  try{
+    r=await fetch('/api/v1/commands',{method:'POST',
+      headers:{'Content-Type':'application/json','X-Admin-Token':adminToken()},
+      body:JSON.stringify({type:type, idempotency_key:idemKey(), reason:note})});
+  }catch(err){ out.textContent='не удалось отправить команду'; return; }
+  const d=await r.json().catch(()=>({})); const res=d.result||{};
+  if(r.status===202){
+    const said=[d.state_label,res.reason_label].filter(Boolean).join(': ');
+    const help=[res.reason_hint,res.reason_action].filter(Boolean).join(' ');
+    out.textContent=(said||'команда выполнена')+(help?(' — '+help):'');
+  }
+  else if(r.status===401) out.textContent='нужен пароль оператора (поле «Пароль оператора»)';
+  else if(r.status===423) out.textContent=
+    [res.reason_label,res.reason_action].filter(Boolean).join(' — ')||
+    'служебный контур нездоров: команды закрыты';
+  else out.textContent='команда не принята ('+r.status+'): '+(d.detail||'');
+  tick(); loadQueue();
+}
+document.getElementById('wake-now').addEventListener('click', ()=>runCommand('wake_now','web: wake now'));
+document.getElementById('resume-node').addEventListener('click', ()=>runCommand('resume','web: resume'));
+document.getElementById('pause-node').addEventListener('click', ()=>runCommand('pause','web: pause'));
+tick(); setInterval(tick, 3000);
+loadQueue(); setInterval(loadQueue, 5000);
+</script></body></html>
+"""
+
+# T7.65: страница ответа на один вопрос («Что я спросил → что получилось»).
+# Бейдж надёжности берёт текст и цвет из серверного перевода уже вычисленной
+# оценки (apps/web/reliability.py), поэтому «Проверено» здесь физически невозможно
+# показать для непроверенного вывода.
+_ANSWER_HTML = """<!doctype html>
+<html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NOEZEMA — ответ на вопрос</title>
+<style>
+ body{font-family:system-ui,sans-serif;margin:2rem;background:#0e1116;color:#e6e6e6}
+ h1{font-size:1.35rem} h2{font-size:1.1rem;margin:.2rem 0}
+ .card{background:#171c26;border:1px solid #2a3142;border-radius:8px;padding:1rem;margin:0.7rem 0}
+ .muted{color:#98a2b3;font-size:.9rem}.warn{color:#e5c07b}
+ #banner{padding:.6rem 1rem;border-radius:6px;font-weight:600;background:#1c2a22}
+ #banner.warn{background:#2a2a1c}#banner.bad{background:#2a1616}
+ .badge{display:inline-block;padding:.15rem .55rem;border-radius:99px;font-size:.82rem;
+   font-weight:700;color:#0e1116;background:#98a2b3;margin-right:.45rem}
+ .claim{border-top:1px solid #2a3142;padding:.55rem 0}
+ .inactive{opacity:.72}
+ ol,ul{margin:.4rem 0 .4rem 1.2rem} li{margin:.25rem 0}
+ a{color:#8ab4f8} code{background:#0b0e13;padding:.1rem .3rem;border-radius:4px}
+</style></head><body>
+<h1>NOEZEMA — ответ на вопрос</h1>
+<p><a href="/">Все вопросы</a> · <a href="/knowledge">Все знания</a> · <a href="/engineer">Для инженера</a></p>
+<div id="banner">загрузка…</div>
+<div class="card"><h2 id="q-text">—</h2>
+ <div class="muted" id="q-meta"></div></div>
+<div class="card"><b>Ответ</b><div id="answer"></div>
+ <p class="muted" id="answer-note"></p>
+ <div id="other-answers"></div></div>
+<div class="card"><b>Как это получено</b><ol id="steps"></ol>
+ <p class="muted" id="steps-note"></p>
+ <details id="engineer-details"><summary>подробно (для инженера)</summary>
+  <p id="session-link"></p><ul id="events"></ul></details></div>
+<div class="card"><b>Честно об этом ответе</b><ul id="honesty"></ul>
+ <p class="muted" id="honesty-note"></p></div>
+<div class="card"><b>Что можно сделать дальше</b><p id="next-actions"></p></div>
+<script>
+const QUESTION_ID='__QUESTION_ID__';
+let timer=null; let workSessionId=''; let eventsLoadedFor='';
+function esc(v){return String(v===null||v===undefined?'':v);}
+function setText(id,value){document.getElementById(id).textContent=esc(value);}
+function when(value){ return value?new Date(value).toLocaleString():''; }
+function banner(text,kind){ const b=document.getElementById('banner');
+  b.textContent=esc(text); b.className=esc(kind); }
+function renderError(text){ banner(text,'bad');
+  ['answer','steps','honesty','next-actions'].forEach((id)=>{document.getElementById(id).innerHTML='';});
+  setText('answer-note',''); setText('steps-note',''); setText('honesty-note',''); }
+function badgeFor(reliability){
+  const b=document.createElement('span'); b.className='badge';
+  b.textContent=reliability&&reliability.label?reliability.label:'оценка неизвестна';
+  if(reliability&&reliability.hint) b.title=reliability.hint;
+  // цвет — логический токен из серверного перевода уже вычисленной оценки
+  if(reliability&&reliability.color) b.style.backgroundColor=reliability.color;
+  return b;
+}
+function renderClaim(claim,inactive){
+  const row=document.createElement('div'); row.className='claim'+(inactive?' inactive':'');
+  row.appendChild(badgeFor(claim.reliability));
+  const statement=document.createElement('b'); statement.textContent=claim.statement;
+  row.appendChild(statement);
+  const checked=document.createElement('div'); checked.className='muted';
+  const lines=(claim.verification||[]).filter(Boolean);
+  if(lines.length){
+    const lead = claim.verification_lead||'чем подтверждено';
+    checked.textContent = lead+': '+lines.join('; '); row.appendChild(checked);
+  }
+  const meta=[claim.type_label,claim.grade_label,claim.freshness_label].filter(Boolean).join(' · ');
+  if(meta){ const m=document.createElement('div'); m.className='muted'; m.textContent=meta; row.appendChild(m); }
+  const link=document.createElement('a'); link.href='/claim/'+esc(claim.id);
+  link.textContent='подробнее об этом выводе'; row.appendChild(link);
+  return row;
+}
+function render(d){
+  const q=d.question||{}; const result=d.result||{}; const claims=d.claims||[];
+  const sessions=d.sessions||[]; const work=d.work||{};
+  if(result.active){
+    const stage=(sessions[0]&&sessions[0].stage)||{};
+    banner('Идёт: '+(stage.name||'этап неизвестен')+' ('+
+      (stage.index===null||stage.index===undefined?'—':stage.index)+' из '+
+      (stage.of===undefined?'—':stage.of)+')','warn');
+  } else if(claims.length){ banner(result.label||'ответ готов',''); }
+  else if(sessions.length){ banner(result.label||'ответа пока нет','bad'); }
+  else { banner(result.label||'ответа пока нет',''); }
+  setText('q-text', q.text);
+  const meta=[q.state_label,q.origin_label,when(q.created_at)].filter(Boolean).join(' · ');
+  setText('q-meta',meta+(q.state_hint?(' — '+q.state_hint):''));
+  if(!result.active && result.hint) setText('answer-note',result.hint);
+  else if(result.action) setText('answer-note',result.action);
+  const box=document.getElementById('answer'); box.innerHTML='';
+  for(const claim of claims) box.appendChild(renderClaim(claim,false));
+  const others=d.other_claims||[]; const otherBox=document.getElementById('other-answers');
+  otherBox.innerHTML='';
+  if(others.length){
+    const head=document.createElement('p'); head.className='muted';
+    head.textContent='Есть и другие выводы по этому вопросу, но они сейчас не действуют:';
+    otherBox.appendChild(head);
+    for(const claim of others) otherBox.appendChild(renderClaim(claim,true));
+  }
+  const steps=document.getElementById('steps'); steps.innerHTML='';
+  for(const step of (d.steps||[])){ const li=document.createElement('li');
+    li.textContent=step.text; steps.appendChild(li); }
+  setText('steps-note', steps.children.length?'':
+    'Рассказать пока нечего: записанных шагов работы по этому вопросу нет.');
+  const honestyList=document.getElementById('honesty'); honestyList.innerHTML='';
+  for(const note of (d.honesty||[])){ const li=document.createElement('li');
+    li.textContent=note; honestyList.appendChild(li); }
+  setText('honesty-note', honestyList.children.length?'':'Замечаний нет.');
+  const next=document.getElementById('next-actions'); next.innerHTML='';
+  const askLink=document.createElement('a');
+  askLink.href='/?ask='+encodeURIComponent(q.text||''); askLink.textContent='Задать уточняющий вопрос';
+  next.appendChild(askLink);
+  const kn=document.createElement('a'); kn.href='/knowledge'; kn.textContent=' · Показать все знания';
+  next.appendChild(kn);
+  workSessionId=work.session_id?String(work.session_id):'';
+  if(workSessionId){
+    const eng=document.createElement('a');
+    eng.href='/session/'+esc(workSessionId); eng.textContent=' · Для инженера';
+    next.appendChild(eng);
+    const linkBox=document.getElementById('session-link'); linkBox.innerHTML='';
+    const a=document.createElement('a'); a.href='/session/'+esc(workSessionId);
+    a.textContent='полная лента этой работы'; linkBox.appendChild(a);
+    ensureEvents();
+  } else {
+    document.getElementById('session-link').innerHTML='';
+    document.getElementById('events').innerHTML=''; eventsLoadedFor='';
+  }
+  if(timer){ clearTimeout(timer); timer=null; }
+  if(result.active) timer=setTimeout(load, 2500);
+}
+async function loadEvents(sessionId){
+  const list=document.getElementById('events'); list.innerHTML='';
+  try{
+    const r=await fetch('/api/v1/sessions/'+encodeURIComponent(sessionId));
+    if(!r.ok){ list.innerHTML=''; return; }
+    const d=await r.json(); eventsLoadedFor=sessionId;
+    for(const e of (d.events||[])){ const li=document.createElement('li');
+      li.textContent=(e.sequence===undefined?'':e.sequence)+': '+(e.type_label||'событие без подписи');
+      list.appendChild(li); }
+  }catch(err){ list.innerHTML=''; }
+}
+function ensureEvents(){
+  if(!workSessionId || eventsLoadedFor===workSessionId) return;
+  if(!document.getElementById('engineer-details').open) return;
+  loadEvents(workSessionId);
+}
+async function load(){
+  if(timer){ clearTimeout(timer); timer=null; }
+  let r;
+  try{ r=await fetch('/api/v1/questions/'+encodeURIComponent(QUESTION_ID)+'/answer'); }
+  catch(e){ renderError('не удалось прочитать ответ'); return; }
+  if(r.status===404){ renderError('такого вопроса нет'); return; }
+  if(!r.ok){ renderError('ответ сейчас недоступен'); return; }
+  const d=await r.json().catch(()=>null);
+  if(!d){ renderError('ответ пришёл пустым'); return; }
+  render(d);
+}
+document.getElementById('engineer-details').addEventListener('toggle', ensureEvents);
+load();
 </script></body></html>
 """
 
@@ -1307,6 +1664,26 @@ def create_app(
             status_code=201 if created else 200, content=annotate_question(payload)
         )
 
+    # ── T7.65: карточка ответа на вопрос оператора (открытый GET, §13.1) ───
+
+    @app.get("/api/v1/questions/{question_id}/answer")
+    async def question_answer(question_id: uuid.UUID) -> JsonDict:
+        """Что узел знает по одному вопросу: итог, действующие выводы, шаги работы.
+
+        Открытый читальный маршрут (как очередь и лента сессии): он ничего не
+        меняет и ничего не оценивает — только собирает уже записанные строки и
+        подписывает их единым словарем (`apps/web/labels.py`, `reliability.py`).
+        Шаги («как это получено») берутся из ленты событий этой работы по
+        `sequence` (AGENTS §7), а не по времени строк. Действующим считается
+        утверждение с головой `current` на действующем снимке правил; прочие
+        выводятся отдельно и как ответ не считаются. Несуществующий вопрос — 404.
+        """
+        async with factory() as db:
+            payload = await answer_queries.question_answer(db, question_id)
+        if payload is None:
+            raise HTTPException(status_code=404, detail="question not found")
+        return payload
+
     # ── T3.19: SSE timeline (committed outbox + host notifications) ───────
 
     @app.get("/api/v1/timeline/sse")
@@ -1581,11 +1958,21 @@ def create_app(
             "stage_count": ui_labels.STAGE_COUNT,
         }
 
-    # ── T3.20/T3.21/T7.1: HTML pages ─────────────────────────────────────
+    # ── T3.20/T3.21/T7.1/T7.65: HTML pages ────────────────────────────────
 
     @app.get("/", response_class=HTMLResponse)
     async def main_page() -> str:
-        return _MAIN_HTML
+        """Простой режим (T7.65): «Вопросы и ответы» для оператора."""
+        return _HOME_HTML
+
+    @app.get("/engineer", response_class=HTMLResponse)
+    async def engineer_page() -> str:
+        """Полный инженерный вид — прежняя главная страница, перенесена целиком."""
+        return _ENGINEER_HTML
+
+    @app.get("/answer/{question_id}", response_class=HTMLResponse)
+    async def answer_page(question_id: uuid.UUID) -> str:
+        return _ANSWER_HTML.replace("__QUESTION_ID__", str(question_id))
 
     @app.get("/session/{session_id}", response_class=HTMLResponse)
     async def session_page(session_id: uuid.UUID) -> str:
