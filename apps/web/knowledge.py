@@ -11,12 +11,15 @@ independence snapshots (those are fixed by assessments).
 from __future__ import annotations
 
 import uuid
+from collections.abc import Mapping
 from typing import Any
 
 from fastapi import HTTPException
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from apps.web.labels import describe
+from apps.web.reliability import describe_verification, reliability
 from packages.domain.models.base import JsonDict
 
 # the effective snapshot pointer (fail-closed: the view is served from
@@ -34,6 +37,65 @@ def _iso(value: Any) -> str | None:
 
 def _uuid(value: Any) -> str | None:
     return None if value is None else str(value)
+
+
+async def effective_claim_rules(db: AsyncSession) -> dict[str, Any]:
+    """Пороги типов утверждений из ДЕЙСТВУЮЩЕГО снимка правил (только чтение).
+
+    Подписям нужен порог ровно того снапшота, по которому rules engine оценивал
+    знание; саму оценку здесь никто не пересчитывает (ADR-0026).
+    """
+    row = (
+        await db.execute(
+            text(
+                """
+                SELECT cs.claim_type_rules
+                FROM runtime_config_heads h
+                JOIN config_snapshots cs ON cs.id = h.active_config_snapshot_id
+                WHERE h.scope = 'global'
+                """
+            )
+        )
+    ).scalar_one_or_none()
+    if isinstance(row, Mapping):
+        return dict(row)
+    return {}
+
+
+def _min_grade_for(rules: Mapping[str, Any], claim_type: Any) -> str | None:
+    rule = rules.get(str(claim_type)) if claim_type is not None else None
+    if isinstance(rule, Mapping):
+        grade = rule.get("min_grade_for_supported")
+        if isinstance(grade, str):
+            return grade
+    return None
+
+
+def assessment_view(
+    *,
+    claim_type: Any,
+    head_state: Any,
+    epistemic_status: Any,
+    effective_grade: Any,
+    freshness_status: Any,
+    rules: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Аддитивные человеческие подписи к уже вычисленной оценке утверждения."""
+    head = str(head_state) if head_state is not None else "none"
+    grade = str(effective_grade) if effective_grade is not None else None
+    return {
+        "type_label": describe("claim_type", claim_type)["label"],
+        "head_label": describe("claim_head_state", head)["label"],
+        "freshness_label": describe("freshness_status", freshness_status)["label"],
+        "grade_label": describe("evidence_grade", grade)["label"] if grade is not None else None,
+        "reliability": reliability(
+            str(claim_type) if claim_type is not None else None,
+            str(epistemic_status) if epistemic_status is not None else None,
+            grade,
+            head_state=head,
+            min_grade_for_supported=_min_grade_for(rules, claim_type),
+        ),
+    }
 
 
 async def list_claims(
@@ -77,24 +139,36 @@ async def list_claims(
         .mappings()
         .all()
     )
+    rules = await effective_claim_rules(db)
+    claims: list[JsonDict] = []
+    for r in rows:
+        item: JsonDict = {
+            "id": _uuid(r["id"]),
+            "statement": r["statement"],
+            "claim_type": r["claim_type"],
+            "freshness_status": r["freshness_status"],
+            "as_of": _iso(r["as_of"]),
+            "reverify_after": _iso(r["reverify_after"]),
+            "created_at": _iso(r["created_at"]),
+            "head_state": r["head_state"],
+            "epistemic_status": r["epistemic_status"],
+            "effective_grade": r["effective_grade"],
+            "confidence": float(r["confidence"]) if r["confidence"] is not None else None,
+        }
+        item.update(
+            assessment_view(
+                claim_type=r["claim_type"],
+                head_state=r["head_state"],
+                epistemic_status=r["epistemic_status"],
+                effective_grade=r["effective_grade"],
+                freshness_status=r["freshness_status"],
+                rules=rules,
+            )
+        )
+        claims.append(item)
     return {
         "total": int(total),
-        "claims": [
-            {
-                "id": _uuid(r["id"]),
-                "statement": r["statement"],
-                "claim_type": r["claim_type"],
-                "freshness_status": r["freshness_status"],
-                "as_of": _iso(r["as_of"]),
-                "reverify_after": _iso(r["reverify_after"]),
-                "created_at": _iso(r["created_at"]),
-                "head_state": r["head_state"],
-                "epistemic_status": r["epistemic_status"],
-                "effective_grade": r["effective_grade"],
-                "confidence": float(r["confidence"]) if r["confidence"] is not None else None,
-            }
-            for r in rows
-        ],
+        "claims": claims,
     }
 
 
@@ -203,7 +277,7 @@ async def claim_detail(db: AsyncSession, claim_id: uuid.UUID) -> JsonDict:
         .all()
     )
 
-    return {
+    detail: JsonDict = {
         "id": _uuid(claim["id"]),
         "statement": claim["statement"],
         "claim_type": claim["claim_type"],
@@ -265,6 +339,26 @@ async def claim_detail(db: AsyncSession, claim_id: uuid.UUID) -> JsonDict:
             for d in deps_in
         ],
     }
+
+    # Аддитивные подписи (T7.64): действующая оценка берётся из первой head —
+    # запрос уже ставит снапшот действует/не действует на первое место.
+    head = heads[0] if len(heads) > 0 else None
+    head_state = str(head["assessment_state"]) if head is not None else "none"
+    rules = await effective_claim_rules(db)
+    detail["head_state"] = head_state
+    detail.update(
+        assessment_view(
+            claim_type=claim["claim_type"],
+            head_state=head_state,
+            epistemic_status=head["epistemic_status"] if head is not None else None,
+            effective_grade=head["effective_grade"] if head is not None else None,
+            freshness_status=claim["freshness_status"],
+            rules=rules,
+        )
+    )
+    # «как проверено» — только из реально переданных полей доказательств.
+    detail["verification"] = describe_verification(detail["evidence"])
+    return detail
 
 
 async def claim_provenance(db: AsyncSession, claim_id: uuid.UUID) -> JsonDict:
@@ -428,9 +522,7 @@ async def claim_provenance(db: AsyncSession, claim_id: uuid.UUID) -> JsonDict:
             for r in roles_rows
         ]
 
-    return {
-        "claim_id": _uuid(claim_id),
-        "evidence": [
+    evidence_items: list[JsonDict] = [
             {
                 "id": _uuid(e["id"]),
                 "relation": e["relation"],
@@ -472,10 +564,19 @@ async def claim_provenance(db: AsyncSession, claim_id: uuid.UUID) -> JsonDict:
                 "environment_protocol_hash": e["env_protocol_hash"],
             }
             for e in evidence
-        ],
+    ]
+
+    return {
+        "claim_id": _uuid(claim_id),
+        "evidence": evidence_items,
         "source_groups": source_groups,
         "environment_groups": env_groups,
         "assessment_evidence_roles": roles,
+        # «как проверено»: независимость групп источников упоминается только
+        # когда эти группы действительно зафиксированы действующей оценкой.
+        "verification": describe_verification(
+            evidence_items, source_groups=source_groups, environment_groups=env_groups
+        ),
     }
 
 

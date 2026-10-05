@@ -6,7 +6,8 @@ M1 slice:
   - POST /api/v1/messages   — inbox message (created/queued);
   - GET  /api/v1/questions  — the FIFO question queue view (T7.59);
   - POST /api/v1/questions  — operator question intake, admin-token guarded (T7.59);
-  - POST /api/v1/commands   — closed operator commands with idempotency key.
+  - POST /api/v1/commands   — closed operator commands with idempotency key;
+  - GET  /api/v1/glossary   — human labels for every enum value the web shows (T7.64).
 
 M1 command semantics: pause/resume (node state), wake_now (run one session
 through the attached orchestrator), stop_gracefully / abort_session (set the
@@ -53,6 +54,7 @@ from apps.orchestrator.scheduler import (
 )
 from apps.web import diagnostics as diagnostics_queries
 from apps.web import knowledge as knowledge_queries
+from apps.web import labels as ui_labels
 from apps.web import metrics as metrics_queries
 from apps.web.bind import resolve_standalone_workspace
 from apps.web.host_status import HostStatus, HostStatusAdapter
@@ -84,6 +86,66 @@ from packages.domain.services.question_intake import (
 
 NODE_STATE_KEY = "node_state"
 NODE_STATES = ("idle", "paused", "session_running")
+
+
+def annotate_reasons(result: object) -> JsonDict:
+    """Аддитивные подписи причины отказа команды (T7.64, ADR-0026).
+
+    Чистая функция presentation-слоя: только уже переданные поля, ничего не
+    решает и не пересчитывает. Известная строка отказа получает label/hint/action
+    из единого словаря подписей; неизвестная остаётся как есть (label = сам
+    текст) — выдумывать причину нельзя. Существующие ключи ответа не меняются.
+    """
+    out: JsonDict = dict(result) if isinstance(result, dict) else {}
+    reason = out.get("reason")
+    if isinstance(reason, str) and reason:
+        entry = ui_labels.describe_refusal(reason)
+        if not entry["hint"]:
+            # отказ мог быть кодом допуска (scheduler REASON_*), а не фразой
+            entry = ui_labels.describe_reason(reason)
+        out["reason_label"] = entry["label"]
+        out["reason_hint"] = entry["hint"]
+        out["reason_action"] = entry["action"]
+    for key, category in (("wake_reason", "wake_reason"), ("paused_reason", "paused_reason")):
+        value = out.get(key)
+        if isinstance(value, str) and value:
+            entry = ui_labels.describe(category, value)
+            out[f"{key}_label"] = entry["label"]
+            out[f"{key}_hint"] = entry["hint"]
+            out[f"{key}_action"] = entry["action"]
+    return out
+
+
+def annotate_host_status(host: object) -> JsonDict:
+    """Подпись состояния восстановления в баннере узла (аддитивно)."""
+    out: JsonDict = dict(host) if isinstance(host, dict) else {}
+    state = out.get("recovery_state")
+    if isinstance(state, str) and state:
+        entry = ui_labels.describe("recovery_state", state)
+        out["recovery_state_label"] = entry["label"]
+        out["recovery_state_hint"] = entry["hint"]
+        out["recovery_state_action"] = entry["action"]
+    return out
+
+
+def annotate_question(row: object) -> JsonDict:
+    """Подписи состояния и происхождения вопроса (аддитивно, строка очереди)."""
+    out: JsonDict = dict(row) if isinstance(row, dict) else {}
+    for key, category in (("state", "question_state"), ("origin", "question_origin")):
+        value = out.get(key)
+        if isinstance(value, str) and value:
+            entry = ui_labels.describe(category, value)
+            out[f"{key}_label"] = entry["label"]
+            out[f"{key}_hint"] = entry["hint"]
+    session = out.get("session")
+    if isinstance(session, dict):
+        inner = dict(session)
+        state = inner.get("state")
+        if isinstance(state, str) and state:
+            inner["state_label"] = ui_labels.describe("session_state", state)["label"]
+        out["session"] = inner
+    return out
+
 
 # T3.20/T3.21: minimal HTML shell. The page is a thin viewer over the JSON
 # API; all invariants live server-side, the HTML only renders them.
@@ -869,7 +931,11 @@ def create_app(
                 recovery_state="resume_blocked",
                 warnings=[f"host_status_unreadable:{type(exc).__name__}"],
             )
-        out["host"] = host.to_dict()
+        out["host"] = annotate_host_status(host.to_dict())
+        # T7.64 (ADR-0026): человеческая подпись состояния узла; сырое значение
+        # остаётся на месте — старые ключи и значения не тронуты.
+        out["node_state_label"] = ui_labels.describe("node_state", node_state)["label"]
+        out["node_state_hint"] = ui_labels.describe("node_state", node_state)["hint"]
         return out
 
     @app.get("/api/v1/timeline")
@@ -901,6 +967,7 @@ def create_app(
                     {
                         "sequence": e.sequence,
                         "type": e.type,
+                        "type_label": ui_labels.describe("audit_event_type", e.type)["label"],
                         "occurred_at": e.occurred_at.isoformat(),
                         "actor": e.actor,
                         "public_summary": e.public_summary,
@@ -933,12 +1000,18 @@ def create_app(
         if not host.healthy:
             return JSONResponse(
                 status_code=423,
-                content={
-                    "rejected": True,
-                    "reason": "host_not_healthy",
-                    "recovery_state": host.recovery_state,
-                    "warnings": host.warnings,
-                },
+                # T7.64 (ADR-0026): причина отказа и состояние восстановления
+                # подписаны поверх существующих ключей; fail-closed поведение прежнее.
+                content=annotate_reasons(
+                    annotate_host_status(
+                        {
+                            "rejected": True,
+                            "reason": "host_not_healthy",
+                            "recovery_state": host.recovery_state,
+                            "warnings": host.warnings,
+                        }
+                    )
+                ),
             )
         async with factory() as db, transaction(db):
             command = ORMOperatorCommand(
@@ -954,9 +1027,11 @@ def create_app(
                 return {
                     "id": str(command.id),
                     "type": command.type,
+                    "type_label": ui_labels.describe("command_type", command.type)["label"],
                     "state": command.state,
+                    "state_label": ui_labels.describe("command_state", command.state)["label"],
                     "replayed": True,
-                    "result": command.result,
+                    "result": annotate_reasons(command.result),
                 }
             state, result = await _apply_command(db, command, body)
             command.state = state.value
@@ -967,9 +1042,11 @@ def create_app(
             return {
                 "id": str(command.id),
                 "type": command.type,
+                "type_label": ui_labels.describe("command_type", command.type)["label"],
                 "state": command.state,
+                "state_label": ui_labels.describe("command_state", command.state)["label"],
                 "replayed": False,
-                "result": result,
+                "result": annotate_reasons(result),
             }
 
     async def _apply_command(
@@ -1171,7 +1248,9 @@ def create_app(
         that took it (id + state) when there is one."""
         async with factory() as db:
             rows = await question_queue(db, limit=max(1, min(limit, 200)))
-            return {"questions": rows, "count": len(rows)}
+            # T7.64 (ADR-0026): человеческие подписи состояния и происхождения
+            # добавляются к существующим полям строки очереди, ничего не заменяя.
+            return {"questions": [annotate_question(row) for row in rows], "count": len(rows)}
 
     @app.post("/api/v1/questions", status_code=201)
     async def post_question(body: QuestionIn, request: Request) -> JSONResponse:
@@ -1190,12 +1269,18 @@ def create_app(
         if not host.healthy:
             return JSONResponse(
                 status_code=423,
-                content={
-                    "rejected": True,
-                    "reason": "host_not_healthy",
-                    "recovery_state": host.recovery_state,
-                    "warnings": host.warnings,
-                },
+                # T7.64 (ADR-0026): причина отказа и состояние восстановления
+                # подписаны поверх существующих ключей; fail-closed поведение прежнее.
+                content=annotate_reasons(
+                    annotate_host_status(
+                        {
+                            "rejected": True,
+                            "reason": "host_not_healthy",
+                            "recovery_state": host.recovery_state,
+                            "warnings": host.warnings,
+                        }
+                    )
+                ),
             )
         try:
             async with factory() as db, transaction(db):
@@ -1218,7 +1303,9 @@ def create_app(
                 status_code=400,
                 content={"error": "invalid_question", "detail": str(exc)},
             )
-        return JSONResponse(status_code=201 if created else 200, content=payload)
+        return JSONResponse(
+            status_code=201 if created else 200, content=annotate_question(payload)
+        )
 
     # ── T3.19: SSE timeline (committed outbox + host notifications) ───────
 
@@ -1312,6 +1399,10 @@ def create_app(
             return {
                 "id": str(session.id),
                 "state": session.state,
+                # T7.64 (ADR-0026): человеческое состояние и этап из пяти; индекс
+                # None у состояний вне линейной шкалы (остановка, прерывание, неудача).
+                "state_label": ui_labels.describe("session_state", session.state)["label"],
+                "stage": ui_labels.session_stage(session.state),
                 "question_id": str(session.question_id) if session.question_id else None,
                 "config_snapshot_id": str(session.config_snapshot_id) if session.config_snapshot_id else None,
                 "stop_requested_at": session.stop_requested_at.isoformat() if session.stop_requested_at else None,
@@ -1320,6 +1411,7 @@ def create_app(
                     {
                         "sequence": e.sequence,
                         "type": e.type,
+                        "type_label": ui_labels.describe("audit_event_type", e.type)["label"],
                         "occurred_at": e.occurred_at.isoformat(),
                         "public_summary": e.public_summary,
                         "payload": e.payload,
@@ -1470,6 +1562,24 @@ def create_app(
                 "blind_sample_size": run.blind_sample_size,
                 "outcome": run.outcome,
             }
+
+    # ── T7.64 (ADR-0026): единый словарь человеческих подписей ─────────────
+
+    @app.get("/api/v1/glossary")
+    async def glossary() -> JsonDict:
+        """Открытый GET: категория → значение → {label, hint, action}.
+
+        Источник — презентационный слой `apps/web.labels`: будущая страница
+        «Справка» (T7.66) читает тексты отсюда, а не дублирует их. Здесь только
+        подписи: правила, пороги и оценку держат домен и rules engine.
+        """
+        categories = ui_labels.glossary()
+        return {
+            "categories": categories,
+            "category_count": len(categories),
+            "entry_count": sum(len(entries) for entries in categories.values()),
+            "stage_count": ui_labels.STAGE_COUNT,
+        }
 
     # ── T3.20/T3.21/T7.1: HTML pages ─────────────────────────────────────
 

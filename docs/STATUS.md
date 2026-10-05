@@ -3050,3 +3050,162 @@ mig 56 / tpl 0 / dbg-семейство 19 / clismoke 2 (до правок бы�
 batch-скрипты, замерные логи и временный probe-тест (создан был один `tests/scenario/zz_t763_probe.py` — удалён
 до коммита). Хосты `.42`/`.48` и стенд `.92` не использовались; eval-run, смоуки и сессии с реальным LLM не
 запускались; `noezema-eval*`/`noezema-smoke*` — только SELECT.
+
+## T7.64 — единый серверный словарь подписей и шкала надёжности; аддитивные `label`/`hint` в JSON API (M7, этап 1 из 3)
+
+Закрыто: проект `docs/ui-simplification-design.md` раздел 5.1 («Словарь подписей») — только фундамент.
+Страницы (T7.65 «главная + страница ответа», T7.66 «справка + страницы для инженера») на этом этапе
+НЕ переделывались: HTML и JS в `apps/web/api.py` не тронуты. ADR-0026.
+
+Файлы: `apps/web/labels.py` (новый, 1390 строк), `apps/web/reliability.py` (новый),
+`apps/web/knowledge.py`, `apps/web/api.py` (только добавления), новый открытый `GET /api/v1/glossary`;
+тесты `tests/unit/test_web_labels.py`, `tests/unit/test_web_reliability.py`,
+`tests/scenario/test_web_labels_api.py`.
+
+### 1. Анализ до правок (инвентарь того, что видно пользователю)
+
+Словарь: **25 категорий, 230 подписей** (label ≤40 знаков, hint ≤160, action ≤120; все три поля
+заполнены). Категории и значения берутся из рабочего кода, а не переписаны в тесте:
+
+| Категория | Значений | Источник значений |
+|---|---|---|
+| `question_state` | 7 | `QuestionState` |
+| `question_origin` | 9 | `QuestionOrigin` |
+| `session_state` | 17 | `SessionState` (+ закрытая пятиступенчатая шкала `session_stage`) |
+| `node_state` | 4 | веб-тройка `api.NODE_STATES` (`idle/paused/session_running`) + доменный `NodeState` (`sleeping`) |
+| `epistemic_status`, `freshness_status` | 5 + 5 | `EpistemicStatus`, `FreshnessStatus` |
+| `claim_type`, `claim_head_state`, `evidence_grade` | 8 + 4 + 5 | `ClaimType`, `AssessmentState` + синтезируемый `none`, `EffectiveGrade` |
+| `command_type`, `command_state` | 8 + 6 | `OperatorCommandType`, `OperatorCommandState` |
+| `wake_reason` | 12 | константы `apps/orchestrator/scheduler.py` (`REASON_*`, `WAIT_*`): `activation_slot_busy`, `backoff_active`, `disk_quota_exceeded`, `gpu_unavailable`, `interval_not_elapsed`, `min_interval_not_elapsed`, `nonterminal_session`, `paused`, `reassessment_backlog`, `repair_backlog`, `session_in_progress`, `unresolved_commit_attempt` |
+| `command_refusal` | 9 | строки отказа Command API: `session_already_running`, `node_paused`, `orchestrator_not_attached`, `no_active_session`, `node_not_paused`, `pause_while_session_running`, `not_available_in_m1`, `host_not_healthy`, `session_lane_unavailable` (для динамической `session lane unavailable: …` — подпись по префиксу) |
+| `termination_reason` | 13 | `CompleteReason` (5) + итоги фиксации как `commit_<итог>` по `FinalizeOutcome` (`committed`, `fencing_conflict`, `lease_lost`, `attempt_missing`) + закрытые литералы оркестратора/сверителя (`no_question`, `operator_abort`, `unknown_action_outcome`, `commit_boundary_error`) |
+| `audit_event_type` | 78 | весь `AuditEventType` (типы ленты сессий и служебных процессов) |
+| `evidence_kind`, `evidence_relation`, `assessment_evidence_role`, `dependency_kind` | 6 + 2 + 4 + 2 | соответствующие перечисления §8.7 (`role: support/counter/scope_witness/context`) |
+| `barrier_status`, `reassessment_job_status`, `commit_attempt_status`, `message_state` | 5 + 5 + 4 + 6 | «Диагностика»: барьеры инвалидации, джобы переоценки, попытки фиксации, сообщения |
+| `recovery_state`, `paused_reason` | 4 + 2 | константы `apps/web/host_status.py` (`RECOVERY_NONE/RETRY_WAIT/RESUME_DEGRADED/RESUME_BLOCKED`) + `{operator, consecutive_failures}` |
+
+Критерий остановки по DB/схемам не сработал: pydantic-модели ответов в веб-слоя нет (`extra="forbid"`
+только у входных `MessageIn`/`QuestionIn`/`CommandIn`, GET-эндпоинты отдают `JsonDict` без
+`response_model`) — значит подписи добавляются без миграций, без изменений payload'ов и без хешей.
+
+### 2. Расхождения дизайн ↔ ARCHITECTURE/код и чем разрешены
+
+1. **`QuestionOrigin.invalid_assessment`** в дизайн-документе (раздел 3) пропущен. Значение закрытого
+   enum существует (§8.7, происхождение вопроса из потерявшей силу оценки) — подпись придумана по смыслу
+   кода: «оценка потеряла силу». Полнота проверена тестом.
+2. **Состояния узла.** Дизайн говорит о тройке `idle/session_running/paused`, доменный `NodeState`
+   содержит ещё `sleeping`. Подписаны оба набора; `sleeping` помечен как служебное, на экран узла не
+   выводится (веб показывает `api.NODE_STATES`).
+3. **`head_state = none`** — не значение `AssessmentState`, а результат COALESCE в запросе знания;
+   добавлен в категорию `claim_head_state` отдельным ключом.
+4. **Пятиступенчатая шкала.** В дизайне без этапа остались `created`, `stopping`, `aborting`. Принято:
+   `created` → этап 1 «подготовка»; `failed/cancelled/stopping/aborting` — вне линейной шкалы
+   (`index = null`) с человеческим названием исхода; успешная линия покрывает ровно 5 этапов (тест
+   `test_every_session_state_maps_to_a_human_stage`).
+5. **«weak = гипотеза E1–E2» против rules-v2.** Правила дают предположению максимум E1 (`supported`
+   получает E2+). Комбинация `hypothesis + E3/E4` product-кодом не производится; если такая запись
+   пришла, бейдж честен: «не проверено» + текст про несогласованность записи, а не «подтверждено слабо»
+   (`test_weak_only_for_hypothesis_with_partial_support`).
+6. **`QuestionState.rejected`** в текущем коде никем не выставляется (закрытое перечисление описывает
+   жизненный цикл по §13.6). Подпись дана по формулировке спецификации; фактической надобности нет.
+7. **`termination_reason` — свободное текстовое поле** (`sessions.termination_reason` пишет и сырые
+   строки модели, и формулировки сверителя вроде «attempt already aborted»). Подписаны закрытые
+   литералы оркестратора/сверителя и `CompleteReason`; неизвестная строка остаётся на запасном пути
+   (label = сам код). Полный перевод требует сделать поле закрытым enum — это решение про модель
+   данных, не про интерфейс, и оно не принято.
+8. **Тексты ошибок валидации приёма вопроса** (`{"error": "invalid_question", "detail": …}`) не
+   подписаны: их формулирует `packages/domain/services/question_intake.py`, а относятся они к форме на
+   главной странице (T7.65). Осознанный лимит этапа.
+9. **«вычислено в изолированной среде» из дизайна (раздел 3) не используется.** Профиль `sealed`
+   действительно без сети, но это свойство запуска, а не поле доказательства: `describe_verification`
+   говорит «выполнено вычисление (+ артефакт результата сохранён)» и никогда не утверждает
+   независимость или изоляцию сверх зафиксированных в данных групп (§6 риск дизайн-документа закрыт
+   честной формулировкой; тесты `test_one_source_versus_two_sources_and_independence_claims`,
+   `test_quote_integrity_is_not_a_check_of_the_source_itself`).
+
+### 3. Шкала надёжности и пороги типов (ничего не пересчитывается)
+
+`reliability(claim_type, epistemic_status, effective_grade, *, head_state, min_grade_for_supported)`
+→ `{level, label, hint, color}`. Уровень выводится ТОЛЬКО из уже посчитанной оценки (§3 «Оценка знания»,
+ADR-0026); статус и grade функция не меняет.
+
+| Тип утверждения | Порог `supported` | Что требует подсказка weak |
+|---|---|---|
+| `local_observation`, `computed_result`, `self_model` | E2 | наблюдение/вычисление в точной области действия |
+| `external_fact`, `procedural`, `temporal_fact` | E3 | минимум два независимых источника; `temporal_fact` — ещё и as_of |
+| `empirical_conjecture` | E3 | два опыта независимо полученными методами (independent_replication) |
+| `formal_theorem` | E4 | формальная проверка вывода в точной области действия |
+
+Пороги взяты из `docs/eval/config-v13-payload.json → claim_type_rules` (действующие правила, §8.7);
+запасная таблица модуля `TYPE_MIN_GRADE` сверяется с payload'ом тестом
+`test_fallback_thresholds_match_the_rules_payload`, а при запросе знания порог читается из
+effective-снапшота (`runtime_config_heads → config_snapshots.claim_type_rules`) и передаётся функцией —
+то есть экран не «помнит» свои пороги (тест `test_threshold_from_snapshot_wins_over_the_fallback` +
+сценарный `test_weak_claim_names_the_threshold_of_its_type_from_the_snapshot`). Расхождений между
+дизайн-документом, README («Модель доказательств»), ARCHITECTURE §8.7 и payload'ом правил не найдено:
+уровни E2/E2/E2/E3/E3/E3/E3/E4 названы одинаково во всех четырёх источниках.
+
+Сопоставление статусов: `supported → verified (green)`; `disputed → disputed (orange)`,
+`refuted → refuted (red)`, `deferred → deferred (gray)` — уровня не зависят; гипотеза E1–E2 →
+`weak (yellow)`; гипотеза E0/без оценки и head `pending/invalid/none` → `unverified (gray)`
+(подсказка называет причину: «новой оценки ещё нет», «прежняя оценка потеряла силу»,
+«оценки нет»). Строка «как проверено» (`describe_verification`) строится только из полей
+доказательств и при отсутствии данных говорит «подробности проверки недоступны».
+
+### 4. Эндпоинт → добавленные поля (существующие ключи и значения не изменены)
+
+| Эндпоинт | Добавлено | Категория словаря |
+|---|---|---|
+| `GET /api/v1/status` | `node_state_label`, `node_state_hint`; в `host`: `recovery_state_label/_hint/_action` | `node_state`, `recovery_state` |
+| `GET /api/v1/questions` и ответ `POST /api/v1/questions` (и replay) | `state_label/_hint`, `origin_label/_hint`, у вложенной сессии `session.state_label` | `question_state`, `question_origin`, `session_state` |
+| `POST /api/v1/questions` при 423 | `reason_label/_hint/_action`, `recovery_state_label/_hint/_action` | `command_refusal` (`host_not_healthy`), `recovery_state` |
+| `GET /api/v1/knowledge/claims` (строка) | `type_label`, `head_label`, `freshness_label`, `grade_label` (None, если оценки нет), `reliability{level,label,hint,color}` | `claim_type`, `claim_head_state`, `freshness_status`, `evidence_grade` |
+| `GET /api/v1/knowledge/claims/{id}` | то же + `head_state` (действующая head) + `verification: [фразы]` | + `reliability.describe_verification` |
+| `GET /api/v1/knowledge/claims/{id}/provenance` | `verification` с зафиксированными группами независимости | `evidence_kind`, группы источников/условий |
+| `GET /api/v1/sessions/{id}` | `state_label`, `stage{index,name,of,hint}`, у каждого события `type_label` | `session_state`, `audit_event_type` |
+| `GET /api/v1/timeline` | у каждого события `type_label` | `audit_event_type` |
+| `POST /api/v1/commands` (и replay), 423 | `type_label`, `state_label`, в `result`: `reason_label/_hint/_action`, `wake_reason_*`, `paused_reason_*`, `recovery_state_*` | `command_type`, `command_state`, `command_refusal`, `wake_reason`, `paused_reason`, `recovery_state` |
+| `GET /api/v1/glossary` (новый, открытый) | `categories{категория → значение → {label,hint,action}}`, `category_count`, `entry_count`, `stage_count` | весь словарь |
+
+### 5. Тесты и краснота проверки полноты
+
+- `tests/unit/test_web_labels.py` (19): полнота по всем категориям (значения из enum'ов, констант
+  планировщика/host_status, `api.NODE_STATES`, строк отказа, вынутых регуляркой из исходника
+  `apps/web/api.py`, итогов фиксации из `FinalizeOutcome`); тексты (длины 40/160/120, непустота, запрет
+  `§`, `T7.xx`, snake_case, uuid/sha-подобных строк); запасной путь; копии словаря; пятиступенчатая
+  шкала по всем `SessionState`; нормализация строк отказа и кодов допуска.
+- `tests/unit/test_web_reliability.py` (18): матрица тип × E0..E4 × статус + инварианты
+  (`verified ⇔ supported`; disputed/refuted/deferred от уровня не зависят; weak только hypothesis E1–E2,
+  иначе unverified); подсказка weak называет отсутствие по порогу типа; цвета шкалы; равенство
+  `TYPE_MIN_GRADE` payload'у правил; приоритет порога из снапшота; честность «нет данных → нет фразы».
+- `tests/scenario/test_web_labels_api.py` (10): прежний контракт эндпоинтов цел (наборы ключей), новые
+  поля совпадают со словарём, `verification` в детали утверждения, порог из снапшота в подсказке,
+  подписи отказов команд и отказа приёма вопроса на деградировавшем узле, полнота `GET /api/v1/glossary`.
+- Краснота проверки полноты доказана временными пробнами (обе отменены до коммита): добавленное в
+  `QuestionOrigin` значение `probe_unlabeled` → красный
+  `test_every_source_value_has_a_label`; заменённая в `apps/web/api.py` строка отказа «node is not
+  paused» → новая фраза → красный `test_command_refusal_literals_from_api_code_are_labeled`; удлинённая
+  подпись → красный тест текстовых лимитов. Диагностический probe-файл обрыва соединения удалён до
+  коммита (утечки не нашлось: предупреждения teardown оказались следствием красных тестов, а не продукта).
+
+### 6. Что осталось за этапом
+
+- T7.65: главная страница «Вопросы и ответы» (одна фраза-статус вместо баннера, форма с выбором
+  «Обычный/Срочно/Потом», кнопка «Запустить обработку» с объяснением), страница ответа
+  `/answer/<id вопроса>` с бейджем надёжности и блоком «как получено» из 4–6 шагов, человеческие
+  тексты отказов команд в разметке. Словарь и шкала для этого уже готовы и доступны через API.
+- T7.66: `/help` (обзорная часть + словарь по алфавиту из `GET /api/v1/glossary` + частые вопросы),
+  tooltip-подсказки, переименования в диагностике/метриках/evaluation, свёрнутые «подробно»,
+  переключатель режимов.
+- Не подписаны (осознанный лимит): тексты ошибок валидации приёма вопроса (сервис intake) и свободные
+  строки `termination_reason` вне закрытого набора — обе вещи требуют решения про модель данных или
+  про форму на главной, не про словарь.
+
+**Проверки коммита T7.64.** `ruff check .` — чисто; `mypy packages apps hostctl` — Success, 135 файлов;
+образ `noezema-sandbox:test` на месте; `pytest -n auto -q -m "not timing"` — **1260 passed, 12 skipped**
+(163,4 с), без единого блока `warnings summary` (то есть форсированный DROP scratch-БД не понадобился);
+`pytest -q -m timing` — **4 passed** (47,4 с). Счётчиков новых wall-clock тестов нет. Новые тесты:
+19 unit + 18 unit + 10 scenario = 47 (было 1213 → стало 1260, существующие тесты не изменены и не
+удалены). Счётчики баз после прогонов: mig 56 / tpl 0 / dbg-семейство 19 / clismoke 2 (как до работы);
+`docker ps -a` — те же 41 контейнер; leftover-процессов нет. Хосты `.42`/`.48` и стенд `.92` не
+использовались, eval-run и смоуки не запускались, `noezema-eval*`/`noezema-smoke*` — только SELECT.

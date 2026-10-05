@@ -340,6 +340,17 @@ config-v13 (T7.59(в): = config-v12, но `model.context_window`/`backend_contex
   соединений держат наш замок» обязан фильтровать `database = (SELECT oid FROM pg_database WHERE datname =
   current_database())`; без фильтра утверждение флакает под `-n auto` и тот же список pid можно отправить в
   `pg_terminate_backend`, убив соединение чужого воркера (T7.63, `tests/scenario/test_node_session_guard.py::_lock_holders`).
+- Подписи интерфейса (T7.64, ADR-0026): каждое значение пользовательского enum — а также строка отказа
+  Command API, причина пропуска запуска и тип события ленты — обязано иметь подпись в `apps/web/labels.py`.
+  Тест полноты `tests/unit/test_web_labels.py` берёт значения из самого кода (перечисления домена,
+  `REASON_*`/`WAIT_*` планировщика, константы `apps/web/host_status.py`, `api.NODE_STATES`, строки отказа,
+  вынутые регуляркой из `apps/web/api.py`, итоги фиксации из `FinalizeOutcome`) — новое значение без подписи
+  краснит тест, молча добавить enum нельзя. Тексты проверяются тем же тестом: ≤40/≤160/≤120 знаков, непустые,
+  без `§`, номеров задач плана (`T7.xx`), кодов snake_case и uuid/sha-подобных строк; неизвестное значение
+  уходит на запасной путь (label = сам код, пустые hint/action) — выдумывать подпись запрещено. Бейдж
+  надёжности — `apps/web/reliability.py`: это перевод уже вычисленной оценки rules engine, пороги берутся из
+  effective-снапшота (`claim_type_rules`), запасная таблица модуля сверяется с `docs/eval/config-v13-payload.json`
+  тестом; presentation-слой grade и epistemic_status не назначает и не повышает (API-поля только добавляются).
 
 ## 8. Гигиена длинных сессий
 
