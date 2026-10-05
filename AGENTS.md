@@ -313,6 +313,15 @@ config-v13 (T7.59(в): = config-v12, но `model.context_window`/`backend_contex
   `tests/scenario/test_node_session_exclusion.py` (репродюсер сквозь реальные точки входа) и
   `tests/scenario/test_node_session_guard.py` (release на всех выходах, `pg_terminate_backend`, разные
   `node_owner`).
+- Тесты статуса: при опросе `/api/v1/status` не требовать условие «для каждого снимка» — синхронизироваться
+  барьерами (T7.62, CI run 37290125308). Хвостовое окно между завершением задачи сессии (`node.session_task`)
+  и сбросом маркера `_record_session_outcome` (done-callback заводит её ОТДЕЛЬНОЙ задачей в `apps/web/api.py`)
+  законно даёт `session_running` + `node_state_stale_marker=True` при отсутствии незавершённой строки `sessions`
+  — это не дефект: команды решает `effective_node_state` (→ `idle`). Снимок «пока веб владеет сессией» получают
+  удержанием сессии (event-гейт в `StubToolExecutor.execute` — тот же event loop), видимость COMMITTING-строки
+  пинят гейтом вокруг `commit_prepare` (окно = phase-1 commit … терминальный commit). Временные ожидания —
+  только потолки против зависания. Тесты: `tests/scenario/test_web_node_state_db_truth.py` (4, incl. тест
+  хвостового окна), `tests/scenario/test_dev_stand_flow.py`.
 
 ## 8. Гигиена длинных сессий
 

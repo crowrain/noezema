@@ -2694,3 +2694,90 @@ COMMITTING до терминального коммита, а снимали е�
 test_orchestrator_entry_workspace.py` — 29 passed. Пул `timing` не пополнен; wall-clock утверждений не
 добавлено. Миграций, изменений модели/промптов/пинов/config-v* нет; ARCHITECTURE.md не изменён. Реальные
 `.92`/`.87`, LLM-хосты `.42`/`.48`, eval/smoke-базы не трогались (только SELECT по счётчикам).
+
+## T7.62 — флаки статусных тестов: барьеры вместо «условия для каждого снимка» (тесты+доки; продукт не тронут)
+
+**Контекст.** CI (run 37290125308) упал на
+`tests/scenario/test_web_node_state_db_truth.py::test_leftover_session_running_marker_does_not_wedge_the_node`
+(`assert all(s["node_state_stale_marker"] is False for s in while_running)`; 1209 passed). На том же HEAD локальный
+полный профиль `pytest -n auto -q -m "not timing"` воспроизвёл красный в **3 прогонах из 4**: run1 и run3 — та же
+цель (163.5 с / 156.9 с), run2 — другой тест того же семейства гонок:
+`tests/scenario/test_dev_stand_flow.py::test_asked_question_runs_a_full_session_and_leaves_the_queue`
+(`assert saw_session`, «сессия должна была быть видна в /api/v1/status»), run4 зелёный (1210 passed).
+
+**Диагноз (продукт прав; изменений продукта нет).** В `apps/web/api.py` конец сессии двухшаговый: завершается
+`node.session_task` (done-callback `_reset` снимает guard и заводит **отдельную** задачу `_record_session_outcome`,
+которая дописывает маркер в `idle` своей транзакцией через `WakeScheduler.record_session_result`). В окне между
+завершением задачи и этой записью статус легально показывает сырой `session_running` + нет незавершённой строки
+`sessions` + живая задача процесса уже не жива ⇒ `node_state_stale_marker=True`. Прежняя формулировка теста
+(«every such sample») предполагала, что любой снимок цикла снят «пока веб владеет сессией» — неверно для хвостового
+окна: оно миллисекундное, тихий локальный прогон в него не попадает, нагруженный раннер — да. Для команд это не
+дефект: `effective_node_state` ровно эту комбинацию приводит к `idle` (`tests/unit/test_web_node_state.py`).
+Второй флейк — та же семья, обратный квантор: строка `sessions` видна сторонним соединениям только в окне [commit
+фазы 1 с `_transition(COMMITTING)` … терминальный коммит финальной транзакции], а `saw_session` ловился poll'ом раз
+в 0,1 с — под `-n auto` снимки не попали в окно.
+
+**Детерминированное воспроизведение (до правки).** Тест-side monkeypatch `WakeScheduler.record_session_result`
+(задержка 1 с перед реальной записью итога) на неизменном коде: **2/2 красных**; оригинальный poll-цикл поймал
+**18 снимков** `node_state=session_running, session=None, stale_marker=True` — ∀-утверждение падает
+детерминированно. Скретч сохранён вне репозитория (`t762_scratch_repro_saved.py`), в suites не входит.
+
+**Что изменено (только тесты).** `test_leftover_…wedge_the_node` переписан на барьерах: `_GateExecutor`
+(подкласс `StubToolExecutor`) паркует сессию event-гейтом на tool-шаге внутри фазы 1 — единственный call-site
+`self.executor.execute(...)` в `apps/orchestrator/orchestrator.py`, тот же event loop; все снимки «пока веб владеет
+сессией» берутся в удержанном состоянии (stale=False гарантирован через `_owns_live_session`), там же проверяется
+отказ повторного wake_now («a session is already running»). Завершение ждёт событий, а не poll'а: обёртка инстанса
+`orchestrator.run_session` (event окончания сессии) и обёртка `WakeScheduler.record_session_result` (event закрытия
+хвостового окна). Абсолютные времена — только потолки против зависания (120 с); `delay_seconds=0.8` убраны: барьер
+держит фазу 1 дольше и надёжнее временной задержки. Хвостовое окно проверяется **отдельным новым тестом**
+`test_tail_window_after_session_end_is_stale_but_harmless`: запись исхода удерживается гейтом, снимок обязан показать
+stale_marker=True, безвредность доказывается прямым `effective_node_state(…) == "idle"`; после снятия — idle /
+stale=False. В основном тесте ни один снимок в хвостовое окно не попадает (обоснование в docstring).
+`test_dev_stand_flow.py`: гейт вокруг `commit_prepare` (seam между committed фазой 1 и шагом prepared-attempt) —
+видимость `session.state=committing` + stale=False проверяется в удержанном окне; `_wait_idle` остался только как
+потолок против зависания. Семантические пины сохранены полностью: остаточный маркер назван и не блокирует wake,
+во время своей сессии маркер не stale, после — idle/`session is None`/counts прежние. Тестов стало +1 (1210→1211).
+
+**Классификация остальных poll-паттернов (grep по tests/, не изменено).** Все перечисленные — ожидания перехода
+состояния или гарантии от зависания, без ∀-утверждений по снимкам и без утверждений об окне видимости:
+`test_web_standalone_wake.py` (poll до idle), `test_web_api.py` (poll до idle), `test_node_session_exclusion.py`
+(ожидание model-запроса + poll до idle; проверка «строки sessions не видно» в начале фазы 1 структурно надёжна —
+фаза 1 держит строку невидимой), `test_node_session_guard.py::_free_lane` (poll acquire замка),
+`test_activation_drain.py::_wait_slot` (poll с monotonic-потолком); `for range(3)` в `test_wake_scheduler.py` —
+итерация отказов, не опрос статуса.
+
+**Найдённый сопутствующий flake (НЕ этого класса; не исправлял).** В двух полных прогонах (A4 покой и B3 под
+нагрузкой) stage1 дал «1211 passed, 12 skipped, **1 error**»: ERROR at teardown
+`tests/scenario/test_node_session_guard.py::test_web_session_returns_the_lane_when_its_task_is_cancelled` —
+`DROP DATABASE noezema_mig_…`: «database is being accessed by other users» (гонка DROP фикстуры с дозавершением
+отменённой веб-сессии/её соединений при нагрузке). Это не падение теста и не цель T7.62; цель в этих прогонах
+зелёная. Именно такие unfixed-DROP остатки объясняют исторический прирост `noezema_mig_*` (см. «Остатки»).
+Молча не перезапускался: зафиксирован как есть, имя/ошибка/нагрузка выше.
+
+**Доказательство (после правки).** Полная двухстейджевая §6 **6 раз подряд** (09:54–10:13): `ruff check .` и
+`mypy packages apps hostctl` чистые в каждой итерации; stage1 — 1211 passed, 12 skipped во всех шести (131,8–163,0 с;
+в A4 дополнительно тот самый teardown-ERROR), **падений целевого теста 0/6**; stage2 — 4 passed ×6 (47,3–51,4 с).
+**3 прогона под нагрузкой** (6 busy `python -c "while True: pass"`, убиты после; pgrep/ps — ноль): B1/B2 полностью
+зелёные (158,9 / 133,4 с), B3 — зелёный по тестам с тем же teardown-ERROR (192,6 с); **падений цели 0/3**.
+**Целевой файл отдельно ×20**: 20/20 зелёных (по ~4,7 с). Итого цель проверена без единого падения в 9 полных
+параллельных профилях и 20 одиночных прогонах. Пул `timing` не пополнен, wall-clock утверждений не добавлено.
+
+**Остатки тестовых БД.** До proof: mig=56, tpl=0, dbg-семейство=19, clismoke=2. После 9 полных + 20 одиночных
+прогонов: mig=58 — ровно два новых scratch, оба остатки teardown-ERROR (A4: `noezema_mig_2c8b5091`, B3:
+`noezema_mig_325fb4bf`). Свои измерительные базы удалены (DROP при нуле активных сессий), после удаления — снова
+**56/0/19/2**, идентично «до». Scratch-базы создаёт только `tests/conftest.py` (+ cleanup в
+`test_fixture_template_clone.py`) и роняет их в `finally`; зелёные прогоны (4 воспроизводящих, скретчи, A1–A3,
+A5–A6, B1–B2) не оставили ничего — утечки mig накапливались только от teardown-гонок и убитых процессов прежних
+сессий; этим же объясняется +2 к числам T7.60. Легаси `noezema_dbg*`/`noezema_clismoke*` текущими тестами не
+создаются — не тронуты.
+
+**Инварианты.** Код продукта (apps/, packages/, hostctl/), схемы, payload'ы, промпты, пины, ARCHITECTURE.md и
+пороги не тронуты; eval/smoke — SELECT-счётчики; `.42`/`.48`/`.92` не использовались, реальных сессий/смоуков нет;
+контейнеры: `docker ps -a` до/после идентичны (41). Ловушка закреплена в AGENTS.md §7 («тесты статуса: …»).
+
+**Проверки коммита T7.62.** `ruff check .` — чисто; `mypy packages apps hostctl` — Success, 133 файла; образ
+`noezema-sandbox:test` на месте; `pytest -n auto -q -m "not timing"` — **1211 passed, 12 skipped** (132,4 с; было
+1210: +1 новый тест хвостового окна); `pytest -q -m timing` — **4 passed** (47,5 с). Финальный прогон зелёный, без
+teardown-ERROR. Счётчики БД после всех прогонов и удаления своих остатков: 56/0/19/2; busy-процессов нет;
+`docker ps -a` — те же 41 контейнер. Миграций, изменений модели/промптов/пинов/config-v*, ARCHITECTURE.md — нет;
+пул `timing` не пополнен. Реальные `.92`/`.87`, LLM-хосты `.42`/`.48`, eval/smoke-базы не трогались (SELECT only).

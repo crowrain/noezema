@@ -6,6 +6,13 @@ model and the stub executor (no GPU, no LLM host), which is exactly the shape of
 
 Also pins the documented "empty queue is not an error" behaviour: admission passes, a session
 runs, finds no candidate and terminates FAILED `no_question`, and the wake bookkeeping counts it.
+
+T7.62 — the visibility of a running session in /api/v1/status used to be polled out of a narrow
+window (the row is committed at COMMITTING and terminal by the final tx: milliseconds), and under
+`-n auto` load a full run missed it (`assert saw_session` went red). The observation is now taken
+at a barrier point: the test parks the session between the committed phase 1 and the prepared-attempt
+step (event gate around `commit_prepare`, test-side monkeypatch) and reads status there — same
+claim, no race. `_wait_idle` remains a hang ceiling only.
 """
 
 from __future__ import annotations
@@ -18,6 +25,7 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from apps.orchestrator import orchestrator as orchestrator_module
 from apps.orchestrator.executor import StubToolExecutor
 from apps.orchestrator.orchestrator import Orchestrator
 from apps.web.api import create_app
@@ -78,26 +86,53 @@ async def _make_stand(scratch_url: str, fake: FakeLLM, tmp_path: Path):
     return app, engine, gateway
 
 
-async def _wait_idle(client: httpx.AsyncClient) -> tuple[dict, bool]:
-    """Poll /api/v1/status until the node is idle again; report whether a session was visible."""
-    seen_session = False
+async def _wait_idle(client: httpx.AsyncClient) -> dict:
+    """Poll /api/v1/status until the node is idle again.
+
+    T7.62: this polling is only a hang ceiling. State-dependent observations are taken at
+    barrier-pinned points (see test 1), never by trying to catch a millisecond commit window
+    with a lucky snapshot.
+    """
+    data: dict = {}
     for _ in range(120):
         data = (await client.get("/api/v1/status")).json()
-        if data.get("session") is not None:
-            seen_session = True
         if data["node_state"] == "idle" and data["session"] is None:
-            return data, seen_session
+            return data
         await asyncio.sleep(0.1)
     pytest.fail(f"сессия не завершилась: {data}")
 
 
+async def _hold_commit_window(
+    monkeypatch: pytest.MonkeyPatch, prepared_visible: asyncio.Event, hold_prepare: asyncio.Event
+) -> None:
+    """Test-side gate on the seam between committed phase 1 and the prepared-attempt step.
+
+    When `commit_prepare` is about to be called, the session row has ALREADY been committed at
+    COMMITTING (visible to every other connection), and the fenced final transaction has not begun
+    yet. Parking here keeps the visibility window open until the test has read /api/v1/status — the
+    old version raced that window with 0.1 s polls and lost under `-n auto` load. The product's own
+    order is unchanged; monkeypatch is restored at test end.
+    """
+    orig_prepare = orchestrator_module.commit_prepare
+
+    async def _gated_prepare(*args, **kwargs):
+        prepared_visible.set()
+        await hold_prepare.wait()
+        return await orig_prepare(*args, **kwargs)
+
+    monkeypatch.setattr(orchestrator_module, "commit_prepare", _gated_prepare)
+
+
 @pytest.mark.asyncio
 async def test_asked_question_runs_a_full_session_and_leaves_the_queue(
-    migrated_db, fake_llm: FakeLLM, tmp_path: Path
+    migrated_db, fake_llm: FakeLLM, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     scratch_url, _ = migrated_db
     fake_llm.script([{"content": TOOL_PYTHON}, {"content": COMPLETE}, {"content": CURATOR_OK}])
     app, engine, gateway = await _make_stand(scratch_url, fake_llm, tmp_path)
+    prepared_visible = asyncio.Event()
+    hold_prepare = asyncio.Event()
+    await _hold_commit_window(monkeypatch, prepared_visible, hold_prepare)
     try:
         async with _client(app) as client:
             r = await client.post(
@@ -121,8 +156,19 @@ async def test_asked_question_runs_a_full_session_and_leaves_the_queue(
             )
             assert r.status_code == 202 and r.json()["state"] == "completed", r.text
 
-            status, saw_session = await _wait_idle(client)
-            assert saw_session, "сессия должна была быть видна в /api/v1/status"
+            # barrier point: the row is committed at COMMITTING, the final tx has not started.
+            # Read status HERE — "the session must be visible in /api/v1/status" then holds by
+            # construction instead of by catching a millisecond window with polls (T7.62).
+            await asyncio.wait_for(prepared_visible.wait(), timeout=120)
+            mid = (await client.get("/api/v1/status")).json()
+            assert mid["node_state"] == "session_running", mid
+            assert mid["session"] is not None and mid["session"]["state"] == "committing", (
+                f"сессия должна была быть видна в /api/v1/status: {mid}"
+            )
+            assert mid["node_state_stale_marker"] is False, mid
+            hold_prepare.set()
+
+            status = await _wait_idle(client)
             assert status["counts"]["sessions"] == 1
 
             events = (await client.get("/api/v1/timeline")).json()["events"]
@@ -168,7 +214,7 @@ async def test_wake_with_an_empty_queue_is_a_recorded_no_question_not_an_error(
             )
             assert r.status_code == 202 and r.json()["state"] == "completed", r.text
 
-            status, _ = await _wait_idle(client)
+            status = await _wait_idle(client)
             assert status["node_state"] == "idle"
             assert status["counts"]["sessions"] == 1
 
