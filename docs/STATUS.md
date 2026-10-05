@@ -3430,4 +3430,49 @@ JSON карточки (реальные прогоны, зонд убран по
 - Этап 3 (T7.66): инженерные `/session/<id>`, `/knowledge`, `/claim/<id>`, `/diagnostics` —
   подписи словаря вместо кодов и сырых payload'ов, лента знаний как «что известно», карточка
   утверждения с зависимостями; `GET /api/v1/questions/{id}/knowledge` остаётся источником для
-  карточки ответа.
+  карточки ответа. (Пометка T7.66: этот этап перенесён в **T7.67**, номер T7.66 занят анализом
+  внешнего доступа ниже.)
+
+## T7.66 — внешний доступ (research proxy): анализ живой ошибки «not configured» и проект включения (M7; без кода)
+
+Полный разбор: `docs/web-access-design.md`; проектное решение (Proposed): ADR-0027
+(`docs/adr/0027-research-proxy-single-wiring-and-curated-egress-semantics.md`). Ничего не
+запускалось на стенде `.92`, сеть не использовалась, код/тесты/конфиги не изменены (только
+документы).
+
+**Гипотеза случая подтверждена полностью.** Web-фабрика `apps/web/api.py::build_standalone_app`
+(`:2004–2036`) вызывает конструктор `Orchestrator(...)` (`:2023–2034`) без аргумента
+`research_service`, поэтому wake_now («Запустить обработку») исполняет
+`_research_fetch` с `self.research_service is None` и даёт ровно наблюдаемую ошибку
+«research proxy is not configured for this host» (`apps/orchestrator/orchestrator.py:1067–1072`) —
+независимо от UFW и конфига. Единственный сборщик с research-сервисом — `build_orchestrator`
+(`apps/orchestrator/main.py:54–62`; wiring закреплён тестом только для него,
+`tests/unit/test_research_wiring.py`; web-путь тестами не покрыт). Wake-tick/eval-run
+(`hostctl/cli.py:303` и `:1334`) сервис имеют — там случай упал бы другой ошибкой (транспорт).
+
+Ключевые уточнения анализа: `curated-v1` = `{name}-{version}` YAML-потолка
+(`packages/policy/profiles.py:44–46` + `sandbox/policy/curated.yaml`), fetch разрешён политикой,
+т.к. сетевой режим профиля ≠ none (`packages/policy/engine.py:158–164`); **curated при пустом
+`allowed_domains` = любой публичный http(s)-хост** (доменный гейт — только у open_lab:
+`apps/research_proxy/service.py:102–107`, `modes.py:125`), а не «запрет всего»; rate-limit
+`20/3600` считается только по upstream-поиску (`service.py:368–392`), прямые fetch количественно
+не лимитированы; SearXNG нужен лишь поиску `search()` curated-режима (`service.py:312–362`) и
+модели сегодня недоступен (в реестре нет инструмента поиска, EVAL-3-freeze.md:83); «sealed» в
+описаниях — следы промпта explorer-v5 (`prompts/explorer/explorer-v5.md:5–10`), bootstrap-дефолтов
+(`packages/domain/config.py:119–120,185–197`) и устаревшей строки
+`docs/ui-simplification-design.md:113`, к активному снимку config-v13 отношения не имеют. Выход в
+сеть при curated — процесс оркестратора на хосте (контейнер сессии всегда `network=none`,
+`apps/orchestrator/tool_executors.py:102–107`).
+
+Пробелы G1–G10, варианты A/B/C/D и рекомендация (сначала кодовый фикс wiring без изменения
+payload'ов, решение по egress-политике — за оператором), план задач **T7.68** (единый wiring +
+тест через `build_standalone_app`), T7.69 (config-решение), T7.70 (SearXNG dev-stand, опц.),
+T7.71 (поиск модели, опц.), T7.72 (лимиты прямых fetch) — в `docs/web-access-design.md` §4–6;
+операторские команды по `.92` с rollback и вопросы пользователя — §7–8 того же документа.
+Этап UI-3 перенесён из T7.66 в **T7.67** (пометка добавлена выше и в
+`docs/ui-simplification-design.md`).
+
+Проверки commit'а: ruff — OK; mypy strict — OK (136 файлов); образ `noezema-sandbox:test` — на месте;
+pytest два прогона: **1306 passed + 12 skipped** (`-n auto -m "not timing"`) и **4 passed** (`-m timing`)
+— совпадает с прежним эталоном. Изменены только `docs/web-access-design.md`, ADR-0027, этот раздел
+STATUS.md и пометка в `docs/ui-simplification-design.md`.
