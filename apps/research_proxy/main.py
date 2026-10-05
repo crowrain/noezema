@@ -21,20 +21,24 @@ from apps.research_proxy.service import ResearchProxyService
 def build_standalone_app() -> FastAPI:
     """Entry helper: build the app from env config (DB URL, artifact
     root)."""
-    from pathlib import Path
-
     from sqlalchemy.ext.asyncio import (
         async_sessionmaker,
         create_async_engine,
     )
 
+    from apps.orchestrator.scheduler import artifacts_root_from_env
     from packages.artifacts.store import FilesystemArtifactStore
     from packages.domain.db.engine import DatabaseSettings
 
     settings = DatabaseSettings()
     engine = create_async_engine(settings.database_url)
     factory = async_sessionmaker(engine, expire_on_commit=False)
-    store = FilesystemArtifactStore(Path("/var/lib/noezema/artifacts"))
+    # T7.61(б): the artifact root is derived from NOEZEMA_DATA_ROOT exactly like every other host entry point —
+    # `<data root>/artifacts`, the sibling of the `<data root>/workspace` used by wake tick, web bind and the
+    # manual orchestrator. It used to be hardcoded to /var/lib/noezema/artifacts, so a node with its own data
+    # root (the dev stand runs as an unprivileged user over /var/lib/noezema-dev) wrote artifacts outside that
+    # node's data. Unset env → the same historical path as before.
+    store = FilesystemArtifactStore(artifacts_root_from_env())
     return create_proxy_app(ResearchProxyService(factory, store))
 
 

@@ -201,7 +201,16 @@ async def test_leftover_session_running_marker_does_not_wedge_the_node(
     does not refuse wake_now forever; while a session row is nonterminal it still does."""
     scratch_url, _fixture_engine = migrated_db
     app, engine, factory, gateway = await _make_app(scratch_url, fake_llm, tmp_path / "ws")
-    fake_llm.script([{"content": TOOL_PYTHON}, {"content": COMPLETE}, {"content": CURATOR_OK}])
+    # модельная задержка держит сессию в phase 1: снимки статуса снимаются не «впритык» к финальному
+    # коммиту (строка sessions видна другой connection только от COMMITTING), а всё время, пока веб
+    # владеет сессией. Проверяемое утверждение от этого только сильнее, см. ниже.
+    fake_llm.script(
+        [
+            {"content": TOOL_PYTHON, "delay_seconds": 0.8},
+            {"content": COMPLETE, "delay_seconds": 0.8},
+            {"content": CURATOR_OK, "delay_seconds": 0.8},
+        ]
+    )
     try:
         await _set_node_state(scratch_url, "session_running")  # marker only, no session behind it
         async with app.router.lifespan_context(app), _client(app) as client:
@@ -215,19 +224,24 @@ async def test_leftover_session_running_marker_does_not_wedge_the_node(
             assert r.json()["state"] == "completed", r.text
 
             data: dict = {}
-            during_run: dict | None = None
-            for _ in range(150):
+            while_running: list[dict] = []
+            for _ in range(300):
                 data = (await client.get("/api/v1/status")).json()
-                if data["node_state"] == "session_running" and data["session"] is not None:
-                    during_run = data
+                if data["node_state"] == "session_running":
+                    # снимок, сделанный, пока этот веб владеет сессией: маркер обязан описывать её
+                    while_running.append(data)
                 if data["node_state"] == "idle" and data["session"] is None:
                     break
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.05)
             else:
                 pytest.fail(f"сессия не завершилась: {data}")
             assert data["counts"]["sessions"] == 1
-            # the wake put the marker back to a session_running that DOES describe a session
-            assert during_run is not None and during_run["node_state_stale_marker"] is False, during_run
+            # the wake put the marker back to a session_running that DOES describe a session: for
+            # EVERY such sample the marker is not stale. Earlier this test tried to catch one sample
+            # in which the sessions row was already visible — phase 1 keeps that row uncommitted
+            # until COMMITTING, so under xdist load the window could be missed entirely.
+            assert while_running, data
+            assert all(s["node_state_stale_marker"] is False for s in while_running), while_running
     finally:
         await gateway.close()
         await engine.dispose()

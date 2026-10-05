@@ -119,6 +119,20 @@ def workspace_root_from_env() -> Path:
     return data_root_from_env() / WORKSPACE_SUBDIR
 
 
+#: Artifact directory relative to the data root: the sibling of `WORKSPACE_SUBDIR`, so content-addressed
+#: artifacts always live beside the workspace of the same node (`<data root>/artifacts`). The orchestrator
+#: already builds its store from `workspace_root.parent`, and `noezemactl blind-sample` reads the same layout
+#: (`NOEZEMA_ARTIFACTS_ROOT` or data_root/artifacts). T7.61(б): the standalone research proxy hardcoded the
+#: production path instead, so a node with its own data root (dev stand) wrote artifacts outside that node's
+#: data. An unset env keeps the historical `/var/lib/noezema/artifacts`.
+ARTIFACTS_SUBDIR = "artifacts"
+
+
+def artifacts_root_from_env() -> Path:
+    """`<NOEZEMA_DATA_ROOT>/artifacts` — the artifact store of THIS process (T7.61(б))."""
+    return data_root_from_env() / ARTIFACTS_SUBDIR
+
+
 @dataclass(frozen=True)
 class WakeSchedule:
     """Validated wake_schedule section of the config snapshot (§5.2.1)."""

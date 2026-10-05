@@ -32,12 +32,13 @@ ssh <user>@192.168.1.92
 git clone -b impl/from-scratch <repo> ~/noezema && cd ~/noezema
 ./deploy/dev-stand/bootstrap.sh --dry-run     # план: что будет сделано, ничего не меняется
 sudo ./deploy/dev-stand/bootstrap.sh          # фактическая установка (скрипт сам добавит sudo где нужно)
-systemctl start noezema-dev.target            # web + три таймера
+systemctl start noezema-dev.target            # web + unit-state и maint (тик-таймер по умолчанию выключен)
 ./deploy/dev-stand/status.sh                  # проверка глазом
 ```
 
 Флаги `bootstrap.sh`: `--dry-run`, `--no-docker-install`, `--no-units`, `--stub-executor`,
-`--force`, `--rotate-secrets`, `--web-host 0.0.0.0`, `--web-port 8321`, `--user <name>`.
+`--force`, `--rotate-secrets`, `--with-tick-timer`, `--web-host 0.0.0.0`, `--web-port 8321`,
+`--user <name>`.
 Идемпотентность: повторный запуск не пересоздаёт venv, базу, контейнер Postgres и sandbox-образ.
 `--force` пересоздаёт venv (`uv venv --clear`) и юниты, заново пишет env-файл **теми же секретами**:
 пока существуют контейнер или том Postgres, ни пароль БД, ни admin-токен не ротируются — пароль живёт
@@ -105,7 +106,7 @@ systemctl start noezema-dev.target            # web + три таймера
 |---|---|
 | `noezema-dev.target` | группа стенда; сам не включается в загрузку (никто не хочет его в `multi-user.target`) |
 | `noezema-dev-web.service` | web UI/API, `Type=simple`, `Restart=always`, bind из env-файла |
-| `noezema-dev-tick.service` + `.timer` | один `hostctl wake-tick` на срабатывание; `Type=oneshot`, `TimeoutStartSec=3600` (сессия имеет право отработать свой бюджет), таймер 60 с, `OnBootSec=10m` |
+| `noezema-dev-tick.service` + `.timer` | один `hostctl wake-tick` на срабатывание; `Type=oneshot`, `TimeoutStartSec=3600` (сессия имеет право отработать свой бюджет), таймер 60 с, `OnBootSec=10m`. **В загрузку не ставится без `--with-tick-timer`** (T7.61(б)): единственный юнит стенда, который сам запускает сессию |
 | `noezema-dev-maint.service` + `.timer` | два шага подряд: `reassessment-tick` затем `reconcile-tick`, таймер 60 с |
 | `noezema-dev-unit-state.service` + `.timer` | публикация снимка юнитов каждые 5 с — без него Command API и приём вопроса на стенде отвечают 423 |
 
@@ -113,6 +114,35 @@ systemctl start noezema-dev.target            # web + три таймера
 target останавливает wakes, публикацию и web разом. Проверка синтаксиса на dev-машине:
 `systemd-analyze verify --man=no` на отрендеренных копиях (тот же критерий, что у
 `scripts/verify_systemd_units.sh`).
+
+## Как запускать сессии
+
+**По умолчанию сессию на стенде запускает только оператор.** Кнопка «wake now» на странице или
+`POST /api/v1/commands` с `{"type":"wake_now"}` (нужен `X-Admin-Token`) — они обходят интервал из снапшота,
+но не обходят admission (§5.2.1): узел в паузе или с незавершённой сессией не будет разбужен и командой.
+
+**Плановые сессии — отдельное решение оператора.** `noezema-dev-tick.timer` (60 с; фактический интервал
+берёт `wake_schedule` из снапшота) включается только явным флагом:
+
+```bash
+sudo ./deploy/dev-stand/bootstrap.sh --with-tick-timer    # поставить/оставить плановый тик
+sudo systemctl disable --now noezema-dev-tick.timer       # выключить plan sessions вручную
+sudo systemctl enable  --now noezema-dev-tick.timer       # включить их вручную, без bootstrap
+```
+
+Повторный `bootstrap.sh` без флага уже включённый таймер НЕ отключает: он печатает текущее состояние и
+команду выключения (самостоятельные сессии оператора — только его решение). Текущее состояние всегда видно в `./status.sh` — строка «тик-таймер: выключен (сессии —
+только wake now)» или «включён (state=…, next=…)».
+
+Почему по умолчанию выключено: узел, который сам себя будит без участия оператора, на пустой очереди
+доходит до `max_consecutive_failures=3` и уходит в автопаузу (ниже раздел про пустую очередь), а «wake now»
+при включённом таймере конкурирует с плановым тиком (и проигрывает ему по времени запуска). Конкуренция закрыта узловым замком (T7.61(а), ADR-0025):
+второй вход получает skip `session_in_progress` и второй сессии не создаёт — но это защита от ошибки, а не
+причина держать таймер включённым.
+
+Одну сессию «в обход расписания» можно запустить и из CLI: `sudo -u <stand user> .venv/bin/python -m
+hostctl.cli wake-tick` — при занятой сессии он так же напечатает `wake-tick: skip (session_in_progress)` и
+выйдет 0.
 
 ## VM без GPU и пустая очередь — это не ошибка
 

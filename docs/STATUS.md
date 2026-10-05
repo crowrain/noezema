@@ -2455,6 +2455,20 @@ AGENTS §7), `context_window`/`max_output_tokens` из снапшота, пор�
 `('selected','running','committing','reconciling_commit')` не совпадал ни с одним значением enum, поэтому
 guard всегда говорил «0» и никогда не останавливал опасный сброс.
 
+**Проверки коммита 3.** `bash -n bootstrap.sh status.sh reset-db.sh` — чисто. `shellcheck -S warning`
+(0.11.0, установлен временно в отдельный venv `.shellcheck-venv`, `pyproject.toml` не тронут; после
+проверки каталог удалён) — 0 замечаний. Реальный `bootstrap.sh --dry-run` на .87: exit 0,
+`/var/lib/noezema-dev` не создан, env-файл не тронут, креды замаскированы (`POSTGRES_PASSWORD=<masked>`,
+`NOEZEMA_DATABASE_URL=postgresql+asyncpg://<creds>@…`), напечатаны выбранный порт (5432 свободен) и
+напоминание про ufw. Новые тесты `tests/unit/test_dev_stand_scripts.py` (12) гоняют **настоящие скрипты**
+с подставными `docker`/`ss`/`sudo`/`apt-get`/`systemctl`/`ufw`/`uv` и покрывают: dry-run ничего не меняет
+и не печатает секреты; автовыбор 5433 при занятом 5432; понятная смерть при явном занятом порту;
+переиспользование порта существующего контейнера (5439); отказ генерировать пароль рядом с чужим
+кластером; `--force` не ротирует секреты; `--rotate-secrets` ротирует токен и честно сообщает про пароль;
+plan uv-установки от root в `/usr/local/bin`; pins на healthcheck `-d postgres`, эндпоинт-проверку,
+«диагностика без правок фаервола» и текст про wake now. Реальный bootstrap/reset на .87 не запускались.
+
+
 ## T7.61 — узел не запускает две сессии одновременно
 
 ### T7.61(а) — гонка «wake now» + запланированного тика: разбор (до правки кода)
@@ -2573,15 +2587,110 @@ unit'а после `systemctl kill` посреди сессии (ожидаем:
 `docs/adr/0025-node-session-advisory-lock.md`, `tests/scenario/test_node_session_exclusion.py`,
 `tests/scenario/test_node_session_guard.py`. Миграций, изменений модели/промптов/пинов/config-v* нет.
 
-**Проверки коммита 3.** `bash -n bootstrap.sh status.sh reset-db.sh` — чисто. `shellcheck -S warning`
-(0.11.0, установлен временно в отдельный venv `.shellcheck-venv`, `pyproject.toml` не тронут; после
-проверки каталог удалён) — 0 замечаний. Реальный `bootstrap.sh --dry-run` на .87: exit 0,
-`/var/lib/noezema-dev` не создан, env-файл не тронут, креды замаскированы (`POSTGRES_PASSWORD=<masked>`,
-`NOEZEMA_DATABASE_URL=postgresql+asyncpg://<creds>@…`), напечатаны выбранный порт (5432 свободен) и
-напоминание про ufw. Новые тесты `tests/unit/test_dev_stand_scripts.py` (12) гоняют **настоящие скрипты**
-с подставными `docker`/`ss`/`sudo`/`apt-get`/`systemctl`/`ufw`/`uv` и покрывают: dry-run ничего не меняет
-и не печатает секреты; автовыбор 5433 при занятом 5432; понятная смерть при явном занятом порту;
-переиспользование порта существующего контейнера (5439); отказ генерировать пароль рядом с чужим
-кластером; `--force` не ротирует секреты; `--rotate-secrets` ротирует токен и честно сообщает про пароль;
-plan uv-установки от root в `/usr/local/bin`; pins на healthcheck `-d postgres`, эндпоинт-проверку,
-«диагностика без правок фаервола» и текст про wake now. Реальный bootstrap/reset на .87 не запускались.
+### T7.61(б) — стенд: сессию запускает оператор; артефакты research_proxy в data root узла
+
+**5. `apps/research_proxy/main.py` больше не хардкодит `/var/lib/noezema/artifacts`.** Единственная
+строка правки была такой: `store = FilesystemArtifactStore(Path("/var/lib/noezema/artifacts"))`. Это
+ production-контурный путь, а standalone-прокси на dev-стенде работает от пользователя стенда над
+`/var/lib/noezema-dev`: (а) это PermissionError при старте процесса, (б) артефакты узла уезжали в чужой
+контур — ровно та находка, из-за которой T7.59(в) переводил workspace на env. Теперь корень берётся из тех
+же правил, что и у остальных точек входа: `apps/orchestrator/scheduler.py` получил `ARTIFACTS_SUBDIR` +
+`artifacts_root_from_env()` (= `data_root_from_env() / ARTIFACTS_SUBDIR`, то есть ровно
+`<NOEZEMA_DATA_ROOT>/artifacts` — sibling того же `<data root>/workspace`, из которого работают wake tick,
+веб-бинд и ручной вход). Env не задан → прежний `/var/lib/noezema/artifacts`, поведение прежнее. Проверено
+`tests/unit/test_research_proxy_entry_artifacts.py` (5): дефолт не изменился (`/var/lib/noezema/artifacts`);
+корень следует за `NOEZEMA_DATA_ROOT`; `build_standalone_app()` (тот же путь, что `python -m
+apps.research_proxy.main`) строит store именно в `<data root>/artifacts`; артефакты остаются sibling'ом
+workspace и не пишутся в production-путь. Отдельно
+закреплено, что сам entry-модуль импортируется только после установки data root: импорт билдит приложение,
+а `FilesystemArtifactStore.__init__` создаёт каталог.
+
+**6. Плановый тик на стенде — только по явному флагу (`--with-tick-timer`).** Дефолт изменён осознанно и в
+пределах dev-стенда: раньше `step_units` включал `noezema-dev-tick.timer` всегда, то есть ВМ сама
+разбуживала узел каждые 60 с (фактически — по `wake_schedule.interval` снапшота) без участия оператора.
+Сейчас `bootstrap.sh`:
+- включает `noezema-dev-unit-state.timer`, `noezema-dev-maint.timer` и `noezema-dev-web.service` как раньше
+  (без unit-state Command API отвечает 423, без maint нечего примирять), а тик-таймер — только при
+  `--with-tick-timer`;
+- **никогда не отключает уже включённый таймер**: read-only `tick_timer_state()` (`systemctl is-enabled`) —
+  если таймер включён, скрипт печатает состояние и команду `sudo systemctl disable --now
+  noezema-dev-tick.timer` для оператора; повторный запуск без флага тоже ничего не меняет. Отключение
+  plan sessions — решение оператора, не следствие переустановки;
+- `status.sh` печатает вердикт: «тик-таймер: выключен (сессии — только wake now)» или
+  «включён (state=…, …)» плюс строки `next=` для всех трёх таймеров (как раньше);
+- README получил раздел «Как запускать сессии»: «wake now» (кнопка/`POST /api/v1/commands`) — обходит
+  интервал, но не admission; плановые сессии — `bootstrap.sh --with-tick-timer` или вручную
+  `systemctl enable|disable --now noezema-dev-tick.timer`; разовый запуск из CLI (`hostctl.cli wake-tick`),
+  и что при занятой сессии он напечатает skip. Строка таблицы юнитов помечена: тик — единственный юнит,
+  который сам запускает сессию, в загрузку без флага не ставится.
+
+Тесты (`tests/unit/test_dev_stand_scripts.py`, +6): по умолчанию в dry-run `systemctl enable` НЕ содержит
+`noezema-dev-tick.timer` (но содержит unit-state/maint/web); флаг добавляет его; уже включённый таймер
+репортится и в плане нет ни одного `disable`; флаг описан в `--help`; `status.sh` (реальный скрипт со
+stub'ным `systemctl`) печатает нужный вердикт в обе стороны; README-пин. Хarness дополнен `_run_status()` и
+stub'ом `systemctl`, отвечающим на `is-enabled` (`STUB_TICK_TIMER_STATE`). `bash -n bootstrap.sh status.sh
+reset-db.sh` — чисто; `shellcheck -S warning` (0.11.0, временно в `.shellcheck-venv`, `pyproject.toml` не
+тронут; каталог удалён после проверки) — 0 замечаний. Реальный `bootstrap.sh` на .87 и тем более на .92 не
+запускался: проверены только dry-run со stub'ами.
+
+**7. Пауза после трёх «пустых» тиков: разбор (код не изменён).**
+
+Как это получается сейчас: admitted wake доходит до выбора вопроса, кандидата нет →
+`_finish(SessionState.FAILED, termination_reason="no_question")` (`apps/orchestrator/orchestrator.py`,
+ветка после `_select_question_with_guard`) → `WakeScheduler.record_session_result(final_state="failed")`
+увеличивает `consecutive_failures`, ставит backoff и при
+`consecutive_failures >= wake_schedule.max_consecutive_failures` (config-v13: 3; backoff 60/120/240, cap
+86400) пишет `node_state='paused'`, `paused_reason='consecutive_failures'`. Дальше блокируется и плановый
+тик, и «wake now»: `_admission` первым условием возвращает `REASON_PAUSED` (§5.2.1: wake_now обходит
+расписание, но не admission). То есть на пустом стенде после трёх тиков оператор, только что добавивший
+вопрос через `ask`, получает отказ разбудить узел, пока явно не сделает `resume`.
+
+Варианты. (А) «Пустая очередь = условие admission»: выводить `skip (empty_queue)` до создания сессии.
+Отклонено: §5.2.1 — закрытый список условий *о состоянии узла и контуре* (пауза, живая сессия, unresolved
+commit, слот активации, liveness, квота диска, GPU); «кандидатов нет» — условие о *содержимом знания*, а
+eligibility кандидата считает селектор сессии по `curiosity`-секции снапшота (режим, score, похожие
+вопросы). Хост, решающий это отдельно, получил бы вторую копию правил отбора и расхождение с тем, что
+реально выберет сессия. (Б) «Считать `no_question` отсутствием работы, а не отказом»: в
+`record_session_result` различать `termination_reason` — при `no_question` не увеличивать счётчик и не
+ставить backoff, но оставить FAILED-сессию в ленте и аудите. (В) Новый терминальный статус/исход («нет
+работы») вместо FAILED — требует изменения enum сессий и миграции; вне рамок задачи. (Г) Ослабить правило
+конфигом (`max_consecutive_failures` или отдельный счётчик пустых очередей в `wake_schedule`) — это новая
+версия снапшота (config-v14), а не кодовая правка: решение пользователя, к тому же лечит симптом.
+
+Рекомендация — (Б): отказ узла и отсутствие работы — разные события, а пауза по §5.2.1 призвана защищать от
+исправляемого отказа (движок, гейты, коммит), а не от того, что спрашивать пока нечего. Правка маленькая:
+`record_session_result` принимает `termination_reason` и на `no_question` оставляет счётчик/backoff нетронутыми
+(FAILED в лентах, аудитах и метриках сохраняется — видимость не теряется); реальные отказы по-прежнему ведут
+к паузе после трёх. Что нужно проверить при реализации: что тест `tests/scenario/test_dev_stand_flow.py`
+пересобирается на новое ожидание (сейчас он пинит именно автопаузу), что пауза по-прежнему достижима за реальными
+отказами, и что оператор видит пустую очередь в `status.sh`/`GET /api/v1/questions` — иначе «не отказывается,
+но и ничего не делает» станет тише, чем сейчас. Снимать автопаузу по-прежнему нужно явно:
+`hostctl resume-runtime` или команда `resume`. Связь с пунктом 6: выключенный по умолчанию тик-таймер сам по
+себе уменьшает число «пустых» прогонов, но не меняет семантику — при включённом таймере разбор остаётся
+актуальным.
+
+**Сопутствующая правка теста (найдено на полной проверке этого коммита).** Первый полный прогон
+`-n auto` упал на `tests/scenario/test_web_node_state_db_truth.py::test_leftover_session_running_marker_does_not_wedge_the_node`
+(`assert during_run is not None`, строка 230) и воспроизвёлось стабильно (2/2 полных профиля), тогда как
+одиночный прогон файла (3×) и целенаправленный `-n 6` по трём файлам статусных тестов были зелёные. Причина
+не в продукте: тест пытался *поймать одним снимком* состояние «маркер `session_running` + видна незавершённая
+строка `sessions`». Phase 1 держит строку `sessions` невидимой для других connections до COMMITTING
+(`apps/orchestrator/orchestrator.py`, комментарий T7.20 перед `_run_to_committing`), поэтому окно = от
+COMMITTING до терминального коммита, а снимали его poll'ом раз в 0,1 с; когда профиль стал на 12 тестов длиннее,
+окно начало попадать между снимками. Правка тестовая и **усиливает** пин: проверяется каждый снимок статуса,
+снятый пока этот веб владеет сессией, — ни на одном маркер не должен выглядеть остаточным
+(`node_state_stale_marker is False`); модельные задержки `delay_seconds = 0.8` держат сессию в phase 1, чтобы
+наблюдение не зависело от длины финального окна. Проверено негативным контролем: если в `apps/web/api.py`
+заменить `node.session_task = asyncio.create_task(_run_locked_session())` на `pass` (маркер есть, сессии нет),
+два из трёх тестов файла краснеют — пин живой. Пул `timing` не пополнен: абсолютных длительностей тест по-прежнему не
+утверждает.
+
+**Проверки коммита T7.61(б).** `ruff check .` — чисто; `mypy packages apps hostctl` — Success, 133 файла;
+образ `noezema-sandbox:test` на месте; `pytest -n auto -q -m "not timing"` — **1210 passed, 12 skipped**
+(после T7.61(а) было 1198: добавлены 5 тестов research_proxy и 7 тестов dev-стенда); `pytest -q -m timing` —
+**4 passed**. Отдельно: `bash -n bootstrap.sh status.sh reset-db.sh` — чисто, `shellcheck -S warning` —
+0 замечаний (проверка временным venv `.shellcheck-venv`, `pyproject.toml` не тронут; каталог удалён после
+проверки), `tests/unit/test_dev_stand_scripts.py + test_research_proxy_entry_artifacts.py +
+test_orchestrator_entry_workspace.py` — 29 passed. Пул `timing` не пополнен; wall-clock утверждений не
+добавлено. Миграций, изменений модели/промптов/пинов/config-v* нет; ARCHITECTURE.md не изменён. Реальные
+`.92`/`.87`, LLM-хосты `.42`/`.48`, eval/smoke-базы не трогались (только SELECT по счётчикам).

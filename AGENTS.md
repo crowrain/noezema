@@ -138,7 +138,7 @@ origin всегда существующий `message` (нового enum-зна
 
 Dev-стенд (T7.59(б), `deploy/dev-stand/`, целевая ВМ 192.168.1.92 — её разворачивает менеджер по ssh,
 агент к `.92` не обращается и пакет только готовит): идемпотентный `bootstrap.sh` (`--dry-run`,
-`--no-docker-install`, `--no-units`, `--stub-executor`, `--force`, `--rotate-secrets`,
+`--no-docker-install`, `--no-units`, `--stub-executor`, `--force`, `--rotate-secrets`, `--with-tick-timer`,
 `--web-host/--web-port/--user`) ставит
 пакеты (в 24.04 apt-пакета `uv` нет → официальный установщик от root: `sudo env
 UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh <скачанный файл>`, затем проверка `uv --version`),
@@ -159,6 +159,14 @@ config-v13 (T7.59(в): = config-v12, но `model.context_window`/`backend_contex
 кодом 78 (`apps/web/bind.py`). Скрипты отказываются работать с базой вне `noezema-dev*` (в том числе
 `*eval*`/`*smoke*`) и с путями `/var/lib/noezema`, `/run/noezema`. Состояние — `status.sh`, сброс dev-базы —
 `reset-db.sh` (подтверждение вписыванием имени базы). Разбор и риски развёртывания: STATUS.md T7.59(б).
+
+**Сессии на стенде запускает оператор (T7.61(б)):** `noezema-dev-tick.timer` — единственный юнит, который
+сам будит узел, и `bootstrap.sh` включает его только по `--with-tick-timer`. Уже включённый таймер скрипт
+ни при первом, ни при повторном запуске не отключает (только сообщает состояние + команду). Состояние видно в
+`status.sh` («тик-таймер: выключен (сессии — только wake now)» / «включён»), раздел README — «Как запускать
+сессии». Причина дефолта: плановый тик на пустой очереди доходит до `no_question`→FAILED и после трёх
+повторов авто-паузит узел, после чего блокируется и сам тик, и «wake now» (admission), а снять паузу нужно
+явно.
 
 ## 7. Известные ловушки
 
@@ -228,7 +236,13 @@ config-v13 (T7.59(в): = config-v12, но `model.context_window`/`backend_contex
 - Ручной вход `python -m apps.orchestrator` до T7.59(в) хардкодил `/var/lib/noezema/workspace` так же; теперь
   корень берётся из env (`apps/orchestrator/scheduler.workspace_root_from_env()`, постоянная
   `WORKSPACE_SUBDIR` — одна на веб-бинд, wake tick и manual entry, литералы «workspace» сведены в неё).
-  Артефакты остаются sibling'ом workspace ⇒ `<NOEZEMA_DATA_ROOT>/artifacts`; env не задан → прежний путь.
+  Артефакты остаются sibling'ом workspace ⇒ `<NOEZEMA_DATA_ROOT>/artifacts` (постоянные `WORKSPACE_SUBDIR` и
+  `ARTIFACTS_SUBDIR` + `workspace_root_from_env()` / `artifacts_root_from_env()`); env не задан → прежний путь.
+  Standalone-прокси (`apps/research_proxy/main.py`) до T7.61(б) хардкодил `/var/lib/noezema/artifacts` и на
+  стенде писал бы артефакты в чужой контур (и получил бы PermissionError) — теперь тот же env, что у всех.
+  Внимание при тестировании: импорт `apps.research_proxy.main` БИЛДИТ приложение (`app = build_standalone_app()`),
+  а `FilesystemArtifactStore.__init__` создаёт каталог — такой импорт делать только после установки
+  `NOEZEMA_DATA_ROOT` на тестовый путь.
 - «wake now» на standalone-входе (T7.59(в)): `build_standalone_app` не может построить оркестратор до создания
   приложения (оркестратор живёт на его factory), поэтому присваивает `app.state.orchestrator` ПОСЛЕ `create_app`.
   Командный обработчик обязан читать `app.state.orchestrator` в момент команды, а не замыкаться на аргументе
@@ -266,7 +280,10 @@ config-v13 (T7.59(в): = config-v12, но `model.context_window`/`backend_contex
   (wake_schedule в config-v12 = config-v13: 60/120/240, cap 86400) и пауза узла после
   `max_consecutive_failures=3`; дальнейшие тики дают `skip`.
   Снимать паузу нужно явно (`hostctl resume-runtime` или команда `resume`). Проверено тестом
-  `tests/scenario/test_dev_stand_flow.py`.
+  `tests/scenario/test_dev_stand_flow.py`. Внимание (T7.61(б)): пауза блокирует и плановый тик, и «wake now»
+  (`_admission` первым условием даёт `REASON_PAUSED`), так что оператор, только что добавивший вопрос через
+  `ask`, разбудить узел не сможет. Разбор вариантов и рекомендация (не считать `no_question` отказом узла в
+  `record_session_result`) — STATUS.md T7.61(б) п.7; кода пока нет.
 - CI (GitHub Actions) ставит `.[dev]` БЕЗ закрепления версий и в job `test` требует отдельной
   сборки sandbox-образа до pytest (шаг §6; с T7.41 фикстура образ не собирает) — расхождение с
   локальной средой даёт красные прогоны (T7.53b разбор: ruff 0.16.10 на раннере против 0.16.7 в

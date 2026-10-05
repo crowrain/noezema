@@ -95,6 +95,13 @@ if have systemctl; then
     next="$(systemctl show -p NextElapseUSecRealtime --value "$timer" 2>/dev/null || true)"
     printf '   %-34s next=%s\n' "$timer" "${next:-n/a}"
   done
+  # Единственный юнит, который сам запускает сессию (T7.61(б)): по умолчанию он выключен.
+  tick_state="$(systemctl is-enabled noezema-dev-tick.timer 2>/dev/null || true)"
+  if [[ "${tick_state:-}" == enabled* ]]; then
+    note "тик-таймер: включён (state=$tick_state) — сессии стартуют по расписанию; выключить: sudo systemctl disable --now noezema-dev-tick.timer"
+  else
+    note "тик-таймер: выключен (сессии — только wake now); включить плановые: ./bootstrap.sh --with-tick-timer"
+  fi
   note "последний код: $(for u in noezema-dev-tick.service noezema-dev-maint.service; do printf '%s=%s ' "$u" "$(systemctl show -p ExecMainStatus --value "$u" 2>/dev/null || true)"; done)"
   note "«wake now» — кнопка на странице или POST /api/v1/commands (wake_now): они обходят интервал, но не admission."
   note "systemctl start noezema-dev-tick.service сессию НЕ запускает: тик увидит interval_not_elapsed и выведет wait"

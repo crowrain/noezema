@@ -16,6 +16,19 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BOOTSTRAP = REPO_ROOT / "deploy" / "dev-stand" / "bootstrap.sh"
+STATUS = REPO_ROOT / "deploy" / "dev-stand" / "status.sh"
+
+# bootstrap asks systemctl only whether the tick timer is enabled (T7.61(б)); status.sh additionally lists
+# units and shows timer schedules. STUB_TICK_TIMER_STATE pins the answer for the tick timer specifically.
+_SYSTEMCTL_STUB = """#!/usr/bin/env bash
+if [[ $1 == is-enabled && $2 == noezema-dev-tick.timer && -n "${STUB_TICK_TIMER_STATE:-}" ]]; then
+  printf '%s\n' "$STUB_TICK_TIMER_STATE"; exit 0
+fi
+if [[ $1 == is-enabled ]]; then
+  printf 'disabled\n'; exit 0
+fi
+exit 0
+"""
 
 FAKE_DB_PASSWORD = "faux-db-password-must-never-be-printed"
 FAKE_ADMIN_TOKEN = "faux-admin-token-must-never-be-printed"
@@ -67,7 +80,7 @@ def stubs(tmp_path: Path) -> dict[str, Path]:
     _write_stub(bin_dir, "ss", _SS_STUB)
     _write_stub(bin_dir, "sudo", '#!/usr/bin/env bash\nexec "$@"\n')
     _write_stub(bin_dir, "apt-get", '#!/usr/bin/env bash\nexit 0\n')
-    _write_stub(bin_dir, "systemctl", '#!/usr/bin/env bash\nexit 0\n')
+    _write_stub(bin_dir, "systemctl", _SYSTEMCTL_STUB)
     _write_stub(bin_dir, "ufw", '#!/usr/bin/env bash\nprintf "Status: active\\n"\n')
     _write_stub(bin_dir, "usermod", '#!/usr/bin/env bash\nexit 0\n')
     return {
@@ -103,6 +116,35 @@ def _run_bootstrap(
     env.update(extra_env or {})
     return subprocess.run(
         ["bash", str(BOOTSTRAP), "--dry-run", *flags],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+
+
+def _run_status(
+    stubs: dict[str, Path],
+    *flags: str,
+    extra_env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run the real status.sh (read-only by construction) against substituted commands.
+
+    The DB container name is deliberately absent so that the script reports instead of reaching into a real
+    Postgres; LLM and web probes are skipped by flags.
+    """
+    env = {
+        "PATH": f"{stubs['bin']}:/usr/bin:/bin",
+        "HOME": str(stubs["bin"].parent),
+        "NOEZEMA_DEV_ENV_FILE": str(stubs["env_file"]),
+        "NOEZEMA_DEV_DATA_ROOT": str(stubs["data_root"]),
+        "NOEZEMA_DEV_DB_CONTAINER": "noezema-dev-db-not-present",
+        "STUB_TICK_TIMER_STATE": "",
+    }
+    env.update(extra_env or {})
+    return subprocess.run(
+        ["bash", str(STATUS), "--no-llm", "--no-web", *flags],
         env=env,
         capture_output=True,
         text=True,
@@ -252,6 +294,81 @@ class TestDevStandScriptContent:
             text = path.read_text(encoding="utf-8")
             assert "interval_not_elapsed" in text
             assert "НЕ запускает" in text
+
+    def test_tick_timer_is_reported_by_status_and_bootstrap(self) -> None:
+        # T7.61(б): both scripts must state the tick-timer decision in words an operator can act on.
+        status_text = (REPO_ROOT / "deploy" / "dev-stand" / "status.sh").read_text(encoding="utf-8")
+        bootstrap_text = BOOTSTRAP.read_text(encoding="utf-8")
+        assert "тик-таймер: выключен (сессии — только wake now)" in status_text
+        assert "systemctl disable --now noezema-dev-tick.timer" in status_text
+        assert "--with-tick-timer) WITH_TICK_TIMER=true" in bootstrap_text
+        # An already enabled timer is only reported. The scripts never run systemctl disable themselves.
+        assert "systemctl disable" not in _strip_notes(bootstrap_text)
+
+
+class TestDevStandTickTimerOptIn:
+    """T7.61(б): плановые сессии — только по явному флагу; уже включённый таймер не трогается."""
+
+    def test_tick_timer_is_not_enabled_by_default(self, stubs: dict[str, Path]) -> None:
+        result = _run_bootstrap(stubs)
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        enabled_line = next(
+            (line for line in result.stdout.splitlines() if "systemctl enable" in line), ""
+        )
+        assert "noezema-dev-tick.timer" not in enabled_line
+        # everything else is still enabled: without unit-state the Command API answers 423, without maint
+        # nothing reconciles.
+        for unit in ("noezema-dev-unit-state.timer", "noezema-dev-maint.timer", "noezema-dev-web.service"):
+            assert unit in enabled_line
+        assert "дефолт" in result.stdout and "wake now" in result.stdout
+
+    def test_flag_enables_the_tick_timer(self, stubs: dict[str, Path]) -> None:
+        result = _run_bootstrap(stubs, "--with-tick-timer")
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        enabled_line = next(
+            (line for line in result.stdout.splitlines() if "systemctl enable" in line), ""
+        )
+        assert "noezema-dev-tick.timer" in enabled_line
+        assert "--with-tick-timer" in result.stdout
+
+    def test_already_enabled_timer_is_reported_not_disabled(self, stubs: dict[str, Path]) -> None:
+        result = _run_bootstrap(stubs, extra_env={"STUB_TICK_TIMER_STATE": "enabled"})
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "УЖЕ включён" in result.stdout
+        # The hint is printed for the operator; the script never runs it.
+        assert "sudo systemctl disable --now noezema-dev-tick.timer" in result.stdout
+        # The hint is printed for the operator; the plan itself contains no disable step.
+        assert not [line for line in result.stdout.splitlines() if "[dry-run]" in line and "disable" in line]
+        enabled_line = next(
+            (line for line in result.stdout.splitlines() if "systemctl enable" in line), ""
+        )
+        assert "noezema-dev-tick.timer" not in enabled_line
+
+    def test_flag_is_documented_in_help(self) -> None:
+        result = subprocess.run(
+            ["bash", str(BOOTSTRAP), "--help"], capture_output=True, text=True, timeout=60, check=False
+        )
+        assert result.returncode == 0
+        assert "--with-tick-timer" in result.stdout
+
+    def test_status_shows_the_tick_timer_state(self, stubs: dict[str, Path]) -> None:
+        off = _run_status(stubs)
+        assert off.returncode == 0, off.stdout + off.stderr
+        assert "тик-таймер: выключен (сессии — только wake now)" in off.stdout
+
+        on = _run_status(stubs, extra_env={"STUB_TICK_TIMER_STATE": "enabled"})
+        assert on.returncode == 0, on.stdout + on.stderr
+        assert "тик-таймер: включён" in on.stdout
+        assert "тик-таймер: выключен" not in on.stdout
+
+    def test_readme_documents_how_sessions_start(self) -> None:
+        text = (REPO_ROOT / "deploy" / "dev-stand" / "README.md").read_text(encoding="utf-8")
+        assert "## Как запускать сессии" in text
+        assert "--with-tick-timer" in text
+        assert "systemctl disable --now noezema-dev-tick.timer" in text
 
 
 def _strip_notes(text: str) -> str:

@@ -12,6 +12,11 @@
 #                                        as long as the Postgres container or its volume exists
 #   ./bootstrap.sh --rotate-secrets      deliberately rotate the admin token (and the DB password,
 #                                        only when no cluster exists — see step 3)
+#   ./bootstrap.sh --with-tick-timer     enable noezema-dev-tick.timer: sessions then start BY THEMSELVES
+#                                        every wake_schedule.interval from the snapshot. Without the flag the
+#                                        tick timer is NOT enabled (T7.61(б)) — a stand starts a session only
+#                                        when the operator presses «wake now». An already-enabled timer is
+#                                        never silently disabled: the script reports its state instead.
 #
 #
 # Env knobs (all optional): NOEZEMA_DEV_USER / _APP_DIR / _DATA_ROOT / _ENV_FILE,
@@ -85,6 +90,9 @@ DOCKER_INSTALL=true
 FORCE=false
 ROTATE_SECRETS=false
 WITH_UNITS=true
+# T7.61(б): плановые сессии — НЕ по умолчанию. Без флага тик-таймер не включается ни при первом,
+# ни при повторном запуске; уже включённый таймер скрипт сам не отключает (см. step_units).
+WITH_TICK_TIMER=false
 
 # ── helpers ───────────────────────────────────────────────────────────────────────────
 say()  { printf '\n\033[1m== %s\033[0m\n' "$*"; }
@@ -206,6 +214,15 @@ assert_dev_path() {
   esac
 }
 
+# Read-only: как сейчас стоит тик-таймер (T7.61(б)). Ничего не меняет и никогда не спросят пароль:
+# systemctl is-enabled — обычная операция чтения, root для неё не нужен.
+tick_timer_state() {
+  have systemctl || { printf 'systemctl недоступен'; return 0; }
+  local state
+  state="$(systemctl is-enabled noezema-dev-tick.timer 2>/dev/null || true)"
+  printf '%s' "${state:-не установлен (unit не найден)}"
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run) DRY_RUN=true ;;
@@ -214,6 +231,7 @@ while [[ $# -gt 0 ]]; do
     --rotate-secrets) ROTATE_SECRETS=true ;;
     --no-units) WITH_UNITS=false ;;
     --stub-executor) TOOL_EXECUTOR=stub ;;
+    --with-tick-timer) WITH_TICK_TIMER=true ;;
     --web-host) WEB_HOST="${2:?--web-host needs a value}"; shift ;;
     --web-port) WEB_PORT="${2:?--web-port needs a value}"; shift ;;
     --user) STAND_USER="${2:?--user needs a value}"; shift ;;
@@ -566,8 +584,26 @@ step_units() {
   done
   note "unit files: $(find "$SCRIPT_DIR/systemd" -maxdepth 1 -type f | wc -l), rendered into /etc/systemd/system"
   run "${SUDO[@]}" systemctl daemon-reload
-  run "${SUDO[@]}" systemctl enable noezema-dev-unit-state.timer noezema-dev-tick.timer \
-    noezema-dev-maint.timer noezema-dev-web.service
+
+  # Тик-таймер — единственный юнит стенда, который сам запускает сессию. По умолчанию он НЕ включается
+  # (T7.61(б)): узел будит только оператор («wake now»), а не таймер каждые 60 с. Уже включённый таймер
+  # мы не отключаем — это решение оператора, скрипт только сообщает текущее состояние.
+  local units=(noezema-dev-unit-state.timer noezema-dev-maint.timer noezema-dev-web.service)
+  if $WITH_TICK_TIMER; then
+    units+=(noezema-dev-tick.timer)
+    note "тик-таймер включается по --with-tick-timer: сессии стартуют сами, каждые wake_schedule.interval из снапшота"
+  else
+    note "тик-таймер НЕ включаем (дефолт): сессию запускает только «wake now» (кнопка или POST /api/v1/commands)"
+    local tick_state
+    tick_state="$(tick_timer_state)"
+    if [[ "$tick_state" == enabled* ]]; then
+      note "он УЖЕ включён (state=$tick_state) — сами мы его не отключаем: решение за оператором"
+      note "  выключить плановые сессии: sudo systemctl disable --now noezema-dev-tick.timer"
+    else
+      note "состояние тик-таймера сейчас: $tick_state; включить плановые сессии: ./bootstrap.sh --with-tick-timer"
+    fi
+  fi
+  run "${SUDO[@]}" systemctl enable "${units[@]}"
   note "started by you: systemctl start noezema-dev.target (the stand is not pulled in at boot)"
 }
 
@@ -579,6 +615,7 @@ step_summary() {
   note "wake now:      ТОЛЬКО кнопка «wake now» на странице или POST /api/v1/commands (wake_now): они обходят интервал,"
   note "                но не admission. systemctl start noezema-dev-tick.service сессию НЕ запускает — тик"
   note "                посмотрит на интервал из снапшота и выведет wait (interval_not_elapsed)"
+  note "сессии:      по умолчанию — только «wake now»; плановый тик включается явно (./bootstrap.sh --with-tick-timer)"
   note "лента событий: ссылка из таблицы очереди (/session/<id>) или curl http://127.0.0.1:$WEB_PORT/api/v1/timeline"
   note "состояние:    ./status.sh · сброс: ./reset-db.sh"
   if $DRY_RUN; then note "(dry-run: ничего не изменено)"; fi
