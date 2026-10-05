@@ -2455,6 +2455,124 @@ AGENTS §7), `context_window`/`max_output_tokens` из снапшота, пор�
 `('selected','running','committing','reconciling_commit')` не совпадал ни с одним значением enum, поэтому
 guard всегда говорил «0» и никогда не останавливал опасный сброс.
 
+## T7.61 — узел не запускает две сессии одновременно
+
+### T7.61(а) — гонка «wake now» + запланированного тика: разбор (до правки кода)
+
+**Симптом на стенде 192.168.1.92 (2026-10-05).** Оператор нажал «wake now»: сессия `7f6b28a7` началась в
+05:26:52 и шла ~40 с. Через 36 с планировщик (`noezema-dev-tick.service`, отдельный процесс) получил
+admission и запустил **вторую** сессию `fa5448d5` на том же узле и (в итоге) на том же вопросе. Инвариант
+§5.2.1 «одна сессия на узел» нарушен; обе сессии прошли полный цикл до succeeded, то есть защита не
+сработала ни на одном из этапов.
+
+**Механизм гонки (по коду, в порядке исполнения).** Admission `decide` → `_admission` проверяет живую
+сессию как `SELECT count(*) FROM sessions WHERE state NOT IN (<terminal>)`
+(`apps/orchestrator/scheduler.py:479`, причина `REASON_NONTERMINAL_SESSION` там же:483). Строка же
+запускаемой сессии создаётся внутри phase 1 (`apps/orchestrator/orchestrator.py:365-368`,
+`_run_to_committing`) в транзакции, которая остаётся открытой до COMMITTING (T7.20, ADR-0009), и видима
+другим соединениям только после финальной транзакции. Следовательно, в момент admission тика строка
+web-сессии для этого соединения **не существует** — счётчик даёт 0, причина `nonterminal_session` не
+выносится, решение = `wake`. Собственная внутренняя проверка оркестратора
+(`orchestrator.py:554`, «single session at a time (M1)») читает те же невидимые rows и тоже пропускает.
+Маркер `system_constants.node_state='session_running'` в admission вообще не участвует (`_admission`
+реагирует только на `paused`; T5.2/T7.59(в) осознанно оставили остаточный маркер неблокирующим, иначе
+убитый тик-юнит клинит узел), поэтому и как взаимное исключение он не работает — при обоих порядках
+записи (веб пишет маркер до старта задачи, тик — до старта сессии) вторая точка входа проходит дальше.
+
+**Инвентарь точек входа, запускающих `run_session` (все обязаны стоять в одном лейне).**
+
+| Точка входа | Где | Как стартует сессию | Отношение к гонке до правки |
+|---|---|---|---|
+| планировщик хоста | `hostctl/cli.py::wake_tick` (`ExecStart=… -m hostctl.cli wake-tick`, `deploy/dev-stand/systemd/noezema-dev-tick.service`) | `decide(scheduled)` → маркер session_running (было:cli 286-293) → `run_session()` | участник гонки (вторая сессия) |
+| «wake now» веб | `apps/web/api.py` `_apply_command`, ветка WAKE_NOW (маркер было:977, `create_task` было:987) | admission на отдельной сессии → маркер → фоновая задача | участник гонки (первая сессия) |
+| ручной вход | `apps/orchestrator/main.py::_run` | `build_orchestrator` → `run_session()` без admission и без маркера | потенциальный третий участник: обходил и admit, и маркер |
+| серия eval | `hostctl/cli.py::eval_run._run_sessions` (маркер было:1305) | цикл admission+retry → `run_session()` | потенциальный участник рядом с тиком на той же БД |
+| тесты/смоуки поверх этих же функций | `tests/scenario/*`, eval-серии | те же пути | — |
+
+Вне списка (sessions не запускают, правки не требуют): `hostctl` maintenance/reconcile/ask/preflight,
+`apps/research_proxy`, offline rules.
+
+**Стоп-критерий проверён до правки — он НЕ сработал.** ARCHITECTURE §5.2.1 предписывает для admission и
+создания сессии блокировку строк (`runtime_config_heads → sessions`, строки 451-452), то есть node lease
+таблица в смысле «отдельная сущность с TTL» здесь не требуется; §8.7.2 (строка 1211) уже описывает
+нужный механизм — «DB ownership — session-level PostgreSQL advisory lock на scope; это не lease и не
+fencing protocol», §12 (≈1406): «advisory lock держит не транзакция, а соединение… потеря connection
+немедленно завершает скрипт». §5.9.1 п.3 уже закрепляет, что admission-гейт живёт вне короткой доменной
+транзакции. Правка не затрагивает модель данных, миграции, payload config-v*, промпты, пины и
+`tool_schema_hash`; новых enum/Reason в доменной модели нет (новый REASON — только хостная константа).
+Значит, вариант с node lease table (потребовал бы таблицы + TTL + reconciler-политики) оставлен как
+отклонённый, а реализация возможна без миграции → коммит 2 делать можно.
+
+**Варианты и почему выбран пятый.**
+- А. «Honour `node_state='session_running'` in admission». Отклонён: ломает T5.2/T7.59(в) (остаточный
+  маркер от убитого юнита клинит узел до ручной чистки) и не закрывает гонку при одновременном старте
+  (оба видят `idle`). Кроме того меняет поведение существующих тестов T7.59(в).
+- Б. «Поднимать маркер в момент session creation внутри phase 1». Отклонён: маркер — строка
+  `system_constants`, её COMMIT невозможен до конца phase 1 (та же транзакция), а отдельная запись из
+  phase 1 была бы незащищённым «staging-обходом» state-machine.
+- В. `SELECT … FOR UPDATE` на строке узла/вопроса через всю сессию. Отклонён: держит row lock минуты
+  (§5.2.2 канонический порядок блокировок + §12 предупреждение о висящих транзакциях), конкурирует с
+  финальной транзакцией и не даёт crash-safety.
+- Г. Отдельная таблица node-lease с heartbeat. Отклонён: требует миграцию и reconciler-политику, а §8.7.2
+  явно говорит, что для этой задачи нужен именно advisory lock, не lease (уже реализовано в offline rules).
+- Д **(выбран)**. Session-level advisory lock узла на **отдельном** соединении, удерживаемый всю
+  `run_session`. Ключ — `hashtext('noezema:node_session:<node_owner>')`, имя считает PostgreSQL (одинаково
+  во всех процессах узла; Python `hash()` запрещён — PYTHONHASHSEED дал бы каждому юниту свой замок).
+  Механизм уже.house-style: тот же паттерн у writer gate (`packages/memory/cascade.py`) и offline rules
+  (`hostctl/offline_rules.py`). Замок не участвует в каноническом порядке блокировок (§5.2.2), потому что
+  живёт вне транзакций (AUTOCOMMIT + NullPool). Порядок в каждой точке входа: admission → замок →
+  маркер session_running → `run_session` → учёт исхода → снятие замка. Снятие идемпотентно и выполняется на
+  всех выходах (нормальный конец, исключение внутри сессии, отмена задачи, fail-closed отказ) плюс
+  автоматически PostgreSQL при гибели соединения — убитый тик не клинит узел.
+
+**Что сделано (коммит «T7.61(а)»).** Новый модуль `apps/orchestrator/node_guard.py` (`NodeSessionGuard`:
+`acquire()` — `pg_try_advisory_lock(hashtext(:n))` без ожидания, `release()` идемпотентный и не падает на
+мёртвом бэкенде, `name`, `held`; `node_session_guard()` async-CM с исключением
+`NodeSessionInProgress`; `NodeSessionGuardError` — fail-closed, если исключить невозможно). В
+`scheduler.py` добавлены `REASON_SESSION_IN_PROGRESS`, `NODE_SESSION_LOCK_PREFIX`,
+`node_session_lock_name()` и `WakeScheduler.record_guard_skip()` (§5.2.1 «пропуск с записью точной
+причины»: аудит `wake_skipped` в той же форме, что и у admission-пропуска). Точки входа: wake-tick берёт
+замок после `decide` и до маркера, занятый лейн = `wake-tick: skip (session_in_progress)` + exit 0; веб
+«wake now» берёт замок до `_save_node_state`, занятый = reject `{"reason": "a session is already running",
+"wake_reason": "session_in_progress"}` (та же формулировка, что и для локального случая), снятие — в
+`finally` обёртки задачи сессии (покрывает исключение и отмену) и как страховка в lifespan; ручной вход
+при занятом лейне печатает skip и возвращает 0 (сессию не создаёт); eval-run берёт/снимает замок на каждую
+сессию серии (поведение серии, backoff и пауза — без изменений). `decide()` и список admission не изменены:
+замок — дополнительная защита окна decide→start, а не замена admission.
+
+**Тесты.** `tests/scenario/test_node_session_exclusion.py` — репродюсер гонки **сквозь реальные точки
+входа**: веб-wake через `build_standalone_app()` (окно держит медленный scripted-ответ модели), тик —
+реальным подпроцессом `python -m hostctl.cli wake-tick` с теми же env. До правки он красный:
+`tick.stdout = "wake-tick: session -> succeeded (node_state=idle)"`, в БД 2 сессии при ожидаемой 1; после
+правки — `wake-tick: skip (session_in_progress)`, exit 0, ровно одна сессия, а «wake now» afterwards
+проходит. Тест отдельно фиксирует сам механизм: в момент admission тика `nonterminal == 0` (строка фазы 1
+невидима). `tests/scenario/test_node_session_guard.py` (9): взаимное исключение двух движков к одной БД и
+идемпотентность acquire/release; разные `node_owner` не блокируют друг друга; после
+`pg_terminate_backend(pid)` держателя лейн свободен, а `release()` мёртвого guard не падает (именно это
+даёт crash-safety убитого юнита); снятие при исключении внутри сессии и при отмене задачи; веб-wake
+отвергается, пока замок занят у другого процесса (и не создаёт сессию); отменённая веб-сессия возвращает
+лейн; wake-tick exit 0 + точная строка скипа + аудит `wake_skipped reason=session_in_progress,
+source=scheduled`; ручной вход при занятом лейне → 0 без строки sessions. Стенных ассертов нет, маркером
+`timing` ничего не добавлено. Существующие тесты не изменены, кроме `tests/unit/test_orchestrator_entry_workspace.py`,
+где collaborator-заглушка дополнена фейком guard'а (эти тесты намеренно не подключаются к БД).
+
+**Остаточные свойства и ограничения.** Session-level advisory lock требует одного DB-соединения на клиента:
+за transaction-mode pooler (pgbouncer) он не даёт взаимного исключения — в проекте прямо соединение с
+PostgreSQL везде, включая стенд (`deploy/dev-stand`), но при появлении pooler guard придётся заменить
+долговременной строкой с lease. Замок не заменяет lease сессии (§5.2.3) и не является fencing токеном
+(§8.7.2): он решает только «кто может **начать** сессию». `node_state` остаётся маркером для оператора,
+admission-список §5.2.1 — прежний. Не проверено на реальном стенде (только локально, fake LLM): поведение
+unit'а после `systemctl kill` посреди сессии (ожидаем: замок освобождён Postgres'ом), совместимость guard
+с transaction pooler, и «wake now» при реально занятом GPU/диске.
+
+**Проверки коммита T7.61(а).** `ruff check .` — чисто; `mypy packages apps hostctl` — 133 файла, ошибок нет;
+образ `noezema-sandbox:test` на месте; `pytest -n auto -q -m "not timing"` — **1198 passed, 12 skipped**
+(до коммита было 1188: добавлены 10 новых тестов); `pytest -q -m timing` — **4 passed**. Репродюсер до
+правки красный (`wake-tick: session -> succeeded`, sessions=2), после — зелёный; wall-clock тестов не
+добавлено, пул `timing` не пополнен. Новые файлы: `apps/orchestrator/node_guard.py`,
+`docs/adr/0025-node-session-advisory-lock.md`, `tests/scenario/test_node_session_exclusion.py`,
+`tests/scenario/test_node_session_guard.py`. Миграций, изменений модели/промптов/пинов/config-v* нет.
+
 **Проверки коммита 3.** `bash -n bootstrap.sh status.sh reset-db.sh` — чисто. `shellcheck -S warning`
 (0.11.0, установлен временно в отдельный venv `.shellcheck-venv`, `pyproject.toml` не тронут; после
 проверки каталог удалён) — 0 замечаний. Реальный `bootstrap.sh --dry-run` на .87: exit 0,

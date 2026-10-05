@@ -41,8 +41,14 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
+from apps.orchestrator.node_guard import NodeSessionGuard, NodeSessionGuardError
 from apps.orchestrator.orchestrator import Orchestrator, SessionOutcome
-from apps.orchestrator.scheduler import WakeScheduler, data_root_from_env, node_owner_from_env
+from apps.orchestrator.scheduler import (
+    REASON_SESSION_IN_PROGRESS,
+    WakeScheduler,
+    data_root_from_env,
+    node_owner_from_env,
+)
 from apps.web import diagnostics as diagnostics_queries
 from apps.web import knowledge as knowledge_queries
 from apps.web import metrics as metrics_queries
@@ -622,6 +628,10 @@ class _Node:
     def __init__(self) -> None:
         self.session_task: asyncio.Task[SessionOutcome] | None = None
         self.last_error: str | None = None
+        # T7.61(а): this process's hold on the node's session lane (see apps/orchestrator/node_guard.py).
+        # It lives here, not in the DB, because it IS this process: released when the session task ends
+        # and — as a safety net — by the lifespan shutdown if the task was cancelled before starting.
+        self.session_guard: NodeSessionGuard | None = None
         self._resets: set[asyncio.Task[None]] = set()
 
 
@@ -719,6 +729,11 @@ def create_app(
         yield
         if node.session_task is not None and not node.session_task.done():
             node.session_task.cancel()
+        # T7.61(а): safety net for the session lane. The task's own finally releases it; this covers the
+        # edge where the process shuts down with a held guard (cancelled before starting, or a release that
+        # could not run). An unheld guard releases to a no-op — no lock is dropped that is not ours.
+        if node.session_guard is not None:
+            await node.session_guard.release()
         if owns_engine:
             await engine.dispose()
 
@@ -974,7 +989,39 @@ def create_app(
                     "reason": decision.reason,
                     "paused_reason": decision.detail,
                 }
+
+            # T7.61(а) (§5.2.1): admitted wake ≠ free session lane. The stand race of this task is exactly
+            # this: «wake now» (web) and `noezema-dev-tick.service` (another process) were both admitted
+            # 36 s apart because phase 1 keeps the running session's row uncommitted until COMMITTING, and
+            # `node_state='session_running'` is not an admission condition. The node advisory lock is taken
+            # BEFORE this process writes the marker; whoever cannot take it does not start a session.
+            guard = NodeSessionGuard(engine, _node_owner)
+            try:
+                lane_free = await guard.acquire()
+            except NodeSessionGuardError as exc:
+                node.last_error = str(exc)[:500]
+                return OperatorCommandState.REJECTED, {"reason": f"session lane unavailable: {exc}"}
+            if not lane_free:
+                # Same operator-visible answer as the in-process case above (§5.2.1: exact reason recorded).
+                return OperatorCommandState.REJECTED, {
+                    "reason": "a session is already running",
+                    "wake_reason": REASON_SESSION_IN_PROGRESS,
+                }
+
             await _save_node_state(db, "session_running")
+            node.session_guard = guard
+
+            async def _run_locked_session() -> SessionOutcome:
+                """The session task, wrapped so the lane is returned on EVERY exit (§5.2.1).
+
+                A normal finish, an exception inside `run_session` and a cancellation (the lifespan
+                shutdown cancels this task) all run this finally — that is what keeps a web-side crash
+                from blocking «wake now» until the process restarts. `release()` is idempotent.
+                """
+                try:
+                    return await orchestrator_ref.run_session()
+                finally:
+                    await guard.release()
 
             def _reset(task: asyncio.Task[SessionOutcome]) -> None:
                 # runs on the event loop after the session task settles
@@ -984,7 +1031,7 @@ def create_app(
                 node._resets.add(reset_task)
                 reset_task.add_done_callback(node._resets.discard)
 
-            node.session_task = asyncio.create_task(orchestrator_ref.run_session())
+            node.session_task = asyncio.create_task(_run_locked_session())
             node.session_task.add_done_callback(_reset)
             return OperatorCommandState.COMPLETED, {"node_state": "session_running"}
 

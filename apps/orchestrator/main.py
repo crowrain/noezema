@@ -10,8 +10,13 @@ from pathlib import Path
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from apps.orchestrator.node_guard import NodeSessionGuard
 from apps.orchestrator.orchestrator import Orchestrator
-from apps.orchestrator.scheduler import workspace_root_from_env
+from apps.orchestrator.scheduler import (
+    REASON_SESSION_IN_PROGRESS,
+    node_owner_from_env,
+    workspace_root_from_env,
+)
 from apps.orchestrator.tool_executors import build_tool_executor
 from apps.research_proxy.service import ResearchProxyService
 from packages.artifacts.store import FilesystemArtifactStore
@@ -69,10 +74,19 @@ async def _run() -> int:
     # a stand running as an ordinary user gets `<its data root>/workspace` + `/artifacts` and no
     # PermissionError at startup. In sandbox mode the stub workspace is not used at all.
     orchestrator, gateway = build_orchestrator(factory, workspace_root_from_env())
+    # T7.61(а) (§5.2.1): the manual entry is a host session entry point like wake-tick, eval-run and the
+    # web's «wake now», so it takes the node's session lane BEFORE starting anything: without it a manual
+    # run could sit next to a scheduled tick's session on the same node (the T7.61(а) race). A busy lane is
+    # a skip, not a failure — exit 0, no session row, no failure accounting touched.
+    guard = NodeSessionGuard(engine, node_owner_from_env())
     try:
+        if not await guard.acquire():
+            print(f"session not started: {REASON_SESSION_IN_PROGRESS} — another session owns this node")
+            return 0
         outcome = await orchestrator.run_session()
     finally:
         await gateway.close()
+        await guard.release()
         await engine.dispose()
     print(
         f"session {outcome.session_id} -> {outcome.final_state.value} "

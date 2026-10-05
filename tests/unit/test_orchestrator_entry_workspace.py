@@ -67,12 +67,32 @@ class _FakeGateway:
         return None
 
 
+class _FakeGuard:
+    """Stand-in for the T7.61(а) node session lane.
+
+    `NodeSessionGuard.acquire` opens a real DB connection, and these tests deliberately never connect to a
+    database (NO_CONNECT_URL): they are about the workspace/artifacts path only. Replacing the collaborator
+    keeps that focus; the guard's own behaviour is tested in `tests/scenario/test_node_session_exclusion.py`
+    against a scratch DB.
+    """
+
+    def __init__(self, target: object, node_owner: str) -> None:
+        self.node_owner = node_owner
+
+    async def acquire(self) -> bool:
+        return True
+
+    async def release(self) -> None:
+        return None
+
+
 def _capture_build(monkeypatch: pytest.MonkeyPatch, captured: dict[str, Path]) -> None:
     def fake_build(session_factory: object, workspace_root: Path) -> tuple[object, _FakeGateway]:
         captured["workspace_root"] = workspace_root
         return _FakeOrchestrator(workspace_root), _FakeGateway()
 
     monkeypatch.setattr("apps.orchestrator.main.build_orchestrator", fake_build)
+    monkeypatch.setattr("apps.orchestrator.main.NodeSessionGuard", _FakeGuard)
 
 
 @pytest.mark.unit

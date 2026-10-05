@@ -275,6 +275,27 @@ config-v13 (T7.59(в): = config-v12, но `model.context_window`/`backend_contex
   (потенциальный источник расхождений — сверять версии CI и `.venv`). С T7.55 ci.yml закреплён:
   `ubuntu-24.04` во всех jobs, `checkout@v5`/`setup-python@v6` (Node 24), pytest `-n auto` в job
   `test`; эффект — по оценке 5–7 мин, подтверждать реальным прогоном (`gh run watch`).
+- Гонка двух точек входа (T7.61(а), найдено на стенде .92): admission `decide` видит только **committed**
+  строки `sessions`, а phase 1 держит строку запущенной сессии открытой до COMMITTING ⇒ «wake now» (веб) и
+  запланированный `noezema-dev-tick.service` (отдельный процесс) получают wake одновременно. Маркер
+  `node_state='session_running'` в admission не участвует и не должен (остаточный маркер от убитого юнита
+  клинил бы узел). Взаимное исключение даёт `apps/orchestrator/node_guard.py`: session-level advisory lock
+  `pg_try_advisory_lock(hashtext(node_session_lock_name(owner)))` на **отдельном** соединении (`NullPool` +
+  AUTOCOMMIT), удерживаемое всю сессию; при гибели соединения замок снимает PostgreSQL — убитый юнит узел не
+  клинит. Ключ считает Postgres (`hashtext`): Python `hash()` солится PYTHONHASHSEED ⇒ каждый юнит взял бы свой
+  замок, и ничего не исключалось бы. Замок не участвует в каноническом порядке блокировок §5.2.2 (живёт вне
+  транзакций), не lease и не fencing (§8.7.2, §5.2.3) и не заменяет список admission §5.2.1 — только окно
+  decide→start. Не работает за transaction-mode pooler (pgbouncer); прямого pooler в проекте нет — при его
+  появлении guard менять на долговременную строку с lease.
+- **Правило:** любая новая точка входа, запускающая `run_session` (wake-tick, веб «wake now», eval-run, ручной
+  `python -m apps.orchestrator`, будущие команды и юниты), обязана взять `NodeSessionGuard` ДО записи маркера
+  `session_running` и отдать его в `finally` на всех выходах: нормальный конец, исключение внутри сессии,
+  отмена задачи, fail-closed отказ (снятие идемпотентно). Порядок: admission → замок → маркер → сессия → учёт
+  исхода → снятие. Занятый лейн — skip с `REASON_SESSION_IN_PROGRESS` (`wake-tick: skip (session_in_progress)`,
+  exit 0; веб-ответ «a session is already running» + `wake_reason`), не ошибка и не failure-учёт. Тесты:
+  `tests/scenario/test_node_session_exclusion.py` (репродюсер сквозь реальные точки входа) и
+  `tests/scenario/test_node_session_guard.py` (release на всех выходах, `pg_terminate_backend`, разные
+  `node_owner`).
 
 ## 8. Гигиена длинных сессий
 

@@ -66,6 +66,25 @@ REASON_REPAIR_BACKLOG = "repair_backlog"
 REASON_DISK_QUOTA = "disk_quota_exceeded"
 REASON_GPU = "gpu_unavailable"
 
+# T7.61(а) (§5.2.1): the wake was granted by the admission list, but another process of THIS node is
+# already inside a session. `decide` cannot see it — phase 1 keeps that session's row uncommitted until
+# COMMITTING, and `node_state='session_running'` is not an admission condition (only `paused` is, and a
+# leftover marker must stay non-blocking, T7.59(в)). So the entry point reports this reason itself after
+# it failed to take the node's session lock (`apps/orchestrator/node_guard.py`).
+REASON_SESSION_IN_PROGRESS = "session_in_progress"
+
+# Advisory-lock NAME of the node session lane. PostgreSQL hashes it (`pg_try_advisory_lock(hashtext(:n))`),
+# so the key is the same in every process of the node — web, tick, eval-run, manual entry. Python `hash()`
+# must never be used here: PYTHONHASHSEED salts it per process, so each systemd unit would take its own
+# lock and nothing would be excluded. Same convention as the writer gate (`packages/memory/cascade.py`)
+# and the offline-rules host lane (`hostctl/offline_rules.py`, ARCHITECTURE §8.7.2).
+NODE_SESSION_LOCK_PREFIX = "noezema:node_session"
+
+
+def node_session_lock_name(node_owner: str) -> str:
+    """The session-lane lock name of ONE node (T7.61(а)). Different owners → different lanes."""
+    return f"{NODE_SESSION_LOCK_PREFIX}:{node_owner}"
+
 # Schedule wait reasons (not audited: "not due yet" is not an event).
 WAIT_INTERVAL = "interval_not_elapsed"
 WAIT_MIN_INTERVAL = "min_interval_not_elapsed"
@@ -595,6 +614,30 @@ class WakeScheduler:
                 )
                 return WakeDecision(action="skip", reason=reason, detail=state.paused_reason)
             return WakeDecision(action="wake", reason=None)
+
+    async def record_guard_skip(self, *, source: Literal["scheduled", "wake_now"], lock_name: str) -> None:
+        """Record a session-lane skip with its exact reason (§5.2.1, T7.61(а)).
+
+        This skip cannot come out of :meth:`decide`: the occupied lane is a live DB advisory lock held by
+        another process, not DB state `decide` could read. The entry point that found the lock busy calls
+        this so the skip still lands in the same `wake_skipped` audit shape as an admission skip — §5.2.1
+        insists on "the exact reason recorded", and a silent skip is what hid the stand race.
+        """
+        async with transaction(self.db):
+            state = await self._load_state()
+            audit = AuditService(self.db)
+            await audit.record(
+                AuditEventType.WAKE_SKIPPED,
+                payload={
+                    "source": source,
+                    "reason": REASON_SESSION_IN_PROGRESS,
+                    "paused_reason": state.paused_reason,
+                    "node_owner": self.node_owner,
+                    "lock": lock_name,
+                },
+                actor="wake-scheduler",
+                visibility=AuditVisibility.OPERATOR,
+            )
 
     # ── session outcome ──────────────────────────────────────────────────
 

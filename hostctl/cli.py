@@ -223,7 +223,9 @@ def wake_tick(node_owner: str | None, data_root: str | None) -> None:
         sys.exit(EXIT_USAGE_ERROR)
 
     from apps.orchestrator.main import build_orchestrator
+    from apps.orchestrator.node_guard import NodeSessionGuard, NodeSessionGuardError
     from apps.orchestrator.scheduler import (
+        REASON_SESSION_IN_PROGRESS,
         WORKSPACE_SUBDIR,
         ReassessmentAdmissionError,
         RepairAdmissionError,
@@ -268,58 +270,84 @@ def wake_tick(node_owner: str | None, data_root: str | None) -> None:
             click.echo(f"wake-tick: {decision.action} ({decision.reason})")
             return 0
 
-        # T7.58 (ADR-0023): the tool executor is resolved at build time
-        # (NOEZEMA_TOOL_EXECUTOR). Sandbox mode refuses to start a session when
-        # the engine/image is unusable — that refusal happens BEFORE the node is
-        # marked session_running and before any tool runs, so it leaves no wedged
-        # node state and never falls back to the unisolated dev stub.
+        # T7.61(а) (§5.2.1): an admitted wake is NOT a free session lane. `decide` only sees COMMITTED
+        # rows, and another entry point (the web's «wake now») keeps its session row uncommitted until
+        # COMMITTING — that is exactly how the stand started two sessions 36 s apart on one node. The
+        # node's advisory lock is taken between the admission decision and the marker write and held for
+        # the whole session; it is given back in the finally below on every path (normal finish, an
+        # exception inside the session, the activation-rejected skip, a fail-closed exit) — and by
+        # PostgreSQL itself if this unit is killed mid-session.
+        guard = NodeSessionGuard(engine, owner)
         try:
-            executor_mode = tool_executor_mode_from_env()
-            orchestrator, gateway = build_orchestrator(factory, root / WORKSPACE_SUBDIR)
-        except (ToolExecutorConfigError, ToolExecutorUnavailableError) as exc:
-            click.echo(f"wake-tick: tool executor fail-closed ({exc})", err=True)
+            lane_free = await guard.acquire()
+        except NodeSessionGuardError as exc:
+            # Exclusivity cannot even be checked: no session (§3 «Host-контур — fail-closed»).
+            click.echo(f"wake-tick: fail-closed ({exc})", err=True)
             return 78
-        if executor_mode == SANDBOX_MODE:
-            # process-log label only: no new audit/fingerprint fields (T7.58, ADR-0023)
-            click.echo("wake-tick: tool executor=sandbox (one container per session)")
-
-        async with factory() as db, db.begin():
-            await db.execute(
-                text(
-                    "INSERT INTO system_constants (key, value) VALUES ('node_state', :v) "
-                    "ON CONFLICT (key) DO UPDATE SET value = :v"
-                ),
-                {"v": "session_running"},
-            )
+        if not lane_free:
+            async with factory() as db:
+                await WakeScheduler(db, node_owner=owner, data_root=root).record_guard_skip(
+                    source="scheduled", lock_name=guard.name
+                )
+            click.echo(f"wake-tick: skip ({REASON_SESSION_IN_PROGRESS})")
+            return 0
 
         try:
-            outcome = await orchestrator.run_session()
-        except ActivationInFlightError as exc:
-            # T7.26 (ADR-0013): the wake was granted on a stale read and a
-            # drain was published before the admission — the session did
-            # NOT start (no session row, no admission record). This is a
-            # SKIP, not a failure: no record_session_result (the drain
-            # must not accumulate consecutive_failures and auto-pause the
-            # node); the next tick's admission sees the slot and skips.
-            await gateway.close()
-            click.echo(f"wake-tick: admission rejected ({exc}); waiting for the next tick")
-            return 0
-        except Exception as exc:
-            # Infra failure around the session; the session row is left to the
-            # reconciler, and the failure counts for the backoff.
-            final_state = "failed"
-            click.echo(f"wake-tick: session error ({type(exc).__name__}: {exc})", err=True)
-        else:
-            final_state = outcome.final_state.value
-        finally:
-            await gateway.close()
+            # T7.58 (ADR-0023): the tool executor is resolved at build time
+            # (NOEZEMA_TOOL_EXECUTOR). Sandbox mode refuses to start a session when
+            # the engine/image is unusable — that refusal happens BEFORE the node is
+            # marked session_running and before any tool runs, so it leaves no wedged
+            # node state and never falls back to the unisolated dev stub.
+            try:
+                executor_mode = tool_executor_mode_from_env()
+                orchestrator, gateway = build_orchestrator(factory, root / WORKSPACE_SUBDIR)
+            except (ToolExecutorConfigError, ToolExecutorUnavailableError) as exc:
+                click.echo(f"wake-tick: tool executor fail-closed ({exc})", err=True)
+                return 78
+            if executor_mode == SANDBOX_MODE:
+                # process-log label only: no new audit/fingerprint fields (T7.58, ADR-0023)
+                click.echo("wake-tick: tool executor=sandbox (one container per session)")
 
-        async with factory() as db:
-            node_state = await WakeScheduler(db, node_owner=owner, data_root=root).record_session_result(
-                final_state=final_state, now=datetime.now(UTC)
-            )
-        click.echo(f"wake-tick: session -> {final_state} (node_state={node_state})")
-        return 0 if final_state in ("succeeded", "succeeded_partial") else 1
+            async with factory() as db, db.begin():
+                await db.execute(
+                    text(
+                        "INSERT INTO system_constants (key, value) VALUES ('node_state', :v) "
+                        "ON CONFLICT (key) DO UPDATE SET value = :v"
+                    ),
+                    {"v": "session_running"},
+                )
+
+            try:
+                outcome = await orchestrator.run_session()
+            except ActivationInFlightError as exc:
+                # T7.26 (ADR-0013): the wake was granted on a stale read and a
+                # drain was published before the admission — the session did
+                # NOT start (no session row, no admission record). This is a
+                # SKIP, not a failure: no record_session_result (the drain
+                # must not accumulate consecutive_failures and auto-pause the
+                # node); the next tick's admission sees the slot and skips.
+                await gateway.close()
+                click.echo(f"wake-tick: admission rejected ({exc}); waiting for the next tick")
+                return 0
+            except Exception as exc:
+                # Infra failure around the session; the session row is left to the
+                # reconciler, and the failure counts for the backoff.
+                final_state = "failed"
+                click.echo(f"wake-tick: session error ({type(exc).__name__}: {exc})", err=True)
+            else:
+                final_state = outcome.final_state.value
+            finally:
+                await gateway.close()
+
+            async with factory() as db:
+                node_state = await WakeScheduler(
+                    db, node_owner=owner, data_root=root
+                ).record_session_result(final_state=final_state, now=datetime.now(UTC))
+            click.echo(f"wake-tick: session -> {final_state} (node_state={node_state})")
+            return 0 if final_state in ("succeeded", "succeeded_partial") else 1
+        finally:
+            # The lane is released AFTER the outcome accounting (§5.2.1 backoff), never before it.
+            await guard.release()
 
     async def _run() -> int:
         try:
@@ -1101,7 +1129,9 @@ def eval_run(
         click.echo("NOEZEMA_DATABASE_URL is not set", err=True)
         sys.exit(EXIT_USAGE_ERROR)
     from apps.orchestrator.main import build_orchestrator
+    from apps.orchestrator.node_guard import NodeSessionGuard
     from apps.orchestrator.scheduler import (
+        REASON_SESSION_IN_PROGRESS,
         WORKSPACE_SUBDIR,
         ReassessmentAdmissionError,
         RepairAdmissionError,
@@ -1302,91 +1332,109 @@ def eval_run(
                         f"session {i + 1}: tool executor=sandbox (one container per session)"
                     )
                 orchestrator, gateway = build_orchestrator(factory, root / WORKSPACE_SUBDIR)
-                await _node_state_set("session_running")
-                t0 = _time.monotonic()
-                outcome_steps = 0
-                in_flight = False
-                try:
-                    outcome = await orchestrator.run_session()
-                except ActivationInFlightError as exc:
-                    # T7.26 (ADR-0013): phase 0 was rejected under the
-                    # head lock (a drain was published after this wake
-                    # was granted) — the session did NOT start (no
-                    # session row, no admission record). Not a failure
-                    # and not a nonterminal_session: back to the
-                    # admission loop for the same session.
-                    in_flight = True
+
+                # T7.61(а) (§5.2.1): the same session lane as every other entry point. The series is a
+                # sequence of sessions on ONE node, and a scheduled tick racing it would produce two live
+                # sessions exactly like the stand race. Per session, not per series: the lane is released
+                # before the next admission, so a paused/backed-off node cannot hold it hostage.
+                guard = NodeSessionGuard(url, owner)
+                if not await guard.acquire():
                     click.echo(
-                        f"session {i + 1}: admission rejected "
-                        f"({type(exc).__name__}); retrying admission"
+                        f"session {i + 1}: skip ({REASON_SESSION_IN_PROGRESS}); "
+                        "another session owns this node; retry"
                     )
-                except Exception as exc:  # infra failure around the session
-                    # T7.7 (EVAL-2): a LeaseLost can be reported after the
-                    # session already committed — the guard's last refused
-                    # renewal (phase deadline) is detected at guard exit,
-                    # while the fenced commit's own is_live() check passed.
-                    # The durable row wins: re-read the session state before
-                    # counting a failure (the EVAL-2 smoke session
-                    # f8c548cc was succeeded in the DB but reported failed).
-                    final_state = "failed"
+                    await asyncio.sleep(10)
+                    continue
+                try:
+                    await _node_state_set("session_running")
+                    t0 = _time.monotonic()
                     outcome_steps = 0
-                    if "LeaseLost" in type(exc).__name__ or "lease lost" in str(exc).lower():
-                        # the session id is in the LeaseLost message
-                        sid = None
-                        for part in str(exc).split():
-                            if len(part) == 36 and part.count("-") == 4:
-                                sid = part
-                                break
-                        if sid is not None:
-                            async with factory() as probe:
-                                row = (
-                                    await probe.execute(
-                                        text(
-                                            "SELECT state, termination_reason "
-                                            "FROM sessions WHERE id = :id"
-                                        ),
-                                        {"id": uuid.UUID(sid)},
-                                    )
-                                ).first()
+                    in_flight = False
+                    try:
+                        outcome = await orchestrator.run_session()
+                    except ActivationInFlightError as exc:
+                        # T7.26 (ADR-0013): phase 0 was rejected under the
+                        # head lock (a drain was published after this wake
+                        # was granted) — the session did NOT start (no
+                        # session row, no admission record). Not a failure
+                        # and not a nonterminal_session: back to the
+                        # admission loop for the same session.
+                        in_flight = True
+                        click.echo(
+                            f"session {i + 1}: admission rejected "
+                            f"({type(exc).__name__}); retrying admission"
+                        )
+                    except Exception as exc:  # infra failure around the session
+                        # T7.7 (EVAL-2): a LeaseLost can be reported after the
+                        # session already committed — the guard's last refused
+                        # renewal (phase deadline) is detected at guard exit,
+                        # while the fenced commit's own is_live() check passed.
+                        # The durable row wins: re-read the session state before
+                        # counting a failure (the EVAL-2 smoke session
+                        # f8c548cc was succeeded in the DB but reported failed).
+                        final_state = "failed"
+                        outcome_steps = 0
+                        if "LeaseLost" in type(exc).__name__ or "lease lost" in str(exc).lower():
+                            # the session id is in the LeaseLost message
+                            sid = None
+                            for part in str(exc).split():
+                                if len(part) == 36 and part.count("-") == 4:
+                                    sid = part
+                                    break
+                            if sid is not None:
+                                async with factory() as probe:
+                                    row = (
+                                        await probe.execute(
+                                            text(
+                                                "SELECT state, termination_reason "
+                                                "FROM sessions WHERE id = :id"
+                                            ),
+                                            {"id": uuid.UUID(sid)},
+                                        )
+                                    ).first()
+                            else:
+                                row = None
+                            if row is not None and row[0] in (
+                                "succeeded", "succeeded_partial"
+                            ):
+                                final_state = row[0]
+                                click.echo(
+                                    f"session {i + 1}: lease-lost reported after "
+                                    f"durable {row[0]} commit (reason={row[1]!r}) — "
+                                    f"counted as {final_state}"
+                                )
+                            else:
+                                click.echo(
+                                    f"session {i + 1}: error (LeaseLost: {exc})", err=True
+                                )
                         else:
-                            row = None
-                        if row is not None and row[0] in (
-                            "succeeded", "succeeded_partial"
-                        ):
-                            final_state = row[0]
                             click.echo(
-                                f"session {i + 1}: lease-lost reported after "
-                                f"durable {row[0]} commit (reason={row[1]!r}) — "
-                                f"counted as {final_state}"
-                            )
-                        else:
-                            click.echo(
-                                f"session {i + 1}: error (LeaseLost: {exc})", err=True
+                                f"session {i + 1}: error ({type(exc).__name__}: {exc})", err=True
                             )
                     else:
-                        click.echo(
-                            f"session {i + 1}: error ({type(exc).__name__}: {exc})", err=True
-                        )
-                else:
-                    final_state = outcome.final_state.value
-                    outcome_steps = outcome.steps
+                        final_state = outcome.final_state.value
+                        outcome_steps = outcome.steps
+                    finally:
+                        await gateway.close()
+                    if in_flight:
+                        continue  # the session did not start — retry admission
+                    elapsed = _time.monotonic() - t0
+                    async with factory() as db:
+                        node_state = await WakeScheduler(
+                            db, node_owner=owner, data_root=root
+                        ).record_session_result(final_state=final_state, now=datetime.now(UTC))
+                    completed += 1
+                    if final_state in ("succeeded", "succeeded_partial"):
+                        succeeded += 1
+                    click.echo(
+                        f"session {i + 1}/{count}: {final_state} (steps={outcome_steps}, "
+                        f"{elapsed:.0f}s, node_state={node_state})"
+                    )
+                    break
                 finally:
-                    await gateway.close()
-                if in_flight:
-                    continue  # the session did not start — retry admission
-                elapsed = _time.monotonic() - t0
-                async with factory() as db:
-                    node_state = await WakeScheduler(
-                        db, node_owner=owner, data_root=root
-                    ).record_session_result(final_state=final_state, now=datetime.now(UTC))
-                completed += 1
-                if final_state in ("succeeded", "succeeded_partial"):
-                    succeeded += 1
-                click.echo(
-                    f"session {i + 1}/{count}: {final_state} (steps={outcome_steps}, "
-                    f"{elapsed:.0f}s, node_state={node_state})"
-                )
-                break
+                    # T7.61(а): released after the accounting (§5.2.1), also when `continue` above
+                    # returns to the admission loop or an error aborts the iteration.
+                    await guard.release()
             if aborted:
                 break
         return completed, succeeded
