@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import time
 import uuid
@@ -29,6 +30,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
@@ -635,6 +637,32 @@ class _Node:
         self._resets: set[asyncio.Task[None]] = set()
 
 
+# T7.63: how long a shutdown may wait for the accounting work this process started itself. A ceiling
+# against a hang — no test and no production path is allowed to depend on this duration.
+_SHUTDOWN_DRAIN_CEILING_SECONDS = 20.0
+
+logger = logging.getLogger(__name__)
+
+
+async def _await_with_ceiling(*tasks: asyncio.Task[Any], ceiling: float = _SHUTDOWN_DRAIN_CEILING_SECONDS) -> None:
+    """Wait for tasks this process owns, but never longer than `ceiling` seconds (T7.63).
+
+    A task that does not finish is cancelled and NAMED in the log: shutdown must not hang on a wedged
+    database, and an abandoned accounting write has to be visible rather than silent.
+    """
+    pending = [task for task in tasks if not task.done()]
+    if not pending:
+        return
+    _, still_running = await asyncio.wait(pending, timeout=ceiling)
+    for task in still_running:
+        logger.warning(
+            "shutdown drain: %s did not finish within %.1f s — cancelled, its accounting is incomplete",
+            task.get_name(),
+            ceiling,
+        )
+        task.cancel()
+
+
 def _now() -> datetime:
     return datetime.now(UTC)
 
@@ -729,6 +757,16 @@ def create_app(
         yield
         if node.session_task is not None and not node.session_task.done():
             node.session_task.cancel()
+            # T7.63: awaiting it is what lets its done-callback run — and that callback CREATES the
+            # outcome task (§5.2.1 «учёт исхода»). Draining without this would drain an empty set and
+            # abandon the accounting write all the same.
+            await _await_with_ceiling(node.session_task)
+        # T7.63 (§5.2.1 «…сессия → учёт исхода → снятие»): the outcome task writes through THIS engine.
+        # Abandoning it loses the wake bookkeeping mid-write and leaves its session attached to the DB as
+        # a live idle transaction until the process dies — visible as `database ... is being accessed by
+        # other users` for anyone who has to drop or recreate that DB. Bounded, so shutdown still cannot
+        # hang on a wedged database: an unfinished task is cancelled and named in the log.
+        await _await_with_ceiling(*list(node._resets))
         # T7.61(а): safety net for the session lane. The task's own finally releases it; this covers the
         # edge where the process shuts down with a held guard (cancelled before starting, or a release that
         # could not run). An unheld guard releases to a no-op — no lock is dropped that is not ours.

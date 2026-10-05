@@ -26,12 +26,14 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
 import pytest
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 
 from apps.orchestrator.executor import StubToolExecutor
 from apps.orchestrator.orchestrator import Orchestrator
@@ -419,5 +421,80 @@ async def test_tail_window_after_session_end_is_stale_but_harmless(
             assert data["node_state_stale_marker"] is False, data
             assert data["counts"]["sessions"] == 1, data
     finally:
+        await gateway.close()
+        await engine.dispose()
+
+
+@asynccontextmanager
+async def _own_reader_engine(url: str) -> AsyncIterator[AsyncEngine]:
+    """A separate engine = the stand's other process (and it is disposed before the DB is dropped)."""
+    engine = create_async_engine(url)
+    try:
+        yield engine
+    finally:
+        await engine.dispose()
+
+
+async def _node_state_view(url: str) -> str:
+    """The node state as another process sees it after this web shut down."""
+    async with _own_reader_engine(url) as engine, engine.connect() as conn:
+        row = await conn.execute(text("SELECT value FROM system_constants WHERE key = 'node_state'"))
+        return str(row.scalar_one())
+
+
+@pytest.mark.asyncio
+async def test_shutdown_waits_for_the_session_outcome_record(
+    migrated_db, fake_llm: FakeLLM, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T7.63: the §5.2.1 order «…сессия → учёт исхода → снятие» has to hold on shutdown too.
+
+    What the lifespan used to do: cancel the session task, release the lane, dispose the engine — and
+    return. The outcome task that the cancelled task's done-callback had just created was left unattended.
+    Two consequences, both real: the wake bookkeeping (backoff/pause/terminal node state) can be lost
+    mid-write, and an abandoned session stays attached to the DB as a live idle transaction — which is what
+    made `DROP DATABASE` of a scratch DB fail at teardown («is being accessed by other users») and leak it.
+
+    The tail window is pinned open with the same event gate as test 4, so «shutdown returned before the
+    accounting write committed» is an observable fact rather than a race: without the drain this test fails
+    in milliseconds. `failsafe_release` exists only so that a waiting shutdown cannot hang forever — per
+    AGENTS §7 a temporal wait here is a ceiling against a hang, and no assertion depends on its duration.
+    """
+    scratch_url, _fixture_engine = migrated_db
+    app, engine, factory, gateway = await _make_app(scratch_url, fake_llm, tmp_path / "ws")
+    session_finished = asyncio.Event()
+    tail_open = asyncio.Event()
+    hold_tail = asyncio.Event()
+    marker_reset = asyncio.Event()
+    _wrap_run_session(app.state.orchestrator, session_finished)
+    _patch_record_outcome(monkeypatch, marker_reset, entered=tail_open, hold=hold_tail)
+    fake_llm.script([{"content": TOOL_PYTHON}, {"content": COMPLETE}, {"content": CURATOR_OK}])
+
+    async def failsafe_release() -> None:
+        await asyncio.sleep(3.0)  # ceiling against a hang, not an expected duration
+        hold_tail.set()
+
+    try:
+        await _seed_question(factory)
+        async with app.router.lifespan_context(app), _client(app) as client:
+            r = await client.post("/api/v1/commands", json={"type": "wake_now", "idempotency_key": "k-drain"})
+            assert r.json()["state"] == "completed", r.text
+
+            # the session task ended and its outcome write is parked right before touching the DB: this
+            # process now owns an unfinished «учёт исхода», and shutdown is about to be asked to stop it
+            await _await_event(session_finished, "сессия не завершилась")
+            await _await_event(tail_open, "задача учёта исхода не дошла до блокированной записи")
+            release_task = asyncio.create_task(failsafe_release())
+
+        # the lifespan shutdown has returned by now — it may only do so after its own accounting finished
+        assert marker_reset.is_set(), (
+            "shutdown вернул управление, не дождавшись записи исхода сессии: «учёт исхода» брошен "
+            "незавершённым (теряются backoff/pause и остаётся живое соединение к БД)"
+        )
+        assert app.state.node._resets == set(), "после shutdown остались незавершённые задачи учёта"
+
+        await release_task
+        assert await _node_state_view(scratch_url) == "idle", "итоговое состояние узла не записано"
+    finally:
+        hold_tail.set()
         await gateway.close()
         await engine.dispose()

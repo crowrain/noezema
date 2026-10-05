@@ -2781,3 +2781,272 @@ A5–A6, B1–B2) не оставили ничего — утечки mig нак
 teardown-ERROR. Счётчики БД после всех прогонов и удаления своих остатков: 56/0/19/2; busy-процессов нет;
 `docker ps -a` — те же 41 контейнер. Миграций, изменений модели/промптов/пинов/config-v*, ARCHITECTURE.md — нет;
 пул `timing` не пополнен. Реальные `.92`/`.87`, LLM-хосты `.42`/`.48`, eval/smoke-базы не трогались (SELECT only).
+
+## T7.63 — teardown scratch-БД: «database is being accessed by other users» и утечка `noezema_mig_*`
+
+**Симптом (унаследован от прогонов T7.62).** В полных двухстейджевых проверках под нагрузкой stage1 давал
+«…passed, 12 skipped, **1 error**»: ERROR at teardown
+`tests/scenario/test_node_session_guard.py::test_web_session_returns_the_lane_when_its_task_is_cancelled` —
+`DROP DATABASE "noezema_mig_…"` → `database … is being accessed by other users`. Тест зелёный, красная именно
+фикстура; scratch-база при этом оставалась в кластере.
+
+### 1. Диагностика (до любой правки)
+
+Репродукция — два независимых профиля, целевые тесты под external load (busy-процессы `while True`,
+убиты по завершении batch; leftovers проверялись `pgrep -af t763_busy`). Временный плагин
+`t763_dbg.py` (`PYTHONPATH=… pytest -p t763_dbg`, в репо НЕ попал) обёртывал `tests.conftest._admin_exec`:
+перед DROP снимал `pg_stat_activity` этого scratch (pid, application_name, backend_type, state, xact_start,
+query_start, backend_start, client_addr, client_port, wait_event, query), при отказе — таймлайн
++0/+50/+150/+400/+1000/+2000 мс и повторный plain `DROP`. Логи: `/home/denis/dsh1/t763_diag.jsonl`.
+
+| Профиль (до правки) | busy | прогонов | красных | teardown-ERROR | утечек mig |
+|---|---|---|---|---|---|
+| A_target_load: целевой тест ×32 | 8 | 32 | **1** (3 %) | 1 | `noezema_mig_6364e3eb` |
+| B_file_load: весь `test_node_session_guard.py` последовательно ×24 | 10 | 24 | 0 | 0 | — |
+| C_group: 5 scenario-файлов `-n 6` ×10 | 8 | 10 | **5** (50 %) | 5 | 06083e53, 3f4250d7, 762f2f33, bb20f1b4, db536c19 |
+
+**(а) «backend ещё умирает» — НЕТ.** Запись отказа A (полная): перед DROP на scratch висел
+`pid 548390`, `application_name ''`, `backend_type 'client backend'`, state **active** с последним запросом
+`COMMIT;` (xact_start и query_start заполнены), `client_addr 172.17.0.1:47024`. Таймлайн после отказа:
++4,29…+8,77 с — по-прежнему **1 строка**, state **idle**, запрос `COMMIT;`; повторный plain DROP через 8 с
+тот же `ObjectInUseError`. Вывод: backend не умирал —  это открытое соединение с уже завершённой транзакцией.
+
+**Кто держит соединение.** Признак по последнему запросу: `COMMIT;` при непустом `xact_start` = сессия из
+sessionmaker-движка (веб-движок приложения), а не NullPool/AUTOCOMMIT-соединение гарда (у того последним
+был бы `pg_try_advisory_lock/unlock`). Владелец по сокету на хосте не опознаваем: 54329 публикуется через
+docker-proxy, внутренний socket принадлежит root-процессу и из `/proc/*/fd` непривилегированному наблюдателю
+невиден (`ss -tnp` процесс не показал) — поэтому атрибуция делалась по SQL-подписи соединения.
+
+Временный зонд (`zz_t763_probe.py`, 10 прогонов ×2 варианта, удалён): **сразу после**
+`await gather(session_task)` в `node._resets` остаётся **1 незавершённая задача** учёта исхода (10/10);
+после выхода из lifespan над scratch висят бэкэнды с `COMMIT;`; вариант, где тест сам дожидается
+`node._resets`, — ноль незавершённых задач. То есть гонка «teardown раньше учёта» реальна и регулярна.
+
+**(в) отмена внутри `NodeSessionGuard.release()` — проверена отдельно и НЕ подтверждена как протечка.**
+`release()` сначала обнуляет `_conn/_engine`, а обработчики её `try` ловят `Exception`, не `BaseException`:
+cancel посреди round trip пропускает `_close_quietly`, и повторный `release()` уже no-op. Замер (одноразовая
+БД + pg_stat_activity/pg_locks, три варианта задержки cancel: 0 / 1 мс / 10 мс): после отмены — **ноль
+бэкэндов** на базе, **ноль держателей** замка, `pg_try_advisory_lock` соперника сразу берёт лейн. SQLAlchemy/
+asyncpg закрывают брошенное соединение сами, PostgreSQL снимает session-level замок с соединением. Код гарда
+не изменён; факт закреплен тестом `test_lane_is_free_when_the_cancel_lands_inside_the_release`.
+
+**Второй, независимый источник того же симптома (тестовый дефект).** В C_group красным падал и сам тест
+`test_lane_is_free_after_the_holders_backend_is_terminated`:
+`AssertionError: замок должен держать ровно одно соединение: [551376, 551385, 551357]` (в остальных прогонах — по 2 pid).
+Причина: `pg_locks` — **кластерное** представление, в нём видны advisory-замки с тем же `hashtext`-ключом,
+которые параллельные xdist-воркеры держат в СВОИХ scratch-БД. Проверено напрямую (psql): замок из
+`noezema_t763_lockprobe` видим из базы `noezema` (`datname=noezema_t763_lockprobe`), с фильтром
+`d.datname = current_database()` — 0 строк. Следствие: утверждение флакало под `-n auto`, и тот же список pid
+мог уйти в `pg_terminate_backend`, убив соединение чужого воркера; а отказ утверждения оставлял гард
+неосвобождённым → держал и лейн, и scratch-БД → teardown-ERROR + утечка (в C_group именно так: state idle,
+последний запрос `SELECT pg_try_advisory_lock(hashtext($1))`, xact_start NULL).
+
+**Классификация:** **(б)** — genuinely open connection, в двух формах: (1) брошенная на shutdown задача
+`_record_session_outcome` (продуктовый порядок «…сессия → учёт исхода → снятие» не выполнялся при остановке);
+(2) тестовый дефект чтения `pg_locks` без фильтра по базе. Причина (а) в замерах не встретилась ни разу.
+
+Детерминированный репроз (1) закреплен новым тестом до правки продукта:
+`test_shutdown_waits_for_the_session_outcome_record` → `FAILED … assert marker_reset.is_set()` за ~12 с, и
+тот самый симптом в warnings: `UserWarning: scratch DB noezema_mig_c9025ef5 still had a connection at teardown
+(pid 555920 state=idle query='COMMIT;')` — подпись соединения идентична случайной отказной записи A.
+
+### 2. Лечение по результату диагностики
+
+**(б-1) Продукт: остановка веб-процесса обязана дождаться собственного «учёта исхода»**
+(`apps/web/api.py`, lifespan shutdown + хелпер `_await_with_ceiling`). Порядок §5.2.1
+«admission → замок → маркер → сессия → учёт исхода → снятие» теперь выполняется и при shutdown:
+
+- cancel `node.session_task` стал **дожидаемым** (`_await_with_ceiling(node.session_task)`): именно
+  done-callback отменённой задачи ЗАВОДИТ отдельную задачу `_record_session_outcome`; без этого ожидания
+  drained-набор был бы пуст и учёт всё равно бросался бы незавершённым;
+- затем `await _await_with_ceiling(*list(node._resets))` — раньше снятия замка гарда и раньше `engine.dispose()`
+  (учёт пишет через ЭТОТ движок);
+- потолок `_SHUTDOWN_DRAIN_CEILING_SECONDS = 20.0` — гарантия против зависания на клиненном Postgres, а не
+  ожидаемая длительность; незавершённая задача отменяется и **называется в логе**
+  (`logger.warning(… "its accounting is incomplete")`) — потеря учёта видна, а не молчалива;
+- `release()` гарда и `owns_engine → engine.dispose()` остались в прежнем относительном порядке, уже после учёта; идемпотентность release, порядок Admission→замок→маркер, пороги, lease/fencing — не затронуты.
+
+Минимальность: правка только в lifespan-shutdown ветке; путь команды `wake_now`, запись маркера, admission и
+учёт внутри сессии не менялись. Тест-репродуктор (красный до правки, зелёный после):
+`tests/scenario/test_web_node_state_db_truth.py::test_shutdown_waits_for_the_session_outcome_record`.
+
+**(б-1, тестовая страховка) Фикстура более не краснеет из-за чужого соединения**
+(`tests/conftest.py::_drop_scratch_database`, + синхронная обёртка `_drop_scratch_database_sync`,
++ диагностический `_database_backends`). Порядок: plain `DROP DATABASE IF EXISTS` → короткое
+ограниченное ожидание (≤2 с: умирающему backend хватает миллисекунд) → только потом `DROP … WITH (FORCE)`
+(PostgreSQL 15; CI — `postgres:15-alpine`, локальный контейнер 15.17), ≤3 попыток, иначе RuntimeError.
+Каждый форс сопровождается warning с **именем базы и перечнем оставшихся бэкэндов (pid, state, последний
+запрос)** — реальная протечка остаётся названной, а не убранной молча; ни один функциональный тест от этого не
+становится зелёным (все утверждения теста выполняются до teardown). Замеченные в диагностике «настоящие»
+случаи теперь выглядят так: `scratch DB noezema_mig_… still had a connection at teardown (pid N state=idle
+query='COMMIT;'); forcing the drop`. В proof-прогонах счётчик таких warning'ов — **0** (см. п. 6): лечится
+причина, а не симптом.
+
+**(б-2) Тест: `pg_locks` — кластерное представление, вопрос про одну базу требует фильтра по базе**
+(`tests/scenario/test_node_session_guard.py::_lock_holders`): добавлено
+`AND database = (SELECT oid FROM pg_database WHERE datname = current_database())`. Утверждение
+«замок держит ровно одно соединение» перестало флакать под xdist и больше не может отдать
+`pg_terminate_backend` pid из чужой scratch-БД. Это усиление, не ослабление (тот же `!= []` в
+`test_web_wake_now_rejects_while_another_process_holds_the_lane` раньше мог случайно удовлетвориться чужим
+замком).
+
+**Гигиена освобождения гарда в тестах.** В `test_lane_is_exclusive_across_engines_and_reusable_after_release`,
+`test_different_node_owners_do_not_block_each_other` и `test_lane_is_free_after_the_holders_backend_is_terminated`
+held-гарды освобождаются в `finally`: падение утверждения больше не оставляет соединение, которое держит и
+лейн, и scratch-БД (именно этот каскад давал «FAILED + ERROR at teardown + утечка» в C_group). Утверждения и
+их порядок сохранены дословно, идемпотентный двойной `release()` остался.
+
+**(в) Правки не потребовалось** — см. замер выше; вместо правки инвариант закреплен новым тестом
+`test_lane_is_free_when_the_cancel_lands_inside_the_release` (зелёный до и после: он закрепляет факт, а не
+чинит падение).
+
+### 3. Проческа других мест DROP/teardown
+
+Все места создания/удаления scratch-БД в тестах (grep `DROP DATABASE|CREATE DATABASE` по `tests/`):
+
+| место | что было | статус |
+|---|---|---|
+| `tests/conftest.py::migrated_db` teardown | `DROP DATABASE "<dbname>"` без IF EXISTS/FORCE | исправлено (`_drop_scratch_database`) |
+| `tests/conftest.py::migrated_db_template` finalizer | `DROP DATABASE IF EXISTS` (уже с UserWarning) | исправлено (тот же хелпер, sync-обёртка) |
+| `tests/unit/test_fixture_template_clone.py` ×2 (`direct_name`, `name_b`) | `DROP DATABASE IF EXISTS` своими руками | исправлено (импортирован тот же хелпер) |
+| `tests/scenario/test_research_proxy.py:140`, `tests/unit/test_staging_reserve.py:32` | только комментарии о том, что пул нельзя оставлять открытым | изменять нечего |
+
+Создание движков без гарантированного `dispose()`: AST-обход всех `tests/**.py` — 22 функции-строителя
+(`_make_app`, `_make_orchestrator`, `_web_app`, `_make_stand`, …) создают `create_async_engine` и возвращают
+его тесту; повторный обход по всем тестам, которые этих строителей вызывают, дал **0** функций без `dispose()`.
+Отдельных правок нет. Важная оговорка (зафиксирована в AGENTS §7): `AsyncEngine.dispose()` закрывает только
+**idle**-соединения пула — соединение, оставленное незавершённой async-задачей, он не закрывает; этот класс
+закрыт на источнике (п. 2, «б-1») и подстрахован teardown'ом (п. 2, страховка). Шаблонный finalizer уже
+до T7.55 дожидается `pg_stat_activity` (≤20 с) перед запечатыванием — оставлено как есть.
+
+### 4. Утечки scratch-БД: что найдено и что предложено
+
+Отправная точка этого разбора (замерена до первой правки): `noezema_mig_* = 56`, `noezema_tpl_* = 0`,
+`noezema_dbg* = 19`, `noezema_clismoke* = 2` — ровно то состояние, с которым закончил T7.62.
+
+**Пара «54 → 56» из отчёта T7.62 (`noezema_mig_2c8b5091`, `noezema_mig_325fb4bf`) в кластере отсутствует**
+(`SELECT datname FROM pg_database WHERE datname IN (…)` — пусто): их удалил сам T7.62 («Свои измерительные базы
+удалены … снова 56/0/19/2»). То есть к началу T7.63 новых unidentified-остатков не было; причина исторического
+роста ровно та, что лечится здесь: teardown-ERROR ронял DROP, база оставалась.
+
+**Свои измерительные базы этой диагностики (удалены мною вручную, см. п. 6).** Созданы моими batch-прогонами
+до правки; в PostgreSQL 15 время создания БД каталогами не хранится — возраст указан по mtime каталога данных
+(`base/<oid>`, это нижняя граница: autovacuum тоже может его обновить):
+
+| база | oid | mtime каталога (UTC) | из какого замера |
+|---|---|---|---|
+| `noezema_mig_6364e3eb` | 68382960 | 2026-10-05T11:08:44 | A_target_load (тот самый teardown-ERROR) |
+| `noezema_mig_3f4250d7` | 68439486 | 2026-10-05T11:15:33 | C_group |
+| `noezema_mig_762f2f33` | 68442186 | 2026-10-05T11:16:09 | C_group |
+| `noezema_mig_db536c19` | 68466404 | 2026-10-05T11:18:55 | C_group |
+| `noezema_mig_bb20f1b4` | 68471789 | 2026-10-05T11:19:39 | C_group |
+| `noezema_mig_06083e53` | 68488838 | 2026-10-05T11:21:58 | C_group |
+
+Удалены явно, поимённо, при нуле активных соединений (`DROP DATABASE IF EXISTS "<name>"`). Легаси-остатки
+прежних сессий (всего в кластере 62 = 56 + свои 6) **не тронуты**; eval/smoke-базы не трогались (только SELECT).
+
+**Предложенная санация легаси (НЕ выполнена).** Шаг 1 — безопасно посмотреть (SELECT-only):
+
+```bash
+docker exec noezema-test-db psql -U noezema -d noezema -Atc "SELECT d.datname FROM pg_database d \
+  WHERE d.datname LIKE 'noezema_mig_%' AND NOT EXISTS (SELECT 1 FROM pg_stat_activity a WHERE a.datname = d.datname) \
+  ORDER BY d.oid"
+```
+
+Шаг 2 — одна команда на удаление: только `noezema_mig_*`, у которых нет ни одного соединения в
+`pg_stat_activity` и чей каталог данных старше 6 часов; `WITH (FORCE)` потому что соединение может появиться
+между проверкой и DROP (окно осознанно, оно не шире самой гонки):
+
+```bash
+docker exec noezema-test-db sh -lc 'psql -U noezema -d noezema -Atc "SELECT d.oid, d.datname FROM pg_database d \
+  WHERE d.datname LIKE '"'"'noezema_mig_%'"'"' AND NOT EXISTS (SELECT 1 FROM pg_stat_activity a WHERE a.datname = d.datname)" \
+  | while IFS="|" read -r oid db; do d=/var/lib/postgresql/data/base/$oid; \
+      if [ -d "$d" ] && [ -z "$(find "$d" -newermt "-6 hours" 2>/dev/null)" ]; then \
+        printf "DROP DATABASE IF EXISTS \"%s\" WITH (FORCE);\n" "$db"; fi; done'
+```
+
+Синтаксис конвейера проверен dry-run'ом (он печатает SQL-текст, сам ничего не удаляет: 62 кандидата на момент
+проверки). `noezema_dbg*` (19), `noezema_clismoke*` (2) и всё, что содержит `eval`/`smoke`, в эту выборку не
+попадают: фильтр — строго префикс `noezema_mig_`.
+
+### 5. Доказательство после правки (те же профили, что и в замерах)
+
+Повторы целевого теста и групп — тем же harness'ом (`t763_proof.sh`), busy-процессы `t763_busy.py` запускались
+перед прогонами и убивались после (`pgrep -af t763_busy` → 0).
+
+| профиль | прогонов | красных | teardown ERROR | forced drops | утечек mig |
+|---|---|---|---|---|---|
+| T_target_load — `test_web_session_returns_the_lane_when_its_task_is_cancelled`, busy=8 | 32 | **0** | **0** | 0 | 0 |
+| T_guard_file_load — весь `test_node_session_guard.py` последовательно, busy=10 | 12 | 0 | 0 | 0 | 0 |
+| T_group_load — 5 scenario-файлов `-n 6`, busy=8 (было 5/10 красных) | 12 | **1** | **0** | 0 | **0** |
+
+Единственный красный в T_group_load, назван как есть:
+`tests/scenario/test_orchestrator.py::test_slow_llm_does_not_lose_commit_lease` —
+`packages.domain.services.lease.LeaseLost: heartbeat refused for session …` (test_orchestrator.py:446).
+Тест помечен `@pytest.mark.timing`: в §6 и CI он специально вынесен из параллельного пула именно потому, что
+так флакает (AGENTS §7, замеры T7.51/T7.55/T7.56). Repro-профиль C намеренно затянул его в `-n 6` под 8
+busy-процессов — это известный класс wall-clock flake под external load, а не следствие правок T7.63: в тех же
+12 прогонов teardown ERROR нет ни одного (было 5), утечек scratch нет ни одной (было 5). Молча не перепрогонялся.
+
+**Полная двухстадийная §6-проверка — 9 прогонов подряд** (`t763_full.sh`: ruff → mypy → наличие образа →
+`pytest -n auto -q -m "not timing"` → `pytest -q -m timing`), 6 в покое и 3 под нагрузкой (busy=8):
+
+| # | профиль | ruff / mypy / образ | stage1 | stage2 | teardown ERROR | forced drops | mig до/после | tpl |
+|---|---|---|---|---|---|---|---|---|
+| F_quiet_1 | покой | OK / OK / OK | 1213 passed, 12 skipped (135,5 с) | 4 passed (47,4 с) | 0 | 0 | 56 / 56 | 0 |
+| F_quiet_2 | покой | OK / OK / OK | 1213 passed, 12 skipped (129,6 с) | 4 passed (47,4 с) | 0 | 0 | 56 / 56 | 0 |
+| F_quiet_3 | покой | OK / OK / OK | 1213 passed, 12 skipped (164,2 с) | 4 passed (47,5 с) | 0 | 0 | 56 / 56 | 0 |
+| F_quiet_4 | покой | OK / OK / OK | 1213 passed, 12 skipped (136,2 с) | 4 passed (47,4 с) | 0 | 0 | 56 / 56 | 0 |
+| F_quiet_5 | покой | OK / OK / OK | 1213 passed, 12 skipped (135,8 с) | 4 passed (47,7 с) | 0 | 0 | 56 / 56 | 0 |
+| F_quiet_6 | покой | OK / OK / OK | 1213 passed, 12 skipped (160,0 с) | 4 passed (47,4 с) | 0 | 0 | 56 / 56 | 0 |
+| F_load_1 | busy=8 | OK / OK / OK | 1213 passed, 12 skipped (130,4 с) | 4 passed (47,4 с) | 0 | 0 | 56 / 56 | 0 |
+| F_load_2 | busy=8 | OK / OK / OK | 1213 passed, 12 skipped (161,3 с) | 4 passed (47,3 с) | 0 | 0 | 56 / 56 | 0 |
+| F_load_3 | busy=8 | OK / OK / OK | 1213 passed, 12 skipped (116,4 с) | 4 passed (49,7 с) | 0 | 0 | 56 / 56 | 0 |
+
+Ни одного «1 error» при teardown; ни одного блока `warnings summary` в stage1 — то есть **путь
+`WITH (FORCE)` не понадобился ни в одном прогоне**: страховка осталась, но лечена причина. Счётчик
+`noezema_mig_*` идентичен до и после каждого из девяти прогонов (56), `noezema_tpl_* = 0`. Stage1 стал на два
+теста длиннее прежнего (1211 → 1213) — добавлены ровно два новых теста, удалённых нет.
+
+Целевые файлы отдельно, последовательно: `test_web_node_state_db_truth.py` + `test_node_session_guard.py` →
+15 passed, счётчик scratch без изменений. Контейнеры: `docker ps -a` до начала работы и после всех прогонов —
+один и тот же набор (41), busy-процессов после завершения нет.
+
+### 6. Инварианты и риски
+
+**Инварианты.** Правка продукта — только ветка остановки lifespan в `apps/web/api.py` (+39 строк: хелпер
+`_await_with_ceiling`, логгер, два дожидания). Порядок §5.2.1 «admission → замок → маркер → сессия → учёт
+исхода → снятие» сохранён и усилен (учёт теперь до снятия и до `dispose`); идемпотентность `release()`,
+структура гарда, lease/fencing, пороги, admission — не тронуты. `ARCHITECTURE.md`, схемы моделей, payload'ы
+config-v*, промпты, пины зависимостей, `tool_schema_hash`, миграции — без изменений (миграций не добавлено).
+Пул `timing` не пополнен; новых wall-clock утверждений нет: в тесте только event-ожидания и один потолок
+против зависания. Ограничение на `-n auto` для wall-clock тестов (AGENTS §7) соблюдено.
+
+**Риски и что осталось.**
+1. Потолок 20 с означает: при клиненном PostgreSQL учёт исхода всё-таки теряется — но не молча, а с warning'ом,
+   называющим задачу. Долговременное решение (учёт вне event loop процесса / persistent-задача) — отдельная
+   задача, здесь сознательно не делалось: правка должна была остаться минимальной.
+2. `WITH (FORCE)` в фикстуре — страховка teardown'а. Она рвёт соединение принудительно, и незавершённая
+   транзакция откатывается; для scratch-базы это безопасно (она всё равно выбрасывается), но warning с pid/state
+   запроса обязан оставаться — иначе страховка начнёт прятать реальные протечки продукта. В зелёных профилях она
+   не сработала ни разу.
+3. Общая форма гонки «учёт исхода пишется отдельной задачей после отмены сессии» закрыта для shutdown
+   веб-процесса. Точка входа wake tick (`apps/orchestrator/scheduler.py`) ведёт учёт синхронно в своём процессе
+   и этой гонки не имеет; новый продукт-код на неё не влияет.
+4. Оставшийся шлейф варианта (в): если cancel приходит внутрь `NodeSessionGuard.release()`, соединение закрывает
+   не наш код, а SQLAlchemy/asyncpg по пути сборки мусора — в одноразовых замерах это давало stderr-шум
+   «Task exception was never retrieved». Логично было бы закрыть явным `BaseException`-путём в гарде, но замер
+   показал отсутствие утечки и незакрытых лейнов; вместо правки инвариант закреплен тестом
+   `test_lane_is_free_when_the_cancel_lands_inside_the_release`.
+5. Wall-clock lease-тесты под external load могут флакать (C_group run 9) — известный и задокументированный
+   класс, относится к профилю прогонов, не к продукту.
+
+**Проверки коммита T7.63.** `ruff check .` — чисто; `mypy packages apps hostctl` — Success, 133 файла; образ
+`noezema-sandbox:test` на месте; `pytest -n auto -q -m "not timing"` — **1213 passed, 12 skipped** (110,3 с),
+**0 ERROR при teardown**, ни одного блока `warnings summary` (то есть `WITH (FORCE)` не понадобился);
+`pytest -q -m timing` — **4 passed** (47,4 с). Счётчики баз после всех прогонов и удаления своих остатков:
+mig 56 / tpl 0 / dbg-семейство 19 / clismoke 2 (до правок было 56; замеры подняли до 62 — свои 6 удалены).
+`docker ps -a` — те же 41 контейнер; busy-процессов нет. В репо не попали временный диагностический плагин,
+batch-скрипты, замерные логи и временный probe-тест (создан был один `tests/scenario/zz_t763_probe.py` — удалён
+до коммита). Хосты `.42`/`.48` и стенд `.92` не использовались; eval-run, смоуки и сессии с реальным LLM не
+запускались; `noezema-eval*`/`noezema-smoke*` — только SELECT.

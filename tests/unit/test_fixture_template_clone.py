@@ -27,7 +27,7 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
-from tests.conftest import REPO_ROOT, _admin_exec
+from tests.conftest import REPO_ROOT, _admin_exec, _drop_scratch_database
 
 pytestmark = [pytest.mark.unit]
 
@@ -132,7 +132,8 @@ async def test_clone_is_identical_to_direct_migration(
         assert clone_fp["constraints"] == direct_fp["constraints"]
     finally:
         await direct_engine.dispose()
-        await _admin_exec(test_db_url, f'DROP DATABASE IF EXISTS "{direct_name}"')
+        # T7.63: same teardown rule as the fixture itself — an attached backend must not leak this DB.
+        await _drop_scratch_database(test_db_url, direct_name)
 
 
 async def test_two_clones_are_isolated(
@@ -165,4 +166,4 @@ async def test_two_clones_are_isolated(
         assert probe_b is None, "clone B must not see a table created in clone A"
     finally:
         await engine_b.dispose()
-        await _admin_exec(test_db_url, f'DROP DATABASE IF EXISTS "{name_b}"')
+        await _drop_scratch_database(test_db_url, name_b)

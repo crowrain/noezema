@@ -8,7 +8,9 @@ start a second session next to «wake now» on the dev stand (the race itself is
 - it is released after a normal finish, after an exception inside the session and after a cancelled task;
 - it survives the worst case — the holder's backend is terminated (a killed systemd unit, a crash): the
   lane becomes free with no cleanup, because PostgreSQL drops session-level advisory locks with the
-  connection that held them.
+  connection that held them;
+- and it survives a cancellation delivered inside `release` itself (T7.63), where the explicit close is
+  skipped: the lock still does not outlive the connection.
 
 Everything here runs against one scratch DB through two or more separate engines: that IS the stand's
 process boundary for this purpose (`wake-tick`, `noezema-dev-web.service` and a manual run are different
@@ -22,7 +24,7 @@ import os
 import subprocess
 import sys
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from uuid import uuid4
 
@@ -63,13 +65,21 @@ async def _session_count(url: str) -> int:
 
 
 async def _lock_holders(url: str, name: str) -> list[int]:
-    """Backend PIDs currently holding this advisory lock — read from another connection."""
+    """Backend PIDs currently holding this advisory lock — read from another connection.
+
+    `pg_locks` is a CLUSTER-wide view (T7.63): under xdist it also lists advisory locks with the same
+    `hashtext` key that other workers hold in THEIR scratch databases — without the database filter those
+    foreign PIDs were counted here (the assertion flaked) and, worse, could be handed to
+    `pg_terminate_backend` below, killing another worker's session. A per-database lock question needs a
+    per-database filter.
+    """
     async with _own_engine(url) as engine, engine.connect() as conn:
         rows = (
             await conn.execute(
                 text(
                     "SELECT pid FROM pg_locks "
                     "WHERE locktype = 'advisory' AND objid = hashtext(:n) "
+                    "AND database = (SELECT oid FROM pg_database WHERE datname = current_database()) "
                     "AND pid <> pg_backend_pid()"
                 ),
                 {"n": name},
@@ -97,22 +107,27 @@ async def test_lane_is_exclusive_across_engines_and_reusable_after_release(migra
     scratch_url, _fixture_engine = migrated_db
 
     holder = NodeSessionGuard(scratch_url, OWNER)
-    assert await holder.acquire() is True
-    assert holder.held is True
-
     rival = NodeSessionGuard(scratch_url, OWNER)
-    assert await rival.acquire() is False, "другое соединение того же узла не должно получать лейн"
-    assert await _lock_holders(scratch_url, node_session_lock_name(OWNER)) != []
+    try:
+        assert await holder.acquire() is True
+        assert holder.held is True
 
-    # re-acquiring one's own lane is a no-op, not a deadlock and not a second lock
-    assert await holder.acquire() is True
+        assert await rival.acquire() is False, "другое соединение того же узла не должно получать лейн"
+        assert await _lock_holders(scratch_url, node_session_lock_name(OWNER)) != []
 
-    await holder.release()
-    await holder.release()  # idempotent: the done-callback path may call it a second time
-    assert holder.held is False
+        # re-acquiring one's own lane is a no-op, not a deadlock and not a second lock
+        assert await holder.acquire() is True
 
-    assert await rival.acquire() is True, "после освобождения лейн обязан быть доступен"
-    await rival.release()
+        await holder.release()
+        await holder.release()  # idempotent: the done-callback path may call it a second time
+        assert holder.held is False
+
+        assert await rival.acquire() is True, "после освобождения лейн обязан быть доступен"
+    finally:
+        # T7.63: an assertion failure here used to leave the guard's connection open — which held both the
+        # lane and its scratch DB, turning one failed test into a teardown error plus a leaked database.
+        await holder.release()
+        await rival.release()
 
 
 @pytest.mark.asyncio
@@ -122,15 +137,16 @@ async def test_different_node_owners_do_not_block_each_other(migrated_db) -> Non
 
     a = NodeSessionGuard(scratch_url, "node-a")
     b = NodeSessionGuard(scratch_url, "node-b")
-    assert await a.acquire() is True
-    assert await b.acquire() is True, "разные node_owner должны брать разные замки"
-    assert node_session_lock_name("node-a") != node_session_lock_name("node-b")
+    try:
+        assert await a.acquire() is True
+        assert await b.acquire() is True, "разные node_owner должны брать разные замки"
+        assert node_session_lock_name("node-a") != node_session_lock_name("node-b")
 
-    blocked = NodeSessionGuard(scratch_url, "node-a")
-    assert await blocked.acquire() is False
-
-    await a.release()
-    await b.release()
+        blocked = NodeSessionGuard(scratch_url, "node-a")
+        assert await blocked.acquire() is False
+    finally:
+        await a.release()
+        await b.release()
 
 
 # ── (в) the holder's backend dies ─────────────────────────────────────────────────
@@ -148,19 +164,52 @@ async def test_lane_is_free_after_the_holders_backend_is_terminated(migrated_db)
 
     holder = NodeSessionGuard(scratch_url, OWNER)
     assert await holder.acquire() is True
-    pids = await _lock_holders(scratch_url, node_session_lock_name(OWNER))
-    assert len(pids) == 1, f"замок должен держать ровно одно соединение: {pids}"
+    try:
+        pids = await _lock_holders(scratch_url, node_session_lock_name(OWNER))
+        assert len(pids) == 1, f"замок должен держать ровно одно соединение: {pids}"
 
-    async with _own_engine(scratch_url) as killer, killer.connect() as conn:
-        terminated = (
-            await conn.execute(text("SELECT pg_terminate_backend(:pid)"), {"pid": pids[0]})
-        ).scalar_one()
-    assert bool(terminated) is True
+        async with _own_engine(scratch_url) as killer, killer.connect() as conn:
+            terminated = (
+                await conn.execute(text("SELECT pg_terminate_backend(:pid)"), {"pid": pids[0]})
+            ).scalar_one()
+        assert bool(terminated) is True
 
-    # the guard's own release must not raise on a dead backend, and must not hang
-    await holder.release()
+        # the guard's own release must not raise on a dead backend, and must not hang
+        await holder.release()
+    finally:
+        await holder.release()  # idempotent; also covers an assertion failure above (T7.63)
 
     assert await _free_lane(scratch_url), "following wake must get the lane after the holder died"
+
+
+@pytest.mark.asyncio
+async def test_lane_is_free_when_the_cancel_lands_inside_the_release(migrated_db) -> None:
+    """Cancellation is delivered WHILE `release` is awaiting its own DB round trip (T7.63 measurement).
+
+    The guard's `release` clears its connection first and its error handlers catch `Exception`, not
+    `BaseException` — so a cancel at this exact point skips the explicit close, and a second `release` is
+    already a no-op. What was measured before pinning this: PostgreSQL still drops the session-level lock,
+    because SQLAlchemy/asyncpg close the abandoned connection; the lane never stayed held and no backend
+    stayed attached. This test pins that fact instead of leaving it to chance: if a future change makes an
+    interrupted release wedge the node, this is where it turns red. No wall-clock assertions.
+    """
+    scratch_url, _fixture_engine = migrated_db
+    inside_release = asyncio.Event()
+
+    async def holder() -> None:
+        guard = NodeSessionGuard(scratch_url, OWNER)
+        assert await guard.acquire() is True
+        inside_release.set()  # last synchronous act before the release round trip
+        await guard.release()
+
+    task = asyncio.create_task(holder())
+    await inside_release.wait()
+    task.cancel()
+    with suppress(asyncio.CancelledError):
+        await task  # either the cancel landed inside `release`, or `release` had already finished
+
+    assert await _lock_holders(scratch_url, node_session_lock_name(OWNER)) == []
+    assert await _free_lane(scratch_url), "отмена внутри release не должна клинить лейн"
 
 
 # ── (б) release on every exit path of a session task ───────────────────────────────

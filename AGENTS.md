@@ -320,8 +320,26 @@ config-v13 (T7.59(в): = config-v12, но `model.context_window`/`backend_contex
   — это не дефект: команды решает `effective_node_state` (→ `idle`). Снимок «пока веб владеет сессией» получают
   удержанием сессии (event-гейт в `StubToolExecutor.execute` — тот же event loop), видимость COMMITTING-строки
   пинят гейтом вокруг `commit_prepare` (окно = phase-1 commit … терминальный commit). Временные ожидания —
-  только потолки против зависания. Тесты: `tests/scenario/test_web_node_state_db_truth.py` (4, incl. тест
-  хвостового окна), `tests/scenario/test_dev_stand_flow.py`.
+  только потолки против зависания. Тесты: `tests/scenario/test_web_node_state_db_truth.py` (5, incl. тест
+  хвостового окна и тест «shutdown не бросает учёт исхода»), `tests/scenario/test_dev_stand_flow.py`.
+
+- Teardown scratch-БД и асинхронное закрытие соединения (T7.63): `DROP DATABASE` чинящей тест фикстуры падает с
+  «database … is being accessed by other users», если в базе осталось **открытое соединение незавершённой
+  async-задачи**. Две стороны: (1) `AsyncEngine.dispose()` закрывает только **idle**-соединения пула — сессию,
+  оставленную живой задачей, он не закрывает; поэтому shutdown обязан дождаться свои незавершённые задачи учёта
+  (`apps/web/api.py::_await_with_ceiling`: сначала дождаться отменённой `session_task` — её done-callback и
+  ЗАВОДИТ задачу `_record_session_outcome`, — затем `node._resets`, и лишь потом снятие гарда и `dispose`;
+  потолок 20 с + warning с именем незавершённой задачи, а не тихий бросок). (2) Фикстурный DROP идёт по схеме
+  plain → короткое ожидание → `DROP DATABASE … WITH (FORCE)` (PostgreSQL 15), и каждый форс **называет**
+  оставшиеся бэкэнды (pid/state/последний запрос) в warning: форс не должен прятать реальную протечку.
+  Признак по подписи соединения: сессия sessionmaker — последний запрос `COMMIT;` при непустом `xact_start`;
+  NullPool/AUTOCOMMIT-соединение гарда — `pg_try_advisory_lock/unlock` при пустом `xact_start`.
+- `pg_locks` (как и `pg_stat_activity` в части advisory-замков) — **кластерное** представление: advisory-замок с
+  тем же `hashtext`-ключом, взятый в другой базе (у каждого xdist-воркера своя scratch-БД), виден из текущей
+  базы (строки несут `database`, `classid=4294967295`, `objid=hashtext(name)`). Любой тестовый вопрос «сколько
+  соединений держат наш замок» обязан фильтровать `database = (SELECT oid FROM pg_database WHERE datname =
+  current_database())`; без фильтра утверждение флакает под `-n auto` и тот же список pid можно отправить в
+  `pg_terminate_backend`, убив соединение чужого воркера (T7.63, `tests/scenario/test_node_session_guard.py::_lock_holders`).
 
 ## 8. Гигиена длинных сессий
 
