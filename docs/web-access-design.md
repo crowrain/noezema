@@ -262,6 +262,9 @@ mode_policy.domain_allowed(url)` → reject). Значит **curated + `allowed_
   (`apps/web/api.py:2004–2036`) не передаёт `research_service`; единственный сборщик —
   `build_orchestrator` (`apps/orchestrator/main.py:54–62`). Тестов на wiring web-пути нет.
   Стенд «web wake» сегодня физически не способен на внешний факт.
+  → **Закрыт T7.68 (коммит `cbac9e2`)**: сборщик сессии — общий чистый модуль
+  `apps/orchestrator/session_assembly.py`, web-фабрика вызывает только его; тесты Wiring и
+  end-to-end wake_now зафиксированы (красны на старом коде) — см. п. 6 плана ниже и STATUS §T7.68.
 - **G2 (семантика curated).** При пустом `allowed_domains` curated открывает fetch к любому
   публичному хосту (п. 2.2): доменный allowlist как принудительный гейт реализован только у
   open_lab. Это либо осознанная политика, либо дыра в ожиданиях оператора. Требует явного
@@ -342,7 +345,8 @@ A со списком UFW-решений оператора), параллель
 сохраняют номера, но меняют статус: **T7.70** (SearXNG на стенде) и **T7.71** (`research.search`)
 приняты решением (c), **T7.72** (лимиты прямых fetch) остаётся отложенным.
 
-- **T7.68 — единый сборщик sessions: research_service во всех точках входа.**
+- **T7.68 — единый сборщик sessions: research_service во всех точках входа.** → **реализовано
+  2026-10-06 (коммит `cbac9e2`, разбор в STATUS §T7.68); G1 закрыт.**
   Извлечение чистого конструирования (например helper `research_service_for(factory, workspace_root)`,
   общий для `apps/orchestrator/main.py` и `build_standalone_app`; AGENTS §4: чистая функция в общем
   модуле, фабрики лишь собирают). Файлы: `apps/web/api.py`, `apps/orchestrator/*` (helper), тесты —
@@ -351,6 +355,17 @@ A со списком UFW-решений оператора), параллель
   собранный web-фабрикой, имеет ResearchProxyService с артефактным корнем `<data root>/artifacts`;
   ошибка «not configured» недостижима ни на одном входе. Stop-criteria: не менять контракт
   `run_session`, пины, payload'ы; тесты только локальные (fake origins как в test_research_proxy.py).
+  Фактическая реализация: чистый модуль `apps/orchestrator/session_assembly.py` с полным построителем
+  сессии (`build_session_orchestrator` = gateway+profile+executor+orchestrator; внутри —
+  `research_service_for` и `artifacts_root_for`, корень артефактов = sibling workspace'а точки входа,
+  прежняя формула `build_orchestrator`; веб-workspace берётся из `resolve_standalone_workspace(data_root_from_env())`)
+  — оба фабрики теперь только вызывают его. Вариант «helper только на research_service_for» отклонён: он
+  оставил бы в api.py дублирующую сборку gateway/profile/executor, из которой точки входа и могли бы
+  снова разойтись. Тесты: +2 unit (wiring веб-фабрики; tick/web эквивалентность) в
+  `tests/unit/test_research_wiring.py` и scenario `tests/scenario/test_web_standalone_research.py`
+  (wake_now через реальную фабрику, FakeLLM + loopback fake origin без сети); краснота на старом коде
+  зафиксирована в STATUS §T7.68. Stop-criteria соблюдены: контракт `run_session`, payload'ы, пины и
+  политика не изменены.
 - ~~**T7.69 — запись решения по G2 и (при необходимости) config-v14**~~ → **закрыто решением
   пользователя 2026-10-06 (a)+(b)** (ADR-0027, раздел «Решения пользователя 2026-10-06»): выбрана
   открытая семантика A (пустой `allowed_domains` = любой публичный http(s)-хост под SSRF-guard'ом),

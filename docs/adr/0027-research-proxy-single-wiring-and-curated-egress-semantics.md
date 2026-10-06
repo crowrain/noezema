@@ -1,8 +1,9 @@
 # ADR-0027: Единый wiring research-сервиса для всех точек входа сессий; явная семантика egress в режиме curated (T7.66 → T7.68+, §5.12, §11.2)
 
 Статус: proposed (решение по пунктам 2 и 4 **принято пользователем 2026-10-06** — см. раздел
-«Решения пользователя 2026-10-06»; ADR остаётся proposed, потому что харнесс-реализация пункта 1
-(T7.68) и задач T7.70–T7.72 ещё не начата)
+«Решения пользователя 2026-10-06»; харнесс-реализация пункта 1 (T7.68) выполнена 2026-10-06 —
+коммит `cbac9e2`, «Реализация» ниже и STATUS §T7.68; ADR остаётся proposed, потому что задачи
+T7.70–T7.72 ещё не начаты)
 
 Дата: 2026-10-06 (анализ — T7.66, `docs/web-access-design.md`; разбор модели и фиксация решений
 пользователя — T7.69b, `docs/eval/MODEL-SELECTION-report.md`)
@@ -60,6 +61,22 @@
 `build_standalone_app()` с env (FakeLLM, monkeypatched FetchClient, без реальной сети):
 оркестратор web-приложения имеет research-сервис; путь wake_now с allowed `research.fetch`
 не даёт ошибки «not configured». Контракт `run_session`, пины промптов и payload'ы не меняются.
+
+**Реализация (T7.68, 2026-10-06, коммит `cbac9e2`).** Единый построитель — новый чистый модуль
+`apps/orchestrator/session_assembly.py`: `build_session_orchestrator(factory, workspace_root)` собирает
+gateway/profile/executor/`Orchestrator` и всегда передаёт `research_service_for(factory, workspace_root)
+= ResearchProxyService(factory, FilesystemArtifactStore(artifacts_root_for(workspace_root)))`;
+`artifacts_root_for` = sibling workspace'а точки входа (`parent/<ARTIFACTS_SUBDIR>`) — прежняя формула
+`build_orchestrator`, поэтому для общего `NOEZEMA_DATA_ROOT` корень совпадает и с `artifacts_root_from_env()`
+(его использует standalone-прокси): тик и веб на одном хосте пишут в одно хранилище. Точки входа стали
+тонкими вызовами: `build_orchestrator` (`apps/orchestrator/main.py`) сохраняет публичную сигнатуру
+(wake-tick, eval-run/smoke, manual), web-фабрика `build_standalone_app` больше не строит `Orchestrator(...)`
+самостоятельно — единственный другой конструктор класса в продакшн-коде не остался. Принятые тесты: unit
+wiring веб-фабрики и tick/web parity каталога (`tests/unit/test_research_wiring.py`), end-to-end wake_now
+через реальную фабрику с loopback fake origin без сети (`tests/scenario/test_web_standalone_research.py`);
+краснота тестов на старом коде (текст живого случая «research proxy is not configured for this host»)
+зафиксирована в STATUS §T7.68. Контракт `run_session`, payload'ы, пины и семантика режимов не изменены;
+sealed по-прежнему fail-closed (`apps/orchestrator/orchestrator.py:1067–1072` как было).
 
 ### 2. Явная политика доменного egress (**решено пользователем 2026-10-06: вариант A**)
 

@@ -3447,7 +3447,7 @@ JSON карточки (реальные прогоны, зонд убран по
 «research proxy is not configured for this host» (`apps/orchestrator/orchestrator.py:1067–1072`) —
 независимо от UFW и конфига. Единственный сборщик с research-сервисом — `build_orchestrator`
 (`apps/orchestrator/main.py:54–62`; wiring закреплён тестом только для него,
-`tests/unit/test_research_wiring.py`; web-путь тестами не покрыт). Wake-tick/eval-run
+`tests/unit/test_research_wiring.py`; web-путь тестами не покрыт — закрыто T7.68, см. раздел ниже). Wake-tick/eval-run
 (`hostctl/cli.py:303` и `:1334`) сервис имеют — там случай упал бы другой ошибкой (транспорт).
 
 Ключевые уточнения анализа: `curated-v1` = `{name}-{version}` YAML-потолка
@@ -3478,6 +3478,85 @@ payload'ов, решение по egress-политике — за операт�
 pytest два прогона: **1306 passed + 12 skipped** (`-n auto -m "not timing"`) и **4 passed** (`-m timing`)
 — совпадает с прежним эталоном. Изменены только `docs/web-access-design.md`, ADR-0027, этот раздел
 STATUS.md и пометка в `docs/ui-simplification-design.md`.
+
+## T7.68 — единый сборщик сессионного оркестратора: web «wake now» получает research proxy (M7; ADR-0027 §1, G1 закрыт). 2026-10-06
+
+**Контекст.** Живой случай стенда `.92` (T7.66: вопрос про инфляцию, веб-запуск): политика разрешает
+`research.fetch`, но каждая попытка умирала с «research proxy is not configured for this host»
+(fail-closed `apps/orchestrator/orchestrator.py:1067–1072`). Причина G1: web-фабрика строила
+`Orchestrator(...)` сама и не передавала `research_service`; единственный сборщик был
+`build_orchestrator`. Задача = пункт 1 ADR-0027.
+
+**Что сделано.** Новый чистый модуль `apps/orchestrator/session_assembly.py` (AGENTS §4):
+`artifacts_root_for(workspace_root)` = sibling workspace'а (`parent/ARTIFACTS_SUBDIR`),
+`research_service_for(factory, workspace_root)` = `ResearchProxyService(factory,
+FilesystemArtifactStore(artifacts_root_for(...)))`, `build_session_orchestrator(factory, workspace_root)` —
+полная сборка (gateway/profile/executor через `build_tool_executor` + Orchestrator) с возвратом
+`(orchestrator, gateway)`: ownership gateway остался у вызывающего. `build_orchestrator` теперь тонкий
+вызов с прежней публичной сигнатурой (wake-tick, eval-run, manual не тронуты; semantics T7.7/T7.58 в
+докстринге сохранены), `build_standalone_app` (`apps/web/api.py`) больше не импортирует LLMMiddleware/
+LLMGatewayConfig/ModelProfile/build_tool_executor и не конструирует Orchestrator — зовёт построитель на
+своей фабрике и своём workspace (`resolve_standalone_workspace(data_root_from_env())`). Других
+конструкторов `Orchestrator(` в продакшн-коде не осталось (только тесты). Поведение gateway прежнее:
+manual/tick закрывают в finally, веб-процесс — нет (живёт с приложением; закреплено докстрингом).
+
+**Точки входа (до → после).**
+
+| Вход | Место сборки | research_service до | после | каталог артефактов |
+|---|---|---|---|---|
+| wake tick | `hostctl/cli.py` → `build_orchestrator(factory, <использованный root>/workspace)` | есть | есть (через построитель) | `<использованный root>/artifacts` (формула выведена из аргумента — override `--data-root` сохранён) |
+| eval-run / смоуки | `hostctl/cli.py` → тот же `build_orchestrator` | есть | есть | тот же |
+| manual `python -m apps.orchestrator` | `apps/orchestrator/main.py`, `workspace_root_from_env()` | есть | есть | `<NOEZEMA_DATA_ROOT>/artifacts` |
+| web standalone («wake now», юнит `noezema-dev-web`) | `apps/web/api.py::build_standalone_app` — раньше прямой `Orchestrator(...)` | **нет (G1): каждый research.fetch fail-closed, артефактного хранилища в веб-процессе не было вовсе** | есть (через построитель) | `<NOEZEMA_DATA_ROOT>/artifacts` (sibling веб-workspace = тот же каталог, что у тика при общем data root) |
+| standalone-прокси `apps/research_proxy/main.py` | свой `ResearchProxyService`, `artifacts_root_from_env()` | есть | не тронут | тот же каталог |
+
+Хостовый контур (hostctl backup/restore-drill/blind-sample читают `NOEZEMA_ARTIFACTS_ROOT`, дефолт —
+data root) не менялся: с T7.61(б) он уже согласен с тиковым default-каталогом.
+
+**Выбор формы.** План допускал «helper вида research_service_for». Выбран полный построитель: веб
+дублировал не только research-строку, но и сборку gateway/profile/executor — точечный helper оставил бы
+в `api.py` дублирующую assembly, из которой входы снова могли бы разойтись; цель задачи — отсутствие
+второй точки конструирования вообще. Компромисс сознательный: веб-фабрика получила зависимость от
+всего модуля сборки сессий (это и есть единомыслие входов).
+
+**Тесты.** `tests/unit/test_research_wiring.py` (+2): (а) wiring веб-фабрики — `research_service` есть,
+store root = `<data root>/artifacts`, executor stub; (б) parity — wake-tick формула вызова и веб-фабрика
+на одном `NOEZEMA_DATA_ROOT` дают один каталог артефактов, одинаковые типы и независимые экземпляры
+сервиса; `artifacts_root_from_env()` согласован. Новый `tests/scenario/test_web_standalone_research.py`:
+активированный curated-снапшот (loopback `private_allowlist`), wake_now через **реальный**
+`build_standalone_app()` с env + lifespan + unit-state, explorer вызывает research.fetch на локальный
+fake-origin: action `completed` без error, в audit нет ни одной строки «not configured», есть
+`research_content_read` (mode=curated), `sources`/`artifact_chunks` (`origin_kind=research_proxy`),
+evidence `source_assertion`, файлы артефактов под `<tmp data root>/artifacts`, fence'd текст вошёл в
+контекст модели, сессия `succeeded`. Сети нет: только loopback HTTP. Краснота на старом коде (api.py
+фабрика временно возвращена к HEAD, без коммита): все три новых теста красные, scenario воспроизводит
+живой текст — `state=failed error=research proxy is not configured for this host`; файл восстановлен.
+
+**Не изменено (стоп-критерии не понадобились).** Контракт `run_session` и `_research_fetch`,
+`apps/research_proxy/*`, политика/профили, payload config-v13, пины промптов, реестр инструментов,
+миграции, JSON API; executor default stub; sealed остаётся fail-closed (wiring инертен там, где egress
+запрещён профилем).
+
+**Эффект на стенде после деплоя.** После redeploy bundle'а web «wake now» собирает сессию идентично
+тику: research.fetch работает по режиму активного снапшота (на `.92` — curated). Операторское условие
+реального внешнего факта прежнее — постоянные исходящие 80/443 UFW на `.92` (нынешние помечены
+временными; SearXNG для fetch не нужен). Проверка без новых инструментов: шаги карточки ответа
+(`research.fetch → completed`) и файлы в `<NOEZEMA_DATA_ROOT>/artifacts` — веб и тик теперь пишут в один
+каталог. Строку «research proxy» в `status.sh` не добавляли: режим виден из payload-файла активного
+снапшота (строка «конфиг» печатает его имя); явная строка запланирована в preflight T7.70.
+
+**Хвосты.** (1) Расхождение config-v13 (в снапшоте есть `artifact.create`, его нет в реестре/исполнителе —
+«unknown tool») — отдельная проблема из разбора T7.69b, эта задача её не касалась. (2) Формула артефактов
+намеренно выведена из АРГУМЕНТА workspace, а не перечитывает env — так сохранён семантика override
+`--data-root` у wake-tick; эквивалентность каталогов гарантирована при общем data root (пин тестом (б)).
+(3) Веб-процесс по-прежнему не закрывает свой gateway (статус-кво T7.59 — до T7.68 было так же); при
+будущем refactor shutdown веб разбирать отдельно.
+
+Проверки commit'а `cbac9e2` (код+тесты): ruff — OK; mypy strict — OK (137 файлов); образ
+`noezema-sandbox:test` — на месте; pytest два прогона: **1309 passed + 12 skipped** (`-n auto -m "not timing"`,
+173.3 с) и **4 passed** (`-m timing`) — baseline 1306+12 ровно + эти три теста. Повторная полная проверка
+перед документным коммитом (этот раздел + отметки в ADR-0027, `docs/web-access-design.md` и README стенда):
+те же результаты — **1309 passed + 12 skipped** и **4 passed**.
 
 ## T7.69 — серия подбора модели NOEZEMA (a/c — прогоны, b — разбор). 2026-10-06
 
