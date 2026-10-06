@@ -149,8 +149,10 @@ venv+prod-зависимости **только через uv** (`--force` пе�
 записи env-файла и пишется в него (`NOEZEMA_DEV_DB_PORT`; 5432, занят → первый свободный 5433..5440;
 повторный запуск переиспользует порт существующего контейнера), готовность ждётся по эндпоинту приложения
 (TCP + `SELECT 1` на `127.0.0.1:<порт>`, ≤120 с), базу `noezema-dev`, миграции, активацию
-config-v13 (T7.59(в): = config-v12, но `model.context_window`/`backend_context_limit` = 131072 под окно EXL3;
-пропуск, если head уже не bootstrap), env-файл `/etc/noezema/dev.env` (0600, секреты не
+config-v14 (с T7.71 дефолт стенда; = config-v13 ровно с двумя правками — `policy.capabilities.tools`
+`+web.search`/`−artifact.create` и пин `prompts.explorer` → explorer-v6; окна EXL3 из config-v13 сохранены:
+`model.context_window`/`backend_context_limit` = 131072. Прежний payload остаётся откатом:
+`NOEZEMA_DEV_CONFIG_PAYLOAD=$REPO_ROOT/docs/eval/config-v13-payload.json`. Пропуск, если head уже не bootstrap), env-файл `/etc/noezema/dev.env` (0600, секреты не
 печатаются и в `--dry-run` маскируются) и dev-юниты `deploy/dev-stand/systemd/*` — **не копии**
 `infra/systemd/*`: `User=` = пользователь стенда, данные `/var/lib/noezema-dev`, группа
 `noezema-dev.target` (в загрузку не ставится), tick 60 с (`TimeoutStartSec=3600`), maint 60 с
@@ -212,6 +214,18 @@ config-v13 (T7.59(в): = config-v12, но `model.context_window`/`backend_contex
   flake — конкуренция нескольких xdist-воркеров за общий PostgreSQL, а не CPU; новые wall-clock тесты в
   параллельный пул не добавлять. Замеры и разбор: STATUS.md T7.56.
 - Проект русскоязычный: RUF001–RUF003 отключены намеренно.
+- Поиск для модели (T7.71, ADR-0028): `web.search` — только `{"query": ≤500}`, класс OBSERVATION; потолки
+  curated/open_lab, sealed не выдан (`memory.search` уже даёт тот же локальный индекс). Хиты поиска никогда не
+  становятся знанием: у `observation_to_evidence` нет ветки для `web.search`, поэтому evidence/sources/artifact_chunks
+  не создаются — знание даёт только `research.fetch` выбранной страницы. Оформление наблюдения — чистый модуль
+  `apps/orchestrator/search_view.py` (fence только вокруг внешней части, резка целыми хитами по бюджету 8000,
+  литералы fence'а в чужих данных нейтрализуются; незакрытый fence = сломанная граница). Профиль open_lab даёт
+  инструмент, но upstream не вызывает (`modes.py` при open_lab принудительно `searxng_url=None`) — наблюдение должно
+  честно это говорить, а не молчать. Снапшот `research_proxy.searxng_url` — **корень origin** (`http://127.0.0.1:8888`),
+  не `/search`: путь добавляет `apps/research_proxy/search.py::upstream_request_url`. В журнале
+  `research_upstream_request` поле — `upstream_host` (только хост, без порта); лимит upstream считается по строкам
+  этого же журнала (fail-closed), при исчерпании — `research_fetch_rejected{reason:"upstream_rate_limit_exceeded"}`.
+  Тесты поиска не делают ни одного внешнего запроса и не трогают эталонный SearXNG (`noezema-searxng` на `.87`).
 - Eval/wake/smoke исполняют инструменты через `StubToolExecutor` (dev-подставка, хост .87 без изоляции —
   риск python.execute осознанный DEV ONLY); sandboxed ToolBroker — только в тестах. Из списка инструментов
   снапшота при этом живут и неисполнимые в stub: shell.execute → Observation `tool_not_supported:` (T7.57(b),
@@ -274,7 +288,7 @@ config-v13 (T7.59(в): = config-v12, но `model.context_window`/`backend_contex
   ждём `SELECT 1` на опубликованном `127.0.0.1:<порт>` (внутренний healthcheck обязан иметь `-d postgres`,
   иначе спам «database does not exist»), ufw только диагностируется — правил скрипт не добавляет.
   Проверка скриптов без реальной ВМ: `bash -n`, `shellcheck -S warning` и
-  `tests/unit/test_dev_stand_scripts.py` (настоящие скрипты с подставными docker/ss/uv/sudo, только `--dry-run`).
+  `tests/unit/test_dev_stand_scripts.py` (настоящие скрипты с подставными docker/ss/uv/sudo, только `--dry-run`); `shellcheck` в агентской среде `.87` не установлен — если его нет и на ВМ, из трёх проверок выполняются две (`bash -n` + pytest) и это указывается в отчёте отдельной строкой, а не «проверено shellcheck».
 - Пустая очередь вопросов на стенде — не ошибка: admitted wake доходит до выбора, кандидата нет, сессия
   `FAILED termination_reason="no_question"` (`apps/orchestrator/orchestrator.py`), дальше backoff
   (wake_schedule в config-v12 = config-v13: 60/120/240, cap 86400) и пауза узла после
