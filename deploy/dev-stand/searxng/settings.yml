@@ -1,0 +1,26 @@
+# NOEZEMA dev stand — SearXNG settings TEMPLATE (T7.70, §5.12/§5.12.1).
+#
+# This file is a template, not a working configuration: `deploy/dev-stand/searxng-settings.sh`
+# substitutes @SECRET@ with a freshly generated key and writes the result to
+# /etc/noezema/searxng/settings.yml, which the container mounts read-only. The secret is never
+# committed and never printed (AGENTS §5) — that is why the placeholder lives here and the real key
+# lives only on the stand VM.
+#
+# Why these settings:
+#   formats html + json — research proxy talks to /search?format=json (§5.12); html stays for the
+#                         operator who opens the container in a browser;
+#   limiter false — SearXNG's own limiter answers 429 to automated JSON requests. The rate limit that
+#                   matters for the node is the one the host enforces from the config snapshot
+#                   (research_proxy.rate_limit_max / rate_limit_window_seconds, §5.12.1): upstream
+#                   queries are counted and journalled by the research proxy, not by the container.
+#   limiter off does not open anything to the network: the container is published on 127.0.0.1 only.
+use_default_settings: true
+server:
+  secret_key: "@SECRET@"
+  limiter: false
+  image_proxy: false
+  public_instance: false
+search:
+  formats:
+    - html
+    - json

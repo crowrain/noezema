@@ -8,6 +8,7 @@ the port is checked and picked before secrets are written, a rerun reuses the co
 
 from __future__ import annotations
 
+import re
 import subprocess
 from pathlib import Path
 from typing import ClassVar
@@ -377,3 +378,227 @@ def _strip_notes(text: str) -> str:
     return "\n".join(
         line for line in text.splitlines() if not line.lstrip().startswith(("note ", 'note "', "printf"))
     )
+
+
+# ─── T7.70: пакет поиска (SearXNG) ─────────────────────────────────────────────────────
+
+SEARXNG_SCRIPT = REPO_ROOT / "deploy" / "dev-stand" / "searxng-settings.sh"
+SEARXNG_TEMPLATE = REPO_ROOT / "deploy" / "dev-stand" / "searxng" / "settings.yml"
+
+
+def _run_settings_script(out_path: Path, *flags: str) -> subprocess.CompletedProcess[str]:
+    """The settings renderer is pure local work: openssl + template. No network, no docker."""
+    return subprocess.run(
+        ["bash", str(SEARXNG_SCRIPT), "--out", str(out_path), *flags],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+
+def _secret_of(path: Path) -> str:
+    line = next(ln for ln in path.read_text(encoding="utf-8").splitlines() if "secret_key:" in ln)
+    return line.split("secret_key:", 1)[1].strip().strip('"')
+
+
+class TestDevStandSearchPackage:
+    """Поиск ставится только по явному флагу и никогда не пересоздаётся молча (T7.70)."""
+
+    def test_search_is_not_installed_by_default(self, stubs: dict[str, Path]) -> None:
+        result = _run_bootstrap(stubs)
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "docker run" not in result.stdout or "noezema-searxng" not in result.stdout
+        assert "поиск не ставим (дефолт)" in result.stdout
+        assert "--with-searxng" in result.stdout
+
+    def test_with_searxng_prints_the_exact_container_command(self, stubs: dict[str, Path]) -> None:
+        result = _run_bootstrap(stubs, "--with-searxng")
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        run_lines = [ln for ln in result.stdout.splitlines() if "docker run" in ln and "noezema-searxng" in ln]
+        assert len(run_lines) == 1
+        command = run_lines[0]
+        # Published on 127.0.0.1 only, container listens 8080 internally (the spec's own port).
+        assert "-p 127.0.0.1:8888:8080" in command
+        assert "--restart unless-stopped" in command
+        # Settings come from /etc/noezema/searxng and are mounted read-only.
+        assert "-v /etc/noezema/searxng/settings.yml:/etc/searxng/settings.yml:ro" in command
+        assert "searxng/searxng:latest" in command
+        # The settings file is rendered from the repo template, never copied with a committed secret.
+        assert "searxng-settings.sh --out /etc/noezema/searxng/settings.yml" in result.stdout
+        assert "secret_key генерируется при установке и не печатается" in result.stdout
+
+    def test_egress_is_described_never_opened(self, stubs: dict[str, Path]) -> None:
+        result = _run_bootstrap(stubs, "--with-searxng")
+
+        assert "исходящие 80/443 tcp" in result.stdout
+        assert "DNS" in result.stdout
+        assert "правила применяете ВЫ, не скрипт" in result.stdout
+        text = BOOTSTRAP.read_text(encoding="utf-8")
+        # Firewall words may only appear as prose/notes. What must never exist is a firewall command in
+        # an executable position (optionally under $SUDO) — that is what would actually change the host.
+        assert "ufw allow" not in _strip_notes(text)
+        firewall_command = re.compile(
+            r"(?m)^\s*(?:\"?\$\{?SUDO\}?\"?|sudo)?\s*(-n\s+)?(?:iptables|ip6tables|ufw)\s+(allow|deny|delete|insert|append|-)"
+        )
+        assert firewall_command.search(text) is None
+        assert "DOCKER-USER" not in _strip_notes(text)
+
+    def test_existing_search_container_survives_a_rerun(self, stubs: dict[str, Path]) -> None:
+        result = _run_bootstrap(
+            stubs,
+            "--with-searxng",
+            container_name="noezema-searxng",
+            published_port="8888",
+        )
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "уже есть" in result.stdout
+        assert "НЕ пересоздаём" in result.stdout
+        assert "docker rm -f noezema-searxng" not in result.stdout
+        assert "docker run -d --name noezema-searxng" not in result.stdout
+
+    def test_without_the_flag_an_existing_container_is_only_reported(self, stubs: dict[str, Path]) -> None:
+        result = _run_bootstrap(stubs, container_name="noezema-searxng", published_port="8888")
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "без --with-searxng мы его НЕ меняем" in result.stdout
+        assert "docker rm -f noezema-searxng" not in result.stdout
+
+    def test_rebuilding_the_container_is_an_explicit_flag(self, stubs: dict[str, Path]) -> None:
+        plain = _run_bootstrap(stubs, "--with-searxng", container_name="noezema-searxng", published_port="8888")
+        rebuilt = _run_bootstrap(
+            stubs,
+            "--with-searxng",
+            "--recreate-searxng",
+            container_name="noezema-searxng",
+            published_port="8888",
+        )
+
+        assert plain.returncode == 0 and "docker rm -f noezema-searxng" not in plain.stdout
+        assert rebuilt.returncode == 0, rebuilt.stdout + rebuilt.stderr
+        assert "--recreate-searxng" in rebuilt.stdout
+        assert "docker rm -f noezema-searxng" in rebuilt.stdout
+        assert any("docker run" in ln and "noezema-searxng" in ln for ln in rebuilt.stdout.splitlines())
+
+    def test_taken_search_port_refuses_with_a_hint(self, stubs: dict[str, Path]) -> None:
+        result = _run_bootstrap(stubs, "--with-searxng", listening=(8888,))
+
+        assert result.returncode != 0
+        assert "127.0.0.1:8888 уже занят" in result.stderr
+        assert "NOEZEMA_DEV_SEARXNG_PORT=" in result.stderr
+
+    def test_flags_are_documented_in_help(self) -> None:
+        result = subprocess.run(
+            ["bash", str(BOOTSTRAP), "--help"], capture_output=True, text=True, timeout=60, check=False
+        )
+
+        assert result.returncode == 0
+        assert "--with-searxng" in result.stdout
+        assert "--recreate-searxng" in result.stdout
+
+
+class TestDevStandSearchSettings:
+    """Настройки поиска: секрет живёт только на ВМ (AGENTS §5), шаблон — в репо."""
+
+    def test_template_carries_no_secret(self) -> None:
+        text = SEARXNG_TEMPLATE.read_text(encoding="utf-8")
+
+        assert 'secret_key: "@SECRET@"' in text
+        assert "limiter: false" in text
+        assert "- html" in text and "- json" in text
+        assert "@SECRET@" in text
+        # A committed 32-byte hex key would mean a real secret leaked into the repository.
+        assert re.search(r"secret_key:\s*\"[0-9a-f]{16,}\"", text) is None
+
+    def test_bootstrap_renders_settings_instead_of_committing_them(self) -> None:
+        text = BOOTSTRAP.read_text(encoding="utf-8")
+
+        assert "searxng-settings.sh" in text
+        assert "/etc/noezema/searxng/settings.yml" in text
+
+    def test_renderer_generates_a_secret_and_never_prints_it(self, tmp_path: Path) -> None:
+        out = tmp_path / "settings.yml"
+
+        first = _run_settings_script(out)
+
+        assert first.returncode == 0, first.stdout + first.stderr
+        secret = _secret_of(out)
+        assert re.fullmatch(r"[0-9a-f]{32,64}", secret), "secret_key must be a generated hex token"
+        assert secret not in first.stdout and secret not in first.stderr
+        assert "@SECRET@" not in out.read_text(encoding="utf-8")
+        assert out.stat().st_mode & 0o777 == 0o644  # readable by the (non-owner) uid inside the container
+
+    def test_rerun_keeps_the_secret_rotation_is_explicit(self, tmp_path: Path) -> None:
+        out = tmp_path / "settings.yml"
+
+        _run_settings_script(out)
+        first = _secret_of(out)
+        again = _run_settings_script(out)
+        assert again.returncode == 0, again.stdout + again.stderr
+        assert "оставляем" in again.stdout
+        assert _secret_of(out) == first
+
+        rotated = _run_settings_script(out, "--rotate-secret")
+        assert rotated.returncode == 0, rotated.stdout + rotated.stderr
+        assert _secret_of(out) != first
+        assert first not in rotated.stdout
+
+    def test_check_mode_is_read_only(self, tmp_path: Path) -> None:
+        out = tmp_path / "nested" / "settings.yml"
+
+        missing = subprocess.run(
+            ["bash", str(SEARXNG_SCRIPT), "--out", str(out), "--check"],
+            capture_output=True, text=True, timeout=60, check=False,
+        )
+        assert missing.returncode == 1 and not out.exists()
+
+        _run_settings_script(out)
+        ready = subprocess.run(
+            ["bash", str(SEARXNG_SCRIPT), "--out", str(out), "--check"],
+            capture_output=True, text=True, timeout=60, check=False,
+        )
+        assert ready.returncode == 0 and "готовы" in ready.stdout
+
+    def test_readme_documents_the_search_package(self) -> None:
+        text = (REPO_ROOT / "deploy" / "dev-stand" / "README.md").read_text(encoding="utf-8")
+
+        assert "## Поиск (SearXNG, T7.70)" in text
+        assert "./bootstrap.sh --with-searxng" in text
+        assert "sudo docker rm -v -f noezema-searxng" in text
+        assert "/etc/noezema/searxng/settings.yml" in text
+        assert "127.0.0.1:8888" in text
+        # The rollback and the firewall guidance are operator actions, not script actions.
+        assert "не меняет UFW и iptables" in text
+
+
+class TestDevStandStatusSearch:
+    """status.sh обязан сказать про поиск три вещи: есть/нет, отвечает/нет, режим снапшота."""
+
+    def test_status_reports_the_missing_search_container(self, stubs: dict[str, Path]) -> None:
+        result = _run_status(stubs)
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "SearXNG: контейнера нет" in result.stdout
+        assert "режим research_proxy активного снапшота" in result.stdout
+
+    def test_status_reports_an_existing_container_without_probing_it(self, stubs: dict[str, Path]) -> None:
+        result = _run_status(
+            stubs,
+            "--no-search",
+            extra_env={"STUB_CONTAINER_NAME": "noezema-searxng", "STUB_PUBLISHED_PORT": "8888"},
+        )
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "SearXNG: контейнер есть" in result.stdout
+        assert "не проверяли (--no-search)" in result.stdout
+
+    def test_search_probe_is_opt_out_not_opt_in(self) -> None:
+        text = STATUS.read_text(encoding="utf-8")
+
+        assert "--no-search" in text
+        assert "research_proxy->>'mode'" in text
+        assert "web.search доступен модели в этом снапшоте" in text
+

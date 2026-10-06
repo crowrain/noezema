@@ -19,9 +19,11 @@
 
 | файл | что делает |
 |---|---|
-| `bootstrap.sh` | идемпотентная установка: пакеты → venv/зависимости → env-файл с секретами → каталоги + sandbox-образ → Postgres 15 в docker (127.0.0.1) → база + миграции + активация конфигурации → юниты |
+| `bootstrap.sh` | идемпотентная установка: пакеты → venv/зависимости → env-файл с секретами → каталоги + sandbox-образ → Postgres 15 в docker (127.0.0.1) → база + миграции + активация конфигурации → юниты → поиск SearXNG (только по `--with-searxng`) |
 | `systemd/*` | 8 файлов стенда: target, web, tick+timer, maint+timer, unit-state+timer |
-| `status.sh` | состояние: юниты, docker, очередь вопросов, последняя сессия, доступность LLM, версия кода, режим исполнителя инструментов |
+| `searxng/settings.yml` | ШАБЛОН настроек поиска (formats html+json, limiter off); `secret_key` здесь — плейсхолдер, настоящего секрета в репозитории нет |
+| `searxng-settings.sh` | рендер настроек из шаблона: генерирует `secret_key` (не печатает), повторный запуск ключ не ротирует |
+| `status.sh` | состояние: юниты, docker, очередь вопросов, последняя сессия, доступность LLM, версия кода, режим исполнителя инструментов, поиск (SearXNG + режим research_proxy снапшота) |
 | `reset-db.sh` | пересоздание dev-базы с явным подтверждением + миграции + повторная активация config-v13 |
 | `README.md` | этот файл |
 
@@ -37,8 +39,8 @@ systemctl start noezema-dev.target            # web + unit-state и maint (ти�
 ```
 
 Флаги `bootstrap.sh`: `--dry-run`, `--no-docker-install`, `--no-units`, `--stub-executor`,
-`--force`, `--rotate-secrets`, `--with-tick-timer`, `--web-host 0.0.0.0`, `--web-port 8321`,
-`--user <name>`.
+`--force`, `--rotate-secrets`, `--with-tick-timer`, `--with-searxng`, `--recreate-searxng`,
+`--web-host 0.0.0.0`, `--web-port 8321`, `--user <name>`.
 Идемпотентность: повторный запуск не пересоздаёт venv, базу, контейнер Postgres и sandbox-образ.
 `--force` пересоздаёт venv (`uv venv --clear`) и юниты, заново пишет env-файл **теми же секретами**:
 пока существуют контейнер или том Postgres, ни пароль БД, ни admin-токен не ротируются — пароль живёт
@@ -58,6 +60,7 @@ systemctl start noezema-dev.target            # web + unit-state и maint (ти�
 | данные сессий | `/var/lib/noezema-dev` (+ `sandbox` — work_root контейнерного исполнителя) |
 | host-контур стенда | `/var/lib/noezema-dev/host`, снимок юнитов: `/var/lib/noezema-dev/host/unit-state.json` |
 | секреты/настройки | `/etc/noezema/dev.env`, режим **0600**, владелец — пользователь стенда; в отчёты и чат не попадают (AGENTS §5) |
+| поиск (опционально) | контейнер `noezema-searxng` (`searxng/searxng:latest`), публикация **только на 127.0.0.1:8888** (внутри 8080); настройки `/etc/noezema/searxng/settings.yml` — `secret_key` генерируется на ВМ и в репозиторий не попадает; ставится только по `--with-searxng` (раздел «Поиск (SearXNG)») |
 | web UI/API | `127.0.0.1:8321` по умолчанию (`NOEZEMA_WEB_HOST`/`NOEZEMA_WEB_PORT`) |
 | sandbox-образ | `noezema-sandbox:dev-stand` (собран из `sandbox/Containerfile`, закреплён одной меткой в `NOEZEMA_SANDBOX_IMAGE`; dev/test метки не затрагиваются) |
 | LLM | `http://192.168.1.42:8080/v1`, модель `qwen38-exl3-3bpw-128k`, `NOEZEMA_LLM_SCHEMA_PROFILE=none`, `MAX_OUTPUT_TOKENS=8192`, `TIMEOUT_SECONDS=600` (переопределяется `NOEZEMA_DEV_LLM_*`) |
@@ -217,6 +220,57 @@ sudo ufw allow out to any port 80,443 proto tcp                      # apt и п
 фактом, и посмотреть шаги карточки ответа (`research.fetch → completed`); режим активного снапшота виден
 в строке «конфиг» `status.sh` (имя payload-файла). Подробный разбор: `docs/web-access-design.md` §6–7 и
 STATUS §T7.68.
+
+## Поиск (SearXNG, T7.70)
+
+Поисковый пакет ставится **только по явному флагу** и только там, где это разрешено режимом снапшота:
+
+```bash
+./bootstrap.sh --with-searxng          # настройки + контейнер noezema-searxng на 127.0.0.1:8888
+./bootstrap.sh --with-searxng --recreate-searxng   # пересобрать контейнер (иначе существующий НЕ трогается)
+```
+
+Что делает шаг и чего он не делает:
+
+- настройки пишутся в `/etc/noezema/searxng/settings.yml` из шаблона
+  `deploy/dev-stand/searxng/settings.yml`; `secret_key` **генерируется на ВМ**, не печатается и не
+  хранится в репозитории (в шаблоне — плейсхолдер). Повторный запуск существующий ключ НЕ ротирует
+  (ротация — отдельный осознанный шаг: `deploy/dev-stand/searxng-settings.sh --out … --rotate-secret`);
+- контейнер публикуется **только на 127.0.0.1:8888** (внутри SearXNG слушает 8080), restart-policy
+  `unless-stopped`, настройки примонтированы read-only;
+- готовности ждут тем же способом, каким узел будет пользоваться поиском: HTTP 200 + JSON на
+  `http://127.0.0.1:8888/search?q=test&format=json` (≤60 с). Пробный запрос настоящий — он уходит к
+  поисковым движкам; если исходящие закрыты, шаг падает с диагностикой (состояние контейнера, лог,
+  подсказка про 80/443 и DNS), а не молча оставляет полу-установку;
+- **`bootstrap.sh` не меняет UFW и iptables**: он печатает нужные правила. Исходящие 80/443 tcp и
+  DNS 53 применяет оператор (раздел «ВМ с deny-by-default UFW» выше); на этой ВМ трафик контейнера
+  уже выпускает цепочка `DOCKER-FORWARD`, а список `DOCKER-USER` пуст — их пакет тоже не трогает;
+- без флага `--with-searxng` шаг ничего не создаёт и не удаляет: если контейнер уже есть, сообщается
+  его состояние и что пересоздавать его никто не будет.
+
+Удаление (откат) — осознанная команда оператора:
+
+```bash
+sudo docker rm -v -f noezema-searxng      # настройки остаются в /etc/noezema/searxng/ (их удаляют вручную)
+```
+
+Как это связано с узлом: `research_proxy` (единственный egress, §5.12) в режиме **curated** отправляет
+поисковый запрос на `research_proxy.searxng_url` — в config-v13/v14 это `http://127.0.0.1:8888`, он же
+в `private_allowlist`. Лимит расхода держит узел, а не контейнер: `rate_limit_max`/`rate_limit_window_seconds`
+из активного снапшота (сейчас 20 запросов на 3600 с), каждый upstream-записанный запрос виден в ленте
+(`research_upstream_request`, при отказе — `research_fetch_rejected` с причиной
+`upstream_rate_limit_exceeded`). Встроенный limiter SearXNG выключен специально: он отвечал бы 429 на
+JSON-запросы автоматического клиента, а ограничивает расход узел.
+
+Состояние — одной строкой в `status.sh` (раздел «поиск (SearXNG)»): контейнер есть/нет, отвечает/нет,
+режим `research_proxy` активного снапшота (`mode`, `searxng_url`, лимит, число разрешённых доменов) и
+то, выдан ли модели инструмент `web.search` в этом снапшоте. Проверку ответа можно пропустить:
+`./status.sh --no-search` (off-VM запуск).
+
+Границы, которые пакет не меняет: в режиме **sealed** поиска у модели нет вовсе (локальный индекс —
+`memory.search`), в open_lab upstream-поиска нет; найденные заголовки и фрагменты — недоверенные данные
+и не становятся доказательством: факт появляется только после `research.fetch` выбранной страницы.
+Решение и разбор: `docs/web-access-design.md` §5/§7.2, ADR-0027 §4 и ADR-0028, STATUS §T7.70/T7.71.
 
 ## Безопасность и границы
 

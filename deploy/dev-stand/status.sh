@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # NOEZEMA dev stand status (T7.59(b)): units, DB, question queue, last session, LLM availability,
-# code version, executor mode. Read-only: it changes nothing and never prints secrets (AGENTS §5).
+# code version, executor mode, search package (SearXNG). Read-only: it changes nothing and never
+# prints secrets (AGENTS §5).
 #
 #   ./status.sh              everything
 #   ./status.sh --no-llm     skip the LLM probe (use this off the stand VM)
 #   ./status.sh --no-web     skip the HTTP probes
+#   ./status.sh --no-search  skip the SearXNG JSON probe (контейнер и режим снапшота всё равно покажем)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -14,14 +16,18 @@ DB_CONTAINER="${NOEZEMA_DEV_DB_CONTAINER:-noezema-dev-db}"
 DB_NAME="${NOEZEMA_DEV_DB_NAME:-noezema-dev}"
 DB_USER=noezema
 UNIT_PREFIX=noezema-dev
+SEARXNG_CONTAINER="${NOEZEMA_DEV_SEARXNG_CONTAINER:-noezema-searxng}"
+SEARXNG_PORT="${NOEZEMA_DEV_SEARXNG_PORT:-8888}"
 
 SKIP_LLM=false
 SKIP_WEB=false
+SKIP_SEARCH=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --no-llm) SKIP_LLM=true ;;
     --no-web) SKIP_WEB=true ;;
-    -h|--help) sed -n '2,10p' "$0"; exit 0 ;;
+    --no-search) SKIP_SEARCH=true ;;
+    -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
     *) echo "unknown flag: $1" >&2; exit 2 ;;
   esac
   shift
@@ -153,6 +159,58 @@ if have docker && docker ps --format '{{.Names}}' | grep -qx "$DB_CONTAINER"; th
   note "node_state (БД — источник истины, T7.59(в)): ${node_state:-не задан} | непустых сессий в БД: $(q "SELECT count(*) FROM sessions WHERE state NOT IN ('succeeded','succeeded_partial','failed','cancelled')")"
 else
   note "Postgres недоступен — пропущено"
+fi
+
+say "поиск (SearXNG)"
+SEARXNG_PUB="127.0.0.1:${SEARXNG_PORT}"
+if ! have docker; then
+  note "docker недоступен — про поиск ничего не сказать"
+else
+  if docker ps -a --format '{{.Names}}' | grep -qx "$SEARXNG_CONTAINER"; then
+    searxng_state="$(docker inspect -f '{{.State.Status}}' "$SEARXNG_CONTAINER" 2>/dev/null || echo '?')"
+    searxng_ports="$(docker inspect -f '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostIp}}:{{(index $conf 0).HostPort}}{{end}}{{end}}' "$SEARXNG_CONTAINER" 2>/dev/null || echo '?')"
+    note "SearXNG: контейнер есть ($SEARXNG_CONTAINER, $searxng_state, publish $searxng_ports)"
+    if $SKIP_SEARCH; then
+      note "отвечает или нет — не проверяли (--no-search)"
+    else
+      # Проверка ровно тем эндпоинтом, который использует узел: JSON-ответ /search. Пробный запрос
+      # настоящий и уходит к внешним движкам (это и есть проверка egress), поэтому её можно пропустить.
+      "$PY" - "$SEARXNG_PUB" <<'PY' 2>&1 | sed 's/^/   /'
+import json
+import sys
+import urllib.parse
+import urllib.request
+
+base = sys.argv[1]
+params = urllib.parse.urlencode({"q": "test", "format": "json"})
+try:
+    with urllib.request.urlopen(f"http://{base}/search?{params}", timeout=10) as response:
+        status = response.status
+        payload = json.loads(response.read().decode("utf-8"))
+except Exception as exc:  # noqa: BLE001 — отчёт обязан назвать причину, а не молчать
+    print(f"SearXNG: НЕ отвечает на {base}/search (format=json): {type(exc).__name__}: {exc}")
+else:
+    results = payload.get("results") if isinstance(payload, dict) else None
+    if status != 200 or not isinstance(results, list):
+        print(f"SearXNG: ответил HTTP {status}, но JSON-формат (/search?format=json) не работает")
+    else:
+        print(f"SearXNG: отвечает (HTTP 200 + JSON), результатов на пробный запрос: {len(results)}")
+PY
+    fi
+  else
+    note "SearXNG: контейнера нет ($SEARXNG_CONTAINER) — поставить: ./bootstrap.sh --with-searxng"
+  fi
+
+  if have docker && docker ps --format '{{.Names}}' | grep -qx "$DB_CONTAINER"; then
+    # Режим egress и расход берются из активного снапшота (AGENTS §3): он решает, уходит ли поисковый
+    # запрос к внешним движкам, кому именно и с каким лимитом (§5.12.1).
+    search_mode="$(docker exec "$DB_CONTAINER" psql -U "$DB_USER" -d "$DB_NAME" -Atc "SELECT coalesce(s.research_proxy->>'mode','—')||' | searxng_url='||coalesce(s.research_proxy->>'searxng_url','—')||' | лимит='||coalesce(s.research_proxy->>'rate_limit_max','—')||' запросов на '||coalesce(s.research_proxy->>'rate_limit_window_seconds','—')||' с | разрешённых доменов: '||coalesce(jsonb_array_length(s.research_proxy->'allowed_domains'),0)||' (пусто = открытый список, §5.12 ADR-0027)' FROM runtime_config_heads h JOIN config_snapshots s ON s.id=h.active_config_snapshot_id WHERE h.scope='global'" 2>/dev/null || true)"
+    note "режим research_proxy активного снапшота: ${search_mode:-снапшота нет}"
+    search_tool="$(docker exec "$DB_CONTAINER" psql -U "$DB_USER" -d "$DB_NAME" -Atc "SELECT CASE WHEN EXISTS (SELECT 1 FROM jsonb_array_elements_text(s.policy->'capabilities'->'tools') t WHERE t='web.search') THEN 'да' ELSE 'нет' END||' | инструменты снапшота: '||(SELECT string_agg(t, ', ') FROM jsonb_array_elements_text(s.policy->'capabilities'->'tools') t) FROM runtime_config_heads h JOIN config_snapshots s ON s.id=h.active_config_snapshot_id WHERE h.scope='global'" 2>/dev/null || true)"
+    note "web.search доступен модели в этом снапшоте: ${search_tool:-снапшота нет}"
+  else
+    note "режим research_proxy активного снапшота: Postgres недоступен — пропущено"
+  fi
 fi
 
 if ! $SKIP_WEB; then

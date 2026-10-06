@@ -17,6 +17,18 @@
 #                                        tick timer is NOT enabled (T7.61(б)) — a stand starts a session only
 #                                        when the operator presses «wake now». An already-enabled timer is
 #                                        never silently disabled: the script reports its state instead.
+#   ./bootstrap.sh --with-searxng        install the search package (T7.70, §5.12): settings are rendered
+#                                        into /etc/noezema/searxng/settings.yml (secret generated there,
+#                                        never printed and never committed) and the container is published on
+#                                        127.0.0.1:8888 only — that is the address research_proxy uses as
+#                                        searxng_url in the config snapshot. Without the flag NOTHING search
+#                                        related is created, changed or removed: an existing container is
+#                                        only reported. Upstream engines are reachable only if the operator
+#                                        opened egress 80/443 + DNS (printed as guidance; the script never
+#                                        changes UFW or iptables — AGENTS §5 host contour).
+#   ./bootstrap.sh --recreate-searxng    explicit rebuild of the search container (docker rm -f + run).
+#                                        Without this flag a running OR existing container is never recreated:
+#                                        settings are rendered, a stopped container is started, done.
 #
 #
 # Env knobs (all optional): NOEZEMA_DEV_USER / _APP_DIR / _DATA_ROOT / _ENV_FILE,
@@ -69,6 +81,16 @@ TOOL_EXECUTOR="${NOEZEMA_DEV_TOOL_EXECUTOR:-sandbox}"
 WEB_HOST="${NOEZEMA_DEV_WEB_HOST:-127.0.0.1}"
 WEB_PORT="${NOEZEMA_DEV_WEB_PORT:-8321}"
 
+# Поиск (T7.70, §5.12): SearXNG ставится ТОЛЬКО по --with-searxng. Контейнер публикуется на 127.0.0.1:8888
+# (внутри он слушает 8080 как обычно) — это ровно тот адрес, который снапшот конфигурации записывает как
+# research_proxy.searxng_url (config-v13 уже содержит http://127.0.0.1:8888 в private_allowlist).
+SEARXNG_CONTAINER="${NOEZEMA_DEV_SEARXNG_CONTAINER:-noezema-searxng}"
+SEARXNG_IMAGE="${NOEZEMA_DEV_SEARXNG_IMAGE:-searxng/searxng:latest}"
+SEARXNG_PORT="${NOEZEMA_DEV_SEARXNG_PORT:-8888}"
+SEARXNG_INTERNAL_PORT=8080
+SEARXNG_SETTINGS_DIR="${NOEZEMA_DEV_SEARXNG_SETTINGS_DIR:-/etc/noezema/searxng}"
+SEARXNG_READY_TIMEOUT="${NOEZEMA_DEV_SEARXNG_READY_TIMEOUT:-60}"   # ожидание JSON /search, секунд
+
 LLM_BASE_URL="${NOEZEMA_DEV_LLM_BASE_URL:-http://192.168.1.42:8080/v1}"
 LLM_MODEL="${NOEZEMA_DEV_LLM_MODEL:-qwen38-exl3-3bpw-128k}"
 LLM_SCHEMA_PROFILE="${NOEZEMA_DEV_LLM_SCHEMA_PROFILE:-none}"
@@ -93,6 +115,10 @@ WITH_UNITS=true
 # T7.61(б): плановые сессии — НЕ по умолчанию. Без флага тик-таймер не включается ни при первом,
 # ни при повторном запуске; уже включённый таймер скрипт сам не отключает (см. step_units).
 WITH_TICK_TIMER=false
+# T7.70: пакет поиска — тоже НЕ по умолчанию (он означает исходящий трафик к внешним движкам).
+# Существующий контейнер поиска без --recreate-searxng не пересоздаётся никогда.
+WITH_SEARXNG=false
+RECREATE_SEARXNG=false
 
 # ── helpers ───────────────────────────────────────────────────────────────────────────
 say()  { printf '\n\033[1m== %s\033[0m\n' "$*"; }
@@ -232,6 +258,8 @@ while [[ $# -gt 0 ]]; do
     --no-units) WITH_UNITS=false ;;
     --stub-executor) TOOL_EXECUTOR=stub ;;
     --with-tick-timer) WITH_TICK_TIMER=true ;;
+    --with-searxng) WITH_SEARXNG=true ;;
+    --recreate-searxng) RECREATE_SEARXNG=true ;;
     --web-host) WEB_HOST="${2:?--web-host needs a value}"; shift ;;
     --web-port) WEB_PORT="${2:?--web-port needs a value}"; shift ;;
     --user) STAND_USER="${2:?--user needs a value}"; shift ;;
@@ -607,6 +635,117 @@ step_units() {
   note "started by you: systemctl start noezema-dev.target (the stand is not pulled in at boot)"
 }
 
+# ── 8. поиск (SearXNG): только по --with-searxng (T7.70, §5.12/§5.12.1) ────────────────
+# Что это вообще такое: research_proxy (единственный egress узла) в режиме curated отправляет
+# поисковый запрос на локальный SearXNG и получает навигационные данные (заголовок/url/фрагменты).
+# Скорость, расход и раскрытие темы ограничивает узел (rate limit + журнал upstream из снапшота),
+# а не контейнер. Контейнер публикуется только на 127.0.0.1: наружу он ничего не слушает.
+searxng_container_state() {  # '' = контейнера нет; иначе одна строка состояния
+  have docker || return 0
+  docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$SEARXNG_CONTAINER" || return 0
+  docker inspect -f 'state={{.State.Status}} restart={{.HostConfig.RestartPolicy.Name}} ports={{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{(index $conf 0).HostIp}}:{{(index $conf 0).HostPort}}<-{{$p}}{{end}}{{end}}' \
+    "$SEARXNG_CONTAINER" 2>/dev/null || printf 'state=unknown'
+}
+
+# Guidance only: ни UFW, ни iptables, ни цепочку DOCKER-FORWARD скрипт не трогает (AGENTS §5).
+searxng_egress_notes() {
+  note "что нужно хосту, чтобы upstream-поиск работал (правила применяете ВЫ, не скрипт):"
+  note "  исходящие 80/443 tcp — запросы SearXNG к поисковым движкам идут из контейнера (§5.12.1)"
+  note "  исходящие DNS udp/tcp 53 — без резолвинга движков поиск не состоится"
+  note "  правило out на docker0 to 172.17.0.0/16 — оно же нужно для пулл образов"
+  note "  публикация только 127.0.0.1:$SEARXNG_PORT: контейнер не должен слушать ничего наружу"
+  note "полные команды — README, разделы «ВМ с deny-by-default UFW» и «Поиск (SearXNG)»"
+}
+
+searxng_json_ready() {  # ровно тот эндпоинт, который использует research proxy: /search?format=json
+  env NOEZEMA_SEARXNG_PROBE_URL="http://127.0.0.1:$SEARXNG_PORT" "$VENV/bin/python" - >/dev/null 2>&1 <<'PY'
+import json
+import os
+import urllib.parse
+import urllib.request
+
+base = os.environ["NOEZEMA_SEARXNG_PROBE_URL"]
+query = urllib.parse.urlencode({"q": "test", "format": "json"})
+with urllib.request.urlopen(f"{base}/search?{query}", timeout=10) as response:
+    if response.status != 200:
+        raise SystemExit(1)
+    payload = json.loads(response.read().decode("utf-8"))
+if not isinstance(payload, dict) or "results" not in payload:
+    raise SystemExit(1)
+PY
+}
+
+step_searxng() {
+  say "8. поиск (SearXNG)"
+  local state settings running waited probe_ok
+  state="$(searxng_container_state)"
+  settings="$SEARXNG_SETTINGS_DIR/settings.yml"
+
+  if ! $WITH_SEARXNG; then
+    if [[ -n "$state" ]]; then
+      note "контейнер $SEARXNG_CONTAINER уже есть: $state — без --with-searxng мы его НЕ меняем (не пересоздаём, не останавливаем, не удаляем)"
+      note "проверить, что поиск отвечает: ./status.sh"
+    else
+      note "поиск не ставим (дефолт): пакет поднимается явно — ./bootstrap.sh --with-searxng"
+    fi
+    return 0
+  fi
+
+  searxng_egress_notes
+
+  # 1) settings: секрет генерируется на ВМ, в репозитории лежит только шаблон с плейсхолдером (AGENTS §5).
+  if $DRY_RUN; then
+    printf '   [dry-run] %s --out %s   (secret_key генерируется при установке и не печатается)\n' \
+      "$SCRIPT_DIR/searxng-settings.sh" "$settings"
+  else
+    run "${SUDO[@]}" bash "$SCRIPT_DIR/searxng-settings.sh" --out "$settings"
+  fi
+
+  # 2) container: существующий НЕ пересоздаётся, остановленный — поднимается.
+  if [[ -n "$state" ]] && $RECREATE_SEARXNG; then
+    note "пересоздаём по явному флагу --recreate-searxng: $state"
+    run "${SUDO[@]}" docker rm -f "$SEARXNG_CONTAINER"
+    state=""
+  elif [[ -n "$state" ]]; then
+    note "контейнер $SEARXNG_CONTAINER уже есть: $state — НЕ пересоздаём (для пересборки нужен --recreate-searxng)"
+    running="$(docker inspect -f '{{.State.Running}}' "$SEARXNG_CONTAINER" 2>/dev/null || echo false)"
+    [[ "$running" == "true" ]] || run "${SUDO[@]}" docker start "$SEARXNG_CONTAINER"
+  fi
+
+  if [[ -z "$state" ]]; then
+    if port_is_taken "$SEARXNG_PORT"; then
+      die "127.0.0.1:$SEARXNG_PORT уже занят (не нашим контейнером поиска): освободите его или задайте другой порт NOEZEMA_DEV_SEARXNG_PORT=<порт> и поменяйте research_proxy.searxng_url в снапшоте"
+    fi
+    note "публикуем 127.0.0.1:$SEARXNG_PORT (внутри контейнера SearXNG слушает $SEARXNG_INTERNAL_PORT)"
+    run "${SUDO[@]}" docker run -d --name "$SEARXNG_CONTAINER" --restart unless-stopped \
+      -v "$settings:/etc/searxng/settings.yml:ro" \
+      -p "127.0.0.1:$SEARXNG_PORT:$SEARXNG_INTERNAL_PORT" \
+      "$SEARXNG_IMAGE"
+  fi
+  if $DRY_RUN; then note "(dry-run: ожидание JSON-ответа пропущено)"; return 0; fi
+
+  # 3) readiness is measured on the endpoint the node actually calls (HTTP 200 + JSON with results).
+  # The probe itself goes to upstream engines: it is a real search for "test", and that is the point —
+  # a container that answers HTML but cannot reach engines is not a working search.
+  waited=0; probe_ok=false
+  while (( waited < SEARXNG_READY_TIMEOUT )); do
+    searxng_json_ready && { probe_ok=true; break; }
+    sleep 3
+    waited=$((waited + 3))
+  done
+  if ! $probe_ok; then
+    note "SearXNG не ответил JSON на 127.0.0.1:$SEARXNG_PORT/search за ${SEARXNG_READY_TIMEOUT} с. Диагностика:"
+    note "  контейнер: $(searxng_container_state)"
+    note "  настройки: $settings (secret_key внутри файла не печатается)"
+    "${SUDO[@]}" docker logs --tail 20 "$SEARXNG_CONTAINER" 2>&1 | mask_creds | sed 's/^/   log: /' || true
+    note "  частые причины: нет исходящих 80/443 или DNS (см. правила выше), чужой процесс занял порт,"
+    note "  контейнер не смог прочитать settings.yml (права), в настройках не включён формат json"
+    die "поиск не готов: сессии узла будут работать, upstream-поиск — нет (вернитесь к правилам выше)"
+  fi
+  note "SearXNG отвечает JSON на 127.0.0.1:$SEARXNG_PORT (за ${waited} с); настройки: $settings (секрет не печатается)"
+  note "снапшот указывает research_proxy.searxng_url=http://127.0.0.1:8888 — тот же адрес; состояние: ./status.sh"
+}
+
 step_summary() {
   say "готово"
   note "старт/стоп:   systemctl start|stop noezema-dev.target"
@@ -628,4 +767,5 @@ step_dirs_and_image
 step_postgres
 step_database
 step_units
+step_searxng
 step_summary
