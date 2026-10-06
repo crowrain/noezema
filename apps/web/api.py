@@ -59,6 +59,7 @@ from apps.orchestrator.scheduler import (
     data_root_from_env,
     node_owner_from_env,
 )
+from apps.orchestrator.session_assembly import build_session_orchestrator
 from apps.web import answer as answer_queries
 from apps.web import diagnostics as diagnostics_queries
 from apps.web import knowledge as knowledge_queries
@@ -2009,28 +2010,27 @@ def build_standalone_app() -> FastAPI:
     command time (`_command_orchestrator` in create_app) — this is the path a real stand uses, and
     the order here is exactly why an argument-only lookup used to answer "orchestrator not
     attached" on the stand while tests that passed the orchestrator as an argument stayed green.
-    """
-    from apps.orchestrator.tool_executors import build_tool_executor
-    from packages.llm_gateway.client import LLMMiddleware
-    from packages.llm_gateway.config import LLMGatewayConfig, ModelProfile
 
+    T7.68 (ADR-0027 §1): the orchestrator is assembled by the same pure builder as the wake tick,
+    eval-run and the manual entry (`apps.orchestrator.session_assembly`), so «wake now» now has a
+    research proxy too — before this wiring it had none, and every web-started session answered
+    `research.fetch` with "research proxy is not configured for this host" (docs/web-access-design.md
+    G1). The artifact store lands at `<NOEZEMA_DATA_ROOT>/artifacts` — the sibling of this factory's
+    workspace (`resolve_standalone_workspace`) and, on one node with one data root, the same directory
+    the tick writes. Like before T7.68 the web process does not close its gateway (it lives as long
+    as the app); tests close it through `app.state.orchestrator.gateway`.
+    """
     settings = DatabaseSettings()
-    llm_config = LLMGatewayConfig()
     # app owns the single engine; the orchestrator shares its factory
     app = create_app(db_url=settings.database_url)
     factory = app.state.factory
-    gateway = LLMMiddleware(llm_config)
-    orchestrator = Orchestrator(
-        session_factory=factory,
-        gateway=gateway,
-        profile=ModelProfile(model_alias=llm_config.model, backend_name="local"),
-        # T7.58 (ADR-0023): the same NOEZEMA_TOOL_EXECUTOR switch as the wake tick
-        # and the eval run; the default ("stub") keeps the previous behavior.
-        # T7.59(b): the workspace follows NOEZEMA_DATA_ROOT (the env the wake tick uses) instead
-        # of a hardcoded production path — same value when the env is unset, but a stand that runs
-        # as an ordinary user can actually create it. Sandbox mode ignores this path: its host
-        # overlay lives in NOEZEMA_SANDBOX_WORK_ROOT.
-        executor=build_tool_executor(resolve_standalone_workspace(data_root_from_env())),
+    # T7.58 (ADR-0023) + T7.59(b): the workspace follows NOEZEMA_DATA_ROOT (the env the wake tick
+    # uses) instead of a hardcoded production path — same value when the env is unset, but a stand
+    # that runs as an ordinary user can actually create it. Sandbox mode ignores this path: its host
+    # overlay lives in NOEZEMA_SANDBOX_WORK_ROOT; the artifact store (host-side research.fetch) does
+    # not ignore it — executor choice never moves the data root (T7.68).
+    orchestrator, _gateway = build_session_orchestrator(
+        factory, resolve_standalone_workspace(data_root_from_env())
     )
     app.state.orchestrator = orchestrator
     return app

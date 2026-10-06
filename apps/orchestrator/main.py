@@ -17,12 +17,9 @@ from apps.orchestrator.scheduler import (
     node_owner_from_env,
     workspace_root_from_env,
 )
-from apps.orchestrator.tool_executors import build_tool_executor
-from apps.research_proxy.service import ResearchProxyService
-from packages.artifacts.store import FilesystemArtifactStore
+from apps.orchestrator.session_assembly import build_session_orchestrator
 from packages.domain.db.engine import DatabaseSettings
 from packages.llm_gateway.client import LLMMiddleware
-from packages.llm_gateway.config import LLMGatewayConfig, ModelProfile
 
 
 def build_orchestrator(
@@ -47,21 +44,14 @@ def build_orchestrator(
     store stays host-side in both modes: it sits next to the workspace root
     (``<data root>/artifacts``), so whoever picks the data root moves artifacts
     with it (T7.59(в) — the manual entry no longer pins ``/var/lib/noezema``).
+
+    T7.68 (ADR-0027 §1): the assembly itself lives in
+    ``apps.orchestrator.session_assembly.build_session_orchestrator`` — one pure
+    builder shared with the standalone web factory, so no entry point can omit
+    the research service or move the artifact store to another directory. The
+    semantics pinned above are unchanged; this function is now a thin call.
     """
-    llm_config = LLMGatewayConfig()
-    profile = ModelProfile(model_alias=llm_config.model, backend_name="local")
-    gateway = LLMMiddleware(llm_config)
-    research_service = ResearchProxyService(
-        session_factory, FilesystemArtifactStore(workspace_root.parent / "artifacts")
-    )
-    orchestrator = Orchestrator(
-        session_factory=session_factory,
-        gateway=gateway,
-        profile=profile,
-        executor=build_tool_executor(workspace_root),
-        research_service=research_service,
-    )
-    return orchestrator, gateway
+    return build_session_orchestrator(session_factory, workspace_root)
 
 
 async def _run() -> int:
