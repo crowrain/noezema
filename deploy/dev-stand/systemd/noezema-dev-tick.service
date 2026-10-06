@@ -1,9 +1,9 @@
 # NOEZEMA dev stand wake tick (T7.59(b), §5.2.1) — NOT a copy of infra/systemd/noezema-wake.service.
 #
 # One `hostctl wake-tick` per timer firing: schedule, admission gates and backoff live in the
-# effective config snapshot (config-v13 activated by bootstrap.sh), not in this unit.
+# effective config snapshot (config-v14 activated by bootstrap.sh), not in this unit.
 #
-# On a GPU-less stand VM with config-v13 (wake_schedule.gpu_required = false) admission passes and
+# On a GPU-less stand VM with config-v14 (wake_schedule.gpu_required = false) admission passes and
 # nothing is skipped for GPU reasons. If gpu_required were true the tick would print "skip (gpu)"
 # and exit 0 — that is NOT an error, it is the gate doing its job (§5.2.1).
 #

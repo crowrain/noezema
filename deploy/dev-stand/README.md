@@ -24,7 +24,7 @@
 | `searxng/settings.yml` | ШАБЛОН настроек поиска (formats html+json, limiter off); `secret_key` здесь — плейсхолдер, настоящего секрета в репозитории нет |
 | `searxng-settings.sh` | рендер настроек из шаблона: генерирует `secret_key` (не печатает), повторный запуск ключ не ротирует |
 | `status.sh` | состояние: юниты, docker, очередь вопросов, последняя сессия, доступность LLM, версия кода, режим исполнителя инструментов, поиск (SearXNG + режим research_proxy снапшота) |
-| `reset-db.sh` | пересоздание dev-базы с явным подтверждением + миграции + повторная активация config-v13 |
+| `reset-db.sh` | пересоздание dev-базы с явным подтверждением + миграции + повторная активация config-v14 |
 | `README.md` | этот файл |
 
 ## Деплой (делает менеджер)
@@ -56,7 +56,7 @@ systemctl start noezema-dev.target            # web + unit-state и maint (ти�
 | приложение | репозиторий как есть (`$APP_DIR`), venv в `$APP_DIR/.venv`, зависимости **только через uv** и только prod-extras (AGENTS §6) |
 | база | docker-контейнер `noezema-dev-db` (образ `postgres:15`), том `noezema-dev-pgdata`, публикация **только на 127.0.0.1**, база `noezema-dev`, пользователь `noezema`. Порт выбирается до записи env-файла: 5432, а если на хосте он уже занят (нативный `postgresql.service`) — первый свободный из 5433..5440; выбранный порт пишется в env-файл (`NOEZEMA_DEV_DB_PORT`), повторный запуск переиспользует порт существующего контейнера. `NOEZEMA_DEV_DB_PORT=<порт>` задаёт явно: занят → понятная ошибка, а не молчаливый переезд |
 | миграции | `alembic upgrade head` из venv (URL из env-файла) |
-| конфигурация | активация `docs/eval/config-v13-payload.json` через `hostctl activate-online` (окно EXL3 131072; пропускается, если снапшот уже активен; переход v12→v13 — STATUS.md T7.59(в)) |
+| конфигурация | активация `docs/eval/config-v14-payload.json` через `hostctl activate-online` (окно EXL3 131072; поиск `web.search` + промпт explorer-v6; пропускается, если снапшот уже активен; переход v13→v14 — STATUS.md T7.71) |
 | данные сессий | `/var/lib/noezema-dev` (+ `sandbox` — work_root контейнерного исполнителя) |
 | host-контур стенда | `/var/lib/noezema-dev/host`, снимок юнитов: `/var/lib/noezema-dev/host/unit-state.json` |
 | секреты/настройки | `/etc/noezema/dev.env`, режим **0600**, владелец — пользователь стенда; в отчёты и чат не попадают (AGENTS §5) |
@@ -109,7 +109,7 @@ systemctl start noezema-dev.target            # web + unit-state и maint (ти�
    Postgres остаётся: `docker stop noezema-dev-db`).
 9. **Сброс:** `./deploy/dev-stand/reset-db.sh` — просит вписать имя базы (защита от «а вдруг это
    прод-база»), останавливает таймеры, пересоздаёт `noezema-dev`, накатывает миграции, заново
-   активирует config-v13, поднимает таймеры. С защитой по состоянию: если в базе есть незавершённая
+   активирует config-v14, поднимает таймеры. С защитой по состоянию: если в базе есть незавершённая
    сессия, reset откажется — сначала дождаться её терминации (или остановить tick-таймер).
 
 ## Юниты стенда (8 файлов)
@@ -158,7 +158,7 @@ hostctl.cli wake-tick` — при занятой сессии он так же �
 
 ## VM без GPU и пустая очередь — это не ошибка
 
-- В `config-v13` стоит `wake_schedule.gpu_required = false`, поэтому на VM без GPU admission
+- В `config-v14` (как и в `config-v13`) стоит `wake_schedule.gpu_required = false`, поэтому на VM без GPU admission
   проходит и сессии запускаются. Если бы значение было `true`, тик напечатал бы `skip (gpu)` и вышел
   с кодом 0: шлюз работает, а не ломается (§5.2.1).
 - Расписание — `interval_seconds=3600`, `min_session_interval_seconds=600`; таймер тикает каждые

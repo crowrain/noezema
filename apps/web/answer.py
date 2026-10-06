@@ -45,9 +45,17 @@ from apps.web.knowledge import (
 from apps.web.reliability import LEVEL_VERIFIED, describe_verification
 from packages.domain.models.base import JsonDict
 from packages.domain.models.enums import QuestionState, SessionState
+from packages.domain.sanitization import mask_nul
 
 #: Короткий рассказ о работе: не больше шести шагов (дизайн упрощения интерфейса).
 MAX_STEPS: Final = 6
+#: Сколько символов поискового запроса показываем в шаге (T7.71); длинный хвост просто отрезается.
+SEARCH_QUERY_CHARS: Final = 80
+#: Действия, которым разрешено добавить пояснение из записи (домен страницы или текст поиска).
+NAMED_ACTIONS: Final[frozenset[str]] = frozenset({"research.fetch", "web.search"})
+#: Что дисквалифицирует показ данных в человеческой строке: символ спецификации, номер задачи плана,
+#: hex/uuid-подобный идентификатор, код инструмента (те же границы, что проверяются для подписей).
+_STEP_UNSAFE: Final = re.compile(r"§|\bT\d+\.\d+\b|[0-9a-fA-F]{16,}|\b[a-z][a-z0-9]*_[a-z0-9_]+\b")
 #: Сколько сессий одного вопроса показываем.
 MAX_SESSIONS: Final = 25
 #: Сколько событий ленты дочитываем у одной сессии (как в GET /api/v1/sessions/{id}).
@@ -152,6 +160,42 @@ def host_of_url(arguments: object) -> str:
     return host
 
 
+def search_query_of(arguments: object) -> str:
+    """Запрос поиска из записанных аргументов действия — единственное, что мы называем.
+
+    Как и домен, берётся ровно то, что записал узел в действии (T7.71): ничего не добавляется и не
+    переформулируется. Одна строка, без управляющих символов, с потолком длины. Если запись содержит
+    то, чего в человеческой строке на экране быть не должно (символ спецификации, номер задачи плана,
+    hex-подобный идентификатор, код инструмента), запрос не показываем вовсе — шаг остаётся просто с
+    названием действия. Название действия при этом берётся из словаря подписей, а не из данных.
+    """
+    text = _arguments_text(arguments)
+    if not text:
+        return ""
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        return ""
+    raw = parsed.get("query") if isinstance(parsed, Mapping) else None
+    if not isinstance(raw, str):
+        return ""
+    query = mask_nul(raw).replace("\r", " ").replace("\t", " ")
+    query = re.sub(r"\s+", " ", query).strip()[:SEARCH_QUERY_CHARS]
+    if not query or _STEP_UNSAFE.search(query):
+        return ""
+    return query
+
+
+def action_detail_of(tool: str, arguments: object) -> str:
+    """Что разрешено назвать рядом с действием: адрес прочитанной страницы или текст поиска.
+
+    Только для инструментов из `_NAMED_ACTIONS`; для остальных пояснения нет — выдумывать его нельзя.
+    """
+    if tool == "web.search":
+        return search_query_of(arguments)
+    return host_of_url(arguments)
+
+
 def times_phrase(count: int) -> str:
     """«2 раза» по-русски; для одного действия суффикс не нужен."""
     if count <= 1:
@@ -163,7 +207,11 @@ def times_phrase(count: int) -> str:
 
 
 def executed_actions(events: Sequence[Mapping[str, Any]]) -> tuple[list[tuple[str, int, str]], int]:
-    """Выполненные действия в порядке первого появления: (инструмент, число, домен).
+    """Выполненные действия в порядке первого появления: (инструмент, число, пояснение из записи).
+
+    Пояснение — домен прочитанной страницы или текст поискового запроса (T7.71), и только для
+    инструментов из `NAMED_ACTIONS`: его берём из записи действия, ничего не придумывая. Пустая строка
+    значит «показывать нечего».
 
     Считаются только `action_started`, чей исход записан успешным `action_completed`
     с `ok = true`. События сортируются по `sequence`: порядок строк на входе не
@@ -175,7 +223,7 @@ def executed_actions(events: Sequence[Mapping[str, Any]]) -> tuple[list[tuple[st
     pending: dict[str, tuple[str, str]] = {}
     order: list[str] = []
     counts: dict[str, int] = {}
-    domains: dict[str, str] = {}
+    named: dict[str, str] = {}
     failed = 0
 
     for event in ordered:
@@ -187,7 +235,7 @@ def executed_actions(events: Sequence[Mapping[str, Any]]) -> tuple[list[tuple[st
                 continue
             action_id = payload.get("action_id")
             key = action_id if isinstance(action_id, str) else f"anon-{len(pending)}"
-            pending[key] = (tool, host_of_url(payload.get("arguments")))
+            pending[key] = (tool, action_detail_of(tool, payload.get("arguments")))
         elif kind == "action_completed":
             action_id = payload.get("action_id")
             resolved = pending.pop(action_id, None) if isinstance(action_id, str) else None
@@ -196,14 +244,14 @@ def executed_actions(events: Sequence[Mapping[str, Any]]) -> tuple[list[tuple[st
                 continue
             if tool not in counts:
                 order.append(tool)
-                domains[tool] = ""
+                named[tool] = ""
             counts[tool] = counts.get(tool, 0) + 1
-            if resolved is not None and resolved[1] and not domains[tool]:
-                domains[tool] = resolved[1]
+            if resolved is not None and resolved[1] and not named[tool]:
+                named[tool] = resolved[1]
         elif kind == "action_failed":
             failed += 1
 
-    return [(tool, counts[tool], domains[tool]) for tool in order], failed
+    return [(tool, counts[tool], named[tool]) for tool in order], failed
 
 
 def build_answer_steps(events: Sequence[Mapping[str, Any]]) -> list[JsonDict]:
@@ -223,12 +271,14 @@ def build_answer_steps(events: Sequence[Mapping[str, Any]]) -> list[JsonDict]:
         _phrase("answer_step", "context_prepared") if "context_packed" in types else "",
     ]
     action_texts: list[str] = []
-    for tool, count, domain in groups:
+    for tool, count, detail in groups:
         label = known_label("action_tool", tool)
         if not label:
             label = _phrase("answer_step", "unnamed_action")
-        if tool == "research.fetch" and domain:
-            label = f"{label}: {domain}"
+        if tool in NAMED_ACTIONS and detail:
+            # T7.65/T7.71: к действию добавляется ровно то, что записано в самом действии
+            # (адрес страницы или текст поиска), а не пересказ его результата.
+            label = f"{label}: {detail}"
         repeat = times_phrase(count)
         action_texts.append(f"{label} — {repeat}" if repeat else label)
 

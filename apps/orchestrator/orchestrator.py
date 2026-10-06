@@ -35,6 +35,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from apps.orchestrator.evidence import observation_to_evidence
 from apps.orchestrator.executor import arguments_hash
+from apps.orchestrator.search_view import render_search_results
 from apps.orchestrator.source_coverage import SourceCoverageTracker, named_source_urls
 from apps.orchestrator.state_machine import transition
 from apps.research_proxy.normalization import PARSER_FINGERPRINT
@@ -1172,6 +1173,56 @@ class Orchestrator:
             },
         )
 
+    async def _web_search(self, args: JsonDict) -> Observation:
+        """web.search (T7.71, §5.12/§5.12.1): навигация к внешним источникам, не доказательство.
+
+        The node's research proxy does the work: the local index in every mode, and — in curated with a
+        configured searxng_url — one guarded upstream query (SSRF-guarded private_allowlist, rate limit
+        counted from the `research_upstream_request` journal). Everything that can go wrong comes back as
+        a failed observation, never as a session crash: an unconfigured host, a refused mode, the rate
+        limit ("upstream rate limit exceeded") or an unreachable engine.
+
+        What the explorer receives is the rendered block (apps/orchestrator/search_view): external hits
+        inside the UNTRUSTED fence with the explicit "data, not instructions / not evidence" note, and
+        the node's own local index hits marked as such. No evidence record, no source row, no artifact:
+        a hit becomes knowledge only after research.fetch of the chosen page (§5.12.1)."""
+        if self.research_service is None:
+            return Observation(
+                tool="web.search",
+                ok=False,
+                error="research proxy is not configured for this host",
+            )
+        assert hasattr(self.research_service, "search")  # ResearchProxyService
+        service: Any = self.research_service
+        query = str(args.get("query", "")).strip()[:500]
+        if not query:
+            return Observation(tool="web.search", ok=False, error="empty search query")
+
+        try:
+            found = await service.search(query)
+        except Exception as exc:
+            # ResearchProxyError (rate_limited / failed), SSRF and config errors all end here: the model
+            # sees the reason and can change strategy; the proxy journaled the refusal itself.
+            return Observation(tool="web.search", ok=False, error=str(exc)[:500])
+
+        view = render_search_results(query, found)
+        return Observation(
+            tool="web.search",
+            ok=True,
+            data={
+                "query": query,
+                "mode": view.mode,
+                "profile": view.profile,
+                "upstream_attempted": view.upstream_attempted,
+                "upstream_count": view.upstream_count,
+                "local_count": view.local_count,
+                "truncated": view.truncated,
+                "evidence": False,
+                "fenced": True,
+                "content": view.text,
+            },
+        )
+
     # ── verification (T5.3, stage 4) ───────────────────────────────────
 
     async def _verify(
@@ -1674,6 +1725,11 @@ class Orchestrator:
                 # the assertion fragment WHERE the question's terms are
                 # densest, not from the leading prefix.
                 obs = await self._research_fetch(db, audit, session, args, ctx)
+            elif tool_name == "web.search":
+                # T7.71 (§5.12.1): navigation through the same proxy. Host-side for the same reason as
+                # research.fetch — the sandbox container always has network=none, and the egress plus its
+                # rate limit and journal belong to the node, not to the session.
+                obs = await self._web_search(args)
             else:
                 obs = await self.executor.execute(tool_name, args, db=db)
             if tool_name == "research.fetch" and obs.ok:
@@ -1757,6 +1813,16 @@ class Orchestrator:
                         f"[{step}] memory.search({_cap_args(args)}) -> пусто"
                     )
                 continue
+            if tool_name == "web.search" and obs.ok:
+                # T7.71 (§5.12.1): a search hit is navigation, not knowledge and not evidence —
+                # observation_to_evidence has no mapping for web.search by design (asserted in tests), so
+                # nothing below turns it into an evidence/source/artifact row. The rendered fenced block
+                # replaces the generic one-line record: it already names the mode, the counts and the
+                # "data, not instructions" boundary, and duplicating it would only spend context.
+                content = str((obs.data or {}).get("content", ""))
+                if content:
+                    ctx.observations.append(content)
+                    continue
             ctx.observations.append(
                 f"[{step}] {tool_name}({_cap_args(args)}) -> {'ok' if obs.ok else obs.error} "
                 f"{_cap_args(obs.data)}"

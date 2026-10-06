@@ -26,6 +26,7 @@ tools:
   message.reply: true
   artifact.create: true
   research.fetch: true      # M6: только через Research Proxy
+  web.search: true          # T7.71 (§5.12, ADR-0027 §4): открытому профилю разрешён тот же поиск
 paths:
   writable: ["/workspace"]
   readable: ["/base", "/workspace"]

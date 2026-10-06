@@ -251,3 +251,68 @@ def test_config_v13_file_is_byte_stable_and_pinned() -> None:
         "fe931c15a34fe71e670c29a2aacc6e63ba3defd54b5db88923201f6342e1a0ed"
     )
     assert canonical_sha256(payload) == "0260fcd2f79035e634d49fe8304e44a3784b63dc0a81566687cbe52aa7f94ce0"
+
+@pytest.mark.unit
+def test_config_v14_differs_from_v13_only_by_the_search_grant_and_the_explorer_pin() -> None:
+    """T7.71 (ADR-0027 §4): config-v14 = config-v13 с двумя осознанными правками —
+    ``policy.capabilities.tools`` (+``web.search``, −несуществующего в реестре ``artifact.create``,
+    из-за которого шаги падали «unknown tool: artifact.create») и пин ``prompts.explorer`` →
+    explorer-v6 (v5 утверждает «сети нет», что на curated-стенде неправда). Всё остальное — байт в
+    байт v13: пороги, бюджеты, sampling, wake_schedule, research_proxy. v13 остаётся как закоммичен
+    (payload'ы не переписываются никогда)."""
+    v13 = _load("config-v13-payload.json")
+    v14 = _load("config-v14-payload.json")
+
+    assert {k for k in v14 if v14[k] != v13[k]} == {"policy", "prompts"}
+
+    tools13 = v13["policy"]["capabilities"]["tools"]
+    tools14 = v14["policy"]["capabilities"]["tools"]
+    assert set(tools14) - set(tools13) == {"web.search"}
+    assert set(tools13) - set(tools14) == {"artifact.create"}
+    # порядок внутри списка значим только как данные снапшота; проверяем содержимое и длину
+    # режим и сеть не меняются: изменён только список выданных инструментов
+    caps13, caps14 = v13["policy"]["capabilities"], v14["policy"]["capabilities"]
+    assert {k for k in caps14 if caps14[k] != caps13[k]} == {"tools"}
+    assert v14["policy"]["access_profile"] == v13["policy"]["access_profile"] == "curated"
+    assert {k for k in v14["policy"] if v14["policy"][k] != v13["policy"][k]} == {"capabilities"}
+
+    assert v14["prompts"]["explorer"] != v13["prompts"]["explorer"]
+    assert {r for r in v14["prompts"] if v14["prompts"][r] != v13["prompts"][r]} == {"explorer"}
+    assert v14["prompts"]["explorer"]["version"] == "explorer-v6"
+    assert v14["prompts"]["explorer"]["path"] == "prompts/explorer/explorer-v6.md"
+    resolved = resolve_prompts(v14["prompts"], REPO_ROOT)
+    assert resolved[Role.EXPLORER].version == "explorer-v6"
+    assert resolved[Role.CURATOR].version == "curator-v7"
+
+    # контекст и бюджеты — те же, что у v13: поиск не меняет окно модели
+    assert v14["model"] == v13["model"]
+    budgets14 = TokenBudgets.from_snapshot(v14["model"], v14["token_budgets"])
+    assert budgets14.section_limits == EVAL2_SECTIONS
+    assert sum(budgets14.section_limits.values()) == 26624 <= budgets14.input_budget == 120832
+    assert budgets14.validate() == []
+
+    for section in ("wake_schedule", "session_limits", "activation_limits", "claim_type_rules",
+                    "curiosity", "embeddings", "extraction", "planning", "reassessment_admission",
+                    "repair_admission", "repetition", "research_proxy", "schema_version",
+                    "verification", "token_budgets"):
+        assert v14[section] == v13[section], section
+
+
+@pytest.mark.unit
+def test_config_v14_file_is_byte_stable_and_pinned() -> None:
+    """Новый payload сохраняет форму frozen-файла (indent=2, sorted keys, trailing newline), а его
+    идентичность закреплена: хеш файла и canonical-хеш (именно он попадает в
+    ``config_snapshots.payload_sha256`` — AGENTS §8). Правка файла позже не пройдёт под тем же
+    именем конфигурации."""
+    import hashlib
+
+    from packages.domain.config import canonical_sha256
+
+    raw = (REPO_ROOT / "docs" / "eval" / "config-v14-payload.json").read_text(encoding="utf-8")
+    payload = json.loads(raw)
+    assert json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True) + "\n" == raw
+    assert hashlib.sha256(raw.encode()).hexdigest() == (
+        "6d361dae4454a56472de58df4c4c34577d6b1ff4cc870d9b418d72943256ed89"
+    )
+    assert canonical_sha256(payload) == "22903be78602cf7897f0de57b99514b66c58eca83960fa05458fd341e0104df4"
+
