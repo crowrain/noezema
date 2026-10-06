@@ -216,14 +216,18 @@ def executed_actions(events: Sequence[Mapping[str, Any]]) -> tuple[list[tuple[st
     Считаются только `action_started`, чей исход записан успешным `action_completed`
     с `ok = true`. События сортируются по `sequence`: порядок строк на входе не
     считается доказательством хронологии (AGENTS §7).
+
+    Повтор сворачивается только по полному совпадению действия и показываемой детали
+    (T7.67a): два `research.fetch` разных доменов — два шага («… : cbr.ru» и «… : expert.ru»),
+    а не один шаг с первым доменом и счётчиком 2; то же для двух `web.search` с разными
+    запросами. Два точных повтора одного действия сворачиваются в «— N раз» с настоящим числом.
     """
     ordered = sorted(
         (event for event in events if isinstance(event, Mapping)), key=_sequence_of
     )
     pending: dict[str, tuple[str, str]] = {}
-    order: list[str] = []
-    counts: dict[str, int] = {}
-    named: dict[str, str] = {}
+    order: list[tuple[str, str]] = []
+    counts: dict[tuple[str, str], int] = {}
     failed = 0
 
     for event in ordered:
@@ -242,16 +246,17 @@ def executed_actions(events: Sequence[Mapping[str, Any]]) -> tuple[list[tuple[st
             tool = resolved[0] if resolved is not None else payload.get("tool")
             if not isinstance(tool, str) or payload.get("ok") is not True:
                 continue
-            if tool not in counts:
-                order.append(tool)
-                named[tool] = ""
-            counts[tool] = counts.get(tool, 0) + 1
-            if resolved is not None and resolved[1] and not named[tool]:
-                named[tool] = resolved[1]
+            # деталь участвует в свёртке ровно когда её разрешено показывать (тот же
+            # фильтр, что у названия шага): скрытая деталь не имеет права раскалывать шаг.
+            detail = resolved[1] if resolved is not None and tool in NAMED_ACTIONS else ""
+            group = (tool, detail)
+            if group not in counts:
+                order.append(group)
+            counts[group] = counts.get(group, 0) + 1
         elif kind == "action_failed":
             failed += 1
 
-    return [(tool, counts[tool], named[tool]) for tool in order], failed
+    return [(tool, counts[group], detail) for tool, detail in order], failed
 
 
 def build_answer_steps(events: Sequence[Mapping[str, Any]]) -> list[JsonDict]:
@@ -435,6 +440,21 @@ async def question_answer(db: AsyncSession, question_id: uuid.UUID) -> JsonDict 
     if question is None:
         return None
 
+    # T7.67a: сквозной номер вопроса — тот же порядок, что у очереди
+    # (`created_at ASC, id ASC` по всей таблице), посчитанный тем же оконным
+    # выражением: карточка и список не могут разойтись в нумерации.
+    number = (
+        await db.execute(
+            text(
+                "SELECT number FROM ("
+                "  SELECT id, row_number() OVER (ORDER BY created_at ASC, id ASC) AS number"
+                "  FROM questions"
+                ") numbered WHERE id = :id"
+            ),
+            {"id": question_id},
+        )
+    ).scalar_one_or_none()
+
     sessions: list[Any] = list(
         (
             await db.execute(
@@ -611,6 +631,8 @@ async def question_answer(db: AsyncSession, question_id: uuid.UUID) -> JsonDict 
             "origin_label": known_label("question_origin", question["origin"]),
             "priority": int(question["priority"]),
             "created_at": _iso(question["created_at"]),
+            # T7.67a: № по всей таблице вопросов (№1 — первый вопрос узла).
+            "number": int(number) if number is not None else None,
         },
         "sessions": [
             {

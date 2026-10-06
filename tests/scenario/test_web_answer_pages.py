@@ -259,3 +259,44 @@ async def test_answer_page_never_invents_a_verification_word_of_its_own(migrated
     lowered = html.lower() + home.lower()
     assert "проверен" not in lowered
     assert "надежно" not in lowered and "надёжен" not in lowered
+
+
+# ─── T7.67a: колонка №, порядок «последние сверху» и номер в заголовке ─────
+
+
+@pytest.mark.asyncio
+async def test_home_page_numbers_questions_and_asks_server_for_recent_order(migrated_db, tmp_path: Path) -> None:
+    """Колонки таблицы: № · Вопрос · Ответ · Когда; последние вопросы — сверху."""
+    scratch_url, _ = migrated_db
+    app, engine = await _make(scratch_url, tmp_path / "host", tmp_path / "unit.json")
+    async with _client(app) as client:
+        home = (await client.get("/")).text
+    await engine.dispose()
+
+    assert "<th>№</th>" in home
+    for marker in ("<th>Вопрос</th>", "<th>Ответ</th>", "<th>Когда</th>", "Мои вопросы", "Открыть ответ"):
+        assert marker in home
+    # порядок просит у сервера и не переиначивает его: сортировки в JS главной нет
+    assert "order=recent" in home
+    script = "".join(match.group("body") for match in _SCRIPT_RE.finditer(home))
+    assert ".sort(" not in script
+    # колонка «Ответ» собираются из данных API: номер, итог и бейдж надёжности
+    assert "q.number" in script and "q.answer" in script and "reliability" in script
+    assert "'в очереди: '" in script  # человеческая фраза позиции очереди — не код состояния
+    _assert_pure("/", home)
+
+
+@pytest.mark.asyncio
+async def test_answer_page_header_shows_question_number(migrated_db, tmp_path: Path) -> None:
+    scratch_url, _ = migrated_db
+    qid = uuid.uuid4()
+    app, engine = await _make(scratch_url, tmp_path / "host", tmp_path / "unit.json")
+    async with _client(app) as client:
+        answer = (await client.get(f"/answer/{qid}")).text
+    await engine.dispose()
+
+    assert 'id="q-number"' in answer
+    script = "".join(match.group("body") for match in _SCRIPT_RE.finditer(answer))
+    assert "q.number" in script  # «Вопрос №N» собирается из данных API, N не выдумывается страницей
+    assert "'Вопрос №'" in script
+    _assert_pure("/answer/<id>", answer.replace(str(qid), "id"))

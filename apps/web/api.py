@@ -40,7 +40,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select, text
@@ -65,6 +65,7 @@ from apps.web import diagnostics as diagnostics_queries
 from apps.web import knowledge as knowledge_queries
 from apps.web import labels as ui_labels
 from apps.web import metrics as metrics_queries
+from apps.web import questions_view as questions_view_queries
 from apps.web.bind import resolve_standalone_workspace
 from apps.web.host_status import HostStatus, HostStatusAdapter
 from packages.domain.db.engine import DatabaseSettings
@@ -89,7 +90,6 @@ from packages.domain.services.question_intake import (
     PRIORITY_MIN,
     QuestionIntakeError,
     put_operator_question,
-    question_queue,
     queue_position,
 )
 
@@ -329,6 +329,8 @@ _HOME_HTML = """<!doctype html>
    padding:.4rem .8rem;cursor:pointer;margin-right:.35rem}
  details{margin-top:.4rem} a{color:#8ab4f8}
  label{margin-right:.7rem;display:inline-block;margin-bottom:.35rem}
+ .badge{display:inline-block;padding:.15rem .55rem;border-radius:99px;font-size:.82rem;
+   font-weight:700;color:#0e1116;background:#98a2b3;margin-right:.45rem}
 </style></head><body>
 <h1>NOEZEMA — вопросы и ответы</h1>
 <p><a href="/knowledge">Все знания</a> · <a href="/diagnostics">Диагностика</a>
@@ -370,8 +372,9 @@ _HOME_HTML = """<!doctype html>
 </div>
 
 <div class="card"><b>Мои вопросы</b>
- <p class="muted">Очередь вопросов: сначала срочные, затем по времени.</p>
- <table id="queue"><thead><tr><th>Вопрос</th><th>Статус</th><th>Когда</th><th></th></tr></thead>
+ <p class="muted">Очередь вопросов: последние заданные — сверху. № — общий номер по порядку задания,
+     «в очереди» — каким по счёте узел возьмёт вопрос. Вопросы, предложенные системой, помечены.</p>
+ <table id="queue"><thead><tr><th>№</th><th>Вопрос</th><th>Ответ</th><th>Когда</th><th></th></tr></thead>
   <tbody></tbody></table>
  <p id="queue-error" class="muted"></p>
 </div>
@@ -380,6 +383,14 @@ _HOME_HTML = """<!doctype html>
 const TOKEN_KEY='noezema.admin.token';
 function esc(v){return String(v===null||v===undefined?'':v);}
 function setText(id,value){document.getElementById(id).textContent=esc(value);}
+function badgeFor(reliability){
+  const b=document.createElement('span'); b.className='badge';
+  b.textContent=reliability&&reliability.label?reliability.label:'оценка неизвестна';
+  if(reliability&&reliability.hint) b.title=reliability.hint;
+  // цвет — логический токен из серверного перевода уже вычисленной оценки
+  if(reliability&&reliability.color) b.style.backgroundColor=reliability.color;
+  return b;
+}
 function adminToken(){
   const el=document.getElementById('ask-token');
   const t=(el.value||'').trim() || (sessionStorage.getItem(TOKEN_KEY)||'');
@@ -408,18 +419,42 @@ async function tick(){
 }
 async function loadQueue(){
   try{
-    const r=await fetch('/api/v1/questions?limit=50'); const d=await r.json();
+    const r=await fetch('/api/v1/questions?limit=50&order=recent'); const d=await r.json();
     const rows=d.questions||[]; const tb=document.querySelector('#queue tbody'); tb.innerHTML='';
     let last=null;
     for(const q of rows){
       const s=q.session;
       if(s && (!last || String(q.created_at)>String(last.created_at))) last=q;
-      const status=[q.state_label,(s&&s.state_label)?('сессия: '+s.state_label):'']
-        .filter(Boolean).join(' · ');
       const tr=document.createElement('tr');
-      tr.innerHTML='<td class="wrap">'+esc(q.text)+'</td><td>'+esc(status)+'</td>'+
-        '<td>'+new Date(q.created_at).toLocaleString()+'</td>'+
-        '<td><a href="/answer/'+esc(q.id)+'">Открыть ответ</a></td>';
+      const numCell=document.createElement('td');
+      numCell.textContent=(q.number===null||q.number===undefined)?'':q.number;
+      tr.appendChild(numCell);
+      const askCell=document.createElement('td'); askCell.className='wrap';
+      const askText=document.createElement('div'); askText.textContent=esc(q.text); askCell.appendChild(askText);
+      if(q.created_by_operator===false && q.origin_label){
+        const tag=document.createElement('div'); tag.className='muted'; tag.textContent=q.origin_label;
+        askCell.appendChild(tag);
+      }
+      tr.appendChild(askCell);
+      const ansCell=document.createElement('td');
+      const a=q.answer||{};
+      if(a.statement){
+        if(a.reliability) ansCell.appendChild(badgeFor(a.reliability));
+        const st=document.createElement('span'); st.textContent=a.statement; ansCell.appendChild(st);
+      } else {
+        const parts=[];
+        if(a.label) parts.push(a.label);
+        if(q.queue_place) parts.push('в очереди: '+q.queue_place+'-й');
+        const sp=document.createElement('span'); sp.textContent=parts.join(' · '); ansCell.appendChild(sp);
+      }
+      tr.appendChild(ansCell);
+      const whenCell=document.createElement('td');
+      whenCell.textContent=new Date(q.created_at).toLocaleString();
+      tr.appendChild(whenCell);
+      const openCell=document.createElement('td');
+      const link=document.createElement('a'); link.href='/answer/'+esc(q.id); link.textContent='Открыть ответ';
+      openCell.appendChild(link);
+      tr.appendChild(openCell);
       tb.appendChild(tr);
     }
     setText('queue-error', rows.length?'':'Очередь пуста. Задайте вопрос выше.');
@@ -512,7 +547,7 @@ _ANSWER_HTML = """<!doctype html>
 <h1>NOEZEMA — ответ на вопрос</h1>
 <p><a href="/">Все вопросы</a> · <a href="/knowledge">Все знания</a> · <a href="/engineer">Для инженера</a></p>
 <div id="banner">загрузка…</div>
-<div class="card"><h2 id="q-text">—</h2>
+<div class="card"><div class="muted" id="q-number"></div><h2 id="q-text">—</h2>
  <div class="muted" id="q-meta"></div></div>
 <div class="card"><b>Ответ</b><div id="answer"></div>
  <p class="muted" id="answer-note"></p>
@@ -571,6 +606,7 @@ function render(d){
   } else if(claims.length){ banner(result.label||'ответ готов',''); }
   else if(sessions.length){ banner(result.label||'ответа пока нет','bad'); }
   else { banner(result.label||'ответа пока нет',''); }
+  setText('q-number', (q.number===null||q.number===undefined)?'':'Вопрос №'+esc(q.number));
   setText('q-text', q.text);
   const meta=[q.state_label,q.origin_label,when(q.created_at)].filter(Boolean).join(' · ');
   setText('q-meta',meta+(q.state_hint?(' — '+q.state_hint):''));
@@ -1600,12 +1636,25 @@ def create_app(
     # (§5.3.2).
 
     @app.get("/api/v1/questions")
-    async def list_questions(limit: int = 100) -> JsonDict:
+    async def list_questions(
+        limit: int = 100,
+        order: str = Query(default="queue", pattern="^(queue|recent)$"),
+    ) -> JsonDict:
         """The question queue: candidates in FIFO order with their position,
         then already-worked questions, each annotated with the newest session
-        that took it (id + state) when there is one."""
+        that took it (id + state) when there is one.
+
+        T7.67a (additive): every row gains a cross-table creation number
+        (`number`, №1 = the node's first question; stable across status changes
+        and new questions), an answer summary built by the same logic as the
+        answer card (`answer`, current claims only), `queue_place` and
+        `created_by_operator`. `order=recent` sorts the page newest-first for
+        the simple view without touching FIFO positions; the default order and
+        all pre-existing fields stay exactly as before."""
         async with factory() as db:
-            rows = await question_queue(db, limit=max(1, min(limit, 200)))
+            rows = await questions_view_queries.list_question_rows(
+                db, limit=max(1, min(limit, 200)), order=order
+            )
             # T7.64 (ADR-0026): человеческие подписи состояния и происхождения
             # добавляются к существующим полям строки очереди, ничего не заменяя.
             return {"questions": [annotate_question(row) for row in rows], "count": len(rows)}

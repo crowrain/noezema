@@ -37,7 +37,15 @@ def _search_event(sequence: int, arguments: object, action_id: str = "s1") -> li
     ]
 
 
+def _fetch_event(sequence: int, url: str, action_id: str = "f1") -> list[dict[str, Any]]:
+    return [
+        _event(sequence, "action_started", tool="research.fetch", action_id=action_id, arguments={"url": url}),
+        _event(sequence + 1, "action_completed", action_id=action_id, ok=True),
+    ]
+
+
 SEARCH_LABEL = ui_labels.describe("action_tool", "web.search")["label"]
+FETCH_LABEL = ui_labels.describe("action_tool", "research.fetch")["label"]
 
 
 # ─── подпись действия ───────────────────────────────────────────────────────
@@ -146,22 +154,84 @@ def test_search_step_without_a_usable_query_stays_bare(arguments: object) -> Non
     assert SEARCH_LABEL in texts
 
 
-def test_repeated_searches_collapse_into_one_step_with_one_real_query() -> None:
-    """Сворачивание повторов не теряет данные и не придумывает третий запрос."""
+def test_different_queries_become_separate_steps_not_one_query_twice() -> None:
+    """T7.67a (стенд, сессия 66c7901a): два разных поиска — два шага.
+
+    Прежняя реализация держила ОДНУ деталь на инструмент и показывала первый
+    запрос дважды («поискал в интернете: <первый> — 2 раза»), теряя второй.
+    Это было неправдой о выполненной работе, поэтому тест переписан по решению
+    пользователя (обоснование — STATUS.md T7.67a): сворачивается только точный
+    повтор; разные записанные запросы остаются отдельными шагами, третий никто
+    не выдумывает и ничего не склеивает.
+    """
     events = [
         _event(1, "question_selected"),
         *_search_event(2, json.dumps({"query": "стоимость владения сервером"}), action_id="s1"),
         *_search_event(6, json.dumps({"query": "цена стойки в дата-центре"}), action_id="s2"),
     ]
     groups, _failed = ans.executed_actions(events)
+    assert [(tool, count, detail) for tool, count, detail in groups] == [
+        ("web.search", 1, "стоимость владения сервером"),
+        ("web.search", 1, "цена стойки в дата-центре"),
+    ]
+
+    texts = [step["text"] for step in ans.build_answer_steps(events)]
+    search_steps = [t for t in texts if t.startswith(SEARCH_LABEL)]
+    assert len(search_steps) == 2
+    assert any("стоимость владения сервером" in t and "цена стойки" not in t for t in search_steps)
+    assert any("цена стойки в дата-центре" in t and "стоимость" not in t for t in search_steps)
+    # ничто не утверждает повтор, которого не было
+    assert all("2 раза" not in t for t in texts)
+
+
+def test_identical_queries_collapse_into_one_step_with_a_true_count() -> None:
+    """Точный повтор по-прежнему сворачивается — с настоящим числом (AGENTS §3)."""
+    events = [
+        _event(1, "question_selected"),
+        *_search_event(2, json.dumps({"query": "стоимость владения сервером"}), action_id="s1"),
+        *_search_event(6, json.dumps({"query": "стоимость владения сервером"}), action_id="s2"),
+    ]
+    groups, _failed = ans.executed_actions(events)
     assert [(tool, count) for tool, count, _d in groups] == [("web.search", 2)]
 
     texts = [step["text"] for step in ans.build_answer_steps(events)]
     step_text = next(t for t in texts if t.startswith(SEARCH_LABEL))
-    assert "2 раза" in step_text
-    assert "стоимость владения сервером" in step_text
-    # второй запрос не выдумывается и не склеивается с первым: показан один записанный запрос
-    assert step_text.count("цена стойки") <= 1
+    assert step_text == f"{SEARCH_LABEL}: стоимость владения сервером — 2 раза"
+
+
+def test_two_different_pages_are_two_steps_not_one_page_read_twice() -> None:
+    """Тот же закон для `research.fetch`: стенд показал «cbr.ru — 2 раза» там, где были cbr.ru и expert.ru."""
+    events = [
+        _event(1, "question_selected"),
+        *_fetch_event(2, "https://cbr.ru/press", action_id="f1"),
+        *_fetch_event(6, "https://expert.ru/article", action_id="f2"),
+    ]
+    groups, _failed = ans.executed_actions(events)
+    assert [(tool, count, detail) for tool, count, detail in groups] == [
+        ("research.fetch", 1, "cbr.ru"),
+        ("research.fetch", 1, "expert.ru"),
+    ]
+
+    texts = [step["text"] for step in ans.build_answer_steps(events)]
+    fetch_steps = [t for t in texts if t.startswith(FETCH_LABEL)]
+    assert len(fetch_steps) == 2
+    assert any(t == f"{FETCH_LABEL}: cbr.ru" for t in fetch_steps)
+    assert any(t == f"{FETCH_LABEL}: expert.ru" for t in fetch_steps)
+    assert all("2 раза" not in t for t in texts)
+
+
+def test_identical_pages_collapse_into_one_step_with_a_true_count() -> None:
+    events = [
+        _event(1, "question_selected"),
+        *_fetch_event(2, "https://cbr.ru/press", action_id="f1"),
+        *_fetch_event(6, "https://cbr.ru/press?page=2", action_id="f2"),
+    ]
+    groups, _failed = ans.executed_actions(events)
+    assert [(tool, count, detail) for tool, count, detail in groups] == [("research.fetch", 2, "cbr.ru")]
+
+    texts = [step["text"] for step in ans.build_answer_steps(events)]
+    step_text = next(t for t in texts if t.startswith(FETCH_LABEL))
+    assert step_text == f"{FETCH_LABEL}: cbr.ru — 2 раза"
 
 
 def test_search_step_is_not_invented_for_a_failed_or_aborted_search() -> None:
