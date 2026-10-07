@@ -480,3 +480,77 @@ def test_earlier_payloads_are_untouched_by_the_v16_activation() -> None:
     }.items():
         raw = (REPO_ROOT / "docs" / "eval" / name).read_text(encoding="utf-8")
         assert hashlib.sha256(raw.encode()).hexdigest() == digest, name
+
+
+# ─── config-v17 (T7.77): ровно смена пина исследователя на explorer-v9 ──────
+
+
+@pytest.mark.unit
+def test_config_v17_differs_from_v16_only_by_the_explorer_pin() -> None:
+    """T7.77: config-v17 = config-v16 ровно с одной правкой — пин ``prompts.explorer`` → explorer-v9
+    (правило 12: прогноз до события не выдаётся за независимую оценку состоявшегося значения). Лимит
+    шагов, пороги, ``claim_type_rules``, token-бюджеты, окна модели, research_proxy и список
+    инструментов остаются байт в байтом v16: правка живёт в инструкциях модели, а не в движке — гейтов,
+    правил группировки и порогов независимости задача не добавляла. v16 остаётся закоммичен и является
+    откатом."""
+    v16 = _load("config-v16-payload.json")
+    v17 = _load("config-v17-payload.json")
+
+    assert set(v17) == set(v16), "у payload'а появился новый раздел"
+    assert {k for k in v17 if v17[k] != v16[k]} == {"prompts"}
+
+    assert {r for r in v17["prompts"] if v17["prompts"][r] != v16["prompts"][r]} == {"explorer"}
+    changed = {k for k in v17["prompts"]["explorer"] if v17["prompts"]["explorer"][k] != v16["prompts"]["explorer"][k]}
+    assert changed == {"path", "sha256", "version"}, changed
+    assert v17["prompts"]["explorer"]["version"] == "explorer-v9"
+    assert v17["prompts"]["explorer"]["path"] == "prompts/explorer/explorer-v9.md"
+    for role in ("curator", "extractor", "planner", "verifier"):
+        assert v17["prompts"][role] == v16["prompts"][role], role
+
+    # лимиты не тронуты вообще — включая max_explorer_steps = 16 из v16
+    assert v17["session_limits"] == v16["session_limits"]
+    assert v17["session_limits"]["max_explorer_steps"] == 16
+
+    for section in sorted(set(v16) - {"prompts"}):
+        assert v17[section] == v16[section], section
+
+    resolved = resolve_prompts(v17["prompts"], REPO_ROOT)
+    assert resolved[Role.EXPLORER].version == "explorer-v9"
+    assert resolved[Role.CURATOR].version == "curator-v8"
+
+    budgets = TokenBudgets.from_snapshot(v17["model"], v17["token_budgets"])
+    assert budgets.section_limits == EVAL2_SECTIONS
+    assert budgets.validate() == []
+
+
+@pytest.mark.unit
+def test_config_v17_file_is_byte_stable_and_pinned() -> None:
+    """Идентичность v17 закреплена: хеш файла и canonical-хеш (последний попадает в
+    ``config_snapshots.payload_sha256`` — AGENTS §8). Пин исследователя в payload'е обязан совпадать
+    с фактическим sha256 файла explorer-v9.md."""
+    import hashlib
+
+    from packages.domain.config import canonical_sha256
+
+    raw = (REPO_ROOT / "docs" / "eval" / "config-v17-payload.json").read_text(encoding="utf-8")
+    payload = json.loads(raw)
+    assert json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True) + "\n" == raw
+    assert hashlib.sha256(raw.encode()).hexdigest() == (
+        "3d51cefc6c2193ad61627325f70bc433156495455c9eef80a60c0f9d38304a86"
+    )
+    assert canonical_sha256(payload) == "5c402f4d75ae000c61d824ba2a4407bbfe8d94e0946311ff9ef90b06db721717"
+    prompt_sha = hashlib.sha256((REPO_ROOT / payload["prompts"]["explorer"]["path"]).read_bytes()).hexdigest()
+    assert payload["prompts"]["explorer"]["sha256"] == prompt_sha
+
+
+@pytest.mark.unit
+def test_earlier_payloads_are_untouched_by_the_v17_activation() -> None:
+    """v16 и v15 не переписаны задним числом (AGENTS §8): v16 — штатный откат v17, v15 — откат v16."""
+    import hashlib
+
+    for name, digest in {
+        "config-v16-payload.json": "79d63b2d380775621495ad2445ce3610484c8ce5fd3c5f857f65f26a7817d131",
+        "config-v15-payload.json": "c65b69db5a1f50d44e6dc9e9c4b6399381c191b1df62506a9ef275a6d3b5f722",
+    }.items():
+        raw = (REPO_ROOT / "docs" / "eval" / name).read_text(encoding="utf-8")
+        assert hashlib.sha256(raw.encode()).hexdigest() == digest, name

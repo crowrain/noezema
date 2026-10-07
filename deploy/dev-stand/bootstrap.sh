@@ -98,7 +98,8 @@ LLM_SCHEMA_PROFILE="${NOEZEMA_DEV_LLM_SCHEMA_PROFILE:-none}"
 LLM_MAX_OUTPUT_TOKENS="${NOEZEMA_DEV_LLM_MAX_OUTPUT_TOKENS:-8192}"
 LLM_TIMEOUT_SECONDS="${NOEZEMA_DEV_LLM_TIMEOUT_SECONDS:-600}"
 
-# Activated config (T7.59(в), T7.71, T7.73, T7.76): config-v16 = config-v15 with exactly two changes —
+# Activated config (T7.59(в), T7.71, T7.73, T7.76; дефолт с T7.77 — config-v17, см. ниже):
+# config-v16 = config-v15 with exactly two changes —
 # the explorer prompt pin (explorer-v8: правило 10 — спорное число проверяется двумя сторонами поиска,
 # официальным первоисточником И независимым исследованием, расхождение называется открыто либо честно
 # говорится «независимых оценок не найдено»; правило 11 — беречь шаги) and one session limit
@@ -124,8 +125,16 @@ LLM_TIMEOUT_SECONDS="${NOEZEMA_DEV_LLM_TIMEOUT_SECONDS:-600}"
 # `NOEZEMA_DEV_CONFIG_PAYLOAD=$REPO_ROOT/docs/eval/config-v15-payload.json` (canonical hash
 # b3801812…, pinned in tests; config-v16 itself is 740ae9a1…). v15, v14, v13 and v12 stay in the repo
 # and are never rewritten.
-CONFIG_PAYLOAD="${NOEZEMA_DEV_CONFIG_PAYLOAD:-$REPO_ROOT/docs/eval/config-v16-payload.json}"
-CONFIG_REASON="${NOEZEMA_DEV_CONFIG_REASON:-T7.76 dev-stand: activate config-v16 (explorer-v8 two-sided search + 16 explorer steps; curator-v8, thresholds and token budgets unchanged)}"
+# config-v17 (T7.77) = config-v16 with exactly ONE change: the explorer prompt pin — explorer-v9
+# (правило 12: прогноз до события — не независимая оценка реализованного значения; сопоставим только с
+# ожиданиями, а измерением состоявшегося называются опросы домохозяйств, альтернативные индексы цен и
+# академические исследования; пересказ официальной цифры со ссылкой на первоисточник вторым наблюдением
+# не считается). Лимит шагов (16), пороги, claim_type_rules, token-бюджеты, окна модели, research_proxy
+# и список инструментов — байт в байт v16: правка живёт в инструкциях модели, движок независимости не
+# тронут. Rollback теперь config-v16 (canonical 740ae9a1…, сам v17 — 5c402f4d…) и задаётся строкой
+# `NOEZEMA_DEV_CONFIG_PAYLOAD=$REPO_ROOT/docs/eval/config-v16-payload.json`; v16 и v15 остаются в репо.
+CONFIG_PAYLOAD="${NOEZEMA_DEV_CONFIG_PAYLOAD:-$REPO_ROOT/docs/eval/config-v17-payload.json}"
+CONFIG_REASON="${NOEZEMA_DEV_CONFIG_REASON:-T7.77 dev-stand: activate config-v17 (explorer-v9: forecast before an event is not an independent measurement of a realized value; explorer step limit, curator-v8, thresholds and token budgets unchanged from config-v16)}"
 NODE_OWNER="${NOEZEMA_DEV_NODE_OWNER:-dev-stand}"
 
 DRY_RUN=false

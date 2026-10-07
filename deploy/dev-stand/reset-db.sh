@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # NOEZEMA dev stand database reset (T7.59(b)): recreate the DEV database from scratch, migrate it,
-# re-activate the stand configuration (config-v16, T7.76; rollback: NOEZEMA_DEV_CONFIG_PAYLOAD points to
-# docs/eval/config-v15-payload.json). Nothing else is touched: the Postgres container and its volume stay,
+# re-activate the stand configuration (config-v17, T7.77; rollback: NOEZEMA_DEV_CONFIG_PAYLOAD points to
+# docs/eval/config-v16-payload.json). Nothing else is touched: the Postgres container and its volume stay,
 # no production path and no eval/smoke database is ever a target (checked below, not by convention).
 #
 #   ./reset-db.sh            interactive: prints what will be lost and asks for the DB name
@@ -16,7 +16,7 @@ DB_VOLUME="${NOEZEMA_DEV_DB_VOLUME:-noezema-dev-pgdata}"
 DB_NAME="${NOEZEMA_DEV_DB_NAME:-noezema-dev}"
 DB_USER=noezema
 DB_PORT="${NOEZEMA_DEV_DB_PORT:-}"   # empty -> taken from the env file / the container (bootstrap may have auto-picked 5433+)
-CONFIG_PAYLOAD="${NOEZEMA_DEV_CONFIG_PAYLOAD:-$REPO_ROOT/docs/eval/config-v16-payload.json}"
+CONFIG_PAYLOAD="${NOEZEMA_DEV_CONFIG_PAYLOAD:-$REPO_ROOT/docs/eval/config-v17-payload.json}"
 ASSUME_YES=false
 
 while [[ $# -gt 0 ]]; do
@@ -80,9 +80,9 @@ psql_as postgres "CREATE DATABASE \"$DB_NAME\" OWNER \"$DB_USER\""
 url="postgresql+asyncpg://$DB_USER:$db_password@127.0.0.1:$DB_PORT/$DB_NAME"
 (cd "$REPO_ROOT" && env NOEZEMA_DATABASE_URL="$url" "$REPO_ROOT/.venv/bin/python" -m alembic upgrade head)
 
-echo "активация конфигурации (config-v16)…"
+echo "активация конфигурации (config-v17)…"
 (cd "$REPO_ROOT" && env NOEZEMA_DATABASE_URL="$url" "$REPO_ROOT/.venv/bin/python" -m hostctl.cli activate-online \
-  --payload "$CONFIG_PAYLOAD" --reason "T7.76 dev-stand: reset-db re-activation (config-v16)" --drain-wait-seconds 120)
+  --payload "$CONFIG_PAYLOAD" --reason "T7.77 dev-stand: reset-db re-activation (config-v17)" --drain-wait-seconds 120)
 
 if have systemctl; then
   sudo systemctl start noezema-dev-unit-state.timer noezema-dev-tick.timer noezema-dev-maint.timer || true
