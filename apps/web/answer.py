@@ -421,6 +421,74 @@ def _in_params(prefix: str, values: Sequence[Any]) -> tuple[str, dict[str, Any]]
     return clause, params
 
 
+async def _assessment_reasons(
+    db: AsyncSession, assessment_ids: Sequence[str], floor: datetime | None
+) -> dict[str, list[str]]:
+    """Причины текущих оценок — из ленты `claim_assessed` (T7.73, ADR-0018).
+
+    Rules engine записывает причины в событие оценки (`packages/memory/service.py`);
+    долговременной колонки причин нет и миграции не добавляются. Карточка берёт их
+    отткак есть: она только подписывает уже вычисленное (ADR-0026), ничего не
+    пересчитывает и не придумывает.
+
+    Хронология — `occurred_at` + `sequence` (AGENTS §7: `created_at` строк одной
+    долгой транзакции не упорядочивает). Нижняя граница времени — самая ранняя из
+    этих claim-строк: оценка не может быть записана раньше claim'а, поэтому выборка
+    идёт по индексу `occurred_at`, а не полным сканом ленты.
+    """
+    if not assessment_ids:
+        return {}
+    clause, params = _in_params("aid", assessment_ids)
+    time_floor = ""
+    if floor is not None:
+        # динамическое условие: параметр присутствует в SQL только когда он есть
+        # (ловушка AGENTS §7 — asyncpg не выводит тип из None)
+        time_floor = "AND occurred_at >= :floor"
+        params["floor"] = floor
+    rows = list(
+        (
+            await db.execute(
+                text(
+                    f"""
+                    WITH latest AS (
+                        SELECT DISTINCT ON (payload->>'assessment_id') payload
+                        FROM audit_events
+                        WHERE type = 'claim_assessed'
+                          AND payload->>'assessment_id' IN ({clause})
+                          {time_floor}
+                        ORDER BY payload->>'assessment_id', occurred_at DESC, sequence DESC
+                    )
+                    SELECT l.payload->>'assessment_id' AS assessment_id, r.reason
+                    FROM latest l
+                    LEFT JOIN LATERAL jsonb_array_elements_text(
+                        COALESCE(l.payload->'reasons', '[]'::jsonb)
+                    ) WITH ORDINALITY AS r(reason, n) ON TRUE
+                    ORDER BY 1, r.n
+                    """
+                ),
+                params,
+            )
+        )
+        .mappings()
+        .all()
+    )
+    reasons: dict[str, list[str]] = {}
+    for row in rows:
+        reason = row["reason"]
+        if reason is None:
+            continue
+        reasons.setdefault(str(row["assessment_id"]), []).append(str(reason))
+    return reasons
+
+
+def grade_reason_view(reasons: Sequence[str]) -> list[JsonDict]:
+    """Подписанные причины оценки для API карточки (T7.73). Порядок — как их записал
+    rules engine; подписи — только из словаря, выдуманных причин здесь нет."""
+    return [
+        {"code": code, **ui_labels.describe("assessment_reason", code)} for code in reasons
+    ]
+
+
 async def question_answer(db: AsyncSession, question_id: uuid.UUID) -> JsonDict | None:
     """Собрать карточку ответа на вопрос. `None` — вопроса нет (эндпоинт ответит 404).
 
@@ -483,7 +551,8 @@ async def question_answer(db: AsyncSession, question_id: uuid.UUID) -> JsonDict 
                         SELECT c.id, c.statement, c.claim_type, c.freshness_status,
                                c.created_in_session, c.created_at,
                                COALESCE(h.assessment_state, 'none') AS head_state,
-                               h.epistemic_status, a.effective_grade, a.confidence
+                               h.epistemic_status, a.effective_grade, a.confidence,
+                               a.id AS assessment_id
                         FROM claims c
                         LEFT JOIN claim_assessment_heads h
                                ON h.claim_id = c.id
@@ -528,6 +597,15 @@ async def question_answer(db: AsyncSession, question_id: uuid.UUID) -> JsonDict 
             for row in evidence_rows:
                 by_claim.setdefault(str(row.get("claim_id")), []).append(row)
 
+        # T7.73 (ADR-0018): вывод правил должен быть объяснён на карточке. Причины
+        # текущей оценки берутся из ленты этой же оценки — понижение grade не может
+        # остаться без названия причины.
+        reason_by_assessment = await _assessment_reasons(
+            db,
+            [str(row["assessment_id"]) for row in claim_rows if row["assessment_id"] is not None],
+            min((row["created_at"] for row in claim_rows if row["created_at"] is not None), default=None),
+        )
+
         for row in claim_rows:
             claim_id = str(row["id"])
             head_state = str(row["head_state"])
@@ -552,6 +630,12 @@ async def question_answer(db: AsyncSession, question_id: uuid.UUID) -> JsonDict 
                 )
             )
             item["verification"] = describe_verification(by_claim.get(claim_id, []))
+            # T7.73 (ADR-0018): текущая оценка объяснена — карточка показывает
+            # причины, записанные rules engine (только подписи, без пересчёта).
+            assessment_id = str(row["assessment_id"]) if row["assessment_id"] is not None else ""
+            item["grade_reasons"] = grade_reason_view(
+                reason_by_assessment.get(assessment_id, [])
+            )
             # Заголовок строки подтверждения выбирается по уже вычисленному бейджу:
             # «как проверено» звучит только там, где оценка действительно есть.
             badge = item.get("reliability")

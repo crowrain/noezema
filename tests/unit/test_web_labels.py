@@ -24,6 +24,7 @@ import apps.orchestrator.scheduler as scheduler
 import apps.web.answer as web_answer
 import apps.web.api as web_api
 import apps.web.host_status as host_status
+import packages.memory.rules_engine as rules_engine
 import packages.policy.tools as policy_tools
 from apps.web import labels
 from apps.web.labels import LABELS, MAX_ACTION_CHARS, MAX_HINT_CHARS, MAX_LABEL_CHARS
@@ -85,6 +86,25 @@ _ORCHESTRATOR_TERMINATIONS = (
 _PAUSED_REASONS = ("operator", "consecutive_failures")
 
 
+def _rules_engine_reasons() -> list[str]:
+    """Закрытый набор причин оценки, который пишет rules engine
+    (packages/memory/rules_engine.py).
+
+    Источник — рабочий код: движок отдаёт причины литералами в tuple
+    (`reasons = (...)`) и одной собранной формой для требования
+    независимости; тест не переписывает их, а вытаскивает. Новая причина
+    без подписи краснит полноту (T7.73: понижение grade обязано доходить
+    до карточки с названием причины).
+    """
+    source = Path(rules_engine.__file__).read_text(encoding="utf-8")
+    found: set[str] = set()
+    for chunk in re.findall(r"reasons[^\n=]*=\s*\((.*?)\)", source, re.S):
+        # f-строки (собранные формы) здесь не берём: они ниже по REQUIRED_RELATIONS
+        found.update(re.findall(r'(?<!f)"([a-z_]+)"', chunk))
+    found.update(f"independence_{relation}_not_met" for relation in rules_engine.REQUIRED_RELATIONS)
+    return sorted(found)
+
+
 def _sources() -> dict[str, list[str]]:
     return {
         "question_state": [e.value for e in QuestionState],
@@ -125,6 +145,9 @@ def _sources() -> dict[str, list[str]]:
         "answer_result": list(web_answer.RESULT_KINDS),
         "honesty_note": list(web_answer.HONESTY_KEYS),
         "verification_lead": list(web_answer.VERIFICATION_LEAD_KEYS),
+        # T7.73 (ADR-0018): причины текущей оценки — закрытый набор rules engine;
+        # карточка обязана подписать каждую, включая причину понижения.
+        "assessment_reason": _rules_engine_reasons(),
     }
 
 
@@ -184,6 +207,18 @@ def test_command_refusal_literals_from_api_code_are_labeled() -> None:
         if not labels.describe_refusal(reason)["hint"]
     ]
     assert not unlabeled, f"отказы без подписи: {unlabeled}"
+
+
+def test_assessment_reasons_from_rules_engine_code_are_labeled() -> None:
+    """T7.73: причина понижения обязана доходить до карточки подписанной.
+    Источник значений — код движка; пустой выборка (сломанныйextractor) также
+    краснит тест, иначе полнота проверяла бы пустое множество."""
+    reasons = _rules_engine_reasons()
+    assert len(reasons) >= 10, f"причин в коде движка не найдено: {reasons}"
+    # опорная причина этого случая обязана быть в наборе
+    assert "as_of_missing" in reasons
+    unlabeled = [r for r in reasons if not labels.describe("assessment_reason", r)["hint"]]
+    assert not unlabeled, f"причины оценки без подписи: {unlabeled}"
 
 
 def test_audit_event_labels_cover_every_audit_type() -> None:

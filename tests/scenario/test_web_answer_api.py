@@ -156,7 +156,10 @@ async def _seed_claim(
     head_state: str,
     grade: str | None = "E2",
     epistemic: str | None = "supported",
-) -> None:
+) -> uuid.UUID | None:
+    """Одна карточка знания. Возвращает id текущей оценки (он нужен тесту
+    причин оценки, T7.73) либо None, если головы `current` нет."""
+    assessment_id: uuid.UUID | None = None
     async with engine.connect() as conn:
         await conn.execute(
             text(
@@ -193,6 +196,7 @@ async def _seed_claim(
                 {"c": claim_id, "st": head_state},
             )
         await conn.commit()
+    return assessment_id
 
 
 def _visible_texts(payload: Any) -> list[str]:
@@ -544,4 +548,167 @@ async def test_unfinished_and_failed_actions_are_reported_but_never_called_steps
     assert not any(label in " ".join(steps) for label in tool_labels)
     failed_note = ui_labels.describe("honesty_note", "failed_steps")["label"]
     assert any(note.startswith(failed_note) for note in card["honesty"])
+    await engine.dispose()
+
+
+# ─── причина текущей оценки на карточке (T7.73, ADR-0018) ──────────────────
+
+
+def _assessed_event(
+    assessment_id: uuid.UUID,
+    claim_id: uuid.UUID,
+    *,
+    grade: str,
+    epistemic: str,
+    reasons: list[str],
+    sequence: int = 90,
+) -> tuple[int, str, Any]:
+    """Событие `claim_assessed` ровно в той форме, в какой его пишет хост
+    (`packages/memory/service.py::_assess`): причина лежит в ленте оценки."""
+    return (
+        sequence,
+        "claim_assessed",
+        {
+            "claim_id": str(claim_id),
+            "assessment_id": str(assessment_id),
+            "grade": grade,
+            "epistemic_status": epistemic,
+            "reasons": reasons,
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_weak_grade_is_explained_on_the_card(migrated_db, tmp_path: Path) -> None:
+    """Оценка E1 hypothesis обязана быть объяснена на карточке: rules engine
+    записал `as_of_missing`, экран показывает человеческое название причины —
+    понижение не может выглядеть как молчаливое."""
+    scratch_url, _ = migrated_db
+    app, engine = await _make(scratch_url, tmp_path / "host", tmp_path / "unit.json")
+    qid, sid, claim_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    await _seed_question(engine, question_id=qid, state="verified")
+    await _seed_session(
+        engine, session_id=sid, question_id=qid, state="succeeded", termination_reason="goal_reached"
+    )
+    assessment_id = await _seed_claim(
+        engine,
+        claim_id=claim_id,
+        session_id=sid,
+        statement="Годовая инфляция составила 5,59 процентного пункта",
+        head_state="current",
+        grade="E1",
+        epistemic="hypothesis",
+    )
+    assert assessment_id is not None
+    event = _assessed_event(
+        assessment_id, claim_id, grade="E1", epistemic="hypothesis", reasons=["as_of_missing"]
+    )
+    await _seed_events(engine, sid, [event])
+
+    async with _client(app) as client:
+        card = (await client.get(f"/api/v1/questions/{qid}/answer")).json()
+
+    claim = card["claims"][0]
+    entry = ui_labels.describe("assessment_reason", "as_of_missing")
+    assert [item["code"] for item in claim["grade_reasons"]] == ["as_of_missing"]
+    assert claim["grade_reasons"][0]["label"] == entry["label"]
+    assert claim["grade_reasons"][0]["hint"] == entry["hint"]
+    assert claim["grade_reasons"][0]["action"] == entry["action"]
+
+    visible = " ".join(_visible_texts(card))
+    assert entry["label"] in visible  # причина названа по-человечески
+    assert "as_of_missing" not in visible  # код наружу не выходит
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_only_the_current_assessment_explains_the_card(migrated_db, tmp_path: Path) -> None:
+    """Причину берут из ленты ТЕКУЩЕЙ оценки: старая оценка того же утверждения
+    (с другим набором причин) не подменяет нынешнюю — ниunion, ни «последняя
+    по времени причина из прошлого прогона»."""
+    scratch_url, _ = migrated_db
+    app, engine = await _make(scratch_url, tmp_path / "host", tmp_path / "unit.json")
+    qid, sid, claim_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    await _seed_question(engine, question_id=qid, state="verified")
+    await _seed_session(
+        engine, session_id=sid, question_id=qid, state="succeeded", termination_reason="goal_reached"
+    )
+    current_assessment = await _seed_claim(
+        engine,
+        claim_id=claim_id,
+        session_id=sid,
+        statement="Годовая инфляция составила 5,59 процентного пункта",
+        head_state="current",
+        grade="E3",
+        epistemic="supported",
+    )
+    assert current_assessment is not None
+
+    old_assessment = uuid.uuid4()
+    async with engine.connect() as conn:
+        await conn.execute(
+            text(
+                "INSERT INTO claim_assessments (id, claim_id, effective_grade, epistemic_status, "
+                "rules_version, rules_hash, evidence_set_hash, assessed_scope, confidence, valid) "
+                "VALUES (:a, :c, 'E1', 'hypothesis', 'rules-v2', 'h', 'ev', '{}', 0.3, true)"
+            ),
+            {"a": old_assessment, "c": claim_id},
+        )
+        await conn.commit()
+
+    await _seed_events(
+        engine,
+        sid,
+        [
+            _assessed_event(
+                old_assessment, claim_id,
+                grade="E1", epistemic="hypothesis", reasons=["as_of_missing"],
+                sequence=80,
+            ),
+            _assessed_event(
+                current_assessment, claim_id,
+                grade="E3", epistemic="supported", reasons=["requirements_met"],
+                sequence=90,
+            ),
+        ],
+    )
+
+    async with _client(app) as client:
+        card = (await client.get(f"/api/v1/questions/{qid}/answer")).json()
+
+    claim = card["claims"][0]
+    assert [item["code"] for item in claim["grade_reasons"]] == ["requirements_met"]
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_card_without_a_current_assessment_invents_no_reason(migrated_db, tmp_path: Path) -> None:
+    """Оценки ещё нет (голова `pending`, `invalid`) — карточка не придумывает
+    причину: пустой список, а не «as_of_missing» на глаз."""
+    scratch_url, _ = migrated_db
+    app, engine = await _make(scratch_url, tmp_path / "host", tmp_path / "unit.json")
+    qid, sid = uuid.uuid4(), uuid.uuid4()
+    await _seed_question(engine, question_id=qid, state="verified")
+    await _seed_session(
+        engine, session_id=sid, question_id=qid, state="succeeded", termination_reason="goal_reached"
+    )
+    claim_id = uuid.uuid4()
+    assessment_id = await _seed_claim(
+        engine,
+        claim_id=claim_id,
+        session_id=sid,
+        statement="Утверждение без принятой оценки",
+        head_state="pending",
+        grade=None,
+        epistemic=None,
+    )
+    assert assessment_id is None
+    # лента этой головы пуста: причина не может появиться из воздуха
+    await _seed_events(engine, sid, [(1, "session_started", {})])
+
+    async with _client(app) as client:
+        card = (await client.get(f"/api/v1/questions/{qid}/answer")).json()
+
+    assert card["claims"] == []  # pending-оценка не подаётся как ответ
+    assert card["other_claims"][0]["grade_reasons"] == []
     await engine.dispose()

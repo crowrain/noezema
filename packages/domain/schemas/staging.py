@@ -111,7 +111,17 @@ class CuratorProposal(BaseModel):
             if link.claim_index >= len(self.claims):
                 problems.append(f"evidence_link[{i}]: claim index {link.claim_index} out of range")
         for i, claim in enumerate(self.claims):
-            if claim.claim_type is ClaimType.TEMPORAL_FACT and claim.as_of is None:
+            if (
+                claim.claim_type is ClaimType.TEMPORAL_FACT
+                and claim.as_of is None
+                # T7.73 (ADR-0018 уточнение): a reverify of an EXISTING claim may
+                # omit the reference date — the host keeps the anchor's own
+                # (packages/memory/reverify.py). Requiring it here was the trap
+                # that pushed the model to relabel a temporal reverify as
+                # external_fact and lose the date: the check ran BEFORE the
+                # orchestrator substitutes the anchor's claim type.
+                and claim.existing_claim_id is None
+            ):
                 problems.append(f"claim[{i}]: temporal_fact requires as_of")
             for k, alt in enumerate(claim.search_statements):
                 if not alt.strip():

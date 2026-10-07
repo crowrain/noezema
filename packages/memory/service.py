@@ -61,6 +61,11 @@ from packages.memory.evidence import (
 )
 from packages.memory.freshness import freshness_status
 from packages.memory.independence import registrable_domain
+from packages.memory.reverify import (
+    merge_reverify_scope,
+    resolve_reverify_reference,
+    reverify_as_of_audit,
+)
 from packages.memory.rules_engine import (
     ClaimTypeRule,
     EvaluatedEvidence,
@@ -133,6 +138,37 @@ def resolve_claim_reference(
             return None, f"no visible claim matches prefix {nodash[:16]}…"
         return None, f"prefix {nodash[:16]}… is ambiguous among {len(candidates)} visible claims"
     return None, f"unparseable claim reference {str(raw)[:20]!r}"
+
+
+async def _head_assessed_scope(
+    db: AsyncSession, claim_id: uuid.UUID, config_snapshot_id: uuid.UUID
+) -> JsonDict | None:
+    """The assessed scope of the claim's CURRENT head in this config
+    snapshot (T7.73, ADR-0018 уточнение): the persisted reference date and
+    its ``date_anchor`` — the same seam the reassessment worker reads when
+    there is no question to re-derive from (T7.32/ADR-0017).
+
+    None when the head has no current assessment (pending/invalid): there
+    is nothing to carry over, and the caller keeps the old behaviour."""
+    return (
+        (
+            await db.execute(
+                select(ORMClaimAssessment.assessed_scope)
+                .where(
+                    ORMClaimAssessment.id
+                    == (
+                        select(ORMClaimAssessmentHead.current_assessment_id)
+                        .where(
+                            ORMClaimAssessmentHead.claim_id == claim_id,
+                            ORMClaimAssessmentHead.config_snapshot_id == config_snapshot_id,
+                        )
+                        .scalar_subquery()
+                    )
+                )
+            )
+        )
+        .scalar_one_or_none()
+    )
 
 
 def find_evidential_cycles(
@@ -478,16 +514,32 @@ class MemoryService:
                 # the evidence).
                 as_of_raw = payload.get("as_of")
                 model_as_of = datetime.fromisoformat(as_of_raw) if as_of_raw else None
-                host_ref = derive_claim_as_of(
-                    question=question_text, as_of=model_as_of, session_date=session_date
+                # T7.73 (ADR-0018 уточнение): a reverify that carries no date of
+                # its own must NOT erase the anchor's established reference
+                # date — the old blind overwrite dropped an E3 supported claim
+                # to E1 with the single rules-engine reason "as_of_missing".
+                existing_as_of = target_claim.as_of
+                existing_scope = await _head_assessed_scope(
+                    db, target_claim.id, session.config_snapshot_id
+                )
+                reference = resolve_reverify_reference(
+                    question=question_text,
+                    proposal_as_of=model_as_of,
+                    session_date=session_date,
+                    existing_as_of=existing_as_of,
+                    existing_scope=existing_scope,
                 )
                 rv_deps = payload.get("dependencies")
                 rv_deps_list: list[Any] = list(rv_deps) if isinstance(rv_deps, list) else []
-                target_claim.as_of = host_ref.as_of
-                claim_scopes[target_claim.id] = derive_claim_scope(
-                    question=question_text,
-                    as_of=target_claim.as_of,
-                    session_date=session_date,
+                target_claim.as_of = reference.as_of
+                claim_scopes[target_claim.id] = merge_reverify_scope(
+                    question_scope=derive_claim_scope(
+                        question=question_text,
+                        as_of=model_as_of,
+                        session_date=session_date,
+                    ),
+                    existing_scope=existing_scope,
+                    reference=reference,
                 )
                 counters["reverified"] += 1
                 claim_deps.append((target_claim, rv_deps_list))
@@ -504,11 +556,14 @@ class MemoryService:
                             model_as_of.isoformat() if model_as_of is not None else None
                         ),
                         "assessed_as_of": (
-                            host_ref.as_of.isoformat()
-                            if host_ref.as_of is not None
+                            reference.as_of.isoformat()
+                            if reference.as_of is not None
                             else None
                         ),
-                        "date_anchor": host_ref.anchor.value,
+                        "date_anchor": reference.anchor.value,
+                        # T7.73: what happened to the anchor's own date —
+                        # kept, moved by the question, or proposed and refused
+                        **reverify_as_of_audit(reference, existing_as_of=existing_as_of),
                     },
                     public_summary=f"reverify: {statement[:120]}",
                 )
@@ -580,11 +635,30 @@ class MemoryService:
                 # T7.18), so reverify_after (recomputed below from
                 # the question's date anchor, T7.32/ADR-0017) never
                 # rests on a stale or model value.
-                existing_claim.as_of = host_ref.as_of
-                claim_scopes[existing_claim.id] = derive_claim_scope(
+                # T7.73 (ADR-0018 уточнение): re-derivation is not
+                # erasure. When this session carries no date of its own,
+                # the claim keeps the reference date it was established
+                # with (and its persisted date anchor) instead of being
+                # nulled into "as_of_missing".
+                reuse_scope = await _head_assessed_scope(
+                    db, existing_claim.id, session.config_snapshot_id
+                )
+                reuse_reference = resolve_reverify_reference(
                     question=question_text,
-                    as_of=existing_claim.as_of,
+                    proposal_as_of=model_as_of,
                     session_date=session_date,
+                    existing_as_of=existing_claim.as_of,
+                    existing_scope=reuse_scope,
+                )
+                existing_claim.as_of = reuse_reference.as_of
+                claim_scopes[existing_claim.id] = merge_reverify_scope(
+                    question_scope=derive_claim_scope(
+                        question=question_text,
+                        as_of=model_as_of,
+                        session_date=session_date,
+                    ),
+                    existing_scope=reuse_scope,
+                    reference=reuse_reference,
                 )
                 counters["reused"] += 1
                 claim_deps.append((existing_claim, deps_list))

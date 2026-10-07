@@ -224,3 +224,53 @@ def test_duplicate_dependencies_flagged() -> None:
     )
     p = CuratorProposal(summary="s", claims=[c])
     assert any("duplicate" in x for x in p.validate_against(evidence_count=0))
+
+
+def test_reverify_of_a_temporal_fact_may_omit_the_date() -> None:
+    """T7.73 (уточнение ADR-0018): перепроверка УЖЕ существующего утверждения
+    не обязана приносить опорную дату — у якоря она есть, и решает её хост.
+
+    Прежняя проверка требовала дату безусловно и исполнялась ДО подстановки
+    типа якоря в оркестраторе (`apps/orchestrator/orchestrator.py`), поэтому
+    модель, честно перепроверяющая временной факт без даты, получала отказ
+    схемы — и уходила в `external_fact`, где дата терялась совсем.
+    """
+    p = CuratorProposal(
+        summary="перепроверка",
+        claims=[
+            ClaimProposal(
+                statement="годовая инфляция 5,59",
+                claim_type=ClaimType.TEMPORAL_FACT,
+                existing_claim_id=str(uuid.uuid4()),
+            )
+        ],
+    )
+    assert p.validate_against(evidence_count=1) == []
+
+
+def test_a_new_temporal_fact_still_needs_the_date() -> None:
+    """Ворота не ослаблены: НОВОМУ временному утверждению без даты хост нечего
+    оценить — отказ схемы остаётся (`existing_claim_id` тут нет)."""
+    p = CuratorProposal(
+        summary="новое",
+        claims=[ClaimProposal(statement="годовая инфляция 5,59", claim_type=ClaimType.TEMPORAL_FACT)],
+    )
+    assert any("temporal_fact requires as_of" in x for x in p.validate_against(evidence_count=0))
+
+
+def test_reverify_still_validated_for_new_claims_in_the_same_proposal() -> None:
+    """Ослабление относится только кclaims с `existing_claim_id`: в одном
+    предложении новое временное утверждение без даты по-прежнему флагается."""
+    p = CuratorProposal(
+        summary="смешанное",
+        claims=[
+            ClaimProposal(
+                statement="старое",
+                claim_type=ClaimType.TEMPORAL_FACT,
+                existing_claim_id=str(uuid.uuid4()),
+            ),
+            ClaimProposal(statement="новое", claim_type=ClaimType.TEMPORAL_FACT),
+        ],
+    )
+    problems = p.validate_against(evidence_count=0)
+    assert problems == ["claim[1]: temporal_fact requires as_of"]
