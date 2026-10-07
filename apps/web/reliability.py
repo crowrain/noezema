@@ -22,6 +22,7 @@ ARCHITECTURE §3.7, §8.7); здесь уже вычисленные значе�
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterable, Mapping
 from typing import Any, Final
 
@@ -235,12 +236,15 @@ def describe_verification(
         phrases.append("использован один источник")
 
     # T7.75 (ADR-0029 B): часть прочитанного может пересказывать один первоисточник — это видно
-    # по указателю происхождения источника. Фраза честная: она не утверждает, что независимость
-    # есть или её нет, она называет найденное.
+    # по указателю происхождения источника. T7.78: то же самое решает запись об улике, когда
+    # страница неоднозначна и страничный указатель не поставлен. Фраза честная: она не утверждает,
+    # что независимость есть или её нет, она называет найденное (сколько прочитанных источников
+    # хоть в чём-то пересказывают первоисточник), ничего сверх переданных полей не выдумывая.
     retold = {
         _source_ref(row)
         for row in supports
-        if _source_ref(row) is not None and _parent_ref(row) is not None
+        if _source_ref(row) is not None
+        and (_parent_ref(row) is not None or _value_attribution_ref(row) is not None)
     }
     if retold:
         phrases.append(f"часть прочитанного — пересказ первоисточника: {len(retold)}")
@@ -294,6 +298,29 @@ def _parent_ref(row: Mapping[str, Any]) -> str | None:
                 return str(value)
     for key in ("parent_uri", "parent_source_id"):
         value = row.get(key)
+        if value:
+            return str(value)
+    return None
+
+
+def _value_attribution_ref(row: Mapping[str, Any]) -> str | None:
+    """Запись об улике (T7.78): этот фрагмент пересказывает первоисточник, даже если сама
+    страница не помечена. Форма та же, что хранит `evidence.scope` (`packages/memory/scope.py`);
+    JSONB приходит то словарём, то строкой — разбираем оба варианта, при битой форме отказа нет.
+    """
+    scope = row.get("scope")
+    if isinstance(scope, str):
+        try:
+            scope = json.loads(scope)
+        except ValueError:
+            return None
+    if not isinstance(scope, Mapping):
+        return None
+    record = scope.get("value_attribution")
+    if not isinstance(record, Mapping):
+        return None
+    for key in ("primary_uri", "primary_name", "parent_source_id"):
+        value = record.get(key)
         if value:
             return str(value)
     return None

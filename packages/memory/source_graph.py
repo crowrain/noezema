@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
+from typing import Any
 
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -42,6 +43,7 @@ from packages.memory.independence import (
     SourceGraphInput,
     group_source_graph,
 )
+from packages.memory.scope import VALUE_ATTRIBUTION_SCHEMA
 
 
 @dataclass(frozen=True)
@@ -50,6 +52,57 @@ class SourceGraphChangeResult:
     invalidated: int
     jobs_created: int
     revision: int
+
+
+async def _value_attribution_parents(
+    db: AsyncSession, *, claim_id: uuid.UUID
+) -> dict[uuid.UUID, set[uuid.UUID]]:
+    """T7.78 (ADR-0029): эффективные родители этого утверждения по записям улик.
+
+    Читает только уже записанное хостом решение (`evidence.scope.value_attribution`,
+    `packages/memory/scope.py`) — детектор отсюда не вызывается: `packages/` не импортирует
+    `apps/`. Ничего, кроме ВХОДА группировщика, от решения не зависит.
+
+    Консервативно: если улики одного утверждения при одном и том же источнике приписывают
+    значение разным первоисточникам, эффективного родителя нет (разные группы, как до задачи).
+    Форма записии проверяется по маркеру схемы; не-UUID родителя игнорируется.
+    """
+    rows = (
+        (
+            await db.execute(
+                text(
+                    "SELECT source_id,"
+                    " scope -> 'value_attribution' ->> 'parent_source_id' AS parent_id"
+                    " FROM evidence"
+                    " WHERE claim_id = :c AND source_id IS NOT NULL"
+                    " AND jsonb_typeof(scope -> 'value_attribution') = 'object'"
+                    " AND scope -> 'value_attribution' ->> 'schema' = :schema"
+                ),
+                {"c": claim_id, "schema": VALUE_ATTRIBUTION_SCHEMA},
+            )
+        )
+        .all()
+    )
+    parents: dict[uuid.UUID, set[uuid.UUID]] = {}
+    for raw_source, raw_parent in rows:
+        source_id = _as_uuid(raw_source)
+        parent_id = _as_uuid(raw_parent)
+        if source_id is None or parent_id is None or parent_id == source_id:
+            continue
+        parents.setdefault(source_id, set()).add(parent_id)
+    return parents
+
+
+def _as_uuid(value: Any) -> uuid.UUID | None:
+    """asyncpg возвращает свой UUID-тип (AGENTS §7): guard перед приведением."""
+    if isinstance(value, uuid.UUID):
+        return value
+    if isinstance(value, str):
+        try:
+            return uuid.UUID(value)
+        except ValueError:
+            return None
+    return None
 
 
 async def build_source_independence_snapshot(
@@ -85,10 +138,25 @@ async def build_source_independence_snapshot(
         .scalars()
         .all()
     )
+    # T7.78 (ADR-0029): эффективный родитель значения для ЭТОГО утверждения — решение хоста,
+    # записанное на улике. Страничный указатель (T7.75) решает, когда он есть; поуровневое
+    # решение применяется там, где строка источника не помечена (именно там страничный детектор
+    # отказался решать: «ambiguous_primaries»). Меняется только ВХОД группировщика:
+    # `group_source_graph` не различает, откуда взялся parent, и склеивает существующим
+    # основанием `parent:<short12>`.
+    attribution_parents = await _value_attribution_parents(db, claim_id=claim_id)
+    effective_parent = {
+        sid: next(iter(parents))
+        for sid, parents in attribution_parents.items()
+        if len(parents) == 1
+    }
     # direct parents of the set: graph nodes (two children of one parent
     # merge through it) but not members of the snapshot
     parent_ids = sorted(
-        {s.parent_source_id for s in sources if s.parent_source_id is not None}
+        (
+            {s.parent_source_id for s in sources if s.parent_source_id is not None}
+            | set(effective_parent.values())
+        )
         - set(source_ids)
     )
     parent_rows = (
@@ -138,7 +206,9 @@ async def build_source_independence_snapshot(
             source_id=s.id,
             canonical_uri=s.canonical_uri,
             content_hash=s.content_hash,
-            parent_source_id=s.parent_source_id,
+            # страничный указатель приоритетнее (он уже факт графа и был учтён прежними
+            # оценками); поуровневое решение подставляется, когда строка не помечена
+            parent_source_id=s.parent_source_id or effective_parent.get(s.id),
         )
         for s in (*sources, *parent_rows)
     ]

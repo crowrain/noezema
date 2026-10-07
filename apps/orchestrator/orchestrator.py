@@ -45,7 +45,13 @@ from apps.orchestrator.tool_context import (
     render_step_budget,
     render_tool_argument_schemas,
 )
+from apps.research_proxy.derivative_pointer import resolve_primary_source
 from apps.research_proxy.normalization import PARSER_FINGERPRINT
+from apps.research_proxy.source_attribution import primary_source
+from apps.research_proxy.value_attribution import (
+    VALUE_ATTRIBUTION_METHOD_VERSION,
+    attribute_value_in_fragment,
+)
 from packages.artifacts import freeze_workspace
 from packages.broker import ToolExecutor, check_idempotency
 from packages.cognition.curiosity import (
@@ -70,6 +76,7 @@ from packages.domain.models.enums import (
     AuditEventType,
     CompleteReason,
     DecisionKind,
+    EvidenceKind,
     IdempotencyClass,
     MessageState,
     QuestionOrigin,
@@ -127,6 +134,7 @@ from packages.llm_gateway.roles import (
     tool_schema_hash,
 )
 from packages.memory.activation import ActivationInFlightError, activation_slot_busy
+from packages.memory.scope import EVIDENCE_VALUE_ATTRIBUTION_KEY, build_value_attribution
 from packages.memory.session_admission import register_session_admission
 from packages.policy.engine import PolicyEngine
 from packages.policy.profiles import CapabilityProfile, ProfileError, effective_profile
@@ -2116,6 +2124,51 @@ class Orchestrator:
             "engine. Я не выдумываю факты и не повышаю свою уверенность."
         )
 
+    async def _value_attribution(
+        self, db: AsyncSession, record: EvidenceRecord, claim_statement: str
+    ) -> JsonDict | None:
+        """Происхождение ЗНАЧЕНИЯ этой улики (T7.78, ADR-0029): чей пересказ читает утверждение.
+
+        Хостовое решение, модель к нему не допускается: детектор видит только текст основания улики
+        и формулировку утверждения. Замораживается решение здесь же — в staging-операции `evidence`
+        (единственное место, где пара «утверждение ↔ улика» существует вместе с обоими текстами),
+        а commit boundary переносит её в `evidence.scope`. Строку источника не трогаем: страничный
+        указатель T7.75 решает, когда он есть, а здесь решается только этот фрагмент. Первоисточник,
+        которого узел не читал, разрешается существующим механизмом якоря (T7.75).
+        """
+        if record.kind is not EvidenceKind.SOURCE_ASSERTION:
+            return None
+        fragment = str(record.payload.get("assertion_text") or "")
+        source_id = str(record.source_id or "")
+        if not fragment or not source_id:
+            return None
+        decision = attribute_value_in_fragment(
+            canonical_uri=str(record.payload.get("url") or "") or None,
+            text=fragment,
+            claim_statement=claim_statement,
+        )
+        if not decision.is_derivative or decision.primary_key is None:
+            return None
+        spec = primary_source(decision.primary_key)
+        if spec is None:
+            return None
+        parent_id = await resolve_primary_source(
+            db, spec, declared_by=VALUE_ATTRIBUTION_METHOD_VERSION
+        )
+        if not parent_id or parent_id == source_id:
+            return None  # первоисточник не может быть родителем самого себя
+        attribution = build_value_attribution(
+            primary_key=spec.key,
+            primary_name=spec.name,
+            primary_uri=spec.home_uri,
+            parent_source_id=parent_id,
+            method=VALUE_ATTRIBUTION_METHOD_VERSION,
+            basis_fragment=decision.basis_fragment,
+        )
+        if attribution is None:
+            return None
+        return {EVIDENCE_VALUE_ATTRIBUTION_KEY: attribution.as_scope()}
+
     async def _curator(
         self,
         db: AsyncSession,
@@ -2356,16 +2409,30 @@ class Orchestrator:
         # evidence links (M3): the only channel for evidence changes; the
         # trusted host recomputes every identity at the commit boundary
         for link in proposal.evidence_links:
+            evidence_payload: JsonDict = {
+                "evidence_index": link.evidence_index,
+                "claim_index": link.claim_index,
+                "relation": link.relation.value,
+            }
+            # T7.78 (ADR-0029): сюда же хост кладёт решение о происхождении ЗНАЧЕНИЯ этой улики
+            # (пересказ первоисточника или отказ) — единственный конверт, где пара «утверждение ↔
+            # улика» существует вместе с обоими текстами. Пусто = детектор не решил фрагмент.
+            if 0 <= link.evidence_index < len(ctx.evidence) and 0 <= link.claim_index < len(
+                proposal.claims
+            ):
+                origin = await self._value_attribution(
+                    db,
+                    ctx.evidence[link.evidence_index],
+                    proposal.claims[link.claim_index].statement,
+                )
+                if origin is not None:
+                    evidence_payload.update(origin)
             await staging.record(
                 db,
                 audit,
                 session,
                 "evidence",
-                {
-                    "evidence_index": link.evidence_index,
-                    "claim_index": link.claim_index,
-                    "relation": link.relation.value,
-                },
+                evidence_payload,
                 proposed_evidence=1,
             )
         for q in proposal.new_questions:

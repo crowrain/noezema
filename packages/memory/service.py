@@ -74,10 +74,13 @@ from packages.memory.rules_engine import (
     reverify_after,
 )
 from packages.memory.scope import (
+    EVIDENCE_VALUE_ATTRIBUTION_KEY,
     anchor_from_scope,
+    carry_value_attribution,
     derive_claim_as_of,
     derive_claim_scope,
     derive_evidence_scope,
+    parse_value_attribution,
 )
 from packages.memory.source_graph import build_source_independence_snapshot
 
@@ -880,6 +883,17 @@ class MemoryService:
             ):
                 problems.append(f"evidence staging rejected: no artifact for {kind} ({row.id})")
                 continue
+            # source provenance (source_assertion / quote_integrity):
+            # the host-verified sources row the assertion was read
+            # from — drives the source-independence groups (§11.3)
+            rec_source_id: uuid.UUID | None = None
+            if kind in ("source_assertion", "quote_integrity"):
+                raw_sid = getattr(record, "source_id", None)
+                if raw_sid:
+                    try:
+                        rec_source_id = uuid.UUID(str(raw_sid))
+                    except ValueError:
+                        rec_source_id = None
             existing_ev = (
                 (
                     await db.execute(
@@ -896,35 +910,45 @@ class MemoryService:
             if existing_ev is not None:
                 ev: ORMEvidence = existing_ev
                 counters["deduped"] += 1
+                # T7.78 (ADR-0029): то же доказательство того же утверждения, перечитанное
+                # позже, может получить решение о происхождении значения — оно дописывается
+                # к уже существующей строке (дедуп не должен терять факт происхождения)
+                if rec_source_id is not None and parse_value_attribution(ev.scope) is None:
+                    decision = parse_value_attribution(payload)
+                    if (
+                        decision is not None
+                        and decision.parent_source_id != str(rec_source_id)
+                    ):
+                        merged = dict(ev.scope or {})
+                        merged[EVIDENCE_VALUE_ATTRIBUTION_KEY] = decision.as_scope()
+                        ev.scope = merged
             else:
-                # source provenance (source_assertion / quote_integrity):
-                # the host-verified sources row the assertion was read
-                # from — drives the source-independence groups (§11.3)
-                rec_source_id: uuid.UUID | None = None
-                if kind in ("source_assertion", "quote_integrity"):
-                    raw_sid = getattr(record, "source_id", None)
-                    if raw_sid:
-                        try:
-                            rec_source_id = uuid.UUID(str(raw_sid))
-                        except ValueError:
-                            rec_source_id = None
-                    if rec_source_id is None:
-                        problems.append(
-                            f"evidence staging rejected: no source provenance for {kind} ({row.id})"
-                        )
-                        continue
+                if kind in ("source_assertion", "quote_integrity") and rec_source_id is None:
+                    problems.append(
+                        f"evidence staging rejected: no source provenance for {kind} ({row.id})"
+                    )
+                    continue
+                # T7.17: the evidence scope is derived by the host from the row's
+                # provenance, not copied from the claim's (model) scope. T7.78 adds the
+                # host-authored origin of the VALUE (staging payload → scope); it is not
+                # part of the identity and is carried across later re-derivations.
+                ev_scope = await self._derive_evidence_scope(
+                    db, source_id=rec_source_id, fallback_at=now
+                )
+                decision = parse_value_attribution(payload)
+                if (
+                    decision is not None
+                    and rec_source_id is not None
+                    and decision.parent_source_id != str(rec_source_id)
+                ):
+                    ev_scope[EVIDENCE_VALUE_ATTRIBUTION_KEY] = decision.as_scope()
                 ev = ORMEvidence(
                     id=uuid.uuid4(),
                     claim_id=linked_claim.id,
                     relation=relation,
                     evidence_kind=kind,
                     identity_hash=identity,
-                    # T7.17: the evidence scope is derived by the host
-                    # from the row's provenance, not copied from the
-                    # claim's (model) scope
-                    scope=await self._derive_evidence_scope(
-                        db, source_id=rec_source_id, fallback_at=now
-                    ),
+                    scope=ev_scope,
                     source_id=rec_source_id,
                     chunk_id=getattr(record, "chunk_id", None),
                     observation_artifact_id=artifact_id,
@@ -971,10 +995,13 @@ class MemoryService:
             # coverage must not depend on which keys the model once
             # invented for the same subject and date
             for ev_row in all_evidence:
-                expected = await self._derive_evidence_scope(
-                    db,
-                    source_id=ev_row.source_id,
-                    fallback_at=ev_row.created_at or now,
+                expected = carry_value_attribution(
+                    ev_row.scope,
+                    await self._derive_evidence_scope(
+                        db,
+                        source_id=ev_row.source_id,
+                        fallback_at=ev_row.created_at or now,
+                    ),
                 )
                 if dict(ev_row.scope or {}) != expected:
                     ev_row.scope = expected
@@ -1294,6 +1321,8 @@ class MemoryService:
                 "confidence": result.confidence,
                 "reasons": list(result.reasons),
                 "rules_hash": self._rules_hash,
+                # T7.78 (ADR-0029): поуровневое происхождение значения этих улик
+                "value_attributions": _value_attribution_summary(all_evidence),
                 "environment_independence_snapshot_id": (
                     str(env_snapshot_id) if env_snapshot_id is not None else None
                 ),
@@ -1422,6 +1451,25 @@ class MemoryService:
             if claim is not None:
                 claims.append(claim)
         return claims
+
+
+def _value_attribution_summary(evidence: list[ORMEvidence]) -> list[JsonDict]:
+    """T7.78 (аддитивное поле аудита): по каким уликам этой оценки значение прочитано как
+    пересказ первоисточника. Детерминированно (сортировка), только уже записанные решения —
+    никаких новых типов событий и никакого влияния на оценку здесь нет."""
+    rows: list[JsonDict] = []
+    for e in evidence:
+        decision = parse_value_attribution(e.scope)
+        if decision is None or e.source_id is None:
+            continue
+        rows.append(
+            {
+                "source_id": str(e.source_id),
+                "primary_name": decision.primary_name,
+                "method": decision.method,
+            }
+        )
+    return sorted(rows, key=lambda row: (row["source_id"], row["primary_name"]))
 
 
 def _evidence_set_hash(evidence: list[ORMEvidence]) -> str:

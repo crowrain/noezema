@@ -39,8 +39,13 @@ from packages.domain.canonical import canonical_json_bytes
 PRIMARY_LOOKUP_SCAN_LIMIT: Final = 500
 
 
-async def resolve_primary_source(db: AsyncSession, spec: PrimarySource) -> str:
-    """Строка первоисточника для указателя: прочитанная страница того же хоста либо якорь."""
+async def resolve_primary_source(
+    db: AsyncSession, spec: PrimarySource, *, declared_by: str = ATTRIBUTION_METHOD_VERSION
+) -> str:
+    """Строка первоисточника для указателя: прочитанная страница того же хоста либо якорь.
+
+    `declared_by` — кто объявил якорь (аддитивный параметр, T7.78: якорь мог создать и
+    поуровневый детектор значения; прежнее поведение — страничный метод — значение по умолчанию)."""
     rows = (
         (
             await db.execute(
@@ -93,7 +98,7 @@ async def resolve_primary_source(db: AsyncSession, spec: PrimarySource) -> str:
                     "declared_primary_anchor": True,
                     "primary_key": spec.key,
                     "primary_name": spec.name,
-                    "declared_by": ATTRIBUTION_METHOD_VERSION,
+                    "declared_by": declared_by,
                     "note": "первоисточник объявлен хостом как общий родитель пересказов; "
                     "узлом не прочитан",
                 }

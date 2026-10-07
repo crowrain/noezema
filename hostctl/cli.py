@@ -11,6 +11,7 @@ import json
 import sys
 import uuid
 from pathlib import Path
+from typing import Any
 
 import click
 
@@ -420,17 +421,37 @@ def reassessment_tick(batch_size: int, lease_seconds: int) -> None:
     help="Начало окна журнала в ISO (например 2026-10-07T14:30:00+00:00 или …Z).",
 )
 @click.option("--dry-run", is_flag=True, default=False, help="Только план: ничего не пишет.")
-def research_reattribute(since: str, dry_run: bool) -> None:
-    """Переатрибуция решений битого детектора v1 (T7.77).
+@click.option(
+    "--evidence-level",
+    is_flag=True,
+    default=False,
+    help=(
+        "T7.78: решать производность для каждого доказательства (утверждение + источник), "
+        "а не для всей страницы."
+    ),
+)
+def research_reattribute(since: str, dry_run: bool, evidence_level: bool) -> None:
+    """Переатрибуция происхождения прочитанного (T7.77 — страница, T7.78 — доказательство).
 
-    Просматривает события `research_fetch_completed` окна, решённые методом
-    `host-source-attribution-v1` (детектор не видел неразрывных пробелов и переносов внутри
-    фраз), перечитывает сохранённый нормализованный текст и принимает решение заново —
-    детектором v2. Указатель производности проставляется тем же кодом, что и при fetch
-    (`apps/research_proxy/derivative_pointer.py`), только ещё не размеченным строкам.
-    Пересчёт оценок — существующим механизмом: каскад §11.3 (`apply_source_graph_change`,
-    тип журнала `source_graph_changed`) и рабочий переоценки. Идемпотентно: повторный запуск
-    ничего не меняет. Новых типов событий, миграций и правок правил нет.
+    По умолчанию (`--evidence-level` не задан): решения битого детектора v1. Просматриваются
+    события `research_fetch_completed` окна, решённые методом `host-source-attribution-v1`
+    (детектор не видел неразрывных пробелов и переносов внутри фраз), сохранённый нормализованный
+    текст перечитывается и решение принимается заново — детектором v2. Указатель производности
+    проставляется тем же кодом, что и при fetch (`apps/research_proxy/derivative_pointer.py`),
+    только ещё не размеченным строкам источников.
+
+    С `--evidence-level`: производится поуровневая атрибуция (T7.78, ADR-0029). Для каждого
+    доказательства окна (утверждение + прочитанный источник) детектор значения смотрит в
+    сохранённом тексте страницы ту атрибуцию, которая касается ЧИСЛА утверждения, и записывает на
+    улике «этот фрагмент — пересказ такого-то первоисточника» (`evidence.scope.value_attribution`).
+    Строки источников не размечаются: страница остаётся независимой для значений, которые её
+    собственная оценка. Искомый первоисточник разрешается тем же механизмом, что и при fetch
+    (прочитанная публикация либо якорь объявленного первоисточника).
+
+    В обоих режимах пересчёт оценок — существующим механизмом: каскад §11.3
+    (`apply_source_graph_change`, тип журнала `source_graph_changed`) и рабочий переоценки.
+    Идемпотентно: повторный запуск ничего не меняет. Новых типов событий, миграций и правок
+    правил нет.
 
     exit 0  -> прогон завершён (dry-run или запись)
     exit 2  -> NOEZEMA_DATABASE_URL не задан, --since не ISO, каталог артефактов недоступен
@@ -446,7 +467,12 @@ def research_reattribute(since: str, dry_run: bool) -> None:
         sys.exit(EXIT_USAGE_ERROR)
 
     from apps.orchestrator.scheduler import artifacts_root_from_env
-    from apps.research_proxy.reattribution import ReattributionError, parse_since, reattribute_window
+    from apps.research_proxy.reattribution import (
+        ReattributionError,
+        parse_since,
+        reattribute_evidence_window,
+        reattribute_window,
+    )
     from packages.artifacts.store import FilesystemArtifactStore
 
     try:
@@ -464,29 +490,56 @@ def research_reattribute(since: str, dry_run: bool) -> None:
     engine = create_async_engine(url)
     factory = async_sessionmaker(engine, expire_on_commit=False)
 
-    async def _run() -> int:
-        try:
-            report = await reattribute_window(factory, store, since=since_ts, dry_run=dry_run)
-        finally:
-            # пул закрываем в том же event loop, где были соединения (ловушка CliRunner-тестов)
-            await engine.dispose()
+    def _print_report(report: Any) -> None:
+        """Отчёт команды: две формы (страница / доказательство) одного пересчёта."""
         click.echo(f"research-reattribute: окно с {report.since}{' (только план)' if report.dry_run else ''}")
         for row in report.rows:
             became = row.now_status + (f" → {row.primary_name}" if row.primary_name else "")
-            click.echo(f"{row.canonical_uri}\n    было: {row.was_status}  стало: {became}  [{row.action}]")
+            if evidence_level:
+                statement = " ".join(row.claim_statement.split())
+                if len(statement) > 90:
+                    statement = statement[:89] + "…"
+                head = f"утверждение {row.claim_id[:8]} · {row.canonical_uri}"
+                click.echo(head)
+                click.echo(f"    утверждение: {statement}")
+                click.echo(f"    было: {row.was_status}  стало: {became}  [{row.action}]")
+            else:
+                click.echo(f"{row.canonical_uri}\n    было: {row.was_status}  стало: {became}  [{row.action}]")
         if not report.rows:
-            click.echo("(в окне нет решений метода v1 — нечего переатрибуцировать)")
-        click.echo(
-            f"изменено источников: {len(report.changed_source_ids)}; "
-            f"затронуто утверждений: {report.affected_claims}; "
-            f"снятых голов: {report.invalidated_heads}; задач переоценки создано: {report.jobs_created}"
-        )
+            click.echo("(в окне нечего переатрибуцировать)")
+        if evidence_level:
+            click.echo(
+                f"доказательств с новым решением: {report.changed_evidence}; "
+                f"изменено источников: {len(report.changed_source_ids)}; "
+                f"затронуто утверждений: {report.affected_claims}; "
+                f"снятых голов: {report.invalidated_heads}; задач переоценки создано: {report.jobs_created}"
+            )
+        else:
+            click.echo(
+                f"изменено источников: {len(report.changed_source_ids)}; "
+                f"затронуто утверждений: {report.affected_claims}; "
+                f"снятых голов: {report.invalidated_heads}; задач переоценки создано: {report.jobs_created}"
+            )
         if report.worker is not None:
             outcome = report.worker
             click.echo(
                 f"рабочий переоценки: processed={outcome.processed} completed={outcome.completed} "
                 f"retried={outcome.retried} blocked={outcome.blocked} deferred={outcome.deferred}"
             )
+
+    async def _run() -> int:
+        report: Any  # две формы отчёта: ReattributionReport (страница) / EvidenceReattributionReport
+        try:
+            if evidence_level:
+                report = await reattribute_evidence_window(
+                    factory, store, since=since_ts, dry_run=dry_run
+                )
+            else:
+                report = await reattribute_window(factory, store, since=since_ts, dry_run=dry_run)
+        finally:
+            # пул закрываем в том же event loop, где были соединения (ловушка CliRunner-тестов)
+            await engine.dispose()
+        _print_report(report)
         return 0
 
     sys.exit(asyncio.run(_run()))
