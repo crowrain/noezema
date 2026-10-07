@@ -234,6 +234,17 @@ def describe_verification(
     elif len(source_refs) == 1:
         phrases.append("использован один источник")
 
+    # T7.75 (ADR-0029 B): часть прочитанного может пересказывать один первоисточник — это видно
+    # по указателю происхождения источника. Фраза честная: она не утверждает, что независимость
+    # есть или её нет, она называет найденное.
+    retold = {
+        _source_ref(row)
+        for row in supports
+        if _source_ref(row) is not None and _parent_ref(row) is not None
+    }
+    if retold:
+        phrases.append(f"часть прочитанного — пересказ первоисточника: {len(retold)}")
+
     groups = _distinct_groups(source_groups)
     if groups >= 2:
         phrases.append(f"источники разнесены по {groups} независимым группам")
@@ -263,6 +274,25 @@ def _source_ref(row: Mapping[str, Any]) -> str | None:
             if value:
                 return str(value)
     for key in ("source_uri", "source_id", "canonical_uri"):
+        value = row.get(key)
+        if value:
+            return str(value)
+    return None
+
+
+def _parent_ref(row: Mapping[str, Any]) -> str | None:
+    """Указатель происхождения прочитанного источника (T7.75): страница пересказывает первоисточник.
+
+    Форма строки зависит от экрана: в provenance инженера это вложенный `parent`, в карточке
+    ответа — плоские колонки запроса доказательств.
+    """
+    parent = row.get("parent")
+    if isinstance(parent, Mapping):
+        for key in ("canonical_uri", "id"):
+            value = parent.get(key)
+            if value:
+                return str(value)
+    for key in ("parent_uri", "parent_source_id"):
         value = row.get(key)
         if value:
             return str(value)

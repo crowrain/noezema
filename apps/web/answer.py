@@ -824,9 +824,11 @@ async def question_answer(db: AsyncSession, question_id: uuid.UUID) -> JsonDict 
                             f"""
                             SELECT e.claim_id, e.relation, e.evidence_kind, e.scope,
                                    e.source_id, e.chunk_id, e.observation_artifact_id,
-                                   s.source_type, s.canonical_uri, ar.sha256 AS artifact_sha256
+                                   s.source_type, s.canonical_uri, ar.sha256 AS artifact_sha256,
+                                   s.parent_source_id, ps.canonical_uri AS parent_uri
                             FROM evidence e
                             LEFT JOIN sources s ON s.id = e.source_id
+                            LEFT JOIN sources ps ON ps.id = s.parent_source_id
                             LEFT JOIN artifacts ar ON ar.id = e.observation_artifact_id
                             WHERE e.claim_id IN ({evidence_clause})
                             ORDER BY e.created_at, e.id

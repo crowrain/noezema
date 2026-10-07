@@ -47,6 +47,14 @@ from apps.research_proxy.search import (
     search_local,
     upstream_request_url,
 )
+from apps.research_proxy.source_attribution import (
+    ATTRIBUTION_METHOD_VERSION,
+    AttributionDecision,
+    PrimarySource,
+    detect_source_attribution,
+    is_home_host,
+    primary_source,
+)
 from apps.research_proxy.ssrf_guard import SSRFError, SSRFPolicy, validate_url
 from packages.artifacts.store import ArtifactStore
 from packages.domain.canonical import canonical_json_bytes
@@ -60,6 +68,13 @@ from packages.domain.services.config import ConfigError, ConfigService
 #: untrusted|external; external content is the "external" class (and
 #: the context marking says it is untrusted, T6.3)
 UNTRUSTED_EXTERNAL = "external"
+
+
+#: строка первоисточника, нужная для указателя происхождения (T7.75, ADR-0029 B): сначала
+#: уже прочитанная страница того же хоста, иначе декларированный якорь. Перебор ограничивает
+#: только стоимость поиска по `sources`: решение детерминировано порядком ORDER BY
+PRIMARY_LOOKUP_SCAN_LIMIT = 500
+
 
 
 class ResearchProxyError(RuntimeError):
@@ -144,6 +159,14 @@ class ResearchProxyService:
         # content-addressed store has it — the proxy keeps no live
         # copy of fetched content
         result.data = b""
+
+        # T7.75 (ADR-0029 вариант B): производность страницы доказывает её текст, а не модель.
+        # Чистый детектор (`source_attribution`) решает по canonical URI + нормализованному тексту;
+        # здесь из решения вырастает указатель `parent_source_id` для НОВОЙ строки источника.
+        attribution = detect_source_attribution(
+            canonical_uri=result.final_url, text=normalized.text
+        )
+        parent_source_id: str | None = None
 
         async with self.session_factory() as db, transaction(db):
             # the content-addressed registry rows (fs store + DB row
@@ -266,6 +289,8 @@ class ResearchProxyService:
                     "trust": UNTRUSTED_EXTERNAL,
                 },
             )
+            if attribution.is_derivative and not idempotent:
+                parent_source_id = await self._mark_derivative(db, source_id, attribution)
             await AuditService(db).record(
                 AuditEventType.RESEARCH_FETCH_COMPLETED,
                 payload={
@@ -278,12 +303,44 @@ class ResearchProxyService:
                     "idempotent": idempotent,
                     "redirects": result.redirects,
                     "elapsed_ms": result.elapsed_ms,
+                    # T7.75: чем обосновано решение о происхождении. Статус пишется всегда, в том
+                    # числе когда хост сознательно НЕ стал склеивать источники (own_assessment,
+                    # ambiguous_primaries, self_primary, no_value_attribution). Ключ
+                    # `derivativity_written` различает «узнали пересказ» и «проставили указатель»:
+                    # повторный fetch уже прочитанной страницы идемпотенен и задним числом ничего
+                    # не дописывает.
+                    "attribution_status": attribution.status,
+                    "attribution_method": ATTRIBUTION_METHOD_VERSION,
+                    **(
+                        {
+                            "derivativity_written": parent_source_id is not None,
+                            **(
+                                {
+                                    "derivative_of": {
+                                        "key": attribution.primary_key,
+                                        "name": attribution.primary_name,
+                                        "uri": attribution.parent_uri,
+                                    },
+                                    "parent_source_id": parent_source_id,
+                                }
+                                if parent_source_id is not None
+                                else {}
+                            ),
+                        }
+                        if attribution.is_derivative
+                        else {}
+                    ),
                 },
                 actor="research_proxy",
                 public_summary=(
                     f"refetch (idempotent) {result.final_url} (untrusted external)"
                     if idempotent
                     else f"fetched {result.final_url} (untrusted external)"
+                )
+                + (
+                    f" · пересказывает: {attribution.primary_name}"
+                    if attribution.is_derivative and not idempotent
+                    else ""
                 ),
             )
 
@@ -300,8 +357,127 @@ class ResearchProxyService:
             "content_type": result.content_type,
             "redirects": result.redirects,
             "trust_class": UNTRUSTED_EXTERNAL,
+            # T7.75 (только добавляются): решение детектора происхождения и, если указатель
+            # реально проставлен, на кого именно он ведёт
+            "attribution_status": attribution.status,
+            "derivative_of": (
+                {"key": attribution.primary_key, "name": attribution.primary_name,
+                 "uri": attribution.parent_uri, "source_id": parent_source_id}
+                if parent_source_id is not None
+                else None
+            ),
             "note": "недоверенный внешний контент: использовать только за fence-ом",
         }
+
+    async def _resolve_primary_source(self, db: AsyncSession, spec: PrimarySource) -> str:
+        """Строка первоисточника для указателя: прочитанная страница того же хоста либо якорь.
+
+        Родителем может быть только **оригинальная** публикация: уже помеченный пересказ
+        (`parent_source_id NOT NULL`) родителем не становится — иначе цепочка «новость → ЦБ,
+        который цитирует Росстат» transitively склеила бы два разных первоисточника.
+
+        Якорь (`content_hash IS NULL`, `retrieved_at IS NULL`, `declared_primary_anchor`) —
+        честная запись объявленного первоисточника: узел его не читал, доказательством он не
+        является и в члены снимка независимости не входит (загрузчик графа добавляет прямых
+        родителей только как узлы — `packages/memory/source_graph.py:87–105`).
+        """
+        rows = (
+            (
+                await db.execute(
+                    text(
+                        "SELECT id, canonical_uri FROM sources "
+                        "WHERE source_type = 'external_url' AND canonical_uri IS NOT NULL "
+                        "  AND content_hash IS NOT NULL AND parent_source_id IS NULL "
+                        "ORDER BY retrieved_at DESC NULLS LAST, id LIMIT :limit"
+                    ),
+                    {"limit": PRIMARY_LOOKUP_SCAN_LIMIT},
+                )
+            )
+            .mappings()
+            .all()
+        )
+        for row in rows:
+            if is_home_host(row["canonical_uri"], spec.home_hosts):
+                return str(row["id"])
+
+        anchor = (
+            (
+                await db.execute(
+                    text(
+                        "SELECT id FROM sources WHERE source_type = 'external_url' "
+                        "AND canonical_uri = :uri AND content_hash IS NULL ORDER BY id LIMIT 1"
+                    ),
+                    {"uri": spec.home_uri},
+                )
+            )
+            .mappings()
+            .first()
+        )
+        if anchor is not None:
+            return str(anchor["id"])
+
+        anchor_id = str(uuid.uuid4())
+        await db.execute(
+            text(
+                """
+                INSERT INTO sources (id, source_type, canonical_uri, retrieved_at,
+                                     content_hash, metadata)
+                VALUES (:id, 'external_url', :uri, NULL, NULL, CAST(:meta AS jsonb))
+                """
+            ),
+            {
+                "id": anchor_id,
+                "uri": spec.home_uri,
+                "meta": canonical_json_bytes(
+                    {
+                        "declared_primary_anchor": True,
+                        "primary_key": spec.key,
+                        "primary_name": spec.name,
+                        "declared_by": ATTRIBUTION_METHOD_VERSION,
+                        "note": "первоисточник объявлен хостом как общий родитель пересказов; "
+                        "узлом не прочитан",
+                    }
+                ).decode("utf-8"),
+            },
+        )
+        return anchor_id
+
+    async def _mark_derivative(
+        self, db: AsyncSession, source_id: str, decision: AttributionDecision
+    ) -> str | None:
+        """Указатель происхождения новой строки источника (T7.75).
+
+        Пишутся только уже существующие поля модели: `sources.parent_source_id` и ключ
+        `derivative_of` в `sources.metadata`. Ничего задним числом не переоценивается: метод
+        вызывается ровно для новой строки (`not idempotent`).
+        """
+        spec = primary_source(decision.primary_key or "")
+        if spec is None:
+            return None
+        parent_id = await self._resolve_primary_source(db, spec)
+        await db.execute(
+            text(
+                "UPDATE sources SET parent_source_id = :p, "
+                "metadata = COALESCE(metadata, '{}'::jsonb) || CAST(:meta AS jsonb) "
+                "WHERE id = :id"
+            ),
+            {
+                "p": parent_id,
+                "id": source_id,
+                "meta": canonical_json_bytes(
+                    {
+                        "derivative_of": {
+                            "key": spec.key,
+                            "name": spec.name,
+                            "uri": spec.home_uri,
+                            "method": ATTRIBUTION_METHOD_VERSION,
+                            "basis_fragment": decision.basis_fragment,
+                        }
+                    }
+                ).decode("utf-8"),
+            },
+        )
+        return parent_id
 
     def _mode_policy(self, section: Any) -> ModePolicy:
         try:

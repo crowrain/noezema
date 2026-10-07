@@ -295,5 +295,43 @@ def test_unrecognized_evidence_rows_do_not_become_a_fake_check() -> None:
     assert describe_verification([{"relation": None, "evidence_kind": None}]) == [NO_DETAILS]
 
 
+def test_retelling_is_named_only_when_the_host_recorded_the_pointer() -> None:
+    """T7.75 (ADR-0029 B): экран говорит о пересказе только если у источника есть указатель
+    происхождения. Фраза не утверждает ни наличие, ни отсутствие независимости."""
+
+    flat = [
+        {
+            "relation": "supports",
+            "evidence_kind": "source_assertion",
+            "canonical_uri": "https://a.example/news",
+            "parent_uri": "https://rosstat.gov.ru/",
+        },
+        {
+            "relation": "supports",
+            "evidence_kind": "source_assertion",
+            "canonical_uri": "https://b.example/news",
+            "parent_uri": "https://rosstat.gov.ru/",
+        },
+    ]
+    phrases = describe_verification(flat)
+    assert any("источников прочитано: 2" in p for p in phrases), phrases
+    assert any("часть прочитанного — пересказ первоисточника: 2" in p for p in phrases), phrases
+
+    # форма provenance инженера — вложенный parent
+    nested = [
+        {
+            "relation": "supports",
+            "evidence_kind": "source_assertion",
+            "source": {"canonical_uri": "https://a.example/news"},
+            "parent": {"canonical_uri": "https://rosstat.gov.ru/"},
+        }
+    ]
+    assert any("пересказ первоисточника: 1" in p for p in describe_verification(nested)), nested
+
+    # указателя нет — фразы нет: presentation не додумывает происхождение
+    plain = [{k: v for k, v in row.items() if k != "parent_uri"} for row in flat]
+    assert not any("пересказ" in p for p in describe_verification(plain)), describe_verification(plain)
+
+
 def _rank(grade: str) -> int:
     return GRADES.index(grade)
