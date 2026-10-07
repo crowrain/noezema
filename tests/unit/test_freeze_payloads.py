@@ -316,3 +316,77 @@ def test_config_v14_file_is_byte_stable_and_pinned() -> None:
     )
     assert canonical_sha256(payload) == "22903be78602cf7897f0de57b99514b66c58eca83960fa05458fd341e0104df4"
 
+
+
+@pytest.mark.unit
+def test_config_v15_differs_from_v14_only_by_the_two_prompt_pins() -> None:
+    """T7.73 (уточнение ADR-0018): config-v15 = config-v14 ровно с двумя правками — пин
+    ``prompts.curator`` → curator-v8 (перепроверка сохраняет опорную дату и scope якоря,
+    каждый использованный источник привязан) и пин ``prompts.explorer`` → explorer-v7
+    (первоисточник и независимое исследование; производный пересказ — не второй источник).
+    Всё остальное — байт в байт v14: пороги, правила типов, бюджеты, окна, research_proxy.
+    Состав правил движка (независимость, пороги, шкала grade) при этом не менялся: ADR-0029
+    описан, но не реализован. v14 остаётся как закоммичен (payload'ы не переписываются никогда)."""
+    v14 = _load("config-v14-payload.json")
+    v15 = _load("config-v15-payload.json")
+
+    assert {k for k in v15 if v15[k] != v14[k]} == {"prompts"}
+    assert {r for r in v15["prompts"] if v15["prompts"][r] != v14["prompts"][r]} == {"curator", "explorer"}
+    changed = {
+        key
+        for role in ("curator", "explorer")
+        for key in v15["prompts"][role]
+        if v15["prompts"][role][key] != v14["prompts"][role][key]
+    }
+    assert changed == {"path", "sha256", "version"}, changed
+
+    assert v15["prompts"]["curator"]["version"] == "curator-v8"
+    assert v15["prompts"]["curator"]["path"] == "prompts/curator/curator-v8.md"
+    assert v15["prompts"]["explorer"]["version"] == "explorer-v7"
+    assert v15["prompts"]["explorer"]["path"] == "prompts/explorer/explorer-v7.md"
+    # не тронутые роли закреплены прежними пинами
+    for role in ("extractor", "planner", "verifier"):
+        assert v15["prompts"][role] == v14["prompts"][role], role
+
+    resolved = resolve_prompts(v15["prompts"], REPO_ROOT)
+    assert resolved[Role.CURATOR].version == "curator-v8"
+    assert resolved[Role.EXPLORER].version == "explorer-v7"
+
+    # правила оценки, независимости и пороги — те же, что у v14 (стопап задачи: не менять)
+    assert set(v15) == set(v14), "у payload'а появился новый раздел"
+    untouched = sorted(k for k in v14 if k != "prompts")
+    for section in untouched:
+        assert v15[section] == v14[section], section
+
+    budgets = TokenBudgets.from_snapshot(v15["model"], v15["token_budgets"])
+    assert budgets.section_limits == EVAL2_SECTIONS
+    assert budgets.validate() == []
+
+
+@pytest.mark.unit
+def test_config_v15_file_is_byte_stable_and_pinned() -> None:
+    """Идентичность v15 закреплена: хеш файла и canonical-хеш (последний попадает в
+    ``config_snapshots.payload_sha256`` — AGENTS §8, путать их нельзя)."""
+    import hashlib
+
+    from packages.domain.config import canonical_sha256
+
+    raw = (REPO_ROOT / "docs" / "eval" / "config-v15-payload.json").read_text(encoding="utf-8")
+    payload = json.loads(raw)
+    assert json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True) + "\n" == raw
+    assert hashlib.sha256(raw.encode()).hexdigest() == (
+        "c65b69db5a1f50d44e6dc9e9c4b6399381c191b1df62506a9ef275a6d3b5f722"
+    )
+    assert canonical_sha256(payload) == "b380181298310e6d1e1904ac5f062b0d1c80543fafe11c6482b7ce9ba05d6a73"
+
+
+@pytest.mark.unit
+def test_config_v14_file_is_untouched_by_the_v15_activation() -> None:
+    """Новый номер конфигурации = новый файл (AGENTS §8): v14 не переписан задним числом и
+    остаётся штатным откатом стенда."""
+    import hashlib
+
+    raw = (REPO_ROOT / "docs" / "eval" / "config-v14-payload.json").read_text(encoding="utf-8")
+    assert hashlib.sha256(raw.encode()).hexdigest() == (
+        "6d361dae4454a56472de58df4c4c34577d6b1ff4cc870d9b418d72943256ed89"
+    )

@@ -70,6 +70,10 @@ def _load_payload(name: str) -> dict:
         # rule-7 negative example — the matrix must remain
         # pair-identical to config-v11's rules.
         ("curator-v7.md", "config-v11-payload.json"),
+        # T7.73: the v7→v8 diff is the reverify reference rules (rule 8) and the
+        # used-source linking rule (rule 9) — the matrix must remain pair-identical
+        # to config-v15's rules, which are byte-identical to config-v14's.
+        ("curator-v8.md", "config-v15-payload.json"),
     ],
 )
 def test_curator_matrix_matches_claim_type_rules(
