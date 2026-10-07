@@ -58,6 +58,7 @@ from apps.research_proxy.source_attribution import (
     detect_source_attribution,
 )
 from apps.research_proxy.ssrf_guard import SSRFError, SSRFPolicy, validate_url
+from apps.research_proxy.tls import ensure_extra_ca_setting
 from packages.artifacts.store import ArtifactStore
 from packages.domain.canonical import canonical_json_bytes
 from packages.domain.db.uow import transaction
@@ -89,6 +90,9 @@ class ResearchProxyService:
     ) -> None:
         self.session_factory = session_factory
         self.store = artifact_store
+        # T7.77: битая конфигурация NOEZEMA_RESEARCH_EXTRA_CA_FILE — отказ при сборке сервиса
+        # (каждый вход research-proxy поднимает сервис), а не при первой же fetch-операции
+        ensure_extra_ca_setting()
 
     async def fetch(self, url: str) -> dict[str, Any]:
         """Fetch ``url`` through the controlled egress. Returns the

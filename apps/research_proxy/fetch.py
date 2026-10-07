@@ -55,12 +55,25 @@ class FetchClient:
         # directly (the stock anyio backend, wrapped by the guard)
         import httpcore
 
+        from apps.research_proxy.tls import extra_ca_ssl_context
+
         transport = httpx.AsyncHTTPTransport()
-        transport._pool = httpcore.AsyncConnectionPool(
-            network_backend=SSRFSafeAsyncBackend(policy),
-            http1=True,
-            http2=False,
-        )
+        # T7.77: NOEZEMA_RESEARCH_EXTRA_CA_FILE добавляет операторский PEM к доверию egress;
+        # без переменной extra_ca_ssl_context() возвращает None — pool ведёт себя ровно как прежде
+        ssl_context = extra_ca_ssl_context()
+        if ssl_context is None:
+            transport._pool = httpcore.AsyncConnectionPool(
+                network_backend=SSRFSafeAsyncBackend(policy),
+                http1=True,
+                http2=False,
+            )
+        else:
+            transport._pool = httpcore.AsyncConnectionPool(
+                network_backend=SSRFSafeAsyncBackend(policy),
+                http1=True,
+                http2=False,
+                ssl_context=ssl_context,
+            )
         self._client = httpx.AsyncClient(
             transport=transport,
             follow_redirects=False,
