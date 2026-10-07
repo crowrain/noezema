@@ -413,6 +413,85 @@ def reassessment_tick(batch_size: int, lease_seconds: int) -> None:
     sys.exit(code)
 
 
+@main.command("research-reattribute")
+@click.option(
+    "--since",
+    required=True,
+    help="Начало окна журнала в ISO (например 2026-10-07T14:30:00+00:00 или …Z).",
+)
+@click.option("--dry-run", is_flag=True, default=False, help="Только план: ничего не пишет.")
+def research_reattribute(since: str, dry_run: bool) -> None:
+    """Переатрибуция решений битого детектора v1 (T7.77).
+
+    Просматривает события `research_fetch_completed` окна, решённые методом
+    `host-source-attribution-v1` (детектор не видел неразрывных пробелов и переносов внутри
+    фраз), перечитывает сохранённый нормализованный текст и принимает решение заново —
+    детектором v2. Указатель производности проставляется тем же кодом, что и при fetch
+    (`apps/research_proxy/derivative_pointer.py`), только ещё не размеченным строкам.
+    Пересчёт оценок — существующим механизмом: каскад §11.3 (`apply_source_graph_change`,
+    тип журнала `source_graph_changed`) и рабочий переоценки. Идемпотентно: повторный запуск
+    ничего не меняет. Новых типов событий, миграций и правок правил нет.
+
+    exit 0  -> прогон завершён (dry-run или запись)
+    exit 2  -> NOEZEMA_DATABASE_URL не задан, --since не ISO, каталог артефактов недоступен
+    """
+    import asyncio
+    import os
+
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    url = os.environ.get("NOEZEMA_DATABASE_URL", "")
+    if not url:
+        click.echo("NOEZEMA_DATABASE_URL is not set", err=True)
+        sys.exit(EXIT_USAGE_ERROR)
+
+    from apps.orchestrator.scheduler import artifacts_root_from_env
+    from apps.research_proxy.reattribution import ReattributionError, parse_since, reattribute_window
+    from packages.artifacts.store import FilesystemArtifactStore
+
+    try:
+        since_ts = parse_since(since)
+    except ReattributionError as exc:
+        click.echo(str(exc), err=True)
+        sys.exit(EXIT_USAGE_ERROR)
+
+    try:
+        store = FilesystemArtifactStore(artifacts_root_from_env())
+    except OSError as exc:
+        click.echo(f"каталог артефактов недоступен ({artifacts_root_from_env()}): {exc}", err=True)
+        sys.exit(EXIT_USAGE_ERROR)
+
+    engine = create_async_engine(url)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    async def _run() -> int:
+        try:
+            report = await reattribute_window(factory, store, since=since_ts, dry_run=dry_run)
+        finally:
+            # пул закрываем в том же event loop, где были соединения (ловушка CliRunner-тестов)
+            await engine.dispose()
+        click.echo(f"research-reattribute: окно с {report.since}{' (только план)' if report.dry_run else ''}")
+        for row in report.rows:
+            became = row.now_status + (f" → {row.primary_name}" if row.primary_name else "")
+            click.echo(f"{row.canonical_uri}\n    было: {row.was_status}  стало: {became}  [{row.action}]")
+        if not report.rows:
+            click.echo("(в окне нет решений метода v1 — нечего переатрибуцировать)")
+        click.echo(
+            f"изменено источников: {len(report.changed_source_ids)}; "
+            f"затронуто утверждений: {report.affected_claims}; "
+            f"снятых голов: {report.invalidated_heads}; задач переоценки создано: {report.jobs_created}"
+        )
+        if report.worker is not None:
+            outcome = report.worker
+            click.echo(
+                f"рабочий переоценки: processed={outcome.processed} completed={outcome.completed} "
+                f"retried={outcome.retried} blocked={outcome.blocked} deferred={outcome.deferred}"
+            )
+        return 0
+
+    sys.exit(asyncio.run(_run()))
+
+
 @main.command("reconcile-tick")
 @click.option(
     "--max-probes", default=5, show_default=True, help="Probes per stuck session (fresh connection each)."

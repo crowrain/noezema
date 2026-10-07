@@ -83,7 +83,7 @@ def test_retelling_of_a_release_is_derivative(uri: str, text: str) -> None:
     assert "http" in decision.parent_uri
     # основание решения записывается: оператор может проверить, чем хост руководствовался
     assert decision.basis_fragment
-    assert ATTRIBUTION_METHOD_VERSION == "host-source-attribution-v1"
+    assert ATTRIBUTION_METHOD_VERSION == "host-source-attribution-v2"
 
 
 # ─── пересказ опознаётся и по-английски ──────────────────────────────────
@@ -316,3 +316,79 @@ def test_templates_and_markers_are_not_empty_or_tautological() -> None:
 
 def _alias_matches(pattern: str, name: str) -> bool:
     return re.search(pattern, name, re.IGNORECASE) is not None
+
+
+# ─── T7.77: живая типографика страниц (регрессия по фактам подставки) ─────────
+#
+# Стендовый прогон T7.76 показал: нормализованный текст страницы сохраняет типографику
+# вёрстки — неразрывные пробелы внутри шаблонов («По\xa0данные»), мягкий перенос внутри
+# слова, перевод строки внутри фразы (HTML-блоки склеиваются одинарным \n). v1 требовал
+# буквального ASCII-пробела в шаблонах и алиасах и рвал фрагмент по любому переводу
+# строки — сберсибовский пересказ релиза Росстата на подставке остался неопознанным.
+# Тесты ниже красные на v1 (проверено до правки детектора) и зелёные на v2: сканируется
+# копия текста с нормализованной типографикой; хранимый текст страницы и его хеш не
+# меняются — меняется только то, по чему сканирует детектор.
+
+
+def test_nbsp_in_the_template_phrase_recognised_verbatim_stand_quote() -> None:
+    # цитата sbercib.ru с подставки дословно: NBSP U+00A0 между словами внутри шаблона
+    text = (
+        "По\xa0данным Росстата, инфляция в\xa0России за\xa0весь 2025 год составила 5,59% "
+        "(после 9,52% в\xa02024 году)."
+    )
+    decision = _derivative("https://www.sbercib.ru/analitics/inflation-2025", text)
+    assert decision.primary_key == "rosstat"
+
+
+def test_narrow_nbsp_u202f_in_the_template_phrase_is_recognised() -> None:
+    text = "По\u202fданным Банка России, ключевая ставка составила 21,00% годовых."
+    decision = _derivative("https://news.example.test/u202f", text)
+    assert decision.primary_key == "cbr"
+
+
+def test_nbsp_inside_a_multiword_alias_is_recognised() -> None:
+    # NBSP разрывает не только шаблон, но и многословный алиас словаря
+    text = (
+        "По данным Федеральной\xa0службы государственной статистики, "
+        "потребительские цены за год выросли на 5,59%."
+    )
+    decision = _derivative("https://news.example.test/alias-nbsp", text)
+    assert decision.primary_key == "rosstat"
+
+
+def test_soft_hyphen_inside_a_word_does_not_hide_the_primary() -> None:
+    # перенос «Росста­та» (U+00AD в вёрстке) не должен прятать первоисточник от детектора
+    text = "По данным Росста\u00adта, инфляция 2025 года составила 5,59%."
+    decision = _derivative("https://news.example.test/soft-hyphen", text)
+    assert decision.primary_key == "rosstat"
+
+
+def test_line_break_inside_a_phrase_does_not_break_the_pair() -> None:
+    # типографический перенос внутри фразы не рвёт пару «шаблон + алиас»: границей
+    # фрагмента остаются окончания предложения и пустая строка (граница блока)
+    text = "По\xa0данным\nРосстата, инфляция в России по итогам 2025 года составила 5,59%."
+    decision = _derivative("https://news.example.test/wrapped-phrase", text)
+    assert decision.primary_key == "rosstat"
+
+
+def test_guillemets_and_nbsp_together_do_not_hide_the_primary() -> None:
+    # кавычки-«ёлочки» сами по себе совпадению не мешали и в v1; красноту даёт NBSP —
+    # тест фиксирует, что после нормализации страница с «ёлочками» опознана пересказом
+    text = "По\xa0данным «Росстата», инфляция в России по итогам 2025 года составила 5,59%."
+    decision = _derivative("https://news.example.test/guillemets", text)
+    assert decision.primary_key == "rosstat"
+
+
+def test_published_data_without_a_named_primary_stays_honest() -> None:
+    # nbj.ru с подставки: шаблон есть, числа есть, имени первоисточника в окне нет —
+    # «опубликованные данные» без имени не есть атрибуция. Тест зелёный на v1 и обязан
+    # остаться зелёным на v2: осторожность детектора нормализация не ослабляет.
+    text = "Согласно опубликованным данным, годовая инфляция в России замедлилась с 9,5% до 5,6%."
+    decision = detect_source_attribution(canonical_uri="https://nbj.ru/economy", text=text)
+    assert decision.status == STATUS_NO_VALUE_ATTRIBUTION
+
+
+def test_typography_fix_bumps_the_method_version() -> None:
+    # решения v2 отличаются от решений битого v1 по методу в metadata и аудите —
+    # на этом различии построена переатрибуция (apps/research_proxy/reattribution.py)
+    assert ATTRIBUTION_METHOD_VERSION == "host-source-attribution-v2"

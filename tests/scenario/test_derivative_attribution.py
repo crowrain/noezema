@@ -230,7 +230,7 @@ async def test_three_retellings_of_one_release_form_one_group(
         record = dict(row["d"])
         assert record["key"] == "rosstat"
         assert record["name"] == "Росстат"
-        assert record["method"] == "host-source-attribution-v1"
+        assert record["method"] == "host-source-attribution-v2"
         assert "Росстат" in record["basis_fragment"] or "государственной статистики" in record[
             "basis_fragment"
         ]

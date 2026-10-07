@@ -28,8 +28,13 @@ from urllib.parse import urlsplit
 from packages.domain.sanitization import mask_nul
 
 #: версия метода: попадает в metadata источника и в аудит, чтобы решение можно было
-#: отличить от решения другой версии детектора (и от человеческой коррекции)
-ATTRIBUTION_METHOD_VERSION: Final = "host-source-attribution-v1"
+#: отличить от решения другой версии детектора (и от человеческой коррекции).
+#: v2 (T7.77): сканирование по копии текста с нормализованной типографикой — v1 не
+#: распознавал неразрывные пробелы внутри шаблонов и алиасов, мягкий перенос внутри
+#: слова и перевод строки внутри фразы (факт подставки: «По\xa0данным Росстата» на
+#: sbercib.ru остался no_value_attribution). Это различие версий использует
+#: переатрибуция (`apps/research_proxy/reattribution.py`).
+ATTRIBUTION_METHOD_VERSION: Final = "host-source-attribution-v2"
 
 #: статусы решения. `derivative` — единственный, при котором хост ставит указатель;
 #: остальные четыре означают «не помечаем» и записываются в аудит как честный отказ.
@@ -54,6 +59,30 @@ BASIS_FRAGMENT_CHARS: Final = 300
 #: максимальный зазор между шаблоном атрибуции и алиасом первоисточника внутри фрагмента:
 #: «по данным <алиас>», «<алиас> сообщает» — это соседние слова, а не разные предложения
 ATTRIBUTION_WINDOW_CHARS: Final = 120
+
+#: T7.77: живая вёрстка набирает словесные промежутки неразрывными и узкими пробелами,
+#: рвёт слова мягким переносом и ZW-символами. Скан идёт по копии текста с приведённой
+#: типографикой; хранимый текст страницы и его хеш не меняются (ADR-0029: детектор читает
+#: копию, провенанс хранит подлинник). Отображение фрагмента-основания согласовано с v1:
+#: `_basis` уже схлопывал пробелы и переводил переводы строк в обычные.
+_SCAN_TRANSLATE: Final[dict[int, str | None]] = {
+    **dict.fromkeys(range(0x2000, 0x200B), " "),  # en…hair spaces, figure and thin space
+    0x00A0: " ",  # NO-BREAK SPACE — виновник стендового пропуска (sbercib.ru)
+    0x202F: " ",  # narrow NBSP
+    0x205F: " ",  # medium mathematical space
+    # невидимая типографика удаляется: софт-гифен (перенос слова), ZWSP/ZWNJ/ZWJ, word joiner, BOM
+    **dict.fromkeys((0x00AD, 0x200B, 0x200C, 0x200D, 0x2060, 0xFEFF), None),
+}
+_CONSECUTIVE_SPACES: Final = re.compile(r" {2,}")
+
+
+def normalize_scan_text(text: str) -> str:
+    """Копия текста для сканирования: типографические пробелы становятся обычными,
+    невидимые разделители слов удаляются, идущие подряд пробелы схлопываются в один.
+    Нормализация применяется ровно один раз — на входе детектора."""
+    collapsed = _CONSECUTIVE_SPACES.sub(" ", text.translate(_SCAN_TRANSLATE))
+    # перенос строки остаётся видимым: это граница строки документа, а не межсловный промежуток
+    return re.sub(r"[ \t]+(\r?\n)[ \t]+", r"\1", collapsed)
 
 
 @dataclass(frozen=True)
@@ -218,8 +247,11 @@ OWN_ASSESSMENT_MARKERS: Final[tuple[str, ...]] = (
 VALUE_NUMBER_PATTERN: Final = re.compile(r"\d[\d.,\u00a0\s]{0,15}\d|\d+")
 
 #: фрагмент = предложение (или строка нормализованного текста): пара «значение + первоисточник»
-#  должна собраться внутри одного фрагмента
-_FRAGMENT_SPLIT: Final = re.compile(r"[.!?\n\u2026]+")
+#  должна собраться внутри одного фрагмента. T7.77: жёсткие границы — окончания предложения
+#  и пустая строка (две подряд — граница блока); одиночный перевод строки — типографический
+#  перенос или склейка HTML-блоков, он фразу не рвёт (пара по-прежнему ограничена окном
+#  ATTRIBUTION_WINDOW_CHARS, а вето собственной оценки действует на уровне документа).
+_FRAGMENT_SPLIT: Final = re.compile(r"([.!?\u2026]+|\n{2,}|\n)")
 
 
 def _compiled(patterns: tuple[str, ...]) -> tuple[re.Pattern[str], ...]:
@@ -279,7 +311,22 @@ def is_home_host(uri: str | None, home_hosts: tuple[str, ...]) -> bool:
 
 
 def _fragments(text: str) -> list[str]:
-    return [part.strip() for part in _FRAGMENT_SPLIT.split(text[:MAX_SCAN_CHARS]) if part.strip()]
+    """Фрагменты сканируемого текста. Разделители с окончанием предложения (или пустая
+    строка) закрывают фрагмент; одиночный перевод строки склеивает соседние куски —
+    типографический перенос внутри фразы не разрывает пару «шаблон + алиас» (T7.77)."""
+    tokens = _FRAGMENT_SPLIT.split(text)
+    fragments: list[str] = []
+    current = ""
+    for index in range(0, len(tokens), 2):
+        piece = tokens[index]
+        current = f"{current} {piece}" if current else piece
+        separator = tokens[index + 1] if index + 1 < len(tokens) else ""
+        hard_break = separator == "" or any(char in ".!?\u2026" for char in separator) or "\n\n" in separator
+        if hard_break:
+            if current.strip():
+                fragments.append(current.strip())
+            current = ""
+    return fragments
 
 
 def _basis(fragment: str) -> str:
@@ -326,7 +373,9 @@ def detect_source_attribution(*, canonical_uri: str | None, text: str | None) ->
     if not text:
         return AttributionDecision(status=STATUS_NO_VALUE_ATTRIBUTION)
 
-    scanned = text[:MAX_SCAN_CHARS]
+    # T7.77: скан идёт по копии текста с нормализованной типографикой (один раз на входе);
+    # потолок скана применяется к копии — решение зависит от начала документа, а не от длины
+    scanned = normalize_scan_text(text)[:MAX_SCAN_CHARS]
     if any(pattern.search(scanned) for pattern in _OWN_ASSESSMENT):
         # своя оценка/спорящий расчёт: страница — самостоятельное исследование, склейка запрещена
         return AttributionDecision(status=STATUS_OWN_ASSESSMENT)
