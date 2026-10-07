@@ -168,6 +168,12 @@ EXPLORER_CONTEXT_BUDGET = RESEARCH_CONTEXT_BUDGET + 8_000 + TOOL_CONTEXT_ADDENDA
 # so and tells the model to change strategy.
 TOOL_REPEAT_DENY_LIMIT = 2
 
+#: T7.79 (§6.4, ADR-0011 доп.): сколько последних публичных rationale шагов и
+#: сколько знаков этого хвоста участвуют в поиске ТОЧНОГО якоря assertion-окна.
+#: Сигнал обязан быть дешёвым и не расти вместе с длиной сессии.
+RATIONALE_SIGNAL_STEPS = 8
+RATIONALE_SIGNAL_CHARS = 6_000
+
 
 def filter_offered_tools(base_tools: list[str], *, has_message: bool) -> list[str]:
     """T7.13 (EVAL-3b P.6): the per-step tool list the explorer is shown.
@@ -897,8 +903,19 @@ class Orchestrator:
             session_id=session.id,
             question_id=question.id,
             terminal=final,
+            # T7.79 (ADR-0011 доп.): «ответ получен и проверен» требует, чтобы сессия
+            # что-то записала. Succeeded без единого staged claim (complete:goal_reached,
+            # а куратор не предложил ничего / был отвергнут / недоступен) — это завершившаяся
+            # работа БЕЗ ответа: terminal вопроса = partially_answered (существующее значение
+            # enum, миграции нет), витрина показывает «Ответ не записан». Граница применимого
+            # знания — claim-операции staging (§5.2.2): создание, перепроверка и дедуп-повтор
+            # дают applied_claims ≥ 1, поэтому законный ответ через уже существующее
+            # утверждение (T7.74) остаётся verified. Fail-closed страховка на границе коммита
+            # — packages/domain/services/commit.py (шаг 5).
             question_terminal=(
-                QuestionState.VERIFIED if final is SessionState.SUCCEEDED else QuestionState.PARTIALLY_ANSWERED
+                QuestionState.VERIFIED
+                if final is SessionState.SUCCEEDED and claims > 0
+                else QuestionState.PARTIALLY_ANSWERED
             ),
             steps=steps,
             evidence_count=len(ctx.evidence),
@@ -1476,6 +1493,13 @@ class Orchestrator:
         # session) and burned a step each time, while `tool_call_counts` never saw it (different args,
         # different session). The repeat DENIAL keeps its exact-argument key and its limit unchanged.
         fetched_urls: dict[str, int] = {}
+        # T7.79 (§6.4, ADR-0011 доп.): публичные rationale шагов — единственный
+        # честный сигнал о том, какая ФРАЗА источника уже заинтересовала
+        # исследователя (кроме значений самого вопроса). Используется ТОЛЬКО как
+        # поисковый needle: assertion_window принимает подстроку, если она дословно
+        # есть в тексте источника, и вырезает окно из текста источника — текст модели
+        # в доказательство не попадает и payload улики не расширяется.
+        rationale_lines: list[str] = []
         for step in range(1, max_steps + 1):
             steps = step
 
@@ -1552,6 +1576,7 @@ class Orchestrator:
             await ModelRunRepository.create(db, run)
 
             decision = response.decision
+            rationale_lines.append(response.public_rationale)
             if decision.kind is DecisionKind.COMPLETE:
                 # T7.21 (EVAL-3d, ADR-0010): the host withholds the
                 # release to consolidation until every source the
@@ -1817,7 +1842,13 @@ class Orchestrator:
 
             await self._apply_host_side(db, audit, session, tool_name, args, staging)
 
-            evidence = observation_to_evidence(obs, args)
+            evidence = observation_to_evidence(
+                obs,
+                args,
+                explorer_text="\n".join(rationale_lines[-RATIONALE_SIGNAL_STEPS:])[
+                    -RATIONALE_SIGNAL_CHARS:
+                ],
+            )
             if evidence is not None:
                 ctx.evidence.append(evidence)
             if tool_name == "memory.search" and obs.ok:

@@ -49,7 +49,11 @@ the 8192-token section).
 
 from __future__ import annotations
 
-from apps.orchestrator.assertion_window import select_assertion_windows
+from apps.orchestrator.assertion_window import (
+    question_value_terms,
+    researcher_quote_terms,
+    select_assertion_windows,
+)
 from apps.orchestrator.executor import Observation
 from packages.domain.canonical import canonical_sha256
 from packages.domain.models.base import JsonDict
@@ -91,7 +95,21 @@ def _finalize(record: EvidenceRecord) -> EvidenceRecord:
     return record
 
 
-def observation_to_evidence(observation: Observation, arguments: JsonDict) -> EvidenceRecord | None:
+def observation_to_evidence(
+    observation: Observation,
+    arguments: JsonDict,
+    *,
+    explorer_text: str = "",
+) -> EvidenceRecord | None:
+    """The trusted host's mapping observation → evidence record.
+
+    ``explorer_text`` (T7.79, ADR-0011 доп.) — публичные rationale шагов этой
+    сессии. Он нужен ТОЛЬКО как поисковый сигнал при выборе assertion-окна:
+    дословные подстроки источника, которые исследователь уже назвал, сильнее
+    общих терминов. Содержимое окна остаётся текстом источника; текст модели в
+    доказательство не попадает и новый payload-ключ не появляется (идентичность
+    §14.3 не зависит от текста фрагмента). Пусто — прежнее поведение T7.22.
+    """
     if not observation.ok:
         return None
 
@@ -191,11 +209,19 @@ def observation_to_evidence(observation: Observation, arguments: JsonDict) -> Ev
         # cases (lead/infobox, first paragraph, data widget). The joined
         # text is NOT part of the identity (as the single window was).
         normalized_text = mask_nul(str(data.get("normalized_text", "")))
+        question_plan = f"{data.get('question', '')}\n{data.get('plan', '')}"
+        # T7.79 (ADR-0011 доп.): второе окно отдаётся точным якорям — значениям
+        # доверенного вопроса («5,59», «21.01.2026») и дословным цитатам
+        # исследователя, которые в ЭТОМ источнике действительно есть (отсутствующая
+        # цитата отбрасывается модулем окон и ничего не «дотягивает»). Ни бюджет,
+        # ни число окон не растут: меняется только то, что попадает в тот же слот.
         windows = select_assertion_windows(
             normalized_text,
-            f"{data.get('question', '')}\n{data.get('plan', '')}",
+            question_plan,
             SOURCE_ASSERTION_TEXT_BUDGET,
             max_windows=SOURCE_ASSERTION_MAX_WINDOWS,
+            value_terms=question_value_terms(question_plan),
+            quote_terms=researcher_quote_terms(explorer_text, normalized_text),
         )
         assertion_text = _FRAGMENT_SEPARATOR.join(w.text for w in windows)
         return _finalize(

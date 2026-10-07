@@ -19,7 +19,7 @@ from apps.orchestrator.executor import StubToolExecutor
 from apps.orchestrator.orchestrator import Orchestrator
 from packages.domain.db.uow import transaction
 from packages.domain.models.base import JsonDict
-from packages.domain.models.enums import QuestionOrigin, QuestionState, SessionState
+from packages.domain.models.enums import AuditEventType, QuestionOrigin, QuestionState, SessionState
 from packages.domain.models.questions import ORMQuestion
 from packages.domain.repositories.questions import QuestionRepository
 from packages.llm_gateway.client import LLMMiddleware
@@ -49,6 +49,21 @@ COMPLETE: JsonDict = {
     "public_rationale": "Вопрос отвечен",
     "decision": {"kind": "complete", "reason": "goal_reached"},
 }
+# ровно одно утверждение — тот же конверт, что CURATOR_OK (без new_questions): нужна
+# чистая пара «применённое знание → terminal вопроса» (T7.79)
+CURATOR_ONE_CLAIM: JsonDict = {
+    "summary": "Одно утверждение",
+    "claims": [
+        {
+            "statement": "6*7 равно 42",
+            "claim_type": "computed_result",
+            "scope": {"expr": "6*7"},
+        }
+    ],
+    "evidence_links": [{"evidence_index": 0, "claim_index": 0, "relation": "supports"}],
+    "new_questions": [],
+}
+
 CURATOR_OK: JsonDict = {
     "summary": "Одно утверждение",
     "claims": [
@@ -989,3 +1004,127 @@ async def test_stub_unsupported_tool_is_a_normal_step_failure(
         {"s": str(outcome.session_id)},
     )
     assert int(ev[0]) == 0
+
+# ─── T7.79: итог сессии без единого утверждения (ADR-0011 доп.) ────────────────
+
+CURATOR_EMPTY: JsonDict = {
+    "summary": "Прочитанное не содержит ответа на вопрос",
+    "claims": [],
+    "evidence_links": [],
+    "new_questions": [],
+}
+
+
+async def _question_state(scratch_url: str, question_id: uuid.UUID) -> str:
+    row = await _scalar(scratch_url, "SELECT state FROM questions WHERE id=:q", {"q": str(question_id)})
+    return str(row[0])
+
+
+@pytest.mark.asyncio
+async def test_succeeded_without_claims_does_not_verify_the_question(
+    migrated_db, fake_llm: FakeLLM, tmp_path: Path
+) -> None:
+    """T7.79 (стендовый отказ 96c710ff): сессия дошла до `complete: goal_reached`, куратор
+    предложил ноль утверждений — «ответ получен и проверен» выставлялся над пустотой (вопрос
+    выглядел закрытым, хотя ответ записан не был). Теперь такой итог = partially_answered
+    (существующее значение enum, миграции нет): завершившаяся работа БЕЗ ответа.
+
+    Провераются обе точки правки: правило оркестратора (terminal вопроса) и fail-closed
+    страховка на границе коммита (хост решает по применённым claim-операциям staging)."""
+    scratch_url, _engine = migrated_db
+    question_id = await _seed_question(scratch_url, "Какая годовая инфляция в России по итогам декабря 2025 года?")
+
+    fake_llm.script(
+        [
+            {"content": TOOL_PYTHON},
+            {"content": COMPLETE},
+            {"content": CURATOR_EMPTY},
+        ]
+    )
+    orch, gateway, engine = _make_orchestrator(scratch_url, fake_llm, tmp_path / "ws")
+    try:
+        outcome = await orch.run_session(question_id)
+    finally:
+        await gateway.close()
+        await engine.dispose()
+
+    # работа действительно завершена успешно: отказом это считать нельзя
+    assert outcome.final_state is SessionState.SUCCEEDED
+    assert outcome.termination_reason == "goal_reached"
+    assert outcome.claims_proposed == 0
+
+    state = await _question_state(scratch_url, question_id)
+    assert state != QuestionState.VERIFIED.value, "ноль утверждений не может означать «ответ проверен»"
+    assert state == QuestionState.PARTIALLY_ANSWERED.value, state
+
+    # хост пишет то состояние, которое реально применил, и называет его в аудите фиксации
+    audit = await _scalar(
+        scratch_url,
+        "SELECT payload->>'question_state' FROM audit_events WHERE type = :t ORDER BY sequence DESC LIMIT 1",
+        {"t": AuditEventType.COMMIT_ATTEMPT_COMMITTED.value},
+    )
+    assert audit is not None and str(audit[0]) == QuestionState.PARTIALLY_ANSWERED.value, audit
+
+    session_row = await _scalar(
+        scratch_url, "SELECT state, termination_reason FROM sessions WHERE id=:s", {"s": str(outcome.session_id)}
+    )
+    assert str(session_row[0]) == SessionState.SUCCEEDED.value
+    assert str(session_row[1]) == "goal_reached"
+
+
+@pytest.mark.asyncio
+async def test_curator_failure_keeps_the_question_honest_too(
+    migrated_db, fake_llm: FakeLLM, tmp_path: Path
+) -> None:
+    """Та же граница на другом пути нуля утверждений: куратор недоступен (отказ модели) —
+    сессия фиксируется успешно, но вопрос не становится «проверенным»."""
+    scratch_url, _engine = migrated_db
+    question_id = await _seed_question(scratch_url, "Сколько будет 6*7?")
+
+    fake_llm.script(
+        [
+            {"content": TOOL_PYTHON},
+            {"content": COMPLETE},
+            {"error": "invalid_json"},
+            {"error": "invalid_json"},
+        ]
+    )
+    orch, gateway, engine = _make_orchestrator(scratch_url, fake_llm, tmp_path / "ws")
+    try:
+        outcome = await orch.run_session(question_id)
+    finally:
+        await gateway.close()
+        await engine.dispose()
+
+    assert outcome.final_state is SessionState.SUCCEEDED
+    assert outcome.claims_proposed == 0
+    state = await _question_state(scratch_url, question_id)
+    assert state != QuestionState.VERIFIED.value, state
+    assert state == QuestionState.PARTIALLY_ANSWERED.value, state
+
+
+@pytest.mark.asyncio
+async def test_one_applied_claim_still_verifies_the_question(migrated_db, fake_llm: FakeLLM, tmp_path: Path) -> None:
+    """Правка не должна обесценивать настоящую работу: ровно одно применённое утверждение —
+    и terminal вопроса остаётся `verified` (иначе правка была бы ослаблением)."""
+    scratch_url, _engine = migrated_db
+    question_id = await _seed_question(scratch_url, "Сколько будет 6*7?")
+
+    fake_llm.script(
+        [
+            {"content": TOOL_PYTHON},
+            {"content": COMPLETE},
+            {"content": CURATOR_ONE_CLAIM},
+        ]
+    )
+    orch, gateway, engine = _make_orchestrator(scratch_url, fake_llm, tmp_path / "ws")
+    try:
+        outcome = await orch.run_session(question_id)
+    finally:
+        await gateway.close()
+        await engine.dispose()
+
+    assert outcome.final_state is SessionState.SUCCEEDED
+    assert outcome.claims_proposed == 1
+    state = await _question_state(scratch_url, question_id)
+    assert state == QuestionState.VERIFIED.value, state

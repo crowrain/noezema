@@ -33,6 +33,15 @@ both sources were fetched, the curator attached one, because the single
 term window missed the assertion in 7 of 12 — the fact sat in the
 lead/infobox, the first paragraph, or a data widget. One test per
 measured miss class: the fact must land inside the joined fragment.
+
+T7.79 (дополнение к ADR-0011): общий value-якорь T7.22 ценит ЛЮБОЕ число в начале страницы и
+ничего не знает о том, какое значение спрашивают. На стенде (сессия 96c710ff) из-за этого фраза
+«Годовая инфляция … составила 5,59%.» на глубине ~14k знаков в фрагмент не попала, хотя куратор
+рассуждал именно про неё, — и утверждений ноль. Теперь внутри того же слота (2 окна × 2000 знаков,
+бюджет и число окон не выросли) точное десятичное значение/дата из доверенного текста вопроса и
+дословная цитата исследователя, реально присутствующая в этом источнике, имеют приоритет над общим
+кандидатом. Цитата — только поисковый сигнал: текст модели в доказательство не попадает, окно
+остаётся дословным вырезом нормализованного текста источника.
 """
 
 from __future__ import annotations
@@ -44,6 +53,8 @@ from pathlib import Path
 from apps.orchestrator.assertion_window import (
     AssertionWindow,
     extract_terms,
+    question_value_terms,
+    researcher_quote_terms,
     select_assertion_window,
     select_assertion_windows,
 )
@@ -650,3 +661,214 @@ def test_two_evidence_fragments_fit_the_claims_evidence_budget() -> None:
         f"two evidence fragments ({total} tokens) must leave ≥ 50% of "
         f"the claims_evidence section free (no displacement)"
     )
+
+
+# ─── T7.79 (ADR-0011 доп.): окно по точному значению вопроса и по цитате ──────
+#
+# Стендовой отказ (session 96c710ff, STATUS T7.79): куратор рассуждал про «5,59%»
+# (фраза «Годовая инфляция в декабре 2025 года составила 5,59%.» реально стояла на
+# странице аналитики на глубине ~14k знаков), но в доказательство этой странице
+# ушли два окна по 2000 знаков, где этого числа нет → 0 утверждений + новый вопрос.
+# Причина: число вопроса не является термином (extract_terms отбрасывает токены из
+# одних цифр), а value-якорь T7.22 ценит ЛЮБОЕ число в начале страницы и ничего не
+# знает о том, какое значение спрашивают.
+
+CBR_QUESTION = (
+    "Банк России публикует ли официально точное значение 5,59% (например, в пресс-релизе "
+    "о решении 21.01.2026), или во всех своих материалах указывает только округлённое 5,6%?"
+)
+
+CBR_KEY_SENTENCE = "Годовая инфляция в декабре 2025 года составила"
+
+
+def _cbr_like_page(value: str = "5,59%") -> str:
+    """Страница той же структуры, что стендовая страница аналитики ЦБ: термины вопроса
+    плотнее всего в хроме навигации («Банк России … публикует … пресс-релиз … точные»),
+    числа насыщают таблицу «ключевые показатели» в начале, ключевая фраза — ближе к
+    концу текста (глубина > 12 000 знаков). Именно такая форма и обманывает density-окно:
+    на этой странице без точного якоря «5,59%» в фрагмент не попадает."""
+    nav = "\n".join(
+        f"Материалы раздела {i}: Банк России официально публикует пресс-релиз и точные величины; "
+        f"переместить в боковую панель, Отобразить/Скрыть подраздел, "
+        f"Дата изменения: {10 + i % 20}.01.2026"
+        for i in range(45)
+    )
+    commentary = "\n".join(
+        f"Абзац {i}: мониторинг ценовой динамики продолжается, показатели устойчивости оцениваются по "
+        f"широкому набору данных за период; отдельный блок описывает структуру потребительских цен и их "
+        f"вклад в общий индекс."
+        for i in range(45)
+    )
+    return (
+        "Департамент исследований публикует мониторинг.\n\n"
+        + nav
+        + "\n\nКлючевые показатели: годовая инфляция, инфляционные ожидания, динамика цен.\n"
+        "9,3% 5,2% 2,6% 4–6% 7,1% 8,4% 3,9% 6,0% 11,2% 2,1%\n"
+        + commentary
+        + f"\n\n{CBR_KEY_SENTENCE} {value}\n"
+        "Оценка устойчивости будет опубликована в следующем отчёте."
+    )
+
+
+def _joined(windows: list[AssertionWindow]) -> str:
+    return "\n[…]\n".join(w.text for w in windows)
+
+
+def _folded(text: str) -> str:
+    """Как researcher_quote_terms складывает подстроку-иглу: нижний регистр без пробелов."""
+    return "".join(text.lower().split())
+
+
+def test_deep_key_sentence_is_outside_windows_without_the_value_anchor() -> None:
+    """Репродюсер дефекта (старое поведение сохраняется, когда сигналов нет):
+    ни основное терминологическое окно, ни общий value-якорь не дотягиваются до
+    ключевой фразы на глубине 14k — «5,59%» в фрагмент не попадает."""
+    page = _cbr_like_page()
+    assert CBR_KEY_SENTENCE in page
+    assert page.index(CBR_KEY_SENTENCE) > 12_000
+    windows = select_assertion_windows(page, CBR_QUESTION, BUDGET, value_terms=(), quote_terms=())
+    assert "5,59%" not in _joined(windows)
+    # default вызов (без новых аргументов) = то же самое: поведение T7.22 не изменилось
+    assert select_assertion_windows(page, CBR_QUESTION, BUDGET) == windows
+
+
+def test_question_value_anchor_puts_the_deep_value_into_the_fragment() -> None:
+    """Точное значение доверенного вопроса («5,59») занимает второе окно вместо
+    общего value-якоря: ключевая фраза оказывается внутри фрагмента."""
+    page = _cbr_like_page()
+    terms = question_value_terms(CBR_QUESTION)
+    assert "5,59" in terms and "21.01.2026" in terms  # год-одиночка «2025» — не значение
+    windows = select_assertion_windows(page, CBR_QUESTION, BUDGET, value_terms=terms)
+    joined = _joined(windows)
+    assert "5,59%" in joined and CBR_KEY_SENTENCE in joined
+    # окно — дословный вырез оригинального текста по своей позиции
+    anchored = [w for w in windows if w.start >= 0 and "5,59%" in w.text]
+    assert anchored, windows
+    for window in anchored:
+        assert window.text == page[window.start : window.start + len(window.text)]
+    assert all(w.start < page.index(CBR_KEY_SENTENCE) < w.start + len(w.text) for w in anchored)
+
+
+def test_value_anchor_survives_nbsp_and_soft_hyphen_typography() -> None:
+    """Живая русская вёрстка набирает число неразрывным пробелом («5,59\\xa0%»,
+    AGENTS §7 T7.77): поиск нечувствителен к пробелам и мягким символам, а окно
+    остаётся дословным вырезом ОРИГИНАЛА — неразрывный пробел в фрагменте виден."""
+    page = _cbr_like_page("5,59\xa0%")
+    windows = select_assertion_windows(page, CBR_QUESTION, BUDGET, value_terms=question_value_terms(CBR_QUESTION))
+    anchored = [w for w in windows if "\xa0" in w.text and "5,59" in w.text]
+    assert anchored, "окно не дотянулось до значения, набранного NBSP"
+    for window in anchored:
+        assert window.text == page[window.start : window.start + len(window.text)]
+    assert _norm("5,59 %") in _norm(_joined(anchored))
+
+
+def test_number_needle_does_not_match_inside_a_larger_number() -> None:
+    """«5,6» не является отдельным числом внутри «115,6%»: якорь обязан искать
+    следующее вхождение, а не цеплять первое попавшееся число."""
+    page = _cbr_like_page("5,6%")
+    decoy_page = "115,6% 115,6% 115,6%\n" + page
+    question = "Какое значение указывает регулятор: 5,6%?"
+    windows = select_assertion_windows(decoy_page, question, BUDGET, value_terms=question_value_terms(question))
+    anchored = [w for w in windows if w.start >= 0 and "5,6%" in w.text]
+    assert anchored, windows
+    # якорь стоит на отдельном значении (глубина страницы), а не на раннем «115,6%»
+    assert min(w.start for w in anchored) > decoy_page.index(page)
+
+
+def test_researcher_quote_anchors_the_window_only_if_verbatim_in_the_source() -> None:
+    """Цитата исследователя — поисковый сигнал: она принимает окно, только если
+    дословно присутствует в тексте этого источника."""
+    page = _cbr_like_page()
+    narrative = (
+        "На странице аналитики прочитано: «"
+        + CBR_KEY_SENTENCE
+        + " 5,59%». Это официальный показатель регулятора."
+    )
+    quotes = researcher_quote_terms(narrative, page)
+    assert quotes, "цитата, присутствующая в источнике, не принята"
+    windows = select_assertion_windows(page, CBR_QUESTION, BUDGET, quote_terms=quotes)
+    joined = _joined(windows)
+    assert CBR_KEY_SENTENCE in joined and "5,59%" in joined
+
+
+def test_absent_researcher_quote_is_ignored_and_injects_nothing() -> None:
+    """Цитаты в этом источнике нет → она отбрасывается и НИЧЕГО не меняет: окно
+    остаётся прежним, текст модели в доказательство не попадает."""
+    page = _cbr_like_page()
+    invented = (
+        "Исследователь утверждает: «Годовая инфляция в декабре 2025 года превысила девять "
+        "процентов и ускорилась выше целевого уровня регулятора»."
+    )
+    assert researcher_quote_terms(invented, page) == []
+    without = select_assertion_windows(page, CBR_QUESTION, BUDGET)
+    invented_quotes = researcher_quote_terms(invented, page)
+    with_invention = select_assertion_windows(page, CBR_QUESTION, BUDGET, quote_terms=invented_quotes)
+    assert with_invention == without
+    joined = _joined(with_invention)
+    assert "превысила девять процентов" not in joined  # дословно: текста модели там нет
+
+
+def test_quote_anchor_takes_priority_over_the_question_value() -> None:
+    """Порядок сигналов — цитата исследователя, затем значение вопроса: когда оба
+    указывают на разные места страницы, второй слот занимает цитата (она говорит, на
+    какую фразу источника исследователь уже опёрся)."""
+    quote = "инфляционные ожидания населения в январе остались на уровне прошлого месяца"
+    page = _cbr_like_page().replace(
+        "Абзац 20:", f"Отдельный блок: {quote} и составили 12,4 процента по оценке. Абзац 20:"
+    )
+    quotes = researcher_quote_terms(f"Я прочитал: «{quote}».", page)
+    assert quotes == [_folded(quote)]
+    windows = select_assertion_windows(
+        page, CBR_QUESTION, BUDGET, value_terms=question_value_terms(CBR_QUESTION), quote_terms=quotes
+    )
+    anchored = [w for w in windows if w.start >= 0 and _norm(quote) in _norm(w.text)]
+    assert anchored, "цитата не заняла второе окно"
+    # значение «5,59%» лежит глубже: слотов два, и их занимает цитата, а не значение
+    assert min(w.start for w in anchored) < page.index(CBR_KEY_SENTENCE)
+    assert all(CBR_KEY_SENTENCE not in w.text for w in anchored)
+
+
+def test_anchor_windows_keep_the_t722_budget_and_bounds() -> None:
+    """Ни бюджет, ни число окон не растут: точные якоря занимают тот же слот."""
+    page = _cbr_like_page()
+    windows = select_assertion_windows(
+        page,
+        CBR_QUESTION,
+        BUDGET,
+        value_terms=question_value_terms(CBR_QUESTION),
+        quote_terms=researcher_quote_terms("«" + CBR_KEY_SENTENCE + " 5,59%»", page),
+    )
+    assert 1 <= len(windows) <= 2
+    assert all(len(w.text) <= BUDGET for w in windows)
+    assert all(w.text == page[w.start : w.start + len(w.text)] for w in windows if w.start >= 0)
+    starts = sorted(w.start for w in windows if w.start >= 0)
+    for first, second in itertools.pairwise(starts):
+        assert second - first >= BUDGET or second == first, (first, second)
+    assert len(_joined(windows)) <= 2 * BUDGET + len("\n[…]\n")
+
+
+def test_question_value_terms_ignores_bare_years_and_keeps_first_order() -> None:
+    """Десятичные значения и даты д.м.гггг — сигналы; год-одиночка — нет (дата стоит
+    в навигации каждой страницы). Дубли не повторяются, порядок — по появлению."""
+    assert question_value_terms("значение 5,59% против округлённого 5,6% в 2025 году") == ["5,59", "5,6"]
+    assert question_value_terms("решение от 21.01.2026 и ставка 6.25 Prozent") == ["21.01.2026", "6.25"]
+    assert question_value_terms("вопрос без чисел вовсе") == []
+
+
+def test_researcher_quote_terms_caps_and_filters_chrome() -> None:
+    """Потолок сигналов и защита от страницного хрома: слишком частые подстроки —
+    не цитаты, кандидатов не больше потолка."""
+    source = ("абзац источника с длинной фразой, которую исследователь процитировал дословно. " * 6) + (
+        "уникальная фраза исследователя про ключевой показатель и его динамику в отчётном периоде."
+    )
+    quotes = researcher_quote_terms(
+        "«абзац источника с длинной фразой, которую исследователь процитировал дословно» и "
+        "«уникальная фраза исследователя про ключевой показатель и его динамику в отчётном периоде»",
+        source,
+    )
+    assert len(quotes) <= 8
+    assert _folded("уникальная фраза исследователя про ключевой показатель и его динамику в отчётном периоде") in quotes
+    # хром (встречается 6 раз) не принят: это не то, что исследователь выделил руками
+    assert _folded("абзац источника с длинной фразой, которую исследователь процитировал дословно") not in quotes
+    # слишком короткая подстрока — не цитата
+    assert researcher_quote_terms("коротко", source) == []

@@ -30,12 +30,19 @@ date/year/TOC index) co-occurs with the question's terms inside the
 fact zone (the first ``_FACT_ZONE_DECAY`` chars — beyond that, the deep
 number-dense regions on long pages are data tables, not assertions).
 The primary window and its selection are unchanged.
+
+T7.79 (ADR-0011 доп.): the second window is an ANCHOR problem, not a density
+problem — the values the question asks for («5,59%», «5,6%», 21.01.2026) and
+the exact substrings the researcher already read are matched literally
+(whitespace/soft-hyphen insensitive, positions mapped back to the original
+text) and take priority over general terms and over "any number near the top".
 """
 
 from __future__ import annotations
 
 import re
 import urllib.parse
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 #: the window (in chars of the lowercased normalized text) over which
@@ -465,6 +472,185 @@ def _fact_region_candidates(
     return out
 
 
+# ─── T7.79 (ADR-0011 доп.): якоря по точному значению и по цитате исследователя ───
+
+#: Точные значения формулировки вопроса: десятичная величина с запятой или
+#: точкой («5,59», «6.2»), вместе с процентами, и дата д.м.гггг. Год-одиночка
+#: сигналом не считается — по той же причине, по которой ``_significant_numbers``
+#: исключает 1900–2099: дата стоит в навигации каждой страницы, и якорь по году
+#: выбирает хром вместо факта. Термины вопроса чисел не дают вовсе
+#: (``extract_terms`` отбрасывает токены только из цифр, :198), поэтому этот
+#: сигнал — отдельный класс, а не частный случай терминов.
+_QUESTION_VALUE_RE = re.compile(r"\d{1,3}(?:[.,]\d+)+")
+
+#: Пробелы (обычный, NBSP U+00A0, узкий U+202F и прочие Unicode-пробелы) и «мягкие»
+#: символы живой вёрстки — софт-гифен U+00AD, ZW-символы, BOM, word joiner
+#: U+2060 — убираются только при ПОИСКЕ точного совпадения: вопрос пишет
+#: «5,59%», а страница набирает «5,59\xa0%» (AGENTS §7, T7.77). Позиции
+#: возвращаются картой индексов ``_fold_with_map``, поэтому окно вырезается из
+#: ОРИГИНАЛЬНОГО текста: невидимые символы в доказательство не исчезают и хеш
+#: артефакта не меняется.
+_FOLD_DROP_CHARS = frozenset(
+    " \t\n\r\v\f\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008"
+    "\u2009\u200a\u202f\u205f\u3000\u00ad\u200b\u200c\u200d\u2060\ufeff"
+)
+
+#: цитата в явных кавычках короче этого — не цитата; обычная фраза без кавычек
+#: обязана быть длиннее: короткие фразы совпадают со служебным текстом страницы
+_MIN_QUOTED_CHARS = 24
+_MIN_CLAUSE_CHARS = 60
+#: потолок сигналов: выбор окна обязан быть дешёвым и предсказуемым
+_MAX_QUOTE_TERMS = 8
+#: сколько кандидатов вообще рассматривается (кавычки — первыми, свежее — раньше)
+_MAX_QUOTE_SCAN = 40
+#: подстрока, которая встречается в тексте чаще этого числа раз, — страница или
+#: её хром, а не то, что исследователь выделил руками
+_MAX_QUOTE_OCCURRENCES = 3
+#: сколько вхождений одного якоря просматривается в поисках непересекающегося окна
+_MAX_OCCURRENCE_ATTEMPTS = 12
+
+_SENTENCE_SPLIT_RE = re.compile(r"[.!?:;\u2026]+")
+_QUOTED_SPAN_RE = re.compile("\u00ab([^\u00bb]+)\u00bb|\u201c([^\u201d]+)\u201d|\"([^\"]+)\"")
+_QUOTE_WRAP_CHARS = "«»\"”“’„‚'()[]{}‘’"
+
+
+def _fold(text: str) -> str:
+    """Нижний регистр без пробелов и невидимых символов (только для поиска)."""
+    return "".join(ch.lower() for ch in text if ch not in _FOLD_DROP_CHARS)
+
+
+def _fold_with_map(text: str) -> tuple[str, list[int]]:
+    """``_fold`` плюс карта позиций: ``map[i]`` — индекс символа ``fold[i]`` в
+    ОРИГИНАЛЬНОМ тексте. Совпадение, найденное в складке, переводится обратно,
+    чтобы окно было дословным фрагментом источника."""
+    chars: list[str] = []
+    positions: list[int] = []
+    for i, ch in enumerate(text):
+        if ch in _FOLD_DROP_CHARS:
+            continue
+        chars.append(ch.lower())
+        positions.append(i)
+    return "".join(chars), positions
+
+
+def _numeric_boundary_ok(folded: str, start: int, end: int) -> bool:
+    """Значение обязано быть отдельным числом.
+
+    «5,6» внутри «15,6%» — не искомое значение вопроса: без этой проверки
+    короткий якорь цепляет первое попавшееся числовое вхождение.
+    """
+    before_ok = start == 0 or not folded[start - 1].isdigit()
+    after_ok = end >= len(folded) or not folded[end].isdigit()
+    return before_ok and after_ok
+
+
+def question_value_terms(question: str) -> list[str]:
+    """Точные значения формулировки вопроса (folds), в порядке появления.
+
+    Текст вопроса — доверенный операторский вход (§1, ADR-0024): спрашиваемое
+    значение хост знает точно и обязан использовать его как самый сильный якорь
+    окна, а не растворять в общей плотности терминов.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for match in _QUESTION_VALUE_RE.finditer(_fold(question)):
+        needle = match.group()
+        if needle not in seen:
+            seen.add(needle)
+            out.append(needle)
+    return out
+
+
+def _candidate_clauses(researcher_text: str) -> list[tuple[str, int]]:
+    """Кандидаты в цитаты: (подстрока, минимальная длина).
+
+    Явные кавычки исследователя идут первыми — это то, что он сам назвал фразой
+    источника; обычные фразы — вторыми, с более высоким порогом длины.
+    """
+    out: list[tuple[str, int]] = []
+    quoted: list[str] = []
+    plain: list[str] = []
+    for line in researcher_text.splitlines():
+        for match in _QUOTED_SPAN_RE.finditer(line):
+            span = next(group for group in match.groups() if group)
+            quoted.append(span.strip())
+        for chunk in _SENTENCE_SPLIT_RE.split(_QUOTED_SPAN_RE.sub(" ", line)):
+            plain.append(chunk.strip().strip(_QUOTE_WRAP_CHARS).strip())
+    out.extend((span, _MIN_QUOTED_CHARS) for span in reversed(quoted))
+    out.extend((chunk, _MIN_CLAUSE_CHARS) for chunk in reversed(plain))
+    return out
+
+
+def researcher_quote_terms(researcher_text: str, source_text: str) -> list[str]:
+    """Подстроки текста исследователя, которые дословно есть в тексте источника.
+
+    Это поисковый сигнал о том, на какую фразу этого источника он уже опёрся, —
+    и только. Текст модели нигде не становится содержимым окна: окно остаётся
+    вырезанным фрагментом нормализованного текста источника (T7.79). Подстрока,
+    которой в этом источнике нет, отбрасывается и ничего не «дотягивает»;
+    подстрока, встречающаяся слишком часто, — страницный хром, а не цитата.
+    Порядок — явные кавычки раньше обычных фраз, свежее раньше прежнего.
+    """
+    if not researcher_text or not source_text:
+        return []
+    folded_source = _fold(source_text)
+    accepted: list[str] = []
+    seen: set[str] = set()
+    for index, (chunk, min_chars) in enumerate(_candidate_clauses(researcher_text)):
+        if index >= _MAX_QUOTE_SCAN:
+            break
+        needle = _fold(chunk)
+        if len(needle) < min_chars or needle in seen:
+            continue
+        occurrences = folded_source.count(needle)
+        if 1 <= occurrences <= _MAX_QUOTE_OCCURRENCES:
+            seen.add(needle)
+            accepted.append(needle)
+    return accepted[:_MAX_QUOTE_TERMS]
+
+
+def _exact_anchor_starts(
+    text: str,
+    terms: Sequence[str],
+    *,
+    budget: int,
+    lead: int,
+    avoid_start: int,
+) -> int:
+    """Начало окна вокруг самой убедительной ТОЧНОЙ подстроки (T7.79).
+
+    Порядок сигналов — цитаты исследователя, затем значения вопроса; внутри
+    сигнала — самое раннее вхождение, дающее окно БЕЗ пересечения с основным.
+    Для числовых якорей требуется граница числа («5,6» не цепляет «15,6%»), а
+    блок оглавления/навигации отбрасывается тем же правилом, что и value-окно
+    T7.22. ``-1`` — точных совпадений нет (прежнее поведение).
+    """
+    if not terms:
+        return -1
+    folded, positions = _fold_with_map(text)
+    for raw in terms:
+        needle = _fold(raw)
+        if len(needle) < 2:
+            continue
+        numeric = needle[0].isdigit()
+        search_from = 0
+        for _attempt in range(_MAX_OCCURRENCE_ATTEMPTS):
+            found = folded.find(needle, search_from)
+            if found < 0:
+                break
+            search_from = found + 1
+            if numeric and not _numeric_boundary_ok(folded, found, found + len(needle)):
+                continue
+            start = max(0, positions[found] - lead)
+            end = min(len(text), start + budget)
+            if avoid_start >= 0 and start < avoid_start + budget and end > avoid_start:
+                continue  # пересекается с основным окном — следующее вхождение
+            if _is_table_of_contents(text[start:end].lower()):
+                continue
+            return start
+    return -1
+
+
 def select_assertion_windows(
     text: str,
     question: str,
@@ -473,6 +659,8 @@ def select_assertion_windows(
     max_windows: int = 2,
     match_span: int = _MATCH_SPAN,
     lead: int = _LEAD,
+    value_terms: Sequence[str] = (),
+    quote_terms: Sequence[str] = (),
 ) -> list[AssertionWindow]:
     """Pick up to ``max_windows`` NON-OVERLAPPING ``budget``-char
     fragments for the ``source_assertion`` payload (T7.22, ADR-0011).
@@ -487,6 +675,19 @@ def select_assertion_windows(
     the assertion in 7 of 12: the fact sits in the lead/infobox, the
     first paragraph, or a data widget, and the term-densest region is
     the TOC or an unrelated body section.
+
+    T7.79 (ADR-0011 доп.) — exact anchors take window 2 BEFORE the generic
+    value window: ``quote_terms`` first (substrings of the researcher's own
+    text that occur verbatim in THIS source), then ``value_terms`` (the exact
+    values the trusted question asks for — «5,59», «5,6», dates д.м.гггг).
+    The generic value window scores ANY data value near the top of the page
+    and knows nothing about which value the question is about: on a long
+    narrative page it picked a number-dense block, while the key sentence —
+    «Годовая инфляция … составила 5,59%» at offset ~14k of the cbr.ru CPD
+    page — stayed outside both fragments. Matching ignores spaces and soft
+    hyphens (positions come back through the index map), the window is still
+    a verbatim slice of the ORIGINAL normalized text, no model text enters
+    the evidence, and neither the number of windows nor their length changes.
 
     Fallbacks (each degrades to the T7.16 behavior):
     - text shorter than the budget → the whole text, one window;
@@ -513,6 +714,20 @@ def select_assertion_windows(
     )
     if max_windows == 1:
         return [primary]
+
+    # T7.79 (ADR-0011 доп.): второе окно отдаётся ТОЧНОМУ якорю — цитате
+    # исследователя, затем значению вопроса; общий value-якорь остаётся
+    # запасным. Ни число окон, ни их длина не растут: слот тот же, меняется
+    # только то, что в него попадает.
+    exact_start = _exact_anchor_starts(
+        text, [*quote_terms, *value_terms], budget=budget, lead=lead, avoid_start=primary.start
+    )
+    if exact_start >= 0:
+        exact = AssertionWindow(text=text[exact_start : exact_start + budget], start=exact_start)
+        if primary.start < 0:
+            # leading-prefix — страницный хром: оставляем только окно по факту
+            return [exact]
+        return [primary, exact]
 
     best_start = -1
     best_score = 0.0

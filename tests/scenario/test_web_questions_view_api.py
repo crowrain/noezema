@@ -29,6 +29,7 @@ import pytest
 from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 
+from apps.web import labels as ui_labels
 from apps.web.api import create_app
 from apps.web.host_status import HostStatusAdapter
 from hostctl.unit_state import publish_unit_state
@@ -486,4 +487,57 @@ async def test_page_costs_a_fixed_number_of_queries(migrated_db, tmp_path: Path)
     assert empty_selects == 1
     assert one_selects == recent_selects == ten_selects
     assert one_selects <= 4  # вопросы + сессии + действующие утверждения + пороги типов
+    await engine.dispose()
+
+# ─── T7.79: сессия без утверждения — карточка и список честны одинаково ────────
+
+
+@pytest.mark.asyncio
+async def test_zero_claim_session_is_shown_as_no_answer_in_card_and_list(migrated_db, tmp_path: Path) -> None:
+    """Что показывает витрина по состоянию, которое хост записывает после успешной сессии без
+    единого утверждения (`partially_answered`, см. тесты оркестратора T7.79): ни карточка, ни
+    список не имеют права утверждать, что ответ есть.
+
+    Отдельно закреплено, что итог в списке и результат в карточке — ОДНА логика: витрина не
+    может показать «Ответ не записан» в таблице и «получен и проверен» в карточке.
+    """
+    scratch_url, _ = migrated_db
+    app, engine = await _make(scratch_url, tmp_path)
+    question_id = uuid.uuid4()
+    await _seed_question(
+        engine,
+        question_id=question_id,
+        created_at=_ts(0),
+        text_value="публикует ли регулятор точное значение 5,59%",
+        state="partially_answered",
+    )
+    await _seed_session(
+        engine,
+        session_id=uuid.uuid4(),
+        question_id=question_id,
+        state="succeeded",
+        termination_reason="goal_reached",
+    )
+
+    row = (await _get(app, "/api/v1/questions?order=recent"))["questions"][0]
+    summary = row["answer"]
+    assert summary["kind"] == "no_answer", summary
+    assert summary["label"] == "Ответ не записан"
+    assert summary["statement"] is None and summary["reliability"] is None
+
+    card = await _get(app, f"/api/v1/questions/{question_id}/answer")
+    # карточка и список: один и тот же итог (одна сборщик-логика на двоих)
+    assert card["result"]["kind"] == summary["kind"]
+    assert card["result"]["label"] == summary["label"]
+    # карточка не выдаёт ни одного утверждения как ответ и нигде не утверждает проверку
+    assert card["claims"] == [] and card["other_claims"] == []
+    texts = [str(card["result"][key]) for key in ("label", "hint", "action")]
+    assert all("проверен" not in text.lower() for text in texts), texts
+
+    # состояние вопроса подписано честно: прежняя подпись («есть частичный ответ»)
+    # утверждала наличие ответа, которого нет
+    state_label = ui_labels.describe("question_state", "partially_answered")
+    assert state_label["label"] == "ответ неполон"
+    assert "проверен" not in state_label["label"] and "проверен" not in state_label["hint"]
+    assert card["question"]["state_label"] == state_label["label"]
     await engine.dispose()

@@ -396,10 +396,23 @@ async def finalize(
     # 5. attempt -> committed + question terminal state
     attempt.status = "committed"
     attempt.finished_at = datetime.now(UTC)
+    # T7.79 (ADR-0011 доп.): fail-closed на границе коммита. «Verified» означает, что по
+    # итогам этого коммита у вопроса есть действующее утверждение — созданное,
+    # перепроверенное либо повторно использованное (все три суть claim-операции staging,
+    # T7.74). При нуле применённых claims запрос на verified не исполняется: пишется
+    # partially_answered — существующее значение enum (миграции нет), и витрина остаётся
+    # честной («Ответ не записан»). Хост решает это по применённым операциям staging, а не
+    # по тексту completeReason куратора или исследователя.
+    written_question_state: str | None = None
     if question_id is not None and question_terminal is not None:
+        written_question_state = (
+            "partially_answered"
+            if question_terminal == "verified" and applied_claims <= 0
+            else question_terminal
+        )
         await db.execute(
             text("UPDATE questions SET state = :st WHERE id = :id"),
-            {"id": question_id, "st": question_terminal},
+            {"id": question_id, "st": written_question_state},
         )
     await db.flush()
 
@@ -439,6 +452,9 @@ async def finalize(
             "knowledge_revision": new_rev,
             "dependency_graph_revision": new_graph_rev,
             "memory": memory_payload,
+            # T7.79: состояние вопроса, которое хост реально записал (может отличаться
+            # от запрошенного — см. шаг 5); аддитивный ключ payload'а
+            "question_state": written_question_state,
         },
     )
     return FinalizeResult(
