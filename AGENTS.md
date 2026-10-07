@@ -149,7 +149,9 @@ venv+prod-зависимости **только через uv** (`--force` пе�
 записи env-файла и пишется в него (`NOEZEMA_DEV_DB_PORT`; 5432, занят → первый свободный 5433..5440;
 повторный запуск переиспользует порт существующего контейнера), готовность ждётся по эндпоинту приложения
 (TCP + `SELECT 1` на `127.0.0.1:<порт>`, ≤120 с), базу `noezema-dev`, миграции, активацию
-config-v16 (с T7.76 дефолт стенда; = config-v15 ровно с двумя правками — пин `prompts.explorer` → explorer-v8
+config-v17 (с T7.77 дефолт стенда; = config-v16 ровно с одной правкой — пин `prompts.explorer` → explorer-v9
+(правило 12: прогноз до события — не независимая оценка реализованного значения; правила 1–11 байт-в-байт
+explorer-v8), а config-v16 = config-v15 ровно с двумя правками — пин → explorer-v8
 (двусторонний поиск: первоисточник + обязательный отдельный запрос про независимую оценку, расхождение
 называется открыто) и `session_limits.max_explorer_steps` 10 → 16). В остальном байт в байт
 config-v15/config-v14: пин `prompts.curator` → curator-v8 (перепроверка сохраняет якорную дату и scope,
@@ -157,8 +159,8 @@ config-v15/config-v14: пин `prompts.curator` → curator-v8 (перепров
 explorer-пины v6…v7 сохранены в истории, окна EXL3 из
 config-v13 сохранены: `model.context_window`/`backend_context_limit` = 131072; пороги, `claim_type_rules` и
 бюджеты токенов не менялись. Прежний payload остаётся откатом:
-`NOEZEMA_DEV_CONFIG_PAYLOAD=$REPO_ROOT/docs/eval/config-v15-payload.json` (canonical `b3801812…`; canonical
-config-v16 — `740ae9a1…`, хеш файла — другое число). Пропуск, если head уже не bootstrap), env-файл `/etc/noezema/dev.env` (0600, секреты не
+`NOEZEMA_DEV_CONFIG_PAYLOAD=$REPO_ROOT/docs/eval/config-v16-payload.json` (canonical `740ae9a1…`; canonical
+config-v17 — `5c402f4d…`, хеш файла — другое число). Пропуск, если head уже не bootstrap), env-файл `/etc/noezema/dev.env` (0600, секреты не
 печатаются и в `--dry-run` маскируются) и dev-юниты `deploy/dev-stand/systemd/*` — **не копии**
 `infra/systemd/*`: `User=` = пользователь стенда, данные `/var/lib/noezema-dev`, группа
 `noezema-dev.target` (в загрузку не ставится), tick 60 с (`TimeoutStartSec=3600`), maint 60 с
@@ -477,6 +479,35 @@ config-v16 — `740ae9a1…`, хеш файла — другое число). П
   сторона двусторонней проверки — ДРУГОЙ адрес и ДРУГОЙ запрос, а не второй заход на ту же страницу: хост это
   объясняет отметкой, а не новым отказом. Канонический ключ адреса (`fetch_url_key`) используется только
   отметкой; сделать его жёстким гейтом — отдельная задача (кандидат вместе с лимитами fetch, T7.72).
+
+- Типографическая слепота детектора и ловушка фикстур (T7.77): живые русские страницы набраны неразрывными
+  пробелами (NBSP U+00A0 — сберсибовское «По\xa0данным Росстата», узкий U+202F), софт-гифеном U+00AD и
+  ZW-символами; шаблоны `ATTRIBUTION_TEMPLATES` требовали ровно одного ASCII-пробела — вся страница
+  пересказа осталась `no_value_attribution`, а утверждение получило E3 с ложной формулировкой. С v2
+  (`host-source-attribution-v2`) типографика нормализуется над **копией** текста на входе детектора:
+  хранимые артефакты и их хеши не меняются, `MAX_SCAN_CHARS` считается по копии, `basis_fragment` — из
+  копии (невидимые символы видны оператору как пробелы). Одинарный `\n` теперь мягкая граница (фрагменты
+  шире) — окно 120, вето `OWN_ASSESSMENT` и отказ при двух первоисточниках не ослаблены. Ловушка тестов:
+  фикстура дефекта обязана содержать Unicode прямо в литерале (`"По\xa0данным …"`); если редактор/копипаст
+  заменит NBSP на обычный пробел, фикстура станет зелёной при сломанном детекторе. Переатрибуция прошлых
+  решений — команда `research-reattribute` (`python -m hostctl.cli research-reattribute --since`; её идемпотентность закреплена
+  `tests/scenario/test_research_reattribute.py`): окно — журнал `research_fetch_completed` с
+  `payload->>'attribution_method'='host-source-attribution-v1'`, помечаются только непомеченные строки,
+  пересчёт — каскад `apply_source_graph_change` + рабочий переоценки (прямых UPDATE нет).
+- Причины оценок рабочего переоценки (T7.77): reassessment-worker НЕ пишет `CLAIM_ASSESSED` (это язык
+  staging-пути, `packages/memory/service.py`); у таблицы `claim_assessments` колонки причин нет вовсе.
+  Grade/status/причины рабочей оценки — в payload события `reassessment_job_completed`; тестам читать
+  последнее по нему (`ORDER BY occurred_at DESC LIMIT 1`). Хронология по `audit_events.sequence` действует
+  только внутри одной сессии (sequence per-session) — кросс-сессийные ORDER BY sequence невалидны.
+- TLS research-proxy и инертный `SSL_CERT_FILE` (T7.77): httpcore строит контекст сам
+  (`create_default_context()` + certifi, `httpcore/_ssl.py`) и переменные окружения OpenSSL не читает —
+  подстановка `SSL_CERT_FILE` на стенде не помогла (`rosstat.gov.ru` → CERTIFICATE_VERIFY_FAILED). Единственный
+  штатный способ дополнить доверие egress — `NOEZEMA_RESEARCH_EXTRA_CA_FILE` (модуль `apps/research_proxy/tls.py`):
+  PEM **добавляется** к certifi-ядру, `check_hostname`/`CERT_REQUIRED` не ослабляются ни в каком режиме; без
+  переменной FetchClient строит пул веткой без `ssl_context` (прежнее поведение); битая переменная —
+  `ResearchTlsError` при сборке FetchClient и `ResearchProxyService` (fail-closed, узел не поднимается).
+  TLS-тесты (`tests/unit/test_research_tls_extra_ca.py`) генерируют сертификаты через `openssl` CLI
+  (trustme/cryptography в зависимостях нет) и без него скипуются — скипы сообщаются отдельной строкой.
 
 ## 8. Гигиена длинных сессий
 
