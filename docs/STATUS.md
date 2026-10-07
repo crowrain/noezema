@@ -5489,18 +5489,21 @@ domain — ловушка T7.75; иначе якорь `declared_primary_anchor`
 ria↔interfax) не трогаются. В `derivative_of` пишется метод v2 и маркер `written_by: "research-reattribute"`.
 Пересчёт — только существующий каскад §11.3 (`apply_source_graph_change`, аудит `SOURCE_GRAPH_CHANGED`)
 и один `run_reassessment_batch()` после записи; остаток очереди dren'ит maint-таймер идемпотентно. Миграции,
-нового AuditEventType, правки правил/порогов нет — стоп-критерии не наступили. Формат вывода (проверен
-тестом CLI):
+нового AuditEventType, правки правил/порогов нет — стоп-критерии не наступили. Формат вывода — вывод кода
+`hostctl/cli.py:473–489`; поведение команды (нулевой dry-run, идемпотентность, exit 2 на ошибках) закреплено
+тестами:
 
 ```
 $ .venv/bin/python -m hostctl.cli research-reattribute --since 2026-10-07T14:30:00Z --dry-run
 research-reattribute: окно с 2026-10-07 14:30:00+00:00 (только план)
-https://sbercib.ru/…           было: no_value_attribution  стало: derivative → Росстат  [указатель будет проставлен]
-https://vedomosti.example/…    было: no_value_attribution  стало: derivative → Росстат  [указатель будет проставлен]
-изменено источников: 2; затронуто утверждений: 1; снятых голов: 1; задач переоценки создано: 1
+https://sbercib.ru/…
+    было: no_value_attribution  стало: derivative → Росстат  [будет проставлен указатель]
+https://vedomosti.example/…
+    было: no_value_attribution  стало: derivative → Росстат  [будет проставлен указатель]
+изменено источников: 0; затронуто утверждений: 0; снятых голов: 0; задач переоценки создано: 0
 ```
 
-(в dry-run строка итога нулевая — ничего не пишется и заявок не заводилось). Реальный прогон добавляет
+(в dry-run строка итога нулевая — план показан построчно, ничего не пишется и заявок не заводится). Реальный прогон добавляет
 строку `рабочий переоценки: processed=… completed=…`. Ошибки — exit 2 с текстом (нет `NOEZEMA_DATABASE_URL`,
 кривой `--since`, недоступный каталог артефактов). Идемпотентность закреплена тестом: второй запуск —
 «изменено источников: 0», действия «указатель уже проставлен», голова оценки та же.
@@ -5572,16 +5575,16 @@ TLS-тестам нужен бинарник `openssl` (генерация те�
 1. **Переатрибуция.** Сначала план: `.venv/bin/python -m hostctl.cli research-reattribute
    --since 2026-10-07T14:30:00Z --dry-run`
    от пользователя узла с env стенда (`NOEZEMA_DATABASE_URL`, артефакты `<NOEZEMA_DATA_ROOT>/artifacts`).
-   Ожидается строка sbercib (и, если читалось, вedomosti-пересказа) «было: no_value_attribution → стало:
+   Ожидается строка sbercib (и, если читалось, пересказ ведомостей) «было: no_value_attribution → стало:
    derivative → Росстат». Затем та же команда без `--dry-run`; в итоге — nonzero «изменено источников» и
-   строка `рабочий переоценки: … completed=1…` (остаток очереди dren'ит maint-таймер). Проверка результата
+   строка `рабочий переоценки: … completed=1…` (остаток очереди добирает maint-таймер). Проверка результата
    read-only: у утверждения `c970bc08…` голова — `E1/hypothesis`, в payload ближайшего
    `reassessment_job_completed` причина `insufficient_independence`; бейдж «Проверено» с карточки уходит.
    Повторный запуск команды обязан дать «изменено источников: 0».
 2. **Откат переатрибуции** как операции нет: проставленный указатель — факт графа, созданный тем же
    механизмом, что и при обычном fetch (удаление `parent_source_id` = вариант C ADR-0029, не реализован).
    Ошибочных склеек v1 не оставлял (детектор молчал), поэтому откат здесь — не ожидаемый сценарий.
-3. **Конфигурация.** Активация: `hostctl activate-online --payload docs/eval/config-v17-payload.json
+3. **Конфигурация.** Активация: `.venv/bin/python -m hostctl.cli activate-online --payload docs/eval/config-v17-payload.json
    --reason "T7.77: explorer-v9 (прогноз — не оценка состоявшегося)" --drain-wait-seconds 120`
    (canonical `5c402f4d…` виден в `config_snapshots.payload_sha256`). Откат: тот же путь с
    `docs/eval/config-v16-payload.json` (canonical `740ae9a1…`) — пин вернётся на explorer-v8.
