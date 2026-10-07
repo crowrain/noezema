@@ -424,6 +424,25 @@ config-v13 сохранены: `model.context_window`/`backend_context_limit` = 
   `apps/web/questions_view.py`): иначе «Мои вопросы» и карточка показывают разное; бюджет списка
   (≤4 SELECT, без N+1) закреплён тестом.
 
+- `registrable_domain` для `.gov.ru` (T7.75): в PSL-списке `packages/memory/independence.py`
+  (`MULTI_PART_SUFFIXES`) нет записи `gov.ru`, поэтому
+  `registrable_domain("https://rosstat.gov.ru/") == registrable_domain("https://minfin.gov.ru/") == "gov.ru"` —
+  все ведомства с одним `.gov.ru` сворачиваются в одну группу. Всё, что решает «это страница самого
+  первоисточника?», обязано сравнивать **метку хоста**, а не registrable domain: в словаре и в
+  разрешении родителя (`apps/research_proxy/source_attribution.py::is_home_host`,
+  `apps/research_proxy/service.py::_resolve_primary_source`) так и сделано. Тот же подводный камень
+  валит тесты независимости: хосты `interfax.example.ru / expert.example.ru / ria.example.ru` дают
+  ОДИН registrable domain `example.ru` (PSL не знает `example.ru`), и группы сливаются сами по себе
+  — фикстуры обязаны брать заведомо разные домены (`interfax.example / expert.example`) и это
+  проверять. Менять PSL-список нельзя молча: это порог группировки, влияющий на прежние прогоны.
+- `split` не отменяет parent-склеивание (T7.75): коррекция `source_graph_corrections{split}` снимает
+  только прямые relation-основания (edge/correction), а `parent_source_id`, общий домен, общий hash и
+  совпадение текста — алгоритмические факты (`packages/memory/independence.py:26–33`, :340–356).
+  Ошибочное склеивание производного источника лечится только изменением данных (обнулить
+  `parent_source_id`) — это вариант C ADR-0029 и он не реализован. Значит детектор производности
+  обязан оставаться консервативным: ложный пропуск безопаснее ложной склейки, а «исправим потом
+  коррекцией» — не план.
+
 ## 8. Гигиена длинных сессий
 
 - После каждого закоммиченного PR: обновить STATUS.md, отметить todo, и только потом начинать
