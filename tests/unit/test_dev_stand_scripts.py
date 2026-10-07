@@ -602,3 +602,57 @@ class TestDevStandStatusSearch:
         assert "research_proxy->>'mode'" in text
         assert "web.search доступен модели в этом снапшоте" in text
 
+
+class TestDevStandConfigVersion:
+    """Стенд по умолчанию поднимает актуальную конфигурацию, а предыдущая остаётся откатом (T7.76).
+
+    Это не косметика: менеджер, повторяющий `bootstrap.sh` на .92, активирует ровно тот payload,
+    который закреплён дефолтом скрипта. Если дефолт и откат перепутаны местами, стенд молча вернётся
+    на прежний промпт исследователя (односторонний поиск) — и следующий замер это измерит не там.
+    """
+
+    V16 = "config-v16-payload.json"
+    V15 = "config-v15-payload.json"
+    #: как эти файлы названы в скриптах (они указывают на payload через $REPO_ROOT)
+    V16_REF = "docs/eval/config-v16-payload.json"
+    V15_REF = "docs/eval/config-v15-payload.json"
+    #: canonical-хеші payload'ов: именно они попадают в `config_snapshots.payload_sha256` (AGENTS §8),
+    #  в скриптах и README они названы короткими префиксами — оператор сверяет head по ним
+    V16_CANONICAL = "740ae9a1"
+    V15_CANONICAL = "b3801812"
+
+    def test_bootstrap_defaults_to_config_v16_and_names_v15_as_the_rollback(self) -> None:
+        text = BOOTSTRAP.read_text(encoding="utf-8")
+
+        assert f'CONFIG_PAYLOAD="${{NOEZEMA_DEV_CONFIG_PAYLOAD:-$REPO_ROOT/{self.V16_REF}}}"' in text
+        # откат обязан быть назван явно: прежнему payload'у принадлежит canonical-хеш, не хеш файла
+        rollback_line = next(line for line in text.splitlines() if self.V15_REF in line)
+        assert "NOEZEMA_DEV_CONFIG_PAYLOAD" in rollback_line
+        assert self.V15_CANONICAL in text
+        # причина активации говорит, что именно изменилось (промпт + лимит шагов), а не «обновили конфиг»
+        reason = next(line for line in text.splitlines() if line.startswith("CONFIG_REASON="))
+        assert "config-v16" in reason and "explorer-v8" in reason and "16 explorer steps" in reason
+
+    def test_reset_db_reactivates_the_same_config_as_bootstrap(self) -> None:
+        script = (REPO_ROOT / "deploy" / "dev-stand" / "reset-db.sh").read_text(encoding="utf-8")
+
+        assert f'CONFIG_PAYLOAD="${{NOEZEMA_DEV_CONFIG_PAYLOAD:-$REPO_ROOT/{self.V16_REF}}}"' in script
+        assert self.V15_REF in script  # откат не потерян и после сброса базы
+        assert "config-v16" in script
+
+    def test_readme_documents_the_activation_and_the_rollback_with_canonical_hashes(self) -> None:
+        text = (REPO_ROOT / "deploy" / "dev-stand" / "README.md").read_text(encoding="utf-8")
+
+        assert self.V16_CANONICAL in text
+        assert self.V15_CANONICAL in text
+        assert "config-v16-payload.json" in text
+        assert "docs/eval/config-v15-payload.json" in text
+        # активация — команда менеджера с drain, а не тихая правка снапшота
+        assert "activate-online" in text and "--drain-wait-seconds 120" in text
+
+    def test_config_v16_payload_file_exists_next_to_the_older_ones(self) -> None:
+        """Новый номер конфигурации = новый файл, прежние не переписываются (AGENTS §8)."""
+        for name in ("config-v13-payload.json", "config-v14-payload.json", "config-v15-payload.json", self.V16):
+            path = REPO_ROOT / "docs" / "eval" / name
+            assert path.is_file(), name
+

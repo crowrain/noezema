@@ -390,3 +390,93 @@ def test_config_v14_file_is_untouched_by_the_v15_activation() -> None:
     assert hashlib.sha256(raw.encode()).hexdigest() == (
         "6d361dae4454a56472de58df4c4c34577d6b1ff4cc870d9b418d72943256ed89"
     )
+
+
+@pytest.mark.unit
+def test_config_v16_differs_from_v15_only_by_the_explorer_pin_and_the_step_limit() -> None:
+    """T7.76: config-v16 = config-v15 ровно с двумя правками — пин ``prompts.explorer`` → explorer-v8
+    (спорное число проверяется двумя сторонами поиска: первоисточник и отдельный запрос про независимую
+    оценку; расхождение называется открыто, а его отсутствие — честно) и
+    ``session_limits.max_explorer_steps`` 10 → 16. Пороги, ``claim_type_rules``, token-бюджеты, окна
+    модели, research_proxy и список инструментов остаются байт в байтом v15: двусторонний поиск меняет
+    то, что модель ищет, и длину сессии, но не то, как хост считает независимость. Композиция правил
+    движка (ADR-0029 реализована в T7.75) здесь не меняется. v15 остаётся закоммичен и является откатом."""
+    v15 = _load("config-v15-payload.json")
+    v16 = _load("config-v16-payload.json")
+
+    assert set(v16) == set(v15), "у payload'а появился новый раздел"
+    assert {k for k in v16 if v16[k] != v15[k]} == {"prompts", "session_limits"}
+
+    # промпты: изменился ровно один пин, ровно своими тремя полями
+    assert {r for r in v16["prompts"] if v16["prompts"][r] != v15["prompts"][r]} == {"explorer"}
+    changed = {k for k in v16["prompts"]["explorer"] if v16["prompts"]["explorer"][k] != v15["prompts"]["explorer"][k]}
+    assert changed == {"path", "sha256", "version"}, changed
+    assert v16["prompts"]["explorer"]["version"] == "explorer-v8"
+    assert v16["prompts"]["explorer"]["path"] == "prompts/explorer/explorer-v8.md"
+    for role in ("curator", "extractor", "planner", "verifier"):
+        assert v16["prompts"][role] == v15["prompts"][role], role
+
+    # лимиты: изменился ровно один, и только в большую сторону
+    assert {k for k in v16["session_limits"] if v16["session_limits"][k] != v15["session_limits"][k]} == {
+        "max_explorer_steps"
+    }
+    assert v16["session_limits"]["max_explorer_steps"] == 16
+    assert v16["session_limits"]["max_explorer_steps"] > v15["session_limits"]["max_explorer_steps"]
+    for key in ("session_timeout_seconds", "phase_deadline_seconds"):
+        assert v16["session_limits"][key] == v15["session_limits"][key], key
+
+    untouched = sorted(k for k in v15 if k not in {"prompts", "session_limits"})
+    for section in untouched:
+        assert v16[section] == v15[section], section
+
+    resolved = resolve_prompts(v16["prompts"], REPO_ROOT)
+    assert resolved[Role.EXPLORER].version == "explorer-v8"
+    assert resolved[Role.CURATOR].version == "curator-v8"
+
+    budgets = TokenBudgets.from_snapshot(v16["model"], v16["token_budgets"])
+    assert budgets.section_limits == EVAL2_SECTIONS
+    assert budgets.validate() == []
+
+
+@pytest.mark.unit
+def test_config_v16_step_limit_fits_the_session_and_search_ceilings() -> None:
+    """Арифметика нового лимита (без замеров в тесте, только по числам снапшота и замерам STATUS T7.76):
+    16 шагов ≈ 16×57 с = 912 с исследования + куратор ≤180 с укладываются в `session_timeout_seconds` и
+    `phase_deadline_seconds` (1800 с, не изменены); максимум upstream-запросов поиска за сессию — меньше
+    лимита шагов, а `rate_limit_max` = 20 на окно 3600 с не менялся. Если эти числа разъедутся, тест
+    краснеет до того, как сессия упрётся в дедлайн посреди независимой стороны проверки."""
+    v16 = _load("config-v16-payload.json")
+    steps = v16["session_limits"]["max_explorer_steps"]
+    assert steps * 60 <= v16["session_limits"]["phase_deadline_seconds"] - 180
+    assert steps <= v16["research_proxy"]["rate_limit_max"], "поисковых шагов больше, чем потолок upstream"
+
+
+@pytest.mark.unit
+def test_config_v16_file_is_byte_stable_and_pinned() -> None:
+    """Идентичность v16 закреплена: хеш файла и canonical-хеш (последний попадает в
+    ``config_snapshots.payload_sha256`` — AGENTS §8, путать их нельзя)."""
+    import hashlib
+
+    from packages.domain.config import canonical_sha256
+
+    raw = (REPO_ROOT / "docs" / "eval" / "config-v16-payload.json").read_text(encoding="utf-8")
+    payload = json.loads(raw)
+    assert json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True) + "\n" == raw
+    assert hashlib.sha256(raw.encode()).hexdigest() == (
+        "79d63b2d380775621495ad2445ce3610484c8ce5fd3c5f857f65f26a7817d131"
+    )
+    assert canonical_sha256(payload) == "740ae9a1022b00ef98b4eb09563ac4645b0047ebd419aba2fe853ee1a31f31b3"
+
+
+@pytest.mark.unit
+def test_earlier_payloads_are_untouched_by_the_v16_activation() -> None:
+    """Новый номер конфигурации = новый файл (AGENTS §8): v15 и v14 не переписаны задним числом, v15
+    остаётся штатным откатом стенда."""
+    import hashlib
+
+    for name, digest in {
+        "config-v15-payload.json": "c65b69db5a1f50d44e6dc9e9c4b6399381c191b1df62506a9ef275a6d3b5f722",
+        "config-v14-payload.json": "6d361dae4454a56472de58df4c4c34577d6b1ff4cc870d9b418d72943256ed89",
+    }.items():
+        raw = (REPO_ROOT / "docs" / "eval" / name).read_text(encoding="utf-8")
+        assert hashlib.sha256(raw.encode()).hexdigest() == digest, name

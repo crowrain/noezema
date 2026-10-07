@@ -83,7 +83,8 @@ WEB_PORT="${NOEZEMA_DEV_WEB_PORT:-8321}"
 
 # Поиск (T7.70, §5.12): SearXNG ставится ТОЛЬКО по --with-searxng. Контейнер публикуется на 127.0.0.1:8888
 # (внутри он слушает 8080 как обычно) — это ровно тот адрес, который снапшот конфигурации записывает как
-# research_proxy.searxng_url (config-v15 унаследовал http://127.0.0.1:8888 в private_allowlist от config-v14).
+# research_proxy.searxng_url (config-v16 унаследовал http://127.0.0.1:8888 в private_allowlist от
+# config-v15, а тот — от config-v14).
 SEARXNG_CONTAINER="${NOEZEMA_DEV_SEARXNG_CONTAINER:-noezema-searxng}"
 SEARXNG_IMAGE="${NOEZEMA_DEV_SEARXNG_IMAGE:-searxng/searxng:latest}"
 SEARXNG_PORT="${NOEZEMA_DEV_SEARXNG_PORT:-8888}"
@@ -97,22 +98,34 @@ LLM_SCHEMA_PROFILE="${NOEZEMA_DEV_LLM_SCHEMA_PROFILE:-none}"
 LLM_MAX_OUTPUT_TOKENS="${NOEZEMA_DEV_LLM_MAX_OUTPUT_TOKENS:-8192}"
 LLM_TIMEOUT_SECONDS="${NOEZEMA_DEV_LLM_TIMEOUT_SECONDS:-600}"
 
-# Activated config (T7.59(в), T7.71, T7.73): config-v15 = config-v14 with exactly two changes — the
-# curator prompt pin (curator-v8: reverify keeps the anchor's as_of/date_anchor/scope and must link
-# every source it actually used) and the explorer prompt pin (explorer-v7: primary source vs derivative
-# publication, divergence shown instead of silently picked). Thresholds, claim_type_rules, budgets and
-# the tool grant are byte-identical to config-v14, which was config-v13 with policy.capabilities.tools
-# (search granted, `artifact.create` removed: it is not in the tool registry and every step that tried
-# it failed with "unknown tool: artifact.create") and explorer-v6 (v5 told the model "Sealed: сети нет"
-# while the stand runs curated); v13 itself was config-v12 with model.context_window /
-# model.backend_context_limit lowered to 131072 — the physical window of the EXL3 engine the stand
-# talks to (qwen38-exl3-3bpw-128k). v12 advertised 262144 (input_budget 251904 > the engine window,
-# observed in SMOKE-V14B); budgets Σ=26624, schedule and thresholds are untouched, so stand sessions
-# stay comparable with the smoke series. Override with NOEZEMA_DEV_CONFIG_PAYLOAD — rollback is
-# `NOEZEMA_DEV_CONFIG_PAYLOAD=$REPO_ROOT/docs/eval/config-v14-payload.json` (canonical hash
-# 22903be7…, pinned in tests). v14, v13 and v12 stay in the repo and are never rewritten.
-CONFIG_PAYLOAD="${NOEZEMA_DEV_CONFIG_PAYLOAD:-$REPO_ROOT/docs/eval/config-v15-payload.json}"
-CONFIG_REASON="${NOEZEMA_DEV_CONFIG_REASON:-T7.73 dev-stand: activate config-v15 (curator-v8 reverify reference rules + explorer-v7 source independence; rules and budgets unchanged)}"
+# Activated config (T7.59(в), T7.71, T7.73, T7.76): config-v16 = config-v15 with exactly two changes —
+# the explorer prompt pin (explorer-v8: правило 10 — спорное число проверяется двумя сторонами поиска,
+# официальным первоисточником И независимым исследованием, расхождение называется открыто либо честно
+# говорится «независимых оценок не найдено»; правило 11 — беречь шаги) and one session limit
+# (session_limits.max_explorer_steps 10 → 16: на подставке перепроверка израсходовала 8 из 10 шагов на
+# официальную сторону, включая повторное чтение уже прочитанного адреса и два захода на недоступный URL,
+# и независимая сторона не состоялась; при ~57 с на шаг это 16×57 ≈ 912 с + куратор ≤180 с — ниже
+# session_timeout/phase_deadline 1800 с, а ≤15 upstream-запросов поиска укладываются в rate_limit_max 20).
+# Thresholds, claim_type_rules, token budgets (Σ=26624), curator-v8 and explorer-v7 pins, model windows
+# and the tool grant are byte-identical to config-v15, which was config-v14 with two prompt pins
+# (curator-v8: reverify keeps the anchor's as_of/date_anchor/scope and must link every source it actually
+# used; explorer-v7: primary source vs derivative publication, divergence shown instead of silently
+# picked) — and config-v14 was config-v13 with policy.capabilities.tools (search granted, `artifact.create`
+# removed: it is not in the tool registry and every step that tried it failed with "unknown tool:
+# artifact.create") and explorer-v6 (v5 told the model "Sealed: сети нет" while the stand runs curated);
+# v13 itself was config-v12 with model.context_window / model.backend_context_limit lowered to 131072 —
+# the physical window of the EXL3 engine the stand talks to (qwen38-exl3-3bpw-128k). v12 advertised 262144
+# (input_budget 251904 > the engine window, observed in SMOKE-V14B); schedule and thresholds are untouched,
+# so stand sessions stay comparable with the smoke series. config-v16 (T7.76) is config-v15 with the
+# explorer pin replaced by explorer-v8 (двусторонний поиск: первоисточник + отдельный запрос про
+# независимую оценку, расхождение называется открыто) and session_limits.max_explorer_steps 10 → 16
+# (16 шагов ≈ 912 с исследования при замеренных ~57 с на шаг, укладывается в phase_deadline 1800 с;
+# ≤15 upstream-поисков < rate_limit_max 20). Override with NOEZEMA_DEV_CONFIG_PAYLOAD — rollback is
+# `NOEZEMA_DEV_CONFIG_PAYLOAD=$REPO_ROOT/docs/eval/config-v15-payload.json` (canonical hash
+# b3801812…, pinned in tests; config-v16 itself is 740ae9a1…). v15, v14, v13 and v12 stay in the repo
+# and are never rewritten.
+CONFIG_PAYLOAD="${NOEZEMA_DEV_CONFIG_PAYLOAD:-$REPO_ROOT/docs/eval/config-v16-payload.json}"
+CONFIG_REASON="${NOEZEMA_DEV_CONFIG_REASON:-T7.76 dev-stand: activate config-v16 (explorer-v8 two-sided search + 16 explorer steps; curator-v8, thresholds and token budgets unchanged)}"
 NODE_OWNER="${NOEZEMA_DEV_NODE_OWNER:-dev-stand}"
 
 DRY_RUN=false
