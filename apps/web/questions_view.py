@@ -37,7 +37,12 @@ from typing import Any, Final
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from apps.web.answer import build_answer_result
+from apps.web.answer import (
+    ANSWER_KINDS,
+    build_answer_result,
+    known_label,
+    touched_claims_cte,
+)
 from apps.web.knowledge import EFFECTIVE_SNAPSHOT_SQL, assessment_view, effective_claim_rules
 from packages.domain.models.base import JsonDict
 from packages.domain.models.enums import QuestionOrigin, QuestionState
@@ -111,9 +116,12 @@ def build_answer_summary(
         question_state=question_state,
         sessions=sessions,
         answer_claim_count=len(claims),
+        # T7.74: перепроверенное или принятое повторно этим вопросом действующее
+        # утверждение — тоже ответ вопроса («Ответ не записан» был бы неправдой).
+        relations=[claim.get("relation") for claim in claims],
     )
     summary: JsonDict = {"kind": result["kind"], "label": result["label"]}
-    if claims and str(result["kind"]) == "answered":
+    if claims and str(result["kind"]) in ANSWER_KINDS:
         first = claims[0]
         summary["statement"] = summary_statement(first.get("statement"))
         summary["reliability"] = assessment_view(
@@ -124,9 +132,14 @@ def build_answer_summary(
             freshness_status=first.get("freshness_status"),
             rules=rules,
         )["reliability"]
+        # T7.74: та же связь, что показывает карточка (подпись — из словаря).
+        summary["relation"] = first.get("relation")
+        summary["relation_label"] = known_label("claim_relation", first.get("relation"))
     else:
         summary["statement"] = None
         summary["reliability"] = None
+        summary["relation"] = None
+        summary["relation_label"] = ""
     return summary
 
 
@@ -187,23 +200,26 @@ async def list_question_rows(
 
     claim_clause = ", ".join(f":c{i}" for i in range(len(ids)))
     claim_params: dict[str, Any] = {f"c{i}": ids[i] for i in range(len(ids))}
+    # T7.74: то же отношение «вопрос → утверждение», что у карточки (та же CTE):
+    # перепроверенное этим вопросом действующее утверждение — ответ вопроса и в списке.
+    scope = f"SELECT id AS session_id, question_id FROM sessions WHERE question_id IN ({claim_clause})"
     claim_rows = list(
         (
             await db.execute(
                 text(
                     f"""
-                    SELECT s.question_id AS question_id, c.id, c.statement, c.claim_type,
+                    WITH {touched_claims_cte(scope)}
+                    SELECT r.question_id, r.relation, c.id, c.statement, c.claim_type,
                            c.freshness_status, c.created_at,
                            h.epistemic_status, a.effective_grade
-                    FROM claims c
-                    JOIN sessions s ON s.id = c.created_in_session
+                    FROM ranked r
+                    JOIN claims c ON c.id = r.claim_id
                     JOIN claim_assessment_heads h
                            ON h.claim_id = c.id
                           AND h.config_snapshot_id = {EFFECTIVE_SNAPSHOT_SQL}
                           AND h.assessment_state = 'current'
                     LEFT JOIN claim_assessments a ON a.id = h.current_assessment_id
-                    WHERE s.question_id IN ({claim_clause})
-                    ORDER BY s.question_id ASC, c.created_at ASC, c.id ASC
+                    ORDER BY r.question_id ASC, c.created_at ASC, c.id ASC
                     """,
                 ),
                 claim_params,

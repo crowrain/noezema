@@ -583,6 +583,19 @@ function renderClaim(claim,inactive){
   row.appendChild(badgeFor(claim.reliability));
   const statement=document.createElement('b'); statement.textContent=claim.statement;
   row.appendChild(statement);
+  // T7.74: как именно этот вопрос связан с выводом (подпись и пояснение — серверные).
+  if(claim.relation_label){
+    const rel=document.createElement('div'); rel.className='muted';
+    rel.textContent=claim.relation_label;
+    if(claim.relation_hint) rel.title=claim.relation_hint;
+    row.appendChild(rel);
+  }
+  // T7.74: что перепроверка сделала с оценкой (строку составляет сервер, JS её печатает).
+  for(const past of (claim.reverify_history||[])){
+    if(!past || !past.text) continue;
+    const line=document.createElement('div'); line.className='muted';
+    line.textContent=past.text; row.appendChild(line);
+  }
   const checked=document.createElement('div'); checked.className='muted';
   const lines=(claim.verification||[]).filter(Boolean);
   if(lines.length){

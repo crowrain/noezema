@@ -18,6 +18,11 @@
 Тест красный на прежнем коде (проверено временным откатом, STATUS T7.73): там
 там E1 с `as_of_missing` и ни одной сохранённой даты.
 
+Пункты (з)–(и) — витрина перепроверки (T7.74): карточка вопроса перепроверки обязана
+показать действующее утверждение как свой ответ («перепроверено этим вопросом») и то же
+должно видеть «Мои вопросы». Их краснота на коде до T7.74 проверена отдельным временным
+откатом (STATUS T7.74).
+
 Никаких внешних запросов: HTTP-слой research proxy подменён (`FakeFetchClient`),
 страницы добавляет этот тест.
 """
@@ -35,6 +40,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from apps.orchestrator.executor import StubToolExecutor
 from apps.orchestrator.orchestrator import Orchestrator
 from apps.research_proxy.service import ResearchProxyService
+from apps.web import labels as ui_labels
 from packages.artifacts.store import FilesystemArtifactStore
 from packages.domain.config import BOOTSTRAP_PAYLOAD
 from packages.llm_gateway.client import LLMMiddleware
@@ -43,6 +49,7 @@ from tests.conftest import FakeLLM
 from tests.scenario.test_online_activation import _run_online
 from tests.scenario.test_research_evidence import PAGES, FakeFetchClient
 from tests.scenario.test_scope_coverage import _all, _scalar, _seed_question
+from tests.scenario.test_web_answer_api import _client, _make
 
 pytestmark = [pytest.mark.scenario]
 
@@ -311,3 +318,43 @@ async def test_dateless_reverify_keeps_the_E3_of_a_temporal_fact(
     assert audit[1] == anchor_as_of.isoformat()
     assert audit[2] == anchor_as_of.isoformat()
     assert audit[3] == "relative"
+
+    # ── (з) карточка вопроса перепроверки называет ответ (T7.74) ───────────────
+    # На прежнем витринном коде здесь был пустой список утверждений и итог
+    # «Ответ не записан», хотя сессия перепровера действовала (краснота проверена
+    # временным откатом, STATUS T7.74).
+    app, app_engine = await _make(scratch_url, tmp_path / "host", tmp_path / "unit.json")
+    async with _client(app) as client:
+        card_response = await client.get(f"/api/v1/questions/{reverify_qid}/answer")
+        assert card_response.status_code == 200
+        card = card_response.json()
+        queue_response = await client.get("/api/v1/questions")
+        assert queue_response.status_code == 200
+        rows = {row["id"]: row for row in queue_response.json()["questions"]}
+    await app_engine.dispose()
+
+    assert [item["relation"] for item in card["claims"]] == ["reverified"]
+    assert card["claims"][0]["relation_label"] == ui_labels.describe("claim_relation", "reverified")["label"]
+    assert card["result"]["kind"] == "reverified"
+    assert card["result"]["label"] == ui_labels.describe("answer_result", "reverified")["label"]
+    assert "Ответ не записан" not in card["result"]["label"]
+    # оценка не изменилась (E3 supported → E3 supported): «было → стало» не выдумывается
+    assert card["claims"][0]["reverify_history"] == []
+    # шаги и итог рассказывают про сессию перепроверки, а не про сессию-якорь
+    assert card["work"]["session_id"] == str(reverify.session_id)
+
+    # (и) список «Мои вопросы» говорит то же, что карточка (тот же итог, та же связь)
+    row = rows[str(reverify_qid)]
+    assert row["answer"]["kind"] == card["result"]["kind"]
+    assert row["answer"]["label"] == card["result"]["label"]
+    assert row["answer"]["relation_label"] == card["claims"][0]["relation_label"]
+    assert row["answer"]["statement"] is not None and row["answer"]["statement"].startswith(STATEMENT[:20])
+    assert row["answer"]["reliability"]["label"] == "Проверено"
+
+    # карточка вопроса-якоря от этой правки не изменилась: там утверждение создано им
+    anchor_app, anchor_engine = await _make(scratch_url, tmp_path / "host2", tmp_path / "unit2.json")
+    async with _client(anchor_app) as client:
+        anchor_card = (await client.get(f"/api/v1/questions/{anchor_qid}/answer")).json()
+    await anchor_engine.dispose()
+    assert anchor_card["claims"][0]["relation"] == "created"
+    assert anchor_card["result"]["kind"] == "answered"

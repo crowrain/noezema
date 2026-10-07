@@ -72,7 +72,30 @@ STEP_KEYS: Final[tuple[str, ...]] = (
     "merged_actions",
     "unnamed_action",
 )
-RESULT_KINDS: Final[tuple[str, ...]] = ("answered", "in_progress", "waiting", "failed", "no_answer")
+RESULT_KINDS: Final[tuple[str, ...]] = (
+    "answered",
+    "in_progress",
+    "waiting",
+    "failed",
+    "no_answer",
+    # T7.74: вопрос может ответить и не записав нового утверждения — перепроверив
+    # или приняв повторно уже записанное (head `current`).
+    "reverified",
+    "partially_reverified",
+    "reused",
+)
+#: Как вопрос связан с утверждением (T7.74): закрытый набор, подписи — категория
+#: `claim_relation`. `created` строку создала сессия этого вопроса; `reverified` —
+#: сессия перепроверяла уже записанное (событие `claim_reverified` этой же сессии);
+#: `reused` — сессия оценила уже записанное без события перепроверки (дедуп-повтор, T7.9).
+RELATION_KEYS: Final[tuple[str, ...]] = ("created", "reverified", "reused")
+#: Убедительность отношения для итога вопроса: созданное важнее перепроверенного,
+#: перепроверенное — важнее принятого повторно. Используется и в SQL (`relation_rank_sql`).
+RELATION_PRECEDENCE: Final[dict[str, int]] = {key: rank for rank, key in enumerate(RELATION_KEYS)}
+#: Итоги, у которых есть человеческий ответ (его показывают и карточка, и список).
+ANSWER_KINDS: Final[frozenset[str]] = frozenset(
+    {"answered", "reverified", "partially_reverified", "reused"}
+)
 #: Заголовок строки подтверждения выбирается по бейджу надёжности (см. labels).
 VERIFICATION_LEAD_KEYS: Final[tuple[str, ...]] = ("verified", "unconfirmed")
 HONESTY_KEYS: Final[tuple[str, ...]] = (
@@ -317,21 +340,57 @@ def is_terminal_session(state: object) -> bool:
         return False
 
 
+def relation_kind(relations: Iterable[object]) -> str | None:
+    """Самое убедительное отношение вопроса к его утверждениям-ответам (T7.74).
+
+    Неизвестные значения игнорируются: витрина не имеет права выдумывать отношение.
+    """
+    known = [str(relation) for relation in relations if str(relation) in RELATION_PRECEDENCE]
+    if not known:
+        return None
+    return min(known, key=lambda relation: RELATION_PRECEDENCE[relation])
+
+
+def finished_partial(question_state: object, sessions: Sequence[Mapping[str, Any]]) -> bool:
+    """Работа вопроса закончилась частично — так говорит состояние вопроса (T7.34)
+    или исход последней завершившейся сессии. Выдумывать частичность нельзя."""
+    if str(question_state) == QuestionState.PARTIALLY_ANSWERED.value:
+        return True
+    for session in sessions:
+        state = str(session.get("state"))
+        if not is_terminal_session(state):
+            continue
+        return state == SessionState.SUCCEEDED_PARTIAL.value
+    return False
+
+
 def build_answer_result(
     *,
     question_state: object,
     sessions: Sequence[Mapping[str, Any]],
     answer_claim_count: int,
+    relations: Iterable[object] = (),
 ) -> JsonDict:
     """Человеческий итог: {kind, label, hint, action, active}.
 
     `active` — готовый булев признак «страницу надо обновлять»: JS не сравнивает
     коды состояний (словарь кодов в браузере повторять нельзя), а читает флаг.
+
+    `relations` (T7.74) — отношения этого вопроса к его действующим утверждениям.
+    Ответом считается не только то, что вопрос записал: перепроверенное или принятое
+    повторно этим вопросом действующее утверждение — тоже ответ, и «Ответ не записан»
+    был бы неправдой.
     """
     state = str(question_state)
     live = [session for session in sessions if not is_terminal_session(session.get("state"))]
     if answer_claim_count > 0:
-        kind = "answered"
+        relation = relation_kind(relations)
+        if relation is None or relation == "created":
+            kind = "answered"
+        elif relation == "reverified":
+            kind = "partially_reverified" if finished_partial(state, sessions) else "reverified"
+        else:
+            kind = "reused"
     elif live or state in WORKING_QUESTION_STATES:
         kind = "in_progress"
     elif sessions and str(sessions[0].get("state")) in FAILED_SESSION_STATES:
@@ -421,6 +480,68 @@ def _in_params(prefix: str, values: Sequence[Any]) -> tuple[str, dict[str, Any]]
     return clause, params
 
 
+#: Порядок убедительности отношения в SQL — тот же, что `RELATION_PRECEDENCE` в Python.
+_RELATION_RANK_SQL: Final[str] = (
+    "CASE t.relation WHEN 'created' THEN 0 WHEN 'reverified' THEN 1 ELSE 2 END"
+)
+
+
+def touched_claims_cte(session_scope_sql: str) -> str:
+    """CTE `sess` → `touches` → `ranked`: утверждения, к которым причастны сессии вопроса (T7.74).
+
+    `session_scope_sql` — выборка пар `session_id, question_id`: карточка перечисляет
+    сессии этого вопроса по их id, список — все сессии вопросов страницы.
+
+    Отношение строится ТОЛЬКО по долговременным записям (никаких текстовых эвристик):
+
+    * `created` — claim-строку создала эта сессия (`claims.created_in_session`);
+    * `reverified` — эта сессия записала оценку уже существующего утверждения
+      (`claim_assessments.claim_id + created_in_session`) и о той же паре есть событие
+      `claim_reverified` этой же сессии (`payload.claim_id`);
+    * `reused` — та же оценка по уже существующему утверждению без события перепроверки:
+      дедуп-повтор по statement+type (T7.9). Отдельного audit-типа у него нет
+      (`AuditEventType` закрыт и не расширяется), поэтому различение — по наличию или
+      отсутствию события перепроверки там, где факт оценки этой сессией уже доказан.
+
+    Оценки worker'а и активационные в выборку не попадают: у них `created_in_session IS NULL`.
+    На одну пару (вопрос, утверждение) выдаётся одно отношение — самое убедительное.
+    """
+    return f"""
+        sess AS (
+            {session_scope_sql}
+        ),
+        touches AS (
+            SELECT sq.question_id, c.id AS claim_id, c.created_in_session AS session_id,
+                   'created' AS relation
+            FROM claims c
+            JOIN sess sq ON sq.session_id = c.created_in_session
+            UNION ALL
+            SELECT sq.question_id, a.claim_id, a.created_in_session AS session_id,
+                   CASE WHEN rv.matched IS NULL THEN 'reused' ELSE 'reverified' END AS relation
+            FROM claim_assessments a
+            JOIN sess sq ON sq.session_id = a.created_in_session
+            LEFT JOIN claims c_own
+                   ON c_own.id = a.claim_id
+                  AND c_own.created_in_session = a.created_in_session
+            LEFT JOIN LATERAL (
+                SELECT 1 AS matched
+                FROM audit_events e
+                WHERE e.session_id = a.created_in_session
+                  AND e.type = 'claim_reverified'
+                  AND e.payload->>'claim_id' = a.claim_id::text
+                LIMIT 1
+            ) rv ON TRUE
+            WHERE c_own.id IS NULL
+        ),
+        ranked AS (
+            SELECT DISTINCT ON (t.question_id, t.claim_id)
+                   t.question_id, t.claim_id, t.session_id, t.relation
+            FROM touches t
+            ORDER BY t.question_id, t.claim_id, {_RELATION_RANK_SQL}, t.session_id DESC
+        )
+    """
+
+
 async def _assessment_reasons(
     db: AsyncSession, assessment_ids: Sequence[str], floor: datetime | None
 ) -> dict[str, list[str]]:
@@ -489,6 +610,122 @@ def grade_reason_view(reasons: Sequence[str]) -> list[JsonDict]:
     ]
 
 
+def _side_view(grade: object, status: object) -> JsonDict | None:
+    """Одна сторона истории оценки: подписанный уровень и эпистемический статус.
+
+    Нет подписи — нет и строки: витрина не имеет права называть оценку своими словами.
+    """
+    grade_label = known_label("evidence_grade", grade)
+    status_label = known_label("epistemic_status", status)
+    if not grade_label or not status_label:
+        return None
+    return {
+        "grade": str(grade),
+        "grade_label": grade_label,
+        "epistemic_status": str(status),
+        "status_label": status_label,
+    }
+
+
+def reverify_history_view(
+    rows: Iterable[Mapping[str, Any]],
+    reasons: Mapping[str, Sequence[str]],
+) -> dict[str, list[JsonDict]]:
+    """Краткая история оценки перепроверенного утверждения: было → стало (T7.74).
+
+    `rows` — пары «оценка этой сессии / прежняя оценка того же утверждения», взятые из
+    долговременных строк `claim_assessments` (соседние строки одного claim'а по
+    `created_at, id`). `reasons` — причины оценок из ленты `claim_assessed` (T7.73).
+
+    Запись появляется только когда оценка действительно изменилась: если перепроверка
+    ничего не изменила, карточка этого не утверждает. Возврат — {claim_id: [записи]}.
+    """
+    history: dict[str, list[JsonDict]] = {}
+    for row in rows:
+        if not isinstance(row, Mapping) or row.get("old_id") is None:
+            continue
+        old = _side_view(row.get("old_grade"), row.get("old_status"))
+        new = _side_view(row.get("effective_grade"), row.get("epistemic_status"))
+        if old is None or new is None:
+            continue
+        if old["grade"] == new["grade"] and old["epistemic_status"] == new["epistemic_status"]:
+            continue
+        claim_id = str(row["claim_id"])
+        history.setdefault(claim_id, []).append(
+            {
+                "session_id": str(row["session_id"]) if row.get("session_id") else None,
+                "assessment_id": str(row["assessment_id"]),
+                "from": old,
+                "to": new,
+                "from_reasons": grade_reason_view(
+                    reasons.get(str(row["old_id"]), ())
+                ),
+                "reasons": grade_reason_view(reasons.get(str(row["assessment_id"]), ())),
+                "text": (
+                    f"было: {old['grade_label']} ({old['status_label']}) → "
+                    f"стало: {new['grade_label']} ({new['status_label']})"
+                ),
+            }
+        )
+    return history
+
+
+async def _reverify_assessment_pairs(
+    db: AsyncSession, claim_ids: Sequence[str], session_ids: Sequence[str]
+) -> list[Any]:
+    """Оценки этих сессий и прежние оценки тех же утверждений — одним запросом (T7.74).
+
+    Прежней считается самая свежая из более ранних строк оценки того же claim'а
+    (`created_at DESC, id DESC`): утверждений без оценки не бывает, а оценка одной
+    сессии на один claim одна (шаг 3 коммита, `packages/memory/service.py:941–1004`).
+    Оценка worker'а сюда не попадает как «новая»: у неё `created_in_session IS NULL`.
+    """
+    if not claim_ids or not session_ids:
+        return []
+    claims_clause, params = _in_params("hc", claim_ids)
+    sessions_clause, session_params = _in_params("hs", session_ids)
+    params.update(session_params)
+    return list(
+        (
+            await db.execute(
+                text(
+                    f"""
+                    WITH fresh AS (
+                        SELECT a.id AS assessment_id, a.claim_id,
+                               a.created_in_session AS session_id,
+                               a.effective_grade, a.epistemic_status, a.created_at
+                        FROM claim_assessments a
+                        WHERE a.claim_id IN ({claims_clause})
+                          AND a.created_in_session IN ({sessions_clause})
+                    ),
+                    previous AS (
+                        SELECT DISTINCT ON (f.assessment_id)
+                               f.assessment_id AS assessment_id,
+                               p.id AS old_id, p.effective_grade AS old_grade,
+                               p.epistemic_status AS old_status
+                        FROM fresh f
+                        JOIN claim_assessments p
+                             ON p.claim_id = f.claim_id
+                            AND p.id <> f.assessment_id
+                            AND p.created_at <= f.created_at
+                        ORDER BY f.assessment_id, p.created_at DESC, p.id DESC
+                    )
+                    SELECT f.claim_id, f.assessment_id, f.session_id,
+                           f.effective_grade, f.epistemic_status,
+                           o.old_id, o.old_grade, o.old_status
+                    FROM fresh f
+                    LEFT JOIN previous o ON o.assessment_id = f.assessment_id
+                    ORDER BY f.created_at ASC, f.assessment_id ASC
+                    """
+                ),
+                params,
+            )
+        )
+        .mappings()
+        .all()
+    )
+
+
 async def question_answer(db: AsyncSession, question_id: uuid.UUID) -> JsonDict | None:
     """Собрать карточку ответа на вопрос. `None` — вопроса нет (эндпоинт ответит 404).
 
@@ -541,24 +778,31 @@ async def question_answer(db: AsyncSession, question_id: uuid.UUID) -> JsonDict 
     claims: list[JsonDict] = []
     other_claims: list[JsonDict] = []
     evidence_rows: list[Any] = []
+    touched_by_claim: dict[str, str] = {}
     if session_ids:
         clause, params = _in_params("s", session_ids)
+        # T7.74: карточка смотрит не только на то, что сессии этого вопроса ЗАПИСАЛИ,
+        # но и на то, что они перепроверили или приняли повторно (связь — долговременные
+        # колонки `claims.created_in_session` и `claim_assessments.created_in_session`).
+        scope = f"SELECT id AS session_id, question_id FROM sessions WHERE id IN ({clause})"
         claim_rows: list[Any] = list(
             (
                 await db.execute(
                     text(
                         f"""
-                        SELECT c.id, c.statement, c.claim_type, c.freshness_status,
+                        WITH {touched_claims_cte(scope)}
+                        SELECT r.relation, r.session_id AS touched_in_session,
+                               c.id, c.statement, c.claim_type, c.freshness_status,
                                c.created_in_session, c.created_at,
                                COALESCE(h.assessment_state, 'none') AS head_state,
                                h.epistemic_status, a.effective_grade, a.confidence,
                                a.id AS assessment_id
-                        FROM claims c
+                        FROM ranked r
+                        JOIN claims c ON c.id = r.claim_id
                         LEFT JOIN claim_assessment_heads h
                                ON h.claim_id = c.id
                               AND h.config_snapshot_id = {EFFECTIVE_SNAPSHOT_SQL}
                         LEFT JOIN claim_assessments a ON a.id = h.current_assessment_id
-                        WHERE c.created_in_session IN ({clause})
                         ORDER BY c.created_at ASC, c.id
                         """
                     ),
@@ -597,18 +841,36 @@ async def question_answer(db: AsyncSession, question_id: uuid.UUID) -> JsonDict 
             for row in evidence_rows:
                 by_claim.setdefault(str(row.get("claim_id")), []).append(row)
 
+        # T7.74: чем именно этот вопрос связан с утверждением и что перепроверка
+        # сделала с его оценкой (было → стало). Строки соседних оценок — долговременные.
+        reverified_ids = [
+            str(row["id"]) for row in claim_rows if str(row["relation"]) == "reverified"
+        ]
+        history_rows = await _reverify_assessment_pairs(db, reverified_ids, session_ids)
+
         # T7.73 (ADR-0018): вывод правил должен быть объяснён на карточке. Причины
         # текущей оценки берутся из ленты этой же оценки — понижение grade не может
-        # остаться без названия причины.
+        # остаться без названия причины. Причины прежней оценки (T7.74) — оттуда же.
+        reason_ids = [
+            *[str(row["assessment_id"]) for row in claim_rows if row["assessment_id"] is not None],
+            *[str(row["old_id"]) for row in history_rows if row["old_id"] is not None],
+        ]
         reason_by_assessment = await _assessment_reasons(
             db,
-            [str(row["assessment_id"]) for row in claim_rows if row["assessment_id"] is not None],
+            reason_ids,
             min((row["created_at"] for row in claim_rows if row["created_at"] is not None), default=None),
         )
+        history = reverify_history_view(history_rows, reason_by_assessment)
 
         for row in claim_rows:
             claim_id = str(row["id"])
             head_state = str(row["head_state"])
+            relation = str(row["relation"]) if row["relation"] is not None else ""
+            # T7.74: сессия этого вопроса, которая прикоснулась к утверждению: именно она
+            # «та работа, что дала ответ», а не та, что когда-то записала строку.
+            touched_by_claim[claim_id] = (
+                str(row["touched_in_session"]) if row["touched_in_session"] is not None else ""
+            )
             item: JsonDict = {
                 "id": claim_id,
                 "statement": row["statement"],
@@ -618,6 +880,12 @@ async def question_answer(db: AsyncSession, question_id: uuid.UUID) -> JsonDict 
                     str(row["created_in_session"]) if row["created_in_session"] else None
                 ),
                 "created_at": _iso(row["created_at"]),
+                # T7.74: чем именно этот вопрос связан с утверждением — создал,
+                # перепроверил или принял повторно (отношение из долговременных записей,
+                # подпись — из словаря).
+                "relation": relation,
+                "relation_label": _phrase("claim_relation", relation),
+                "relation_hint": ui_labels.describe("claim_relation", relation)["hint"],
             }
             item.update(
                 assessment_view(
@@ -636,6 +904,9 @@ async def question_answer(db: AsyncSession, question_id: uuid.UUID) -> JsonDict 
             item["grade_reasons"] = grade_reason_view(
                 reason_by_assessment.get(assessment_id, [])
             )
+            # T7.74: если эта сессия перепроверила утверждение и оценка изменилась,
+            # карточка называет это прямо («было → стало») с причинами обеих оценок.
+            item["reverify_history"] = history.get(claim_id, [])
             # Заголовок строки подтверждения выбирается по уже вычисленному бейджу:
             # «как проверено» звучит только там, где оценка действительно есть.
             badge = item.get("reliability")
@@ -648,12 +919,14 @@ async def question_answer(db: AsyncSession, question_id: uuid.UUID) -> JsonDict 
             else:
                 other_claims.append(item)
 
-    # шаги рассказывают про ТУ работу, которая дала ответ; её нет — про последнюю сессию
+    # шаги рассказывают про ТУ работу, которая дала ответ; её нет — про последнюю сессию.
+    # T7.74: для перепроверенного или принятого повторно утверждения такая работа — сессия
+    # этого вопроса, а не та, что записала строку в прошлом (она другому вопросу).
     work_session_id: str | None = None
     for item in claims:
-        created = item["created_in_session"]
-        if isinstance(created, str) and created:
-            work_session_id = created
+        touched = touched_by_claim.get(str(item["id"]))
+        if isinstance(touched, str) and touched:
+            work_session_id = touched
             break
     if work_session_id is None and session_ids:
         work_session_id = session_ids[0]
@@ -692,6 +965,9 @@ async def question_answer(db: AsyncSession, question_id: uuid.UUID) -> JsonDict 
         question_state=question["state"],
         sessions=[dict(row) for row in sessions],
         answer_claim_count=len(claims),
+        # T7.74: итог учитывает и те действующие утверждения, которые этот вопрос
+        # перепроверил или принял повторно, а не только записанные им заново.
+        relations=[str(item.get("relation")) for item in claims],
     )
     honesty = build_honesty_notes(
         saw_research_fetch=any(tool == "research.fetch" for tool, _count, _domain in groups),

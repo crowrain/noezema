@@ -410,6 +410,20 @@ config-v13 сохранены: `model.context_window`/`backend_context_limit` = 
   перепроверки обязана цитировать statement якоря, иначе сессия проходит без anchor'а и без доказательств
   (первые версии репродюсера `tests/scenario/test_reverify_temporal_scenario.py` краснели именно на этом).
 
+- Витрина «вопрос → утверждение» (T7.74): перепроверка и дедуп-повтор НЕ заводят строку `claims`
+  (`packages/memory/service.py`: ветки `existing_claim_id` и reuse берут существующий claim, его
+  `created_in_session` — сессия **прежнего** вопроса), поэтому выборка утверждений только по
+  `claims.created_in_session` слепа к ответу нового вопроса (на стенде это читалось как «Ответ не
+  записан»). Долговременная связь «эта сессия оценила этот claim» — `claim_assessments.claim_id +
+  created_in_session` (тот же источник, что `packages/evaluation/gates.py::_gate_reuse`; worker- и
+  активационные оценки имеют `created_in_session IS NULL` и в карточку не попадают). Отдельного
+  события дедуп-повтора в закрытом `AuditEventType` нет: отношение `reverified`/`reused` различается
+  наличием или отсутствием `claim_reverified` для пары (claim, session) при уже доказанном факте
+  оценки этой сессией; текстовые эвристики (statement, публичные summary) запрещены. Окно связи
+  общее для карточки и списка (`apps/web/answer.py::touched_claims_cte`, использует и
+  `apps/web/questions_view.py`): иначе «Мои вопросы» и карточка показывают разное; бюджет списка
+  (≤4 SELECT, без N+1) закреплён тестом.
+
 ## 8. Гигиена длинных сессий
 
 - После каждого закоммиченного PR: обновить STATUS.md, отметить todo, и только потом начинать

@@ -145,6 +145,9 @@ def _sources() -> dict[str, list[str]]:
         "answer_result": list(web_answer.RESULT_KINDS),
         "honesty_note": list(web_answer.HONESTY_KEYS),
         "verification_lead": list(web_answer.VERIFICATION_LEAD_KEYS),
+        # T7.74: связь вопроса с утверждением (создано/перепроверено/принято повторно)
+        # — закрытый набор построителя карточки.
+        "claim_relation": list(web_answer.RELATION_KEYS),
         # T7.73 (ADR-0018): причины текущей оценки — закрытый набор rules engine;
         # карточка обязана подписать каждую, включая причину понижения.
         "assessment_reason": _rules_engine_reasons(),
@@ -268,6 +271,7 @@ def test_answer_builder_keys_are_all_labelled() -> None:
         ("answer_result", web_answer.RESULT_KINDS),
         ("honesty_note", web_answer.HONESTY_KEYS),
         ("verification_lead", web_answer.VERIFICATION_LEAD_KEYS),
+        ("claim_relation", web_answer.RELATION_KEYS),
     ):
         assert keys, f"пустой набор ключей: {category}"
         unlabeled = [key for key in keys if not labels.describe(category, key)["hint"]]

@@ -289,6 +289,252 @@ def test_known_label_refuses_to_invent_a_label() -> None:
     assert ans.known_label("session_state", "totally_new_state") == ""
 
 
+# ─── связь вопроса с утверждением (T7.74) ─────────────────────────────────
+
+
+def test_reverified_and_reused_claims_are_an_answer_too() -> None:
+    """Действующее утверждение, которое сессия вопроса перепроверила или приняла повторно,
+    — ответ вопроса: «Ответ не записан» был бы неправдой."""
+    sessions = [_session("succeeded", "goal_reached")]
+    for relation, expected in (
+        ("created", "answered"),
+        ("reverified", "reverified"),
+        ("reused", "reused"),
+    ):
+        result = ans.build_answer_result(
+            question_state="verified",
+            sessions=sessions,
+            answer_claim_count=1,
+            relations=[relation],
+        )
+        assert result["kind"] == expected
+        entry = ui_labels.describe("answer_result", expected)
+        assert result["label"] == entry["label"] and result["action"] == entry["action"]
+        assert result["active"] is False
+
+
+def test_partial_work_is_called_partial_not_whole() -> None:
+    """Частичность берётся из состояния вопроса или исхода последней сессии (T7.34)."""
+    by_question = ans.build_answer_result(
+        question_state="partially_answered",
+        sessions=[_session("succeeded", "goal_reached")],
+        answer_claim_count=1,
+        relations=["reverified"],
+    )
+    by_session = ans.build_answer_result(
+        question_state="verified",
+        sessions=[_session("succeeded_partial", "budget_exhausted")],
+        answer_claim_count=1,
+        relations=["reverified"],
+    )
+    whole = ans.build_answer_result(
+        question_state="verified",
+        sessions=[_session("succeeded", "goal_reached")],
+        answer_claim_count=1,
+        relations=["reverified"],
+    )
+    assert by_question["kind"] == "partially_reverified"
+    assert by_session["kind"] == "partially_reverified"
+    assert whole["kind"] == "reverified"
+    # живая сессия — не «частично»: работа ещё идёт, и это другой итог
+    running = ans.build_answer_result(
+        question_state="researching",
+        sessions=[_session("exploring", None)],
+        answer_claim_count=0,
+        relations=["reverified"],
+    )
+    assert running["kind"] == "in_progress" and running["active"] is True
+
+
+def test_relation_precedence_picks_the_strongest_link() -> None:
+    """Созданное важнее перепроверенного, перепроверенное — принятого повторно."""
+    assert ans.relation_kind(["reused", "reverified", "created"]) == "created"
+    assert ans.relation_kind(["reused", "reverified"]) == "reverified"
+    assert ans.relation_kind(["reused"]) == "reused"
+    assert ans.relation_kind([]) is None
+    # выдуманных отношений не бывает: неизвестное значение игнорируется
+    assert ans.relation_kind(["made_up_relation"]) is None
+
+
+def test_relations_act_only_when_there_is_an_answer_claim() -> None:
+    """Без действующего утверждения итог остаётся прежним: отношения его не сочиняют."""
+    for relations in (["reverified"], ["reused"], ["created"]):
+        result = ans.build_answer_result(
+            question_state="verified",
+            sessions=[_session("succeeded", "goal_reached")],
+            answer_claim_count=0,
+            relations=relations,
+        )
+        assert result["kind"] == "no_answer"
+
+
+def _history_row(
+    *,
+    claim_id: str,
+    assessment_id: str,
+    new_grade: str,
+    new_status: str,
+    old_grade: str | None,
+    old_status: str | None,
+) -> dict[str, Any]:
+    return {
+        "claim_id": claim_id,
+        "assessment_id": assessment_id,
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "effective_grade": new_grade,
+        "epistemic_status": new_status,
+        "old_id": "22222222-2222-4222-8222-222222222222" if old_grade else None,
+        "old_grade": old_grade,
+        "old_status": old_status,
+    }
+
+
+def test_history_is_written_only_when_the_assessment_changed() -> None:
+    """«Было → стало» появляется только когда оценка действительно изменилась."""
+    claim_a, claim_b = "aaaaaaaa-0000-4000-8000-000000000001", "aaaaaaaa-0000-4000-8000-000000000002"
+    rows = [
+        _history_row(
+            claim_id=claim_a,
+            assessment_id="bbbbbbbb-0000-4000-8000-000000000001",
+            new_grade="E1",
+            new_status="hypothesis",
+            old_grade="E3",
+            old_status="supported",
+        ),
+        _history_row(
+            claim_id=claim_b,
+            assessment_id="bbbbbbbb-0000-4000-8000-000000000002",
+            new_grade="E3",
+            new_status="supported",
+            old_grade="E3",
+            old_status="supported",
+        ),
+    ]
+    history = ans.reverify_history_view(rows, {})
+
+    assert list(history) == [claim_a]
+    entry = history[claim_a][0]
+    assert entry["from"]["grade"] == "E3" and entry["to"]["grade"] == "E1"
+    assert entry["from"]["grade_label"] == ui_labels.describe("evidence_grade", "E3")["label"]
+    assert entry["to"]["status_label"] == ui_labels.describe("epistemic_status", "hypothesis")["label"]
+    assert "было:" in entry["text"] and "стало:" in entry["text"]
+    # прежней оценки нет — историю выдумывать нечем
+    assert claim_b not in history
+
+
+def test_history_explains_both_assessments_with_known_reasons() -> None:
+    """Причины обеих оценок подписаны словарём (T7.73), их берёт тот же построитель."""
+    claim_id = "aaaaaaaa-0000-4000-8000-000000000003"
+    reason_code = next(iter(ui_labels.LABELS["assessment_reason"]))
+    rows = [
+        _history_row(
+            claim_id=claim_id,
+            assessment_id="bbbbbbbb-0000-4000-8000-000000000003",
+            new_grade="E1",
+            new_status="hypothesis",
+            old_grade="E3",
+            old_status="supported",
+        )
+    ]
+    history = ans.reverify_history_view(
+        rows,
+        {
+            "22222222-2222-4222-8222-222222222222": [reason_code],
+            "bbbbbbbb-0000-4000-8000-000000000003": [reason_code],
+        },
+    )
+    entry = history[claim_id][0]
+    assert [item["label"] for item in entry["from_reasons"]] == [
+        ui_labels.describe("assessment_reason", reason_code)["label"]
+    ]
+    assert [item["label"] for item in entry["reasons"]] == [
+        ui_labels.describe("assessment_reason", reason_code)["label"]
+    ]
+
+
+def test_history_without_a_known_label_is_not_shown() -> None:
+    """Нет подписи у оценки — нет и строки: витрина не называет grade своими словами."""
+    rows = [
+        _history_row(
+            claim_id="aaaaaaaa-0000-4000-8000-000000000004",
+            assessment_id="bbbbbbbb-0000-4000-8000-000000000004",
+            new_grade="E9",
+            new_status="supported",
+            old_grade="E3",
+            old_status="supported",
+        )
+    ]
+    assert ans.reverify_history_view(rows, {}) == {}
+
+
+def _outcome_texts() -> list[str]:
+    """Тексты итога и истории оценки: обещать проверку они не имеют права."""
+    texts: list[str] = []
+    for kind, question_state, session in (
+        ("reverified", "answered", _session("succeeded", "goal_reached")),
+        ("partially_reverified", "partially_answered", _session("succeeded", "goal_reached")),
+        ("reused", "answered", _session("succeeded", "goal_reached")),
+    ):
+        result = ans.build_answer_result(
+            question_state=question_state,
+            sessions=[session],
+            answer_claim_count=1,
+            relations=["reused" if kind == "reused" else "reverified"],
+        )
+        assert result["kind"] == kind
+        entry = ui_labels.describe("answer_result", kind)
+        texts.extend([result["label"], result["hint"], entry["hint"], entry["action"]])
+    history = ans.reverify_history_view(
+        [
+            _history_row(
+                claim_id="aaaaaaaa-0000-4000-8000-000000000005",
+                assessment_id="bbbbbbbb-0000-4000-8000-000000000005",
+                new_grade="E1",
+                new_status="disputed",
+                old_grade="E3",
+                old_status="supported",
+            )
+        ],
+        {},
+    )
+    for entry in history.values():
+        for item in entry:
+            texts.append(item["text"])
+            for reason in [*item["from_reasons"], *item["reasons"]]:
+                texts.extend([reason["label"], reason["hint"], reason["action"]])
+    return texts
+
+
+def _relation_texts() -> list[str]:
+    texts: list[str] = []
+    for relation in ans.RELATION_KEYS:
+        entry = ui_labels.describe("claim_relation", relation)
+        texts.extend([entry["label"], entry["hint"], entry["action"]])
+    return texts
+
+
+def test_relation_and_history_texts_carry_no_codes_or_verified_word() -> None:
+    """Связь вопроса с утверждением и история оценки — только слова словаря (T7.65, T7.74).
+
+    Итог и история не имеют права утверждать проверку: «проверено» имеет один источник —
+    бейдж надёжности. Отношение «перепроверено этим вопросом» описывает СВЯЗЬ вопроса с
+    уже записанным утверждением, а не обещает проверку; отдельное слово «проверено»
+    запрещено и там (тот же lookbehind-скан, что у карточки).
+    """
+    outcome = "\n".join(_outcome_texts())
+    relation = "\n".join(_relation_texts())
+    assert outcome and relation
+    for pattern in _FORBIDDEN:
+        assert not pattern.search(outcome), f"{pattern.pattern} в итоге/истории: {outcome}"
+        assert not pattern.search(relation), f"{pattern.pattern} в подписи связи: {relation}"
+    lowered = outcome.lower()
+    for fragment in ("проверен", "проверено"):
+        assert fragment not in lowered, f"утверждение о проверке в итоге/истории: {lowered}"
+    affirming = re.compile(r"(?<!не )\bпроверен")
+    offenders = [text for text in _relation_texts() if affirming.search(text.lower())]
+    assert not offenders, f"подпись связи утверждает проверку: {offenders}"
+
+
 # ─── чистота текстов ответа ───────────────────────────────────────────────
 
 _FORBIDDEN = (
