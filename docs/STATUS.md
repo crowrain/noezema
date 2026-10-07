@@ -4069,3 +4069,221 @@ pending/invalid не показываются, обрезка 160 внутри �
 `question_intake`. Дальше в T7.67 (следующие части упрощения «вопросов») следует
 наследовать этот контракт: общий номер по creation-хронологии и порядок recent уже
 заданы и не должны дублироваться клиентскими сортировками.
+
+## T7.73 — честность понижения оценки при перепроверке (стенд .92: кейс 66c7901a → da2abfc1). Анализ до кода
+
+### 1. Что произошло на стенде (данные сняты read-only, `/home/denis/dsh1/stand-case-inflation-reverify/`)
+
+Claim `9266248e-2433-4a12-a3f7-b51ff10ad803` — «Годовая инфляция в России по итогам 2025 года
+… составила 5,59% — официальный показатель Росстата …».
+
+| | сессия 1 (66c7901a) | сессия 2 (da2abfc1, перепроверка) |
+|---|---|---|
+| evidence | cbr.ru + expert.ru (`source_assertion`, `supports`) | + interfax.ru; cbr.ru перечитан → дедуп |
+| assessment | E3 / supported / p=0.75, reasons `["requirements_met"]` | **E1 / hypothesis / p=0.30, reasons `["as_of_missing"]`** |
+| claim.as_of | `2026-01-21T00:00:00+03:00` | **NULL** |
+| counters | — | `evidence_added 1`, `deduped 1` |
+
+Карточка ответа после сессии 2: бейдж «Подтверждено слабо» вместо «Подтверждено». Доказательная
+база при этом **выросла**: three sources, три независимые группы (`basis: "single"` — cbr.ru,
+expert.ru, interfax.ru), ни одного опровергающего evidence.
+
+### 2. Механика падения (цепочка, файл:строка)
+
+1. Куратор в сессии 2 предложил перепроверку `existing_claim_id=9266248e…` с
+   `claim_type: external_fact`, `as_of: null`, `scope: {}` (`staging_validated`, payload
+   `claim_created`). Модель поступила ровно так, как её учат prompt и ADR: правило 7 curator-v7
+   требует на перепроверке `existing_claim_id` и тип существующего claim'а, пример в самом
+   правиле содержит `"as_of": null`; тот же пример — в ADR-0018 (`docs/adr/0018-reverify-existing-claim.md:98–102`).
+2. Ветка перепроверки коммита: `packages/memory/service.py:479–491`. Строка **486** —
+   **безусловное** `target_claim.as_of = host_ref.as_of`, где `host_ref` —
+   `derive_claim_as_of(question=…, as_of=model_as_of, session_date=…)`. Вопрос перепроверки
+   даты не содержал, модельный `as_of` — null ⇒ `packages/memory/scope.py` возвращает
+   `(None, ClaimDateAnchor.NONE)` (ветка «нет ничего») ⇒ **уже установленная опорная дата claim'а
+   затирается в NULL**. Туда же: `claim_scopes[…] = derive_claim_scope(… as_of=None …)` →
+   assessed_scope `{"as_of": null, "date_anchor": "none", "source_domains": []}`. Аудит
+   `claim_reverified` зафиксировал это честно: `"as_of": null, "assessed_as_of": null,
+   "date_anchor": "none"`.
+3. Оценка: `packages/memory/service.py:1132` передаёт в rules engine `has_as_of=claim.as_of is not None`
+   ⇒ `False`. `packages/memory/rules_engine.py:182` `as_of_ok = (not rule.requires_as_of) or has_as_of`
+   ⇒ `False` для `temporal_fact` (`requires_as_of: true` в config-v14); `requirements_met`
+   (:213) не выполняется; ветка «не выполняет» (:230–246) даёт статус `hypothesis`,
+   пониженный grade и **единственную причину `("as_of_missing",)`** (:246).
+4. Уверенность: `rules_engine.py:248` `GRADE_CONFIDENCE_BASE[E1] = 0.30`, множитель
+   `min(1, groups/min_independence_groups) = min(1, 3/2) = 1` ⇒ ровно **0.30**.
+5. Витрина: `apps/web/knowledge.py:78–103 assessment_view` + `apps/web/reliability.py`
+   (уровень E1 → «Подтверждено слабо») — витрина лишь переводит вывод rules engine,
+   ничего не придумывая. **Правила не сломаны: сломан вход в них.**
+
+Причина падения — не contradiction, не устаревание и не отзыв источника: единственная причина,
+записанная rules engine, — «у claim'а нет опорной даты», а claim'ом она была и была утрачена
+на шаге 2 по вине хоста. Оценка упала из-за **пустого поля предложения**, то есть ровно так,
+как это запрещено формулировкой задачи.
+
+### 3. Почему `evidence_added 1` / `deduped 1` и почему привязалось только одно evidence
+
+Куратор предложил две ссылки: на interfax.ru (новый источник → новый ряд evidence) и на
+перечитанный cbr.ru. Второй fetch дал байт-в-байт тот же артефакт, поэтому идентичность
+`source_assertion_identity` (URL канонический + content hash + chunk) совпала с рядом якоря:
+`packages/memory/service.py:809–824` находит существующий ряд по
+`UNIQUE(claim_id, evidence_kind, identity_hash)` и увеличивает `deduped`, **не** дублируя
+доказательство (инвариант T7.9 «duplicate evidence не повышает grade»). Итого 1 новый ряд +
+1 повторное использование. Отдельно: ria.ru был прочитан, но куратор сам его не связал
+(«не использован фрагмент RIA»), rosstat ×2 отвалился по таймауту, rbc вернул 401 —
+связывать было нечего. Пересмотр при этом уже идёт по **объединённому** набору:
+`service.py:883–914` поднимает все rows claim'а (`all_evidence`) в одну оценку — так что
+«union» менять не нужно, нужно его закреплять тестами.
+
+### 4. Это дефект реализации или пробел решения? И то и другое
+
+- **Реализация:** `service.py:486` затирает as_of без условия «если выведены новые данные».
+  Для нового claim это предписано ADR-0016 §4 (as_of re-deriviруется на каждом коммите), для
+  **перепроверки** — нет nowhere not stated. Дедуп-ветка (`service.py:572–590`) делает то же
+  (`existing_claim.as_of = host_ref.as_of` безусловно): dateless reuse так же стирает дату.
+- **Пробел решения:** ADR-0016 §4 «re-derive on every commit» + ADR-0018 (тип/значение —
+  якорные) не оговаривают случай «перепроверка без даты»: при буквальном следовании им
+  уже установленная опорная дата исчезает, а вместе с ней — выполнение `requires_as_of`.
+  Требуется уточнение ADR-0018 (и запись следствия в ADR-0016), а не только патч кода.
+- **Ловушка prompts/хоста:** `CuratorProposal.validate_against` (`packages/domain/schemas/
+  staging.py:104–115`) требует `as_of` для `temporal_fact`, а подмену типа на тип якоря
+  оркестратор делает **позже** (`apps/orchestrator/orchestrator.py:2180` против
+  :2258–2259). Честная перепроверка temporal-якоря с `as_of: null` отклоняет ВСЁ предложение
+  («claim[0]: temporal_fact requires as_of») — поэтому модель на стенде и выбрала
+  `external_fact`. Это ловушка выбора «солгать о типе или потерять дату», её надо закрыть.
+
+### 5. Как независимость считает «независимые» источники (для ADR-0029, реализация вне T7.73)
+
+`packages/memory/independence.py` + `packages/memory/source_graph.py:60–190`: группировка
+строится по registrable domain канонического URL и по идентичному content hash; слияния по
+`parent_source_id`, валидным рёбрам графа и поправкам графа **не имеют производите-ля** (строки
+`sources` пишет только `apps/research_proxy/service.py:219–235`, ни parent, ни рёбер, ни
+populated `SourceGraphInput.sample_text`) ⇒ текстовое перекрытие (`TEXT_OVERLAP_THRESHOLD = 0.8`)
+в реальных сессиях инертно. Практика стенда: Rosstat → «Интерфакс»/«Expert» — три домена,
+три группы, гейт `min_independence_groups: 2` выполнен, хотя первоисточник один. Разделение
+первоисточника и производной публикации — предмет **ADR-0029 (Proposed)**, не кода T7.73.
+
+### 6. Принимаемые решения T7.73 (реализация)
+
+1. **Перепроверка/reuse хранят якорную дату.** Новая чистая функция `packages/memory/reverify.py`
+   (`resolve_reverify_reference` + `merge_reverify_scope`), вызываемая из обеих веток
+   (`service.py:479–491`, :572–590): если вопрос сессии **сам** принёс якорь (explicit-дата или
+   relative-форма) — поведение прежнее, предписанное ADR-0016/0017/0018 (в т.ч. сдвиг
+   `reverify_after` у relative-якоря); если ничего не принесено, а у якоря дата есть —
+   сохраняется **она** вместе с её `date_anchor` из assessed_scope текущего head (relative не
+   превращается в evergreen); если предложение несёт **другую непустую** дату при датеless
+   вопросе — она **не подставляется**: остаётся якорная, а расхождение пишется в аудит
+   `claim_reverified` (`as_of_conflict`) — по ADR-0018 смена значения это revision/контр-evidence,
+   не молчаливая замена. Scope перепроверки = хостовый из вопроса, но с сохранённой датой/якорем
+   и `source_domains` = **объединение** старых и новых доменов (иначе старые evidence сами
+   провалят `_canonical_covers` и downgrade воспроизведётся другим путём).
+2. **Ловушка curate-гейта закрывается:** `validate_against` не требует `as_of` от операции,
+   у которой задан `existing_claim_id` (дату держит хост). Тип якоря по-прежнему подменяется
+   оркестратором, требования к **новым** temporal-claim'ам не ослабляются.
+3. **Причина понижения доходит до карточки.** Reasons rules engine сейчас живут только в аудите
+   `claim_assessed` (`service.py:1221`) и никуда дальше; карточка их не показывает
+   (`apps/web/answer.py`). Добавляемое поле карточки (без миграции): причины текущего head
+   подтягиваются из `audit_events` по `payload->>'assessment_id'` и подписываются новым
+   словарём `labels` (категория `assessment_reason`) — «нет опорной даты», «мало доказательств»,
+   «независимость не набрана» и т.д. Оценка по-прежнему производится **только** rules engine.
+4. **Промпты (commit 2):** curator-v8 (на перепроверке — либо перенести `as_of`/`scope`
+   существующего claim'а, либо задать новые с обоснованием; связывать каждое использованное
+   наблюдение) и explorer-v7 (находить первоисточник **и** независимое исследование, отличать
+   первоисточник от пересказа, расхождение показывать, а не выбирать молча). curator-v7 и
+   explorer-v6 не трогаются; новый payload `config-v15` = v14 + ровно два пина.
+5. **Критерий остановки:** миграции, ARCHITECTURE.md, пороги и шкала grading, правила
+   независимости в rules engine — не трогаются; способ отделения первоисточника описывается в
+   ADR-0029 как вариант, не реализуется.
+
+### Результаты T7.73 (реализация)
+
+Три коммита: код+тесты, промпты+снапшот, документы. Полная проверка §6 перед каждым:
+ruff чисто, mypy `packages apps hostctl` — «Success: no issues found in 140 source files»,
+`pytest -n auto -m "not timing"`: **1412 → 1438** (коммит 1) → **1470 passed, 12 skipped**
+(коммит 2); `pytest -m timing`: 4 passed оба раза. Откатов и ослабленных проверок нет.
+
+**Коммит 1 — механика перепроверки (`packages/memory/reverify.py`, новый модуль).**
+
+Причина дефекта была не в rules engine: он честно доложил `as_of_missing` (кейс .92: голова
+`9266248e-…` упала с E3/0.75 supported до E1/0.30 hypothesis, `claim_assessed.reasons =
+["as_of_missing"]`). Пустую дату создал ветка записи перепроверки: у вопроса без даты
+`derive_claim_as_of` даёт `(None, NONE)`, и прежний код присваивал `claims.as_of = None` и
+перезаписывал assessed_scope (`{"as_of": null, "date_anchor": "none", "source_domains": []}`),
+то есть *хост сам снял опорную дату с claim'а, который он же перепроверяет*.
+
+Что теперь (чистая функция + две ветки записи):
+
+| случай | было | стало |
+|---|---|---|
+| вопрос без даты, `as_of: null` в предложении | дата якоря стиралась → `as_of_missing` → E1 | дата и `date_anchor` якоря **сохраняются** (`carried_existing`) |
+| вопрос без даты, предложение с **другой** датой | дата предложения подставлялась молча | остаётся якорная; расхождение в аудит `claim_reverified.as_of_conflict` (ADR-0018: смена значения — revision, не подмена) |
+| вопрос называет дату явно или требует «на сегодня» | перенос привязки | без изменений (ADR-0016/0017), в т.ч. сдвиг `reverify_after` у relative-якоря; смена UTC-дня пишется в аудит `anchor_date_changed` |
+| scope перепроверки | хостовый scope вопроса, пустые `source_domains` | хостовый + сохранённая дата/якорь + `source_domains` = **объединение** прежних и новых доменов (иначе собственные старые evidence не проходят `_canonical_covers` и downgrade воспроизводится другим путём) |
+| curate-гейт | `validate_against` требовал `as_of` у операции с `existing_claim_id`, хотя тип якоря подменяется оркестратором **после** гейта (`apps/orchestrator/orchestrator.py:2180` против :2201–2259) | требования к дате нет только для операции с `existing_claim_id`; **новым** temporal-claim'ам дата по-прежнему обязательна (`tests/unit/test_staging_schema.py::test_temporal_fact_requires_as_of` зелёный) |
+| причина оценки на карточке | жила только в аудите `claim_assessed` | поле `grade_reasons` карточки: причины текущего head подтягиваются из `audit_events` по `payload->>'assessment_id'` и подписываются словарём `labels` (новая категория `assessment_reason`, 12 кодов rules engine). Миграции нет; оценку по-прежнему производит только rules engine |
+
+Тесты commit 1 (красные на прежнем коде — проверка с временным откатом файлов, без коммита:
+«13 failed, 49 passed»; ключевые сообщения «reverify erased the anchor's reference date»,
+`assert (datetime.datetime(1995, 1, 1…) is not None and 1995 != 1995)`, «epistemic status
+lowered: hypothesis», `['claim[0]: temporal_fact requires as_of'] == []`, «нет категории
+подписей: assessment_reason», `KeyError: 'grade_reasons'`):
+`tests/unit/test_reverify_reference.py` (13), `tests/unit/test_reverify_temporal_anchor.py` (5),
+`tests/scenario/test_reverify_temporal_scenario.py` (1, полный двухсессийный репродюсер на
+FakeLLM: одна голова, E3 supported, дата якоря сохранена, три источника в assessed_scope,
+`reasons = ["requirements_met"]`, `anchor_kept = "true"`), плюс +3 в `test_staging_schema.py`,
++2 в `test_web_labels.py` (полнота словаря проверяет коды прямо из `rules_engine`), +3 карточки
+в `tests/scenario/test_web_answer_api.py`. Новый тип аудита не добавлялся: закрытый
+`AuditEventType` не расширяем, новая информация — ключи payload'а существующего события
+`claim_reverified`.
+
+**Коммит 2 — промпты и снапшот.**
+
+- `prompts/curator/curator-v8.md` (sha256 `c14603eed9119c474f85c2848b68ab5a1e661398f930f0effe5dbb50caadde71`):
+  правило 8 — «`as_of: null` при `existing_claim_id` означает „сохранить дату якоря“… пустое поле
+  предложения не является основанием понизить оценку… значение, просто отличное от якорного, без
+  обоснования молча не применяется… понижение оценки возможно по делу (противоречие,
+  устаревание, отзыв источника)»; правило 9 — «Каждый ИСПОЛЬЗОВАННЫЙ источник обязан иметь запись
+  в `evidence_links`… иначе независимость считается по меньшему числу источников». Тестом
+  закреплено, что правила 1–7 переехали дословно и добавлены ровно 8 и 9.
+- `prompts/explorer/explorer-v7.md` (sha256 `41d3f7a22f5704f2b9302057fc944ab8cd069c8cfb3063fc5973df28f8ea40fa`):
+  правило 9 — «Независимость источника — не количество адресов… Ищи ПЕРВОИСТОЧНИК — того, кто
+  данные получил или посчитал… И НЕЗАВИСИМОЕ исследование… Публикация, пересказывающая релиз
+  первоисточника („по данным ведомства“), — это продолжение того же источника… Числа расходятся —
+  покажи расхождение открыто в `public_rationale`… никогда не выбирай одно число молча». Правила
+  1–8 сохранены дословно.
+- `docs/eval/config-v15-payload.json` = config-v14 **ровно с двумя правками** (`prompts.curator`,
+  `prompts.explorer`; тест сверяет изменённые ключи `{path, sha256, version}` и равенство всех
+  остальных разделов). Хеш файла `c65b69db5a1f50d44e6dc9e9c4b6399381c191b1df62506a9ef275a6d3b5f722`,
+  **canonical** `b380181298310e6d1e1904ac5f062b0d1c80543fafe11c6482b7ce9ba05d6a73` — последний
+  попадает в `config_snapshots.payload_sha256`. Пороги, `claim_type_rules` (в т.ч.
+  `requires_as_of: true` для `temporal_fact`), окна, `research_proxy`, `policy` — байт в байт v14;
+  payload v14 не тронут и остаётся откатом.
+- Тесты commit 2: `tests/unit/test_curator_prompt_reverify.py` (12),
+  `tests/unit/test_explorer_prompt_source_independence.py` (9, включая повторную проверку
+  протокола завершения ADR-0022 на v7), `tests/scenario/test_config_v15_activation.py` (2: снимок
+  опознаётся по canonical-хешу, пины читаются из разделов снимка и резолвятся по путям payload'а;
+  откат активацией payload'а v14 возвращает head на `22903be7…` с curator-v7/explorer-v6),
+  +1 параметризованная пара в `test_curator_prompt_matrix.py` (curator-v8 ↔ config-v15) и +3 в
+  `test_freeze_payloads.py`. Ещё +5 дало прежнее тестовое множество: `test_prompt_example_no_real_data.py`
+  параметризуется найденными в `prompts/` файлами, поэтому примеры v8/v7 проверяются им автоматически.
+
+**Как включить v15 на стенде .92 (делает менеджер; агент к .92 не обращается).** После deploy
+пакета из этой ветки — одна онлайн-активация:
+
+```bash
+hostctl activate-online --payload docs/eval/config-v15-payload.json --drain-wait-seconds 120
+```
+
+Проверка после активации (агент её не выполняет, это команды менеджера): head → canonical
+`b380181298310e6d1e1904ac5f062b0d1c80543fafe11c6482b7ce9ba05d6a73`; `bootstrap.sh`/`reset-db.sh`
+дефолтом уже указывают на v15. Откат — активация payload'а v14 (он закоммичен и не менялся) либо
+явный выбор при развёртывании: `NOEZEMA_DEV_CONFIG_PAYLOAD=$REPO_ROOT/docs/eval/config-v14-payload.json`.
+Верификационный вопрос на стенде — перепроверка уже подтверждённого временного факта без даты в
+вопросе: ожидаемый исход — та же голова, оценка не ниже прежней, `claim_reverified` с
+`anchor_kept`, а если причина всё же появилась — она видна на карточке в `grade_reasons`.
+
+**Что осталось за границей задачи.** Независимость «три адреса = три группы» (Rosstat →
+«Интерфакс»/«Expert») не исправлена: разделённые механизмы (`parent_source_id`,
+`source_dependency_edges`, `source_graph_corrections`) существуют в модели и движке, но продуцента
+не имеют. Варианты и рекомендация — **ADR-0029 (Proposed)**; реализация требует отдельной задачи и,
+для вариантов C и D, явного решения пользователя. ARCHITECTURE.md, миграции, пороги и шкала
+grading не менялись.

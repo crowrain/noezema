@@ -24,7 +24,7 @@
 | `searxng/settings.yml` | ШАБЛОН настроек поиска (formats html+json, limiter off); `secret_key` здесь — плейсхолдер, настоящего секрета в репозитории нет |
 | `searxng-settings.sh` | рендер настроек из шаблона: генерирует `secret_key` (не печатает), повторный запуск ключ не ротирует |
 | `status.sh` | состояние: юниты, docker, очередь вопросов, последняя сессия, доступность LLM, версия кода, режим исполнителя инструментов, поиск (SearXNG + режим research_proxy снапшота) |
-| `reset-db.sh` | пересоздание dev-базы с явным подтверждением + миграции + повторная активация config-v14 |
+| `reset-db.sh` | пересоздание dev-базы с явным подтверждением + миграции + повторная активация config-v15 |
 | `README.md` | этот файл |
 
 ## Деплой (делает менеджер)
@@ -56,7 +56,7 @@ systemctl start noezema-dev.target            # web + unit-state и maint (ти�
 | приложение | репозиторий как есть (`$APP_DIR`), venv в `$APP_DIR/.venv`, зависимости **только через uv** и только prod-extras (AGENTS §6) |
 | база | docker-контейнер `noezema-dev-db` (образ `postgres:15`), том `noezema-dev-pgdata`, публикация **только на 127.0.0.1**, база `noezema-dev`, пользователь `noezema`. Порт выбирается до записи env-файла: 5432, а если на хосте он уже занят (нативный `postgresql.service`) — первый свободный из 5433..5440; выбранный порт пишется в env-файл (`NOEZEMA_DEV_DB_PORT`), повторный запуск переиспользует порт существующего контейнера. `NOEZEMA_DEV_DB_PORT=<порт>` задаёт явно: занят → понятная ошибка, а не молчаливый переезд |
 | миграции | `alembic upgrade head` из venv (URL из env-файла) |
-| конфигурация | активация `docs/eval/config-v14-payload.json` через `hostctl activate-online` (окно EXL3 131072; поиск `web.search` + промпт explorer-v6; пропускается, если снапшот уже активен; переход v13→v14 — STATUS.md T7.71) |
+| конфигурация | активация `docs/eval/config-v15-payload.json` через `hostctl activate-online` (промпты curator-v8 + explorer-v7; всё остальное — байт в байт config-v14: окно EXL3 131072, поиск `web.search`, пороги и бюджеты; пропускается, если снапшот уже активен; переход v14→v15 — STATUS.md T7.73) |
 | данные сессий | `/var/lib/noezema-dev` (+ `sandbox` — work_root контейнерного исполнителя) |
 | host-контур стенда | `/var/lib/noezema-dev/host`, снимок юнитов: `/var/lib/noezema-dev/host/unit-state.json` |
 | секреты/настройки | `/etc/noezema/dev.env`, режим **0600**, владелец — пользователь стенда; в отчёты и чат не попадают (AGENTS §5) |
@@ -109,7 +109,7 @@ systemctl start noezema-dev.target            # web + unit-state и maint (ти�
    Postgres остаётся: `docker stop noezema-dev-db`).
 9. **Сброс:** `./deploy/dev-stand/reset-db.sh` — просит вписать имя базы (защита от «а вдруг это
    прод-база»), останавливает таймеры, пересоздаёт `noezema-dev`, накатывает миграции, заново
-   активирует config-v14, поднимает таймеры. С защитой по состоянию: если в базе есть незавершённая
+   активирует config-v15, поднимает таймеры. С защитой по состоянию: если в базе есть незавершённая
    сессия, reset откажется — сначала дождаться её терминации (или остановить tick-таймер).
 
 ## Юниты стенда (8 файлов)
@@ -158,7 +158,7 @@ hostctl.cli wake-tick` — при занятой сессии он так же �
 
 ## VM без GPU и пустая очередь — это не ошибка
 
-- В `config-v14` (как и в `config-v13`) стоит `wake_schedule.gpu_required = false`, поэтому на VM без GPU admission
+- В `config-v15` (как и в `config-v14` и `config-v13`) стоит `wake_schedule.gpu_required = false`, поэтому на VM без GPU admission
   проходит и сессии запускаются. Если бы значение было `true`, тик напечатал бы `skip (gpu)` и вышел
   с кодом 0: шлюз работает, а не ломается (§5.2.1).
 - Расписание — `interval_seconds=3600`, `min_session_interval_seconds=600`; таймер тикает каждые
@@ -255,7 +255,7 @@ sudo docker rm -v -f noezema-searxng      # настройки остаются 
 ```
 
 Как это связано с узлом: `research_proxy` (единственный egress, §5.12) в режиме **curated** отправляет
-поисковый запрос на `research_proxy.searxng_url` — в config-v13/v14 это `http://127.0.0.1:8888`, он же
+поисковый запрос на `research_proxy.searxng_url` — в config-v13…v15 это `http://127.0.0.1:8888`, он же
 в `private_allowlist`. Лимит расхода держит узел, а не контейнер: `rate_limit_max`/`rate_limit_window_seconds`
 из активного снапшота (сейчас 20 запросов на 3600 с), каждый upstream-записанный запрос виден в ленте
 (`research_upstream_request`, при отказе — `research_fetch_rejected` с причиной
@@ -275,8 +275,10 @@ JSON-запросы автоматического клиента, а огран
 ### Поиск для модели: активация снапшота и откат (делает менеджер)
 
 Контейнер сам по себе модели ничего не даёт — инструмент `web.search` появляется только вместе с активным
-снапшотом. `bootstrap.sh` активирует `config-v14` автоматически; если ВМ уже работала на `config-v13`, переход —
-одна явная онлайн-активация (шлюзы admission и drain не обходятся):
+снапшотом. Он есть и в текущем дефолте (`config-v15`), и в прежнем (`config-v14`); исторически переход
+`v13 → v14` был нужен именно ради поиска — `bootstrap.sh` тогда активировал `config-v14`, а узлы, уже
+работавшие на `config-v13`, переводились одной явной онлайн-активацией (шлюзы admission и drain не
+обходятся):
 
 ```bash
 cd ~/noezema
@@ -286,7 +288,7 @@ cd ~/noezema
 ./deploy/dev-stand/status.sh | sed -n '/поиск (SearXNG)/,/^$/p'   # «web.search доступен модели в этом снапшоте: да»
 ```
 
-Откат — активация прежнего снапшота (файл `config-v13-payload.json` не переписывался, canonical payload
+Откат того шага — прежний снапшот (файл `config-v13-payload.json` не переписывался, canonical payload
 `0260fcd2f79035e634d49fe8304e44a3784b63dc0a81566687cbe52aa7f94ce0`):
 
 ```bash
@@ -297,6 +299,43 @@ cd ~/noezema
 Постфактум переход видно по `model_runs`: шаги v14 идут с `prompt_version = explorer-v6` и
 `tool_schema_hash = a7adc948…` (offered-список v14), шаги v13 — с `explorer-v5` и `f7628473…`; никакого
 «тихого» переключения нет ни в UI, ни в БД.
+
+### Перепроверка без самовыведения даты: активация config-v15 (T7.73)
+
+`config-v15` = `config-v14` ровно с двумя пинами — `prompts.curator` → **curator-v8** (перепроверка
+сохраняет опорную дату и scope якоря; каждое использованное наблюдение обязано быть привязано) и
+`prompts.explorer` → **explorer-v7** (первоисточник и независимое исследование, расхождение показывать,
+а не выбирать молча). Пороги, `claim_type_rules`, окна и бюджеты не изменились, поэтому сравнение с
+прежними прогонами сохраняется. Canonical payload
+`b380181298310e6d1e1904ac5f062b0d1c80543fafe11c6482b7ce9ba05d6a73` (в `config_snapshots.payload_sha256`
+попадает canonical, не хеш файла).
+
+Узел, уже работавший на v14, переводится одной онлайн-активацией:
+
+```bash
+cd ~/noezema
+git pull                                   # пакет с prompts/curator/curator-v8.md и prompts/explorer/explorer-v7.md
+.venv/bin/python -m hostctl.cli activate-online \
+  --payload docs/eval/config-v15-payload.json \
+  --reason "T7.73: curator-v8 (перепроверка хранит якорную дату) + explorer-v7 (первоисточник vs пересказ)" \
+  --drain-wait-seconds 120
+```
+
+Откат — активация payload'а v14 (он закоммичен и не менялся, canonical
+`22903be78602cf7897f0de57b99514b66c58eca83960fa05458fd341e0104df4`):
+
+```bash
+.venv/bin/python -m hostctl.cli activate-online \
+  --payload docs/eval/config-v14-payload.json --reason "откат T7.73" --drain-wait-seconds 120
+```
+
+Верификация после активации (вопрос задаёт оператор, например через `noezemactl ask`): перепроверка уже
+подтверждённого временного факта **без даты в формулировке** — «Перепроверь по независимому источнику
+<https://…>: <тот же текст утверждения>?». Ожидаемый исход: та же голова и та же оценка (или выше), в
+журнале `claim_reverified` с `anchor_kept`, карточка не показала понижения; если причина оценки всё-таки
+появилась — она подписана прямо на карточке (`grade_reasons`), а не исчезла молча. Шаги новых сессий видно
+по `model_runs.prompt_version`: `curator-v8` и `explorer-v7`.
+
 
 Если SearXNG не поднят (или закрыт egress 80/443), активный curated продолжает работать как раньше для
 `research.fetch`, а `web.search` даёт **failed-действие**: наблюдение с текстом ошибки (≤500 знаков, fence'а

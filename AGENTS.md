@@ -149,10 +149,14 @@ venv+prod-зависимости **только через uv** (`--force` пе�
 записи env-файла и пишется в него (`NOEZEMA_DEV_DB_PORT`; 5432, занят → первый свободный 5433..5440;
 повторный запуск переиспользует порт существующего контейнера), готовность ждётся по эндпоинту приложения
 (TCP + `SELECT 1` на `127.0.0.1:<порт>`, ≤120 с), базу `noezema-dev`, миграции, активацию
-config-v14 (с T7.71 дефолт стенда; = config-v13 ровно с двумя правками — `policy.capabilities.tools`
-`+web.search`/`−artifact.create` и пин `prompts.explorer` → explorer-v6; окна EXL3 из config-v13 сохранены:
-`model.context_window`/`backend_context_limit` = 131072. Прежний payload остаётся откатом:
-`NOEZEMA_DEV_CONFIG_PAYLOAD=$REPO_ROOT/docs/eval/config-v13-payload.json`. Пропуск, если head уже не bootstrap), env-файл `/etc/noezema/dev.env` (0600, секреты не
+config-v15 (с T7.73 дефолт стенда; = config-v14 ровно с двумя пинами — `prompts.curator` → curator-v8
+(перепроверка сохраняет якорную дату и scope, связывает каждое использованное наблюдение) и
+`prompts.explorer` → explorer-v7 (первоисточник против пересказа релиза). В остальном байт в байт
+config-v14: `policy.capabilities.tools` `+web.search`/`−artifact.create`, пин `prompts.explorer` →
+explorer-v6 (в v15 заменён на explorer-v7), окна EXL3 из
+config-v13 сохранены: `model.context_window`/`backend_context_limit` = 131072; пороги, `claim_type_rules` и
+бюджеты не менялись. Прежний payload остаётся откатом:
+`NOEZEMA_DEV_CONFIG_PAYLOAD=$REPO_ROOT/docs/eval/config-v14-payload.json`. Пропуск, если head уже не bootstrap), env-файл `/etc/noezema/dev.env` (0600, секреты не
 печатаются и в `--dry-run` маскируются) и dev-юниты `deploy/dev-stand/systemd/*` — **не копии**
 `infra/systemd/*`: `User=` = пользователь стенда, данные `/var/lib/noezema-dev`, группа
 `noezema-dev.target` (в загрузку не ставится), tick 60 с (`TimeoutStartSec=3600`), maint 60 с
@@ -392,6 +396,19 @@ config-v14 (с T7.71 дефолт стенда; = config-v13 ровно с дв�
   сам код сюда не попадает — `answer.known_label` отдаёт пустую строку). Утверждение «сеть закрыта»
   допускается только если это подтверждает снимок правил этой работы (`policy.capabilities.network == "none"`);
   без сессии работает нейтральная формулировка.
+
+- Перепроверка существующего claim'а и гейт staging (T7.73, уточнение ADR-0018): `validate_against`
+  (`apps/orchestrator/orchestrator.py:2180`) выполняется ДО подмены типа якоря (:2201–2259), поэтому требование
+  `as_of` для `temporal_fact` проверялось по типу из предложения модели, а оценка потом считалась по типу якоря —
+  на датless-перепроверке это гарантированно давало `as_of_missing` и падение E3/0.75 → E1/0.30. Теперь гейт не
+  требует даты у операции с `existing_claim_id`; дату, `date_anchor` и assessed_scope якоря сохраняет хост
+  (`packages/memory/reverify.py`: `resolve_reverify_reference`, `merge_reverify_scope`), а непустая дата предложения
+  при датless вопросе молча не подставляется — это revision (в аудит `claim_reverified.as_of_conflict`). Вторая
+  половина той же ловушки: `existing_claim_id` отвергается fail-closed, если якорь не попал в контекст-пак
+  (`curator_rejected: "claim[0]: reverify reference <id> is not visible to the session"`,
+  `curator_reject_kind: "reverify_unresolved"`), а пакет собирается лексикой FTS — формулировка вопроса
+  перепроверки обязана цитировать statement якоря, иначе сессия проходит без anchor'а и без доказательств
+  (первые версии репродюсера `tests/scenario/test_reverify_temporal_scenario.py` краснели именно на этом).
 
 ## 8. Гигиена длинных сессий
 

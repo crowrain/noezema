@@ -83,7 +83,7 @@ WEB_PORT="${NOEZEMA_DEV_WEB_PORT:-8321}"
 
 # Поиск (T7.70, §5.12): SearXNG ставится ТОЛЬКО по --with-searxng. Контейнер публикуется на 127.0.0.1:8888
 # (внутри он слушает 8080 как обычно) — это ровно тот адрес, который снапшот конфигурации записывает как
-# research_proxy.searxng_url (config-v14 уже содержит http://127.0.0.1:8888 в private_allowlist).
+# research_proxy.searxng_url (config-v15 унаследовал http://127.0.0.1:8888 в private_allowlist от config-v14).
 SEARXNG_CONTAINER="${NOEZEMA_DEV_SEARXNG_CONTAINER:-noezema-searxng}"
 SEARXNG_IMAGE="${NOEZEMA_DEV_SEARXNG_IMAGE:-searxng/searxng:latest}"
 SEARXNG_PORT="${NOEZEMA_DEV_SEARXNG_PORT:-8888}"
@@ -97,19 +97,22 @@ LLM_SCHEMA_PROFILE="${NOEZEMA_DEV_LLM_SCHEMA_PROFILE:-none}"
 LLM_MAX_OUTPUT_TOKENS="${NOEZEMA_DEV_LLM_MAX_OUTPUT_TOKENS:-8192}"
 LLM_TIMEOUT_SECONDS="${NOEZEMA_DEV_LLM_TIMEOUT_SECONDS:-600}"
 
-# Activated config (T7.59(в), T7.71): config-v14 = config-v13 with exactly two changes —
-# policy.capabilities.tools (search granted, `artifact.create` removed: it is not in the tool registry
-# and every step that tried it failed with "unknown tool: artifact.create") and the explorer prompt pin
-# (explorer-v6: v5 told the model "Sealed: сети нет" while the stand runs curated). Everything else is
-# byte-identical to v13, which itself was config-v12 with model.context_window /
+# Activated config (T7.59(в), T7.71, T7.73): config-v15 = config-v14 with exactly two changes — the
+# curator prompt pin (curator-v8: reverify keeps the anchor's as_of/date_anchor/scope and must link
+# every source it actually used) and the explorer prompt pin (explorer-v7: primary source vs derivative
+# publication, divergence shown instead of silently picked). Thresholds, claim_type_rules, budgets and
+# the tool grant are byte-identical to config-v14, which was config-v13 with policy.capabilities.tools
+# (search granted, `artifact.create` removed: it is not in the tool registry and every step that tried
+# it failed with "unknown tool: artifact.create") and explorer-v6 (v5 told the model "Sealed: сети нет"
+# while the stand runs curated); v13 itself was config-v12 with model.context_window /
 # model.backend_context_limit lowered to 131072 — the physical window of the EXL3 engine the stand
 # talks to (qwen38-exl3-3bpw-128k). v12 advertised 262144 (input_budget 251904 > the engine window,
 # observed in SMOKE-V14B); budgets Σ=26624, schedule and thresholds are untouched, so stand sessions
 # stay comparable with the smoke series. Override with NOEZEMA_DEV_CONFIG_PAYLOAD — rollback is
-# `NOEZEMA_DEV_CONFIG_PAYLOAD=$REPO_ROOT/docs/eval/config-v13-payload.json` (canonical hash
-# 0260fcd2…, pinned in tests). v13 and v12 stay in the repo and are never rewritten.
-CONFIG_PAYLOAD="${NOEZEMA_DEV_CONFIG_PAYLOAD:-$REPO_ROOT/docs/eval/config-v14-payload.json}"
-CONFIG_REASON="${NOEZEMA_DEV_CONFIG_REASON:-T7.71 dev-stand: activate config-v14 (web.search + explorer-v6; EXL3 context window 131072)}"
+# `NOEZEMA_DEV_CONFIG_PAYLOAD=$REPO_ROOT/docs/eval/config-v14-payload.json` (canonical hash
+# 22903be7…, pinned in tests). v14, v13 and v12 stay in the repo and are never rewritten.
+CONFIG_PAYLOAD="${NOEZEMA_DEV_CONFIG_PAYLOAD:-$REPO_ROOT/docs/eval/config-v15-payload.json}"
+CONFIG_REASON="${NOEZEMA_DEV_CONFIG_REASON:-T7.73 dev-stand: activate config-v15 (curator-v8 reverify reference rules + explorer-v7 source independence; rules and budgets unchanged)}"
 NODE_OWNER="${NOEZEMA_DEV_NODE_OWNER:-dev-stand}"
 
 DRY_RUN=false
