@@ -107,6 +107,7 @@ from packages.domain.models.enums import (
 from packages.domain.models.memory import ORMClaim, ORMClaimAssessmentHead, ORMReassessmentJob
 from packages.domain.models.questions import ORMQuestion
 from packages.domain.services.audit import AuditService
+from packages.llm_gateway.reasoning_compat import reasoning_payload_problems
 from packages.memory.session_admission import (
     count_live_admissions,
     sweep_expired_admissions,
@@ -209,6 +210,22 @@ def _validate_payload_budgets(requested_payload: dict[str, Any]) -> None:
     ).validate()
     if problems:
         raise ActivationError("invalid token budgets in payload: " + "; ".join(problems))
+
+
+def _validate_payload_reasoning(requested_payload: dict[str, Any]) -> None:
+    """Fail-closed before publishing (§5.4.1): the reasoning phase policy must be
+    STARTABLE too (T7.80, ADR-0030).
+
+    ``model.reasoning_by_phase`` is consulted at every LLM call of a session, so a
+    payload naming an unknown phase or a nonsense mode would surface only as failed
+    sessions — after the payload is already effective. The key is optional: absent
+    (every payload up to config-v17) means "no policy", i.e. requests stay exactly as
+    they were. The vocabulary itself belongs to the gateway (`reasoning_compat`): a
+    phase name here must be a phase the gateway actually knows how to switch.
+    """
+    problems = reasoning_payload_problems(requested_payload)
+    if problems:
+        raise ActivationError("invalid model.reasoning_by_phase in payload: " + "; ".join(problems))
 
 
 @dataclass(frozen=True)
@@ -1781,6 +1798,7 @@ async def run_online_change(
     stays ``draft``) and an ``ActivationError`` is raised; the next run
     re-publishes the drain."""
     _validate_payload_budgets(requested_payload)
+    _validate_payload_reasoning(requested_payload)
     async with transaction(db):
         head_row = (
             await db.execute(

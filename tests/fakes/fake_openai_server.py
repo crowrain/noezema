@@ -14,8 +14,21 @@ A scripted response entry is a JSON object:
     {"error": 500}  /  {"error": "timeout"} inject a transient HTTP failure
     {"error": "invalid_json"}               200 OK, but the content is not
                                             valid JSON (model hiccup)
+    {"raw_message": "..."}                  200 OK with this VERBATIM content —
+                                            no JSON round-trip, so an entry may
+                                            carry a deliberately CUT-OFF JSON
+                                            document (T7.80: finish_reason=length)
+    {"usage": {...}}                        scripted usage block; lets a test fix
+                                            completion_tokens exactly at the
+                                            gateway's max_output_tokens cap
+    {"finish_reason": "length"}             reported stop reason (default "stop")
     {"delay_seconds": 2.5}                  (any entry) the server sleeps
                                             before replying — a slow model
+
+The per-request log records every body parameter except `messages` and
+`response_format` (logged separately) under `params` — so a test can assert
+what the gateway actually sent on each attempt, e.g. that a reasoning-off
+retry really carries the engine's "stop reasoning" parameter (T7.80, ADR-0030).
 
 The server is single-process and single-client by design (one session at a
 time in v1, ARCHITECTURE §5.2.1).
@@ -42,6 +55,11 @@ class ScriptedResponse(BaseModel):
     error: int | str | None = None
     finish_reason: str = "stop"
     delay_seconds: float = 0.0  # T3.30: simulate a slow model (real local LLMs: 15–90 s)
+    # T7.80: verbatim assistant content — lets a script carry a CUT-OFF JSON document
+    # (what an engine really returns when it stops at max_tokens), no JSON round-trip
+    raw_message: str | None = None
+    # T7.80: scripted usage block; None = the fixed small usage below
+    usage: dict[str, Any] | None = None
 
 
 class Scenario(BaseModel):
@@ -91,6 +109,10 @@ def _record(body: dict[str, Any]) -> None:
             "model": body.get("model"),
             "response_format": body.get("response_format"),
             "messages_count": len(messages),
+            # T7.80: every other request parameter as sent (reasoning_effort,
+            # chat_template_kwargs, temperature, max_tokens …) — a test asserts
+            # what the engine was actually asked to do on EACH attempt
+            "params": {k: v for k, v in body.items() if k not in {"messages", "response_format"}},
             # T5.5: scenario tests assert what actually reached the model
             # (e.g. that raw untrusted content never enters the context)
             "last_user": last_user[:20_000],
@@ -110,10 +132,15 @@ async def chat_completions(body: dict[str, Any]) -> dict[str, Any]:
         await asyncio.sleep(float(scripted["delay_seconds"]))
 
     error = scripted.get("error")
+    raw_message = scripted.get("raw_message")
     if error == "invalid_json":
         # 200 OK, but the model "produced" non-JSON content for a structured
         # request — simulates a model hiccup the gateway must recover from.
         message = "this is definitely not json"
+    elif isinstance(raw_message, str):
+        # T7.80: a verbatim answer, possibly a CUT-OFF JSON document. The fake
+        # server does not repair it: classifying it is the gateway's job.
+        message = raw_message
     else:
         if error is not None:
             code = error if isinstance(error, int) else 500
@@ -130,6 +157,18 @@ async def chat_completions(body: dict[str, Any]) -> dict[str, Any]:
         if response_format.get("type") == "json_schema":
             json.loads(message)  # must be valid JSON for structured-output scenarios
 
+    scripted_usage = scripted.get("usage")
+    if scripted_usage is None and scripted.get("finish_reason") == "length":
+        # the measured halogen behavior (T7.80): an answer stopped by the output
+        # limit reports completion_tokens EXACTLY at the requested max_tokens
+        capped = body.get("max_tokens")
+        completion_tokens = capped if isinstance(capped, int) else 20
+        scripted_usage = {
+            "prompt_tokens": 10,
+            "completion_tokens": completion_tokens,
+            "total_tokens": 10 + completion_tokens,
+        }
+
     return {
         "id": f"fake-cmplt-{next(_state['seq'])}",
         "object": "chat.completion",
@@ -142,7 +181,7 @@ async def chat_completions(body: dict[str, Any]) -> dict[str, Any]:
                 "finish_reason": scripted.get("finish_reason", "stop"),
             }
         ],
-        "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30},
+        "usage": scripted_usage or {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30},
     }
 
 

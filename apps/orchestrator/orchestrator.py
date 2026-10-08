@@ -123,9 +123,25 @@ from packages.domain.services.lease import DEFAULT_LEASE_TTL, LeaseHeartbeatGuar
 from packages.domain.services.reconciler import reconcile_commit
 from packages.domain.services.reserve import HostReserveService, ReserveLimits
 from packages.domain.services.staging import StagingService
-from packages.llm_gateway.client import LLMError, LLMMiddleware, LLMRequestRejectedError, LLMSchemaError
+from packages.llm_gateway.client import (
+    AttemptRecord,
+    LLMAnswerUnusableError,
+    LLMError,
+    LLMMiddleware,
+    LLMRequestRejectedError,
+    LLMSchemaError,
+    LLMTruncatedResponseError,
+)
 from packages.llm_gateway.config import ModelProfile
 from packages.llm_gateway.fingerprint import build_model_fingerprint
+from packages.llm_gateway.reasoning_compat import (
+    PHASE_CONSOLIDATION,
+    PHASE_EXPLORATION,
+    PHASE_EXTRACTION,
+    PHASE_PLANNING,
+    PHASE_VERIFICATION,
+    resolve_reasoning_policy,
+)
 from packages.llm_gateway.roles import (
     LoadedPrompt,
     PromptPinError,
@@ -714,7 +730,7 @@ class Orchestrator:
             # _propose_plan records the PLAN_FALLBACK audit itself on
             # schema/budget failure; transport LLMErrors propagate
             proposed = await self._propose_plan(
-                db, audit, session, question, ctx, planning_section, cap_profile
+                db, audit, session, question, ctx, planning_section, cap_profile, snapshot
             )
             if proposed is not None:
                 ctx.plan = render_plan(proposed)
@@ -802,7 +818,7 @@ class Orchestrator:
             # _verify records the VERIFICATION_FALLBACK audit itself on
             # schema/budget failure; transport LLM errors propagate
             report = await self._verify(
-                db, audit, session, ctx, verification_section, cap_profile
+                db, audit, session, ctx, verification_section, cap_profile, snapshot
             )
             if report is not None:
                 ctx.verification_report = render_verification(report)
@@ -948,6 +964,65 @@ class Orchestrator:
 
     # ── extraction (T5.5, stage 4) ─────────────────────────────────────
 
+    def _reasoning_mode(self, snapshot: ORMConfigSnapshot, phase: str) -> str | None:
+        """What the EFFECTIVE snapshot says about reasoning in one call phase
+        (`model.reasoning_by_phase`, T7.80 / ADR-0030).
+
+        Resolved from the snapshot at every use and never cached on the
+        orchestrator (§3 "effective config"). A snapshot without the key — every
+        payload up to config-v17 — resolves to None for every phase, i.e. the
+        request stays exactly as it was. A malformed key raises: activation
+        validates it before publication, so a malformed snapshot reaching here is
+        refused, not guessed at (fail-closed).
+        """
+        return resolve_reasoning_policy(dict(snapshot.model)).mode_for(phase)
+
+    async def _record_unusable_attempts(
+        self,
+        db: AsyncSession,
+        session: ORMSession,
+        attempts: list[AttemptRecord],
+        *,
+        fingerprint: JsonDict,
+        prompt_version: str,
+        prompt_sha256: str,
+        tool_schema_hash: str | None,
+    ) -> int:
+        """Write one model_runs row per answered attempt the host could not use
+        (T7.80, ADR-0030).
+
+        finish_reason and output_tokens are recorded AS THE ENGINE REPORTED them
+        ("length" for an answer cut by the limit) with output_schema_valid=false;
+        turn_id stays host-generated (§20.10) and `phase` stays the session state
+        — the call phase is not a session state and does not move this column.
+        Before this, a curator call that ended in zero truncated attempts was
+        visible only in the engine's own log; the journal could not tell a cut
+        answer from an unavailable model.
+        """
+        created = 0
+        for attempt in attempts:
+            if attempt.output_schema_valid:
+                continue
+            await ModelRunRepository.create(
+                db,
+                ORMModelRun(
+                    session_id=session.id,
+                    turn_id=uuid.uuid4(),
+                    phase=session.state,
+                    model_fingerprint=fingerprint,
+                    prompt_version=prompt_version,
+                    prompt_sha256=prompt_sha256,
+                    tool_schema_hash=tool_schema_hash,
+                    input_tokens=attempt.input_tokens,
+                    output_tokens=attempt.output_tokens,
+                    latency_ms=attempt.latency_ms,
+                    finish_reason=attempt.finish_reason,
+                    output_schema_valid=False,
+                ),
+            )
+            created += 1
+        return created
+
     async def _apply_extraction_profile(
         self,
         db: AsyncSession,
@@ -998,28 +1073,51 @@ class Orchestrator:
                     user=user,
                     response_schema=ExtractionReport,
                     fingerprint=fingerprint,
+                    phase=PHASE_EXTRACTION,
+                    reasoning_mode=self._reasoning_mode(snapshot, PHASE_EXTRACTION),
                 )
-        except LLMSchemaError as exc:
-            run = ORMModelRun(
-                session_id=session.id,
-                turn_id=uuid.uuid4(),
-                phase=session.state,
-                model_fingerprint=fingerprint,
+        except (LLMSchemaError, LLMTruncatedResponseError) as exc:
+            # T7.80 (ADR-0030): "the answer was cut by the output limit" and
+            # "the answer does not fit the schema" are different outcomes — the
+            # host fallback is the same (raw read), the journal must not be.
+            truncated = isinstance(exc, LLMTruncatedResponseError)
+            written = await self._record_unusable_attempts(
+                db,
+                session,
+                exc.attempts,
+                fingerprint=fingerprint,
                 prompt_version=extractor.version,
                 prompt_sha256=extractor.sha256,
                 tool_schema_hash=tool_schema_hash([]),
-                input_tokens=record.input_tokens if record is not None else 0,
-                output_tokens=record.output_tokens if record is not None else 0,
-                latency_ms=record.latency_ms if record is not None else 0.0,
-                finish_reason=record.finish_reason if record is not None else "schema_error",
-                output_schema_valid=False,
             )
-            await ModelRunRepository.create(db, run)
+            if written == 0:
+                run = ORMModelRun(
+                    session_id=session.id,
+                    turn_id=uuid.uuid4(),
+                    phase=session.state,
+                    model_fingerprint=fingerprint,
+                    prompt_version=extractor.version,
+                    prompt_sha256=extractor.sha256,
+                    tool_schema_hash=tool_schema_hash([]),
+                    input_tokens=record.input_tokens if record is not None else 0,
+                    output_tokens=record.output_tokens if record is not None else 0,
+                    latency_ms=record.latency_ms if record is not None else 0.0,
+                    finish_reason=record.finish_reason if record is not None else "schema_error",
+                    output_schema_valid=False,
+                )
+                await ModelRunRepository.create(db, run)
             await audit.record(
                 AuditEventType.EXTRACTION_FALLBACK,
                 session_id=session.id,
-                payload={"reason": "schema_invalid", "error": str(exc)[:500]},
-                public_summary="extraction report invalid; raw read fallback",
+                payload={
+                    "reason": "truncated_output" if truncated else "schema_invalid",
+                    "error": str(exc)[:500],
+                },
+                public_summary=(
+                    "extraction answer truncated by the output limit; raw read fallback"
+                    if truncated
+                    else "extraction report invalid; raw read fallback"
+                ),
             )
             return obs
 
@@ -1039,6 +1137,19 @@ class Orchestrator:
             output_schema_valid=record.output_schema_valid,
         )
         await ModelRunRepository.create(db, run)
+
+        # T7.80 (ADR-0030): a call that was cut by the output limit and then
+        # recovered must not erase the evidence of the cut — every unusable attempt
+        # of THIS call gets its own model_runs row alongside the valid one.
+        await self._record_unusable_attempts(
+            db,
+            session,
+            record.attempts_detail,
+            fingerprint=fingerprint,
+            prompt_version=extractor.version,
+            prompt_sha256=extractor.sha256,
+            tool_schema_hash=tool_schema_hash([]),
+        )
 
         try:
             validate_extraction(response, content, int(extraction_section.get("max_chunks", 8)))
@@ -1270,6 +1381,7 @@ class Orchestrator:
         ctx: SessionContext,
         verification_section: Mapping[str, Any],
         cap_profile: CapabilityProfile,
+        snapshot: ORMConfigSnapshot,
     ) -> VerifierReport | None:
         """The verifier role organizes deterministic checks over the
         session's typed evidence and interprets their results. Returns
@@ -1302,29 +1414,51 @@ class Orchestrator:
                     user=user,
                     response_schema=VerifierReport,
                     fingerprint=fingerprint,
+                    phase=PHASE_VERIFICATION,
+                    reasoning_mode=self._reasoning_mode(snapshot, PHASE_VERIFICATION),
                 )
-        except LLMSchemaError as exc:
-            turn_id = uuid.uuid4()
-            run = ORMModelRun(
-                session_id=session.id,
-                turn_id=turn_id,
-                phase=session.state,
-                model_fingerprint=fingerprint,
+        except (LLMSchemaError, LLMTruncatedResponseError) as exc:
+            # T7.80 (ADR-0030): a cut answer is not a schema hiccup; the
+            # fallback (no-op verifying phase) is the same, the journal is not.
+            truncated = isinstance(exc, LLMTruncatedResponseError)
+            written = await self._record_unusable_attempts(
+                db,
+                session,
+                exc.attempts,
+                fingerprint=fingerprint,
                 prompt_version=verifier.version,
                 prompt_sha256=verifier.sha256,
                 tool_schema_hash=tool_schema_hash([]),
-                input_tokens=record.input_tokens if record is not None else 0,
-                output_tokens=record.output_tokens if record is not None else 0,
-                latency_ms=record.latency_ms if record is not None else 0.0,
-                finish_reason=record.finish_reason if record is not None else "schema_error",
-                output_schema_valid=False,
             )
-            await ModelRunRepository.create(db, run)
+            if written == 0:
+                turn_id = uuid.uuid4()
+                run = ORMModelRun(
+                    session_id=session.id,
+                    turn_id=turn_id,
+                    phase=session.state,
+                    model_fingerprint=fingerprint,
+                    prompt_version=verifier.version,
+                    prompt_sha256=verifier.sha256,
+                    tool_schema_hash=tool_schema_hash([]),
+                    input_tokens=record.input_tokens if record is not None else 0,
+                    output_tokens=record.output_tokens if record is not None else 0,
+                    latency_ms=record.latency_ms if record is not None else 0.0,
+                    finish_reason=record.finish_reason if record is not None else "schema_error",
+                    output_schema_valid=False,
+                )
+                await ModelRunRepository.create(db, run)
             await audit.record(
                 AuditEventType.VERIFICATION_FALLBACK,
                 session_id=session.id,
-                payload={"reason": "schema_invalid", "error": str(exc)[:500]},
-                public_summary="verifier report invalid; MVP no-op verifying phase",
+                payload={
+                    "reason": "truncated_output" if truncated else "schema_invalid",
+                    "error": str(exc)[:500],
+                },
+                public_summary=(
+                    "verifier answer truncated by the output limit; MVP no-op verifying phase"
+                    if truncated
+                    else "verifier report invalid; MVP no-op verifying phase"
+                ),
             )
             return None
 
@@ -1345,6 +1479,19 @@ class Orchestrator:
             output_schema_valid=record.output_schema_valid,
         )
         await ModelRunRepository.create(db, run)
+
+        # T7.80 (ADR-0030): a call that was cut by the output limit and then
+        # recovered must not erase the evidence of the cut — every unusable attempt
+        # of THIS call gets its own model_runs row alongside the valid one.
+        await self._record_unusable_attempts(
+            db,
+            session,
+            record.attempts_detail,
+            fingerprint=fingerprint,
+            prompt_version=verifier.version,
+            prompt_sha256=verifier.sha256,
+            tool_schema_hash=tool_schema_hash([]),
+        )
 
         report = response
         try:
@@ -1370,6 +1517,7 @@ class Orchestrator:
         ctx: SessionContext,
         planning_section: Mapping[str, Any],
         cap_profile: CapabilityProfile,
+        snapshot: ORMConfigSnapshot,
     ) -> SessionPlan | None:
         """The planner role proposes the multi-step plan. Returns the
         validated plan, or None when the proposal is unusable (schema
@@ -1404,29 +1552,51 @@ class Orchestrator:
                     user=user,
                     response_schema=PlanResponse,
                     fingerprint=fingerprint,
+                    phase=PHASE_PLANNING,
+                    reasoning_mode=self._reasoning_mode(snapshot, PHASE_PLANNING),
                 )
-        except LLMSchemaError as exc:
-            turn_id = uuid.uuid4()
-            run = ORMModelRun(
-                session_id=session.id,
-                turn_id=turn_id,
-                phase=session.state,
-                model_fingerprint=fingerprint,
+        except (LLMSchemaError, LLMTruncatedResponseError) as exc:
+            # T7.80 (ADR-0030): a cut answer and an invalid answer both fall back
+            # to the template plan, but the journal must tell them apart.
+            truncated = isinstance(exc, LLMTruncatedResponseError)
+            written = await self._record_unusable_attempts(
+                db,
+                session,
+                exc.attempts,
+                fingerprint=fingerprint,
                 prompt_version=planner.version,
                 prompt_sha256=planner.sha256,
                 tool_schema_hash=tool_schema_hash([]),
-                input_tokens=record.input_tokens if record is not None else 0,
-                output_tokens=record.output_tokens if record is not None else 0,
-                latency_ms=record.latency_ms if record is not None else 0.0,
-                finish_reason=record.finish_reason if record is not None else "schema_error",
-                output_schema_valid=False,
             )
-            await ModelRunRepository.create(db, run)
+            if written == 0:
+                turn_id = uuid.uuid4()
+                run = ORMModelRun(
+                    session_id=session.id,
+                    turn_id=turn_id,
+                    phase=session.state,
+                    model_fingerprint=fingerprint,
+                    prompt_version=planner.version,
+                    prompt_sha256=planner.sha256,
+                    tool_schema_hash=tool_schema_hash([]),
+                    input_tokens=record.input_tokens if record is not None else 0,
+                    output_tokens=record.output_tokens if record is not None else 0,
+                    latency_ms=record.latency_ms if record is not None else 0.0,
+                    finish_reason=record.finish_reason if record is not None else "schema_error",
+                    output_schema_valid=False,
+                )
+                await ModelRunRepository.create(db, run)
             await audit.record(
                 AuditEventType.PLAN_FALLBACK,
                 session_id=session.id,
-                payload={"reason": "schema_invalid", "error": str(exc)[:500]},
-                public_summary="plan proposal invalid; MVP template plan used",
+                payload={
+                    "reason": "truncated_output" if truncated else "schema_invalid",
+                    "error": str(exc)[:500],
+                },
+                public_summary=(
+                    "plan answer truncated by the output limit; MVP template plan used"
+                    if truncated
+                    else "plan proposal invalid; MVP template plan used"
+                ),
             )
             return None
         assert record is not None and response is not None  # chat() returns both
@@ -1447,6 +1617,19 @@ class Orchestrator:
             output_schema_valid=record.output_schema_valid,
         )
         await ModelRunRepository.create(db, run)
+
+        # T7.80 (ADR-0030): a call that was cut by the output limit and then
+        # recovered must not erase the evidence of the cut — every unusable attempt
+        # of THIS call gets its own model_runs row alongside the valid one.
+        await self._record_unusable_attempts(
+            db,
+            session,
+            record.attempts_detail,
+            fingerprint=fingerprint,
+            prompt_version=planner.version,
+            prompt_sha256=planner.sha256,
+            tool_schema_hash=tool_schema_hash([]),
+        )
 
         plan = response.plan
         try:
@@ -1537,14 +1720,45 @@ class Orchestrator:
                 # call is in flight (§5.2.3: TTL = several heartbeat intervals)
                 async with LeaseHeartbeatGuard(lease, db, session.id, self.node_owner):
                     response, record = await self.gateway.chat(
-                        system=explorer.text, user=user_ctx, response_schema=ModelResponse, fingerprint=fingerprint
+                        system=explorer.text,
+                        user=user_ctx,
+                        response_schema=ModelResponse,
+                        fingerprint=fingerprint,
+                        phase=PHASE_EXPLORATION,
+                        reasoning_mode=self._reasoning_mode(snapshot, PHASE_EXPLORATION),
                     )
             except LLMError as exc:
+                # T7.80 (ADR-0030): an explorer answer the engine cut by the
+                # output limit is recorded as what it was — finish_reason="length",
+                # output_schema_valid=false — before the session fails. The
+                # outcome stays "host failure" (§6.5); only its evidence becomes
+                # readable. A transient transport error carries no answer and so
+                # no rows.
+                if isinstance(exc, LLMAnswerUnusableError):
+                    await self._record_unusable_attempts(
+                        db,
+                        session,
+                        exc.attempts,
+                        fingerprint=fingerprint,
+                        prompt_version=explorer.version,
+                        prompt_sha256=explorer.sha256,
+                        tool_schema_hash=tool_schema_hash(allowed_tools),
+                    )
                 await audit.record(
                     AuditEventType.SESSION_FAILED,
                     session_id=session.id,
-                    payload={"error": str(exc)[:500], "phase": "exploring"},
-                    public_summary="LLM unavailable; host failure report",
+                    payload={
+                        "error": str(exc)[:500],
+                        "phase": "exploring",
+                        "llm_error_kind": (
+                            "truncated_output" if isinstance(exc, LLMTruncatedResponseError) else "unavailable"
+                        ),
+                    },
+                    public_summary=(
+                        "LLM answer truncated by the output limit; host failure report"
+                        if isinstance(exc, LLMTruncatedResponseError)
+                        else "LLM unavailable; host failure report"
+                    ),
                 )
                 raise
             except LeaseLost as exc:
@@ -1574,6 +1788,19 @@ class Orchestrator:
                 output_schema_valid=record.output_schema_valid,
             )
             await ModelRunRepository.create(db, run)
+
+            # T7.80 (ADR-0030): a call that was cut by the output limit and then
+            # recovered must not erase the evidence of the cut — every unusable attempt
+            # of THIS call gets its own model_runs row alongside the valid one.
+            await self._record_unusable_attempts(
+                db,
+                session,
+                record.attempts_detail,
+                fingerprint=fingerprint,
+                prompt_version=explorer.version,
+                prompt_sha256=explorer.sha256,
+                tool_schema_hash=tool_schema_hash(allowed_tools),
+            )
 
             decision = response.decision
             rationale_lines.append(response.public_rationale)
@@ -2251,7 +2478,40 @@ class Orchestrator:
                     user=user,
                     response_schema=CuratorProposal,
                     fingerprint=fingerprint,
+                    phase=PHASE_CONSOLIDATION,
+                    reasoning_mode=self._reasoning_mode(snapshot, PHASE_CONSOLIDATION),
                 )
+        except LLMTruncatedResponseError as exc:
+            # T7.80 (ADR-0030): the curator answer was STOPPED BY THE OUTPUT
+            # LIMIT. Not a schema hiccup and not "model unavailable": the model
+            # is up and answered — the answer was cut mid-document, so the host
+            # has nothing it may trust. Soft failure (research work kept, no
+            # claims) with an HONEST marker, and every cut attempt written to
+            # model_runs with finish_reason="length": before this the journal
+            # said only "unavailable" and the attempts existed nowhere.
+            written = await self._record_unusable_attempts(
+                db,
+                session,
+                exc.attempts,
+                fingerprint=fingerprint,
+                prompt_version=curator.version,
+                prompt_sha256=curator.sha256,
+                tool_schema_hash=None,
+            )
+            await audit.record(
+                AuditEventType.SESSION_STATE_CHANGED,
+                session_id=session.id,
+                payload={
+                    "curator_error": str(exc)[:300],
+                    "curator_error_kind": "truncated_output",
+                    "truncated_attempts": written,
+                },
+                public_summary=(
+                    "curator answer truncated by the output limit; "
+                    "no claims proposed — see model_runs for the cut attempts"
+                ),
+            )
+            return 0, 0
         except LLMRequestRejectedError as exc:
             # T7.23 (ADR-0012): the engine REFUSED THE REQUEST itself
             # (HTTP 4xx — a schema keyword/param it does not support, an
@@ -2275,6 +2535,20 @@ class Orchestrator:
             return 0, 0
         except LLMError as exc:
             # host-generated failure report (§6.5): curator unavailable
+            if isinstance(exc, LLMAnswerUnusableError):
+                # T7.80: the model DID answer (invalid schema) — those attempts
+                # belong in the journal, not only in the error text. The audit
+                # marker stays "unavailable": re-classifying an existing outcome
+                # is a separate decision, not a side effect of this task.
+                await self._record_unusable_attempts(
+                    db,
+                    session,
+                    exc.attempts,
+                    fingerprint=fingerprint,
+                    prompt_version=curator.version,
+                    prompt_sha256=curator.sha256,
+                    tool_schema_hash=None,
+                )
             await audit.record(
                 AuditEventType.SESSION_STATE_CHANGED,
                 session_id=session.id,
@@ -2311,6 +2585,19 @@ class Orchestrator:
             output_schema_valid=record.output_schema_valid,
         )
         await ModelRunRepository.create(db, run)
+
+        # T7.80 (ADR-0030): a call that was cut by the output limit and then
+        # recovered must not erase the evidence of the cut — every unusable attempt
+        # of THIS call gets its own model_runs row alongside the valid one.
+        await self._record_unusable_attempts(
+            db,
+            session,
+            record.attempts_detail,
+            fingerprint=fingerprint,
+            prompt_version=curator.version,
+            prompt_sha256=curator.sha256,
+            tool_schema_hash=None,
+        )
 
         max_questions = int(snapshot.session_limits.get("max_new_questions_per_session", 4))
         problems = proposal.validate_against(len(ctx.evidence), questions_max=max_questions)
