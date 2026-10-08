@@ -604,58 +604,62 @@ class TestDevStandStatusSearch:
 
 
 class TestDevStandConfigVersion:
-    """Стенд по умолчанию поднимает актуальную конфигурацию, а предыдущая остаётся откатом (T7.76 → T7.77).
+    """Стенд по умолчанию поднимает актуальную конфигурацию, а предыдущая остаётся откатом (T7.77 → T7.80).
 
     Это не косметика: менеджер, повторяющий `bootstrap.sh` на .92, активирует ровно тот payload,
     который закреплён дефолтом скрипта. Если дефолт и откат перепутаны местами, стенд молча вернётся
-    на прежний промпт исследователя — и следующий замер это измерит не там.
+    на прежнюю конфигурацию — и следующий замер это измерит не там.
     """
 
+    V18 = "config-v18-payload.json"
     V17 = "config-v17-payload.json"
     V16 = "config-v16-payload.json"
     V15 = "config-v15-payload.json"
     #: как эти файлы названы в скриптах (они указывают на payload через $REPO_ROOT)
+    V18_REF = "docs/eval/config-v18-payload.json"
     V17_REF = "docs/eval/config-v17-payload.json"
     V16_REF = "docs/eval/config-v16-payload.json"
     V15_REF = "docs/eval/config-v15-payload.json"
     #: canonical-хеші payload'ов: именно они попадают в `config_snapshots.payload_sha256` (AGENTS §8),
     #  в скриптах и README они названы короткими префиксами — оператор сверяет head по ним
+    V18_CANONICAL = "b5605e4e"
     V17_CANONICAL = "5c402f4d"
     V16_CANONICAL = "740ae9a1"
     V15_CANONICAL = "b3801812"
 
-    def test_bootstrap_defaults_to_config_v17_and_names_v16_as_the_rollback(self) -> None:
+    def test_bootstrap_defaults_to_config_v18_and_names_v17_as_the_rollback(self) -> None:
         text = BOOTSTRAP.read_text(encoding="utf-8")
 
-        assert f'CONFIG_PAYLOAD="${{NOEZEMA_DEV_CONFIG_PAYLOAD:-$REPO_ROOT/{self.V17_REF}}}"' in text
+        assert f'CONFIG_PAYLOAD="${{NOEZEMA_DEV_CONFIG_PAYLOAD:-$REPO_ROOT/{self.V18_REF}}}"' in text
         # откат обязан быть назван явно: прежнему payload'у принадлежит canonical-хеш, не хеш файла
-        rollback_line = next(line for line in text.splitlines() if self.V16_REF in line)
+        rollback_line = next(line for line in text.splitlines() if self.V17_REF in line)
         assert "NOEZEMA_DEV_CONFIG_PAYLOAD" in rollback_line
-        assert self.V16_CANONICAL in text
-        # причина активации говорит, что именно изменилось (пин исследователя), а не «обновили конфиг»
+        assert self.V17_CANONICAL in text
+        # причина активации говорит, что именно изменилось (политика рассуждения по фазам),
+        # а не «обновили конфиг»; и что потолок вывода НЕ поднят
         reason = next(line for line in text.splitlines() if line.startswith("CONFIG_REASON="))
-        assert "config-v17" in reason and "explorer-v9" in reason
-        # лимит шагов v17 не трогает — причина говорит об этом прямо
+        assert "config-v18" in reason and "reasoning_by_phase" in reason
+        # лимит шагов, пины и бюджеты v18 не трогает — причина говорит об этом прямо
         assert "unchanged" in reason
 
     def test_reset_db_reactivates_the_same_config_as_bootstrap(self) -> None:
         script = (REPO_ROOT / "deploy" / "dev-stand" / "reset-db.sh").read_text(encoding="utf-8")
 
-        assert f'CONFIG_PAYLOAD="${{NOEZEMA_DEV_CONFIG_PAYLOAD:-$REPO_ROOT/{self.V17_REF}}}"' in script
-        assert self.V16_REF in script  # откат не потерян и после сброса базы
-        assert "config-v17" in script
+        assert f'CONFIG_PAYLOAD="${{NOEZEMA_DEV_CONFIG_PAYLOAD:-$REPO_ROOT/{self.V18_REF}}}"' in script
+        assert self.V17_REF in script  # откат не потерян и после сброса базы
+        assert "config-v18" in script
 
     def test_readme_documents_the_activation_and_the_rollback_with_canonical_hashes(self) -> None:
         text = (REPO_ROOT / "deploy" / "dev-stand" / "README.md").read_text(encoding="utf-8")
 
+        assert self.V18_CANONICAL in text
         assert self.V17_CANONICAL in text
-        assert self.V16_CANONICAL in text
-        assert "config-v17-payload.json" in text
-        assert "docs/eval/config-v16-payload.json" in text
+        assert "config-v18-payload.json" in text
+        assert "docs/eval/config-v17-payload.json" in text
         # активация — команда менеджера с drain, а не тихая правка снапшота
         assert "activate-online" in text and "--drain-wait-seconds 120" in text
 
-    def test_config_v17_payload_file_exists_next_to_the_older_ones(self) -> None:
+    def test_config_v18_payload_file_exists_next_to_the_older_ones(self) -> None:
         """Новый номер конфигурации = новый файл, прежние не переписываются (AGENTS §8)."""
         for name in (
             "config-v13-payload.json",
@@ -663,7 +667,59 @@ class TestDevStandConfigVersion:
             "config-v15-payload.json",
             self.V16,
             self.V17,
+            self.V18,
         ):
             path = REPO_ROOT / "docs" / "eval" / name
             assert path.is_file(), name
+
+
+class TestDevStandReasoningProfile:
+    """Профиль рассуждения движка (T7.80, ADR-0030) — возможность ДВИЖКА, поэтому он в окружении
+    стенда, а не в payload'е; политика фаз при этом живёт в снапшоте.
+
+    Дефолт обязан оставаться «none»: без замера конкретного движка стенд не имеет права добавлять
+    в запрос параметр рассуждения — иначе прежние прогоны перестают быть сравнимыми, а неизвестный
+    движок может отклонить сам запрос (ADR-0012 ровно об этом).
+    """
+
+    def test_bootstrap_exposes_the_reasoning_profile_and_writes_it_to_the_env_file(self) -> None:
+        text = BOOTSTRAP.read_text(encoding="utf-8")
+
+        assert 'LLM_REASONING_PROFILE="${NOEZEMA_DEV_LLM_REASONING_PROFILE:-none}"' in text
+        # переменная должна дойти до юнитов: без этой строки профиль так и останется none
+        env_lines = [line for line in text.splitlines() if "NOEZEMA_LLM_REASONING_PROFILE=" in line]
+        assert any("NOEZEMA_LLM_REASONING_PROFILE=$LLM_REASONING_PROFILE" in line for line in env_lines), env_lines
+        # и быть видна в сводке запуска, как schema_profile (оператор сверяет её с фактическим движком)
+        summary = next(line for line in text.splitlines() if "schema_profile=$LLM_SCHEMA_PROFILE" in line)
+        assert "reasoning_profile=$LLM_REASONING_PROFILE" in summary
+
+    def test_readme_names_the_engine_profiles_it_has_measured(self) -> None:
+        """README обязан называть профили, а не абстракцию: менеджер ставит стенд на конкретный
+        движок и выбирает профиль по замеру, а не догадкой."""
+        text = (REPO_ROOT / "deploy" / "dev-stand" / "README.md").read_text(encoding="utf-8")
+
+        assert "NOEZEMA_DEV_LLM_REASONING_PROFILE" in text
+        for profile in ("none", "halogen", "chat-template"):
+            assert profile in text, profile
+        # неизвестный профиль — отказ при старте, а не тихий дефолт
+        assert "fail-closed" in text or "отказ" in text
+
+    def test_bootstrap_default_is_none_and_the_reasoning_policy_lives_in_the_payload(self) -> None:
+        """Разделение ответственности (ADR-0030): payload говорит «где не рассуждать», окружение —
+        «умеет ли этот движок выключать рассуждение». Ни одна из сторон не подменяет другую."""
+        import json
+
+        text = BOOTSTRAP.read_text(encoding="utf-8")
+        assert 'NOEZEMA_DEV_LLM_REASONING_PROFILE:-none' in text
+
+        payload = json.loads((REPO_ROOT / "docs" / "eval" / "config-v18-payload.json").read_text(encoding="utf-8"))
+        assert sorted(payload["model"]["reasoning_by_phase"]) == [
+            "consolidation",
+            "exploration",
+            "extraction",
+            "planning",
+            "verification",
+        ]
+        # потолок вывода не поднят: фиксированная комната ответа halogen (замер T7.80)
+        assert payload["model"]["max_output_tokens"] == 8192
 

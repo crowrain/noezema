@@ -24,7 +24,7 @@
 | `searxng/settings.yml` | ШАБЛОН настроек поиска (formats html+json, limiter off); `secret_key` здесь — плейсхолдер, настоящего секрета в репозитории нет |
 | `searxng-settings.sh` | рендер настроек из шаблона: генерирует `secret_key` (не печатает), повторный запуск ключ не ротирует |
 | `status.sh` | состояние: юниты, docker, очередь вопросов, последняя сессия, доступность LLM, версия кода, режим исполнителя инструментов, поиск (SearXNG + режим research_proxy снапшота) |
-| `reset-db.sh` | пересоздание dev-базы с явным подтверждением + миграции + повторная активация config-v17 |
+| `reset-db.sh` | пересоздание dev-базы с явным подтверждением + миграции + повторная активация config-v18 |
 | `README.md` | этот файл |
 
 ## Деплой (делает менеджер)
@@ -56,14 +56,14 @@ systemctl start noezema-dev.target            # web + unit-state и maint (ти�
 | приложение | репозиторий как есть (`$APP_DIR`), venv в `$APP_DIR/.venv`, зависимости **только через uv** и только prod-extras (AGENTS §6) |
 | база | docker-контейнер `noezema-dev-db` (образ `postgres:15`), том `noezema-dev-pgdata`, публикация **только на 127.0.0.1**, база `noezema-dev`, пользователь `noezema`. Порт выбирается до записи env-файла: 5432, а если на хосте он уже занят (нативный `postgresql.service`) — первый свободный из 5433..5440; выбранный порт пишется в env-файл (`NOEZEMA_DEV_DB_PORT`), повторный запуск переиспользует порт существующего контейнера. `NOEZEMA_DEV_DB_PORT=<порт>` задаёт явно: занят → понятная ошибка, а не молчаливый переезд |
 | миграции | `alembic upgrade head` из venv (URL из env-файла) |
-| конфигурация | активация `docs/eval/config-v17-payload.json` через `hostctl activate-online` (промпт исследователя explorer-v9 = explorer-v8 с правилами 1–11 дословно + правило 12: прогноз до события — не независимая оценка реализованного значения; `session_limits.max_explorer_steps = 16` прежний из config-v16; промпт куратора curator-v8 прежний; всё остальное — байт в байт config-v16: окно EXL3 131072, поиск `web.search`, пороги и бюджеты; пропускается, если снапшот уже активен; переход v16→v17 — STATUS.md T7.77) |
+| конфигурация | активация `docs/eval/config-v18-payload.json` через `hostctl activate-online` (config-v18 = config-v17 ровно с одной правкой: `model.reasoning_by_phase` — куратору, экстрактору и верификатору ответ запрашивается БЕЗ рассуждения движка, исследователю и планировщику оставляется; `session_limits.max_explorer_steps = 16`, пины explorer-v9 и curator-v8, пороги, бюджеты, окно EXL3 131072 и `model.max_output_tokens = 8192` — байт в байт config-v17; пропускается, если снапшот уже активен; переход v17→v18 — STATUS.md T7.80) |
 | данные сессий | `/var/lib/noezema-dev` (+ `sandbox` — work_root контейнерного исполнителя) |
 | host-контур стенда | `/var/lib/noezema-dev/host`, снимок юнитов: `/var/lib/noezema-dev/host/unit-state.json` |
 | секреты/настройки | `/etc/noezema/dev.env`, режим **0600**, владелец — пользователь стенда; в отчёты и чат не попадают (AGENTS §5) |
 | поиск (опционально) | контейнер `noezema-searxng` (`searxng/searxng:latest`), публикация **только на 127.0.0.1:8888** (внутри 8080); настройки `/etc/noezema/searxng/settings.yml` — `secret_key` генерируется на ВМ и в репозиторий не попадает; ставится только по `--with-searxng` (раздел «Поиск (SearXNG)») |
 | web UI/API | `127.0.0.1:8321` по умолчанию (`NOEZEMA_WEB_HOST`/`NOEZEMA_WEB_PORT`) |
 | sandbox-образ | `noezema-sandbox:dev-stand` (собран из `sandbox/Containerfile`, закреплён одной меткой в `NOEZEMA_SANDBOX_IMAGE`; dev/test метки не затрагиваются) |
-| LLM | `http://192.168.1.42:8080/v1`, модель `qwen38-exl3-3bpw-128k`, `NOEZEMA_LLM_SCHEMA_PROFILE=none`, `MAX_OUTPUT_TOKENS=8192`, `TIMEOUT_SECONDS=600` (переопределяется `NOEZEMA_DEV_LLM_*`) |
+| LLM | `http://192.168.1.42:8080/v1`, модель `qwen38-exl3-3bpw-128k`, `NOEZEMA_LLM_SCHEMA_PROFILE=none`, `NOEZEMA_LLM_REASONING_PROFILE=none` (раздел «Профиль рассуждения движка»), `MAX_OUTPUT_TOKENS=8192`, `TIMEOUT_SECONDS=600` (переопределяется `NOEZEMA_DEV_LLM_*`) |
 
 ## Пользование: цикл MVP
 
@@ -109,7 +109,7 @@ systemctl start noezema-dev.target            # web + unit-state и maint (ти�
    Postgres остаётся: `docker stop noezema-dev-db`).
 9. **Сброс:** `./deploy/dev-stand/reset-db.sh` — просит вписать имя базы (защита от «а вдруг это
    прод-база»), останавливает таймеры, пересоздаёт `noezema-dev`, накатывает миграции, заново
-   активирует config-v17, поднимает таймеры. С защитой по состоянию: если в базе есть незавершённая
+   активирует config-v18, поднимает таймеры. С защитой по состоянию: если в базе есть незавершённая
    сессия, reset откажется — сначала дождаться её терминации (или остановить tick-таймер).
 
 ## Юниты стенда (8 файлов)
@@ -158,7 +158,7 @@ hostctl.cli wake-tick` — при занятой сессии он так же �
 
 ## VM без GPU и пустая очередь — это не ошибка
 
-- В `config-v17` (как и в `config-v16`, `config-v15`, `config-v14` и `config-v13`) стоит `wake_schedule.gpu_required = false`, поэтому на VM без GPU admission
+- В `config-v18` (как и в `config-v17`, `config-v16`, `config-v15`, `config-v14` и `config-v13`) стоит `wake_schedule.gpu_required = false`, поэтому на VM без GPU admission
   проходит и сессии запускаются. Если бы значение было `true`, тик напечатал бы `skip (gpu)` и вышел
   с кодом 0: шлюз работает, а не ломается (§5.2.1).
 - Расписание — `interval_seconds=3600`, `min_session_interval_seconds=600`; таймер тикает каждые
@@ -275,7 +275,7 @@ JSON-запросы автоматического клиента, а огран
 ### Поиск для модели: активация снапшота и откат (делает менеджер)
 
 Контейнер сам по себе модели ничего не даёт — инструмент `web.search` появляется только вместе с активным
-снапшотом. Он есть и в текущем дефолте (`config-v17`, как и в `config-v16` и `config-v15`), и в прежнем (`config-v14`); исторически переход
+снапшотом. Он есть и в текущем дефолте (`config-v18`, как и в `config-v17`, `config-v16` и `config-v15`), и в прежнем (`config-v14`); исторически переход
 `v13 → v14` был нужен именно ради поиска — `bootstrap.sh` тогда активировал `config-v14`, а узлы, уже
 работавшие на `config-v13`, переводились одной явной онлайн-активацией (шлюзы admission и drain не
 обходятся):
@@ -423,6 +423,78 @@ git pull                                   # пакет с prompts/explorer/expl
 первоисточник) закрыта в T7.77 детектором производности v2 и командой переатрибуции
 `python -m hostctl.cli research-reattribute --since <дата>` —
 STATUS §T7.77.
+
+### Профиль рассуждения движка и обрезанный ответ: активация config-v18 (T7.80)
+
+`config-v18` = `config-v17` ровно с одной правкой: в `model` добавлен `reasoning_by_phase` —
+политика «рассуждать / не рассуждать» для каждой фазы **вызова** (не путать с состоянием сессии):
+
+| фаза вызова | режим | почему |
+|---|---|---|
+| `consolidation` (куратор) | `off` | ответ куратора — самый длинный JSON в системе; замер 2026-10-08 (сессия 1d0886fa, halogen-flash-next): три ответа ровно по 8192 completion tokens с `finish_reason=length`, JSON оборван внутри строки → «failed schema after 3 attempts» → ноль утверждений |
+| `extraction`, `verification` | `off` | у этих ответов тоже структурированный документ под тем же потолком; при выключенном рассуждении валидный schema-JSON приходит за доли секунды |
+| `exploration`, `planning` | `on` | выбор инструмента и план — то, где рассуждение полезно; ответы короткие, срез под 8192 для них не измерялся |
+
+Важно: **в config-v17 режимы `extraction.mode=off`, `verification.mode=off` и `planning.mode=template`**,
+то есть на стенде сегодня существует только два реальных вызова — исследовательский и кураторский.
+Политика для остальных фаз задекларирована заранее, чтобы не менять payload в момент включения режима.
+`model.max_output_tokens` остаётся **8192**: у halogen комната ответа фиксирована (рассуждение закрывается
+«by answer_room» примерно за ~1000 токенов до потолка), поэтому raising потолок не убирает обрезку длинного
+JSON — она лишь переезжает. Проверено тестом активации (`tests/scenario/test_config_v18_activation.py`).
+
+Самая правка payload ничего не меняет в запросе, пока узлу не сказано, **как** его движок умеет
+отключать рассуждение. Это возможность движка, поэтому она в окружении (`ADR-0030`):
+
+| движок | значение | что добавляется к запросу при режиме `off` |
+|---|---|---|
+| не измерен | `none` (дефолт стенда) | ничего: запрос байт в байт прежний, сравнимые прогоны не ломаются |
+| halogen-* | `halogen` | `"reasoning_effort": "none"` (замер: `reasoning_tokens` = 0, валидный JSON за доли секунды; `low` и `thinking_budget` движок игнорирует) |
+| llama.cpp c ChatML-шаблоном Qwen3.x | `chat-template` | `"chat_template_kwargs": {"enable_thinking": false}` (замер на 192.168.1.141: `reasoning_tokens` = 0) |
+
+Неизвестное имя профиля — **отказ при старте** (`unknown reasoning_profile ...; known profiles: …`),
+а не тихий дефолт: молча послать движку параметр, который он может отклонить, хуже чем ничего не послать
+(та же логика, что у `NOEZEMA_LLM_SCHEMA_PROFILE`, ADR-0012). Профиль `none` при этом честно означает,
+что обрезанный ответ становится немедленной ошибкой «ответ обрезан по лимиту» — повторять тот же запрос
+при температуре 0 бессмысленно.
+
+Активация (делает менеджер; узел, уже работавший на v17):
+
+```bash
+cd ~/noezema
+git pull                                    # пакет с docs/eval/config-v18-payload.json
+# одна строка в /etc/noezema/dev.env (0600): значение — по фактическому движку стенда.
+# если строка уже есть с другим значением — править её вручную, не добавлять вторую
+grep -q '^NOEZEMA_LLM_REASONING_PROFILE=' /etc/noezema/dev.env \
+  || sudo sh -c 'printf "NOEZEMA_LLM_REASONING_PROFILE=halogen\n" >> /etc/noezema/dev.env'
+sudo systemctl restart noezema-dev-web.service noezema-dev-tick.service noezema-dev-maint.service
+.venv/bin/python -m hostctl.cli activate-online \
+  --payload docs/eval/config-v18-payload.json \
+  --reason "T7.80: model.reasoning_by_phase (curator/extractor/verifier without engine reasoning)" \
+  --drain-wait-seconds 120
+```
+
+Либо с самого начала: `NOEZEMA_DEV_LLM_REASONING_PROFILE=halogen ./deploy/dev-stand/bootstrap.sh` —
+скрипт положит строку в `/etc/noezema/dev.env` сам и напечатает `reasoning_profile=…` в сводке запуска.
+
+Что видно после активации: `./status.sh` показывает снапшот по canonical-префиксу `b5605e4e`
+(полный canonical config-v18 — `b5605e4eb04d610ca387f732bfa35f4571750fd4370013f2f2a0e8e7e45f9dec`;
+в `config_snapshots.payload_sha256` попадает canonical, не хеш файла); кураторские строки
+`model_runs` при обрезке получают `finish_reason='length'` и `output_tokens`, равный потолку, а аудит —
+`curator_error_kind: "truncated_output"` вместо прежнего «unavailable». Проверочный вопрос — любой, где
+ответ куратора длинный (например «ключевая ставка ЦБ РФ на последнем заседании»): при профиле `halogen`
+второй кураторский запрос содержит `reasoning_effort="none"`, и утверждение появляется.
+
+Откат — активация payload'а v17 (он закоммичен и не менялся, canonical
+`5c402f4d75ae000c61d824ba2a4407bbfe8d94e0946311ff9ef90b06db721717`) плюс удаление строки профиля из
+`/etc/noezema/dev.env` и рестарт юнитов: без политики `reasoning_by_phase` ни одна фаза режима не получает,
+и запросы шлюза снова байт в байт прежние.
+
+```bash
+.venv/bin/python -m hostctl.cli activate-online \
+  --payload docs/eval/config-v17-payload.json \
+  --reason "T7.80 rollback: config-v17 (no phase reasoning policy)" \
+  --drain-wait-seconds 120
+```
 
 ### Дополнительный корневой сертификат для research-proxy (T7.77)
 

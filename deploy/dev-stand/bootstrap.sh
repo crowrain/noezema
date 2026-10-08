@@ -95,6 +95,14 @@ SEARXNG_READY_TIMEOUT="${NOEZEMA_DEV_SEARXNG_READY_TIMEOUT:-60}"   # ожида�
 LLM_BASE_URL="${NOEZEMA_DEV_LLM_BASE_URL:-http://192.168.1.42:8080/v1}"
 LLM_MODEL="${NOEZEMA_DEV_LLM_MODEL:-qwen38-exl3-3bpw-128k}"
 LLM_SCHEMA_PROFILE="${NOEZEMA_DEV_LLM_SCHEMA_PROFILE:-none}"
+# T7.80 (ADR-0030): how THIS engine can be asked to stop reasoning. "none" (the default) means
+# the deployment has not been probed: no reasoning parameter is added to any request, so every
+# stand run stays byte-for-byte comparable with earlier config versions. "halogen" adds
+# reasoning_effort=none, "chat-template" (llama.cpp Qwen3.x) adds chat_template_kwargs
+# {"enable_thinking": false} — both verified on 192.168.1.141 (reasoning_tokens=0). An unknown
+# name is a startup failure, not a silent default: the stand would otherwise send a parameter the
+# engine may reject.
+LLM_REASONING_PROFILE="${NOEZEMA_DEV_LLM_REASONING_PROFILE:-none}"
 LLM_MAX_OUTPUT_TOKENS="${NOEZEMA_DEV_LLM_MAX_OUTPUT_TOKENS:-8192}"
 LLM_TIMEOUT_SECONDS="${NOEZEMA_DEV_LLM_TIMEOUT_SECONDS:-600}"
 
@@ -131,10 +139,20 @@ LLM_TIMEOUT_SECONDS="${NOEZEMA_DEV_LLM_TIMEOUT_SECONDS:-600}"
 # академические исследования; пересказ официальной цифры со ссылкой на первоисточник вторым наблюдением
 # не считается). Лимит шагов (16), пороги, claim_type_rules, token-бюджеты, окна модели, research_proxy
 # и список инструментов — байт в байт v16: правка живёт в инструкциях модели, движок независимости не
-# тронут. Rollback теперь config-v16 (canonical 740ae9a1…, сам v17 — 5c402f4d…) и задаётся строкой
-# `NOEZEMA_DEV_CONFIG_PAYLOAD=$REPO_ROOT/docs/eval/config-v16-payload.json`; v16 и v15 остаются в репо.
-CONFIG_PAYLOAD="${NOEZEMA_DEV_CONFIG_PAYLOAD:-$REPO_ROOT/docs/eval/config-v17-payload.json}"
-CONFIG_REASON="${NOEZEMA_DEV_CONFIG_REASON:-T7.77 dev-stand: activate config-v17 (explorer-v9: forecast before an event is not an independent measurement of a realized value; explorer step limit, curator-v8, thresholds and token budgets unchanged from config-v16)}"
+# тронут. Откатом v17 был config-v16 (canonical 740ae9a1…, сам v17 — 5c402f4d…).
+# config-v18 (T7.80, ADR-0030) = config-v17 ровно с одной правкой: в раздел `model` добавлен
+# `reasoning_by_phase` — политика «рассуждать/не рассуждать» для каждой фазы ВЫЗОВА
+# (consolidation/extraction/verification off, exploration/planning on). Пороги, claim_type_rules,
+# token-бюджеты, лимит шагов (16), окна модели, research_proxy, список инструментов и все пины
+# промптов — байт в байт v17. В том числе model.max_output_tokens остаётся 8192: halogen держит
+# фиксированную комнату ответа (~1000 токенов), поэтому raising потолок не убирает обрезку длинного
+# JSON — он переносит место среза (замер T7.80). Сама возможность выключить рассуждение задаётся НЕ
+# payload'ом, а окружением стенда (`NOEZEMA_DEV_LLM_REASONING_PROFILE` выше): payload описывает
+# намерение, движок — способность. Откат теперь config-v17 (canonical 5c402f4d…, сам v18 —
+# b5605e4e…) и задаётся строкой `NOEZEMA_DEV_CONFIG_PAYLOAD=$REPO_ROOT/docs/eval/config-v17-payload.json`;
+# v17, v16 и v15 остаются в репо и не переписываются.
+CONFIG_PAYLOAD="${NOEZEMA_DEV_CONFIG_PAYLOAD:-$REPO_ROOT/docs/eval/config-v18-payload.json}"
+CONFIG_REASON="${NOEZEMA_DEV_CONFIG_REASON:-T7.80 dev-stand: activate config-v18 (model.reasoning_by_phase: the curator, extractor and verifier answers are asked without engine reasoning because those answers are long structured JSON under a fixed output limit; explorer and planner keep it; step limit, curator-v8, explorer-v9, thresholds and token budgets unchanged from config-v17)}"
 NODE_OWNER="${NOEZEMA_DEV_NODE_OWNER:-dev-stand}"
 
 DRY_RUN=false
@@ -321,7 +339,7 @@ resolve_db_port
 say "NOEZEMA dev stand bootstrap (T7.59(b))"
 note "repo=$REPO_ROOT app=$APP_DIR user=$STAND_USER:$STAND_GROUP data_root=$DATA_ROOT"
 note "db=$DB_CONTAINER/$DB_NAME on 127.0.0.1:$DB_PORT · sandbox_image=$SANDBOX_IMAGE executor=$TOOL_EXECUTOR"
-note "web=$WEB_HOST:$WEB_PORT · llm=$LLM_BASE_URL model=$LLM_MODEL schema_profile=$LLM_SCHEMA_PROFILE max_out=$LLM_MAX_OUTPUT_TOKENS timeout=$LLM_TIMEOUT_SECONDS"
+note "web=$WEB_HOST:$WEB_PORT · llm=$LLM_BASE_URL model=$LLM_MODEL schema_profile=$LLM_SCHEMA_PROFILE reasoning_profile=$LLM_REASONING_PROFILE max_out=$LLM_MAX_OUTPUT_TOKENS timeout=$LLM_TIMEOUT_SECONDS"
 note "env_file=$ENV_FILE (0600, owner $STAND_USER) dry_run=$DRY_RUN force=$FORCE units=$WITH_UNITS"
 
 # ── 1. packages: docker + python >= 3.11 + uv ─────────────────────────────────────────
@@ -485,6 +503,10 @@ step_env_file() {
     echo "NOEZEMA_LLM_BASE_URL=$LLM_BASE_URL"
     echo "NOEZEMA_LLM_MODEL=$LLM_MODEL"
     echo "NOEZEMA_LLM_SCHEMA_PROFILE=$LLM_SCHEMA_PROFILE"
+    # T7.80: without this line the stand keeps profile "none" — no reasoning parameter is ever
+    # sent, and a truncated curator answer stays an immediate honest failure instead of one
+    # reasoning-off retry. Set NOEZEMA_DEV_LLM_REASONING_PROFILE=halogen on the halogen node.
+    echo "NOEZEMA_LLM_REASONING_PROFILE=$LLM_REASONING_PROFILE"
     echo "NOEZEMA_LLM_MAX_OUTPUT_TOKENS=$LLM_MAX_OUTPUT_TOKENS"
     echo "NOEZEMA_LLM_TIMEOUT_SECONDS=$LLM_TIMEOUT_SECONDS"
     echo "NOEZEMA_TOOL_EXECUTOR=$TOOL_EXECUTOR"

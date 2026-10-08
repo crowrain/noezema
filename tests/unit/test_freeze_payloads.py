@@ -554,3 +554,110 @@ def test_earlier_payloads_are_untouched_by_the_v17_activation() -> None:
     }.items():
         raw = (REPO_ROOT / "docs" / "eval" / name).read_text(encoding="utf-8")
         assert hashlib.sha256(raw.encode()).hexdigest() == digest, name
+
+
+# ─── config-v18 (T7.80): ровно политика рассуждения по фазам в разделе model ──────
+
+
+@pytest.mark.unit
+def test_config_v18_differs_from_v17_only_by_the_reasoning_policy() -> None:
+    """T7.80: config-v18 = config-v17 ровно с одной правкой — новый ключ `model.reasoning_by_phase`
+    (ADR-0030): куратору, экстрактору и верификатору ответ запрашивается без рассуждения движка
+    (их ответы — длинные структурированные документы под одним потолком; замер 1d0886fa: три ответа
+    ровно по 8192 completion tokens с finish_reason=length), исследователю и планировщику рассуждение
+    оставляется. Всё остальное — байт в байт v17, включая `model.max_output_tokens` = 8192: у halogen
+    комната ответа фиксирована, поэтому raising потолка не убирает обрезку, а лишь переносит её.
+    Пороги, claim_type_rules, token-бюджеты, лимит шагов, окна модели, research_proxy, список
+    инструментов и пины промптов задача не трогала (гейтов и правил группировки не добавляла).
+    v17 остаётся закоммичен и является откатом."""
+    from packages.llm_gateway.reasoning_compat import resolve_reasoning_policy
+
+    v17 = _load("config-v17-payload.json")
+    v18 = _load("config-v18-payload.json")
+
+    assert set(v18) == set(v17), "у payload'а появился новый раздел"
+    assert {k for k in v18 if v18[k] != v17[k]} == {"model"}
+
+    model17, model18 = v17["model"], v18["model"]
+    assert set(model18) - set(model17) == {"reasoning_by_phase"}, sorted(set(model18) - set(model17))
+    assert set(model17) - set(model18) == set(), "из v17 ничего не удалено"
+    assert model18["reasoning_by_phase"] == {
+        "consolidation": "off",
+        "extraction": "off",
+        "exploration": "on",
+        "planning": "on",
+        "verification": "off",
+    }
+    for key in sorted(set(model17)):
+        assert model18[key] == model17[key], key
+
+    policy = resolve_reasoning_policy(model18)
+    assert policy.mode_for("consolidation") == "off"
+    assert policy.mode_for("exploration") == "on"
+    # потолок вывода не поднят (комната ответа halogen фиксирована — замер T7.80)
+    assert model18["max_output_tokens"] == 8192, model18["max_output_tokens"]
+
+    for section in sorted(set(v17) - {"model"}):
+        assert v18[section] == v17[section], section
+    assert v18["session_limits"]["max_explorer_steps"] == 16
+
+    resolved = resolve_prompts(v18["prompts"], REPO_ROOT)
+    assert resolved[Role.EXPLORER].version == "explorer-v9"
+    assert resolved[Role.CURATOR].version == "curator-v8"
+
+    budgets = TokenBudgets.from_snapshot(v18["model"], v18["token_budgets"])
+    assert budgets.section_limits == EVAL2_SECTIONS
+    assert budgets.validate() == []
+
+
+@pytest.mark.unit
+def test_config_v18_policy_is_accepted_by_activation_validation() -> None:
+    """Payload проходит ту же проверку, которой его проверяет активация (§5.4.1): фазы замкнуты,
+    режимы "on"/"off". Кривые варианты обязаны быть отвергнуты до публикации снапшота."""
+    from packages.llm_gateway.reasoning_compat import reasoning_payload_problems
+
+    v18 = _load("config-v18-payload.json")
+    assert reasoning_payload_problems(v18) == []
+
+    broken_phase = json.loads(json.dumps(v18))
+    broken_phase["model"]["reasoning_by_phase"] = {"curating": "sometimes"}
+    problems = reasoning_payload_problems(broken_phase)
+    assert problems, "кривая фаза не замечена"
+    assert any("curating" in problem for problem in problems), problems
+
+    broken_mode = json.loads(json.dumps(v18))
+    broken_mode["model"]["reasoning_by_phase"] = {"consolidation": True}
+    assert reasoning_payload_problems(broken_mode), "нережим 'on'/'off' не замечен"
+
+    # payload'ы до v18 не обязаны иметь этот ключ: отсутствие политики — прежнее поведение
+    assert reasoning_payload_problems(_load("config-v17-payload.json")) == []
+
+
+@pytest.mark.unit
+def test_config_v18_file_is_byte_stable_and_pinned() -> None:
+    """Идентичность v18 закреплена: хеш файла и canonical-хеш (последний попадает в
+    ``config_snapshots.payload_sha256`` — AGENTS §8)."""
+    import hashlib
+
+    from packages.domain.config import canonical_sha256
+
+    raw = (REPO_ROOT / "docs" / "eval" / "config-v18-payload.json").read_text(encoding="utf-8")
+    payload = json.loads(raw)
+    assert json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True) + "\n" == raw
+    assert hashlib.sha256(raw.encode()).hexdigest() == (
+        "3cbd70840ad6c7454234666daf44d9e2befde9281cc822b554fa71d7f28b2009"
+    )
+    assert canonical_sha256(payload) == "b5605e4eb04d610ca387f732bfa35f4571750fd4370013f2f2a0e8e7e45f9dec"
+
+
+@pytest.mark.unit
+def test_earlier_payloads_are_untouched_by_the_v18_activation() -> None:
+    """v17 и v16 не переписаны задним числом (AGENTS §8): v17 — штатный откат v18."""
+    import hashlib
+
+    for name, digest in {
+        "config-v17-payload.json": "3d51cefc6c2193ad61627325f70bc433156495455c9eef80a60c0f9d38304a86",
+        "config-v16-payload.json": "79d63b2d380775621495ad2445ce3610484c8ce5fd3c5f857f65f26a7817d131",
+    }.items():
+        raw = (REPO_ROOT / "docs" / "eval" / name).read_text(encoding="utf-8")
+        assert hashlib.sha256(raw.encode()).hexdigest() == digest, name
