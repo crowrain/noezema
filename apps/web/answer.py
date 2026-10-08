@@ -44,7 +44,7 @@ from apps.web.knowledge import (
 )
 from apps.web.reliability import LEVEL_VERIFIED, describe_verification
 from packages.domain.models.base import JsonDict
-from packages.domain.models.enums import QuestionState, SessionState
+from packages.domain.models.enums import AuditEventType, QuestionState, SessionState
 from packages.domain.sanitization import mask_nul
 
 #: Короткий рассказ о работе: не больше шести шагов (дизайн упрощения интерфейса).
@@ -60,6 +60,10 @@ _STEP_UNSAFE: Final = re.compile(r"§|\bT\d+\.\d+\b|[0-9a-fA-F]{16,}|\b[a-z][a-z
 MAX_SESSIONS: Final = 25
 #: Сколько событий ленты дочитываем у одной сессии (как в GET /api/v1/sessions/{id}).
 MAX_EVENTS: Final = 500
+#: T7.82 (B): оборонительный потолок строк «использовано из знаний» на карточке
+#: (пишущий потолок держит хост в `_curator`; читатель не должен зависеть от того,
+#: что когда-то лежит в payload).
+MAX_RELIED_CLAIMS: Final = 16
 
 #: Закрытые наборы ключей этого модуля: тест полноты `tests/unit/test_web_labels.py`
 #: краснеет, если новый ключ появился здесь, но не получил подпись в словаре.
@@ -88,7 +92,11 @@ RESULT_KINDS: Final[tuple[str, ...]] = (
 #: `claim_relation`. `created` строку создала сессия этого вопроса; `reverified` —
 #: сессия перепроверяла уже записанное (событие `claim_reverified` этой же сессии);
 #: `reused` — сессия оценила уже записанное без события перепроверки (дедуп-повтор, T7.9).
-RELATION_KEYS: Final[tuple[str, ...]] = ("created", "reverified", "reused")
+#: T7.82 (B, ADR-0032): `relied` — куратор этого ответа оперся на уже записанное
+#: утверждение из контекста, не перепроверяя его (факт из payload события CLAIM_CREATED;
+#: строка claims и её оценка не менялись). В `touched_claims_cte`/итогах вопроса
+#: `relied` не участвует: это отношение отдельного блока карточки, не связь оценки.
+RELATION_KEYS: Final[tuple[str, ...]] = ("created", "reverified", "reused", "relied")
 #: Убедительность отношения для итога вопроса: созданное важнее перепроверенного,
 #: перепроверенное — важнее принятого повторно. Используется и в SQL (`relation_rank_sql`).
 RELATION_PRECEDENCE: Final[dict[str, int]] = {key: rank for rank, key in enumerate(RELATION_KEYS)}
@@ -726,6 +734,63 @@ async def _reverify_assessment_pairs(
     )
 
 
+async def _relied_claims_rows(db: AsyncSession, session_ids: Sequence[str]) -> list[Any]:
+    """Утверждения, на которые куратор этого ответа оперся без перепроверки (T7.82 (B)).
+
+    Долговременный источник — уже существующее событие `claim_created` сессий этого
+    вопроса: хост записывает в его payload разрешённые id контекста (`relied_claim_ids`,
+    полные UUID; отказанные id лежат в `relied_claims_rejected` и строками не становятся).
+    New columns or event types are not needed — and rows are read via JOIN to `claims`:
+    a record may point at a row whose assessment changed since then — the card shows its
+    CURRENT value on the same rules as other rows, it doesn't recompute anything here.
+    """
+    if not session_ids:
+        return []
+    clause, params = _in_params("s", session_ids)
+    params["t"] = AuditEventType.CLAIM_CREATED.value
+    params["limit"] = MAX_RELIED_CLAIMS
+    return list(
+        (
+            await db.execute(
+                text(
+                    f"""
+                    WITH ev AS (
+                        SELECT a.session_id,
+                               jsonb_array_elements_text(a.payload -> 'relied_claim_ids') AS claim_ref
+                        FROM audit_events a
+                        WHERE a.type = :t AND a.session_id IN ({clause})
+                        ORDER BY a.sequence DESC
+                        LIMIT 200
+                    ),
+                    refs AS (
+                        SELECT DISTINCT claim_ref, session_id
+                        FROM ev
+                        WHERE claim_ref ~* '^[0-9a-f]{{8}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{12}}$'
+                    )
+                    SELECT DISTINCT ON (c.id)
+                           c.id, c.statement, c.claim_type, c.freshness_status,
+                           c.created_in_session, c.created_at, refs.session_id AS relied_in_session,
+                           COALESCE(h.assessment_state, 'none') AS head_state,
+                           h.epistemic_status, a.effective_grade, a.confidence,
+                           a.id AS assessment_id
+                    FROM refs
+                    JOIN claims c ON c.id::text = refs.claim_ref
+                    LEFT JOIN claim_assessment_heads h
+                           ON h.claim_id = c.id
+                          AND h.config_snapshot_id = {EFFECTIVE_SNAPSHOT_SQL}
+                    LEFT JOIN claim_assessments a ON a.id = h.current_assessment_id
+                    ORDER BY c.id, refs.session_id DESC
+                    LIMIT :limit
+                    """
+                ),
+                params,
+            )
+        )
+        .mappings()
+        .all()
+    )
+
+
 async def question_answer(db: AsyncSession, question_id: uuid.UUID) -> JsonDict | None:
     """Собрать карточку ответа на вопрос. `None` — вопроса нет (эндпоинт ответит 404).
 
@@ -777,6 +842,7 @@ async def question_answer(db: AsyncSession, question_id: uuid.UUID) -> JsonDict 
 
     claims: list[JsonDict] = []
     other_claims: list[JsonDict] = []
+    relied_claims: list[JsonDict] = []
     evidence_rows: list[Any] = []
     touched_by_claim: dict[str, str] = {}
     if session_ids:
@@ -814,9 +880,18 @@ async def question_answer(db: AsyncSession, question_id: uuid.UUID) -> JsonDict 
         )
         rules = await effective_claim_rules(db)
         claim_ids = [str(row["id"]) for row in claim_rows]
+        # T7.82 (B): строки, на которые ответ оперся, не создавая и не перепроверяя их.
+        # Утверждения, уже затронутые этим вопросом (создано/перепроверено/повторно),
+        # из блока исключаются: карточка не показывает одно и то же дважды.
+        relied_rows = [
+            row
+            for row in await _relied_claims_rows(db, session_ids)
+            if str(row["id"]) not in {str(row2["id"]) for row2 in claim_rows}
+        ]
+        evidence_claim_ids = [*claim_ids, *[str(row["id"]) for row in relied_rows]]
         by_claim: dict[str, list[Mapping[str, Any]]] = {}
-        if claim_ids:
-            evidence_clause, evidence_params = _in_params("c", claim_ids)
+        if evidence_claim_ids:
+            evidence_clause, evidence_params = _in_params("c", evidence_claim_ids)
             evidence_rows = list(
                 (
                     await db.execute(
@@ -921,6 +996,44 @@ async def question_answer(db: AsyncSession, question_id: uuid.UUID) -> JsonDict 
             else:
                 other_claims.append(item)
 
+        # T7.82 (B): отдельный блок карточки — существующее знание, на которое опёрся
+        # ответ этого вопроса (факт из payload события claim_created; ADR-0032).
+        # Ни перепроверки, ни новой оценки здесь нет: grade/as_of/scope показываются как
+        # есть — тем же `assessment_view` по текущей голове.
+        for row in relied_rows:
+            claim_id = str(row["id"])
+            head_state = str(row["head_state"])
+            item = {
+                "id": claim_id,
+                "statement": row["statement"],
+                "claim_type": row["claim_type"],
+                "head_state": head_state,
+                "created_in_session": (
+                    str(row["created_in_session"]) if row["created_in_session"] else None
+                ),
+                "created_at": _iso(row["created_at"]),
+                "relation": "relied",
+                "relation_label": _phrase("claim_relation", "relied"),
+                "relation_hint": ui_labels.describe("claim_relation", "relied")["hint"],
+            }
+            item.update(
+                assessment_view(
+                    claim_type=row["claim_type"],
+                    head_state=head_state,
+                    epistemic_status=row["epistemic_status"],
+                    effective_grade=row["effective_grade"],
+                    freshness_status=row["freshness_status"],
+                    rules=rules,
+                )
+            )
+            item["verification"] = describe_verification(by_claim.get(claim_id, []))
+            badge = item.get("reliability")
+            level = badge.get("level") if isinstance(badge, Mapping) else None
+            lead_key = "verified" if level == LEVEL_VERIFIED else "unconfirmed"
+            item["verification_lead"] = ui_labels.describe("verification_lead", lead_key)["label"]
+            item["active"] = head_state == "current"
+            relied_claims.append(item)
+
     # шаги рассказывают про ТУ работу, которая дала ответ; её нет — про последнюю сессию.
     # T7.74: для перепроверенного или принятого повторно утверждения такая работа — сессия
     # этого вопроса, а не та, что записала строку в прошлом (она другому вопросу).
@@ -1013,6 +1126,9 @@ async def question_answer(db: AsyncSession, question_id: uuid.UUID) -> JsonDict 
         "result": result,
         "claims": claims,
         "other_claims": other_claims,
+        # T7.82 (B): «использовано из знаний» — отдельный блок под записанными
+        # утверждениями; ни одной новой колонки или события для него не заводилось.
+        "relied_claims": relied_claims,
         "steps": steps,
         "honesty": honesty,
         "work": {

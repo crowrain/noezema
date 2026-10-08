@@ -100,6 +100,13 @@ class CuratorProposal(BaseModel):
     claims: list[ClaimProposal] = Field(default_factory=list)
     evidence_links: list[EvidenceLink] = Field(default_factory=list)
     new_questions: list[QuestionProposal] = Field(default_factory=list)
+    # T7.82 (B), ADR-0032: id СУЩЕСТВУЮЩИХ claim этого контекст-пака, на которые
+    # опирается ответ, без перепроверки и без новой оценки (факультативное поле
+    # prompt curator-v9). Никакого лимита в схеме нет специально: лишнее и мусорное
+    # отбраковывает не pydantic-гейт всего предложения, а хостовый разрешатель в
+    # _curator — честной отказной пометкой в payload уже существующего события
+    # CLAIM_CREATED. Ни staging-операций, ни новых типов событий это поле не заводит.
+    relied_claim_ids: list[str] = Field(default_factory=list)
 
     def validate_against(self, evidence_count: int, questions_max: int = 4) -> list[str]:
         """Host-side validation of references and budgets. Returns problem

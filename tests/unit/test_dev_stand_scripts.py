@@ -604,62 +604,71 @@ class TestDevStandStatusSearch:
 
 
 class TestDevStandConfigVersion:
-    """Стенд по умолчанию поднимает актуальную конфигурацию, а предыдущая остаётся откатом (T7.77 → T7.80).
+    """Стенд по умолчанию поднимает актуальную конфигурацию, а предыдущая остаётся откатом
+    (T7.77 → T7.80 → T7.82(б)).
 
     Это не косметика: менеджер, повторяющий `bootstrap.sh` на .92, активирует ровно тот payload,
     который закреплён дефолтом скрипта. Если дефолт и откат перепутаны местами, стенд молча вернётся
     на прежнюю конфигурацию — и следующий замер это измерит не там.
     """
 
+    V19 = "config-v19-payload.json"
     V18 = "config-v18-payload.json"
     V17 = "config-v17-payload.json"
     V16 = "config-v16-payload.json"
     V15 = "config-v15-payload.json"
     #: как эти файлы названы в скриптах (они указывают на payload через $REPO_ROOT)
+    V19_REF = "docs/eval/config-v19-payload.json"
     V18_REF = "docs/eval/config-v18-payload.json"
     V17_REF = "docs/eval/config-v17-payload.json"
     V16_REF = "docs/eval/config-v16-payload.json"
     V15_REF = "docs/eval/config-v15-payload.json"
     #: canonical-хеші payload'ов: именно они попадают в `config_snapshots.payload_sha256` (AGENTS §8),
     #  в скриптах и README они названы короткими префиксами — оператор сверяет head по ним
+    V19_CANONICAL = "4d76c000"
     V18_CANONICAL = "b5605e4e"
     V17_CANONICAL = "5c402f4d"
     V16_CANONICAL = "740ae9a1"
     V15_CANONICAL = "b3801812"
 
-    def test_bootstrap_defaults_to_config_v18_and_names_v17_as_the_rollback(self) -> None:
+    def test_bootstrap_defaults_to_config_v19_and_names_v18_as_the_rollback(self) -> None:
         text = BOOTSTRAP.read_text(encoding="utf-8")
 
-        assert f'CONFIG_PAYLOAD="${{NOEZEMA_DEV_CONFIG_PAYLOAD:-$REPO_ROOT/{self.V18_REF}}}"' in text
+        assert f'CONFIG_PAYLOAD="${{NOEZEMA_DEV_CONFIG_PAYLOAD:-$REPO_ROOT/{self.V19_REF}}}"' in text
         # откат обязан быть назван явно: прежнему payload'у принадлежит canonical-хеш, не хеш файла
-        rollback_line = next(line for line in text.splitlines() if self.V17_REF in line)
-        assert "NOEZEMA_DEV_CONFIG_PAYLOAD" in rollback_line
-        assert self.V17_CANONICAL in text
-        # причина активации говорит, что именно изменилось (политика рассуждения по фазам),
-        # а не «обновили конфиг»; и что потолок вывода НЕ поднят
+        rollback_line = next(
+            line
+            for line in text.splitlines()
+            if self.V18_REF in line and "NOEZEMA_DEV_CONFIG_PAYLOAD" in line
+        )
+        assert self.V18_REF in rollback_line
+        assert self.V18_CANONICAL in text and self.V19_CANONICAL in text
+        # причина активации говорит, что именно изменилось (пин куратора и новое факультативное
+        # поле ответа), а не «обновили конфиг»
         reason = next(line for line in text.splitlines() if line.startswith("CONFIG_REASON="))
-        assert "config-v18" in reason and "reasoning_by_phase" in reason
-        # лимит шагов, пины и бюджеты v18 не трогает — причина говорит об этом прямо
+        assert "config-v19" in reason and "relied_claim_ids" in reason
+        # лимит шагов, пороги и бюджеты v19 не трогает — причина говорит об этом прямо
         assert "unchanged" in reason
 
     def test_reset_db_reactivates_the_same_config_as_bootstrap(self) -> None:
         script = (REPO_ROOT / "deploy" / "dev-stand" / "reset-db.sh").read_text(encoding="utf-8")
 
-        assert f'CONFIG_PAYLOAD="${{NOEZEMA_DEV_CONFIG_PAYLOAD:-$REPO_ROOT/{self.V18_REF}}}"' in script
-        assert self.V17_REF in script  # откат не потерян и после сброса базы
-        assert "config-v18" in script
+        assert f'CONFIG_PAYLOAD="${{NOEZEMA_DEV_CONFIG_PAYLOAD:-$REPO_ROOT/{self.V19_REF}}}"' in script
+        assert self.V18_REF in script  # откат не потерян и после сброса базы
+        assert "config-v19" in script
 
     def test_readme_documents_the_activation_and_the_rollback_with_canonical_hashes(self) -> None:
         text = (REPO_ROOT / "deploy" / "dev-stand" / "README.md").read_text(encoding="utf-8")
 
+        assert self.V19_CANONICAL in text
         assert self.V18_CANONICAL in text
         assert self.V17_CANONICAL in text
-        assert "config-v18-payload.json" in text
-        assert "docs/eval/config-v17-payload.json" in text
+        assert "config-v19-payload.json" in text
+        assert "docs/eval/config-v18-payload.json" in text
         # активация — команда менеджера с drain, а не тихая правка снапшота
         assert "activate-online" in text and "--drain-wait-seconds 120" in text
 
-    def test_config_v18_payload_file_exists_next_to_the_older_ones(self) -> None:
+    def test_config_v19_payload_file_exists_next_to_the_older_ones(self) -> None:
         """Новый номер конфигурации = новый файл, прежние не переписываются (AGENTS §8)."""
         for name in (
             "config-v13-payload.json",
@@ -668,9 +677,30 @@ class TestDevStandConfigVersion:
             self.V16,
             self.V17,
             self.V18,
+            self.V19,
         ):
             path = REPO_ROOT / "docs" / "eval" / name
             assert path.is_file(), name
+
+    def test_config_v19_is_config_v18_with_one_curator_pin(self) -> None:
+        """T7.82(б): единственная правка v19 — пин `prompts.curator` → curator-v9; canonical-хеш
+        payload'а (то, что попадает в config_snapshots.payload_sha256) закреплён и проверен на
+        живом файле; payload'ы v1…v18 не переписаны."""
+        import json
+
+        from packages.domain.canonical import canonical_sha256
+        from packages.llm_gateway.roles import Role, resolve_prompts
+
+        v18 = json.loads((REPO_ROOT / "docs" / "eval" / self.V18).read_text(encoding="utf-8"))
+        v19 = json.loads((REPO_ROOT / "docs" / "eval" / self.V19).read_text(encoding="utf-8"))
+        assert {k for k in v19 if v19[k] != v18[k]} == {"prompts"}
+        assert {r for r in v19["prompts"] if v19["prompts"][r] != v18["prompts"][r]} == {"curator"}
+        assert canonical_sha256(v19).startswith(self.V19_CANONICAL)
+        resolved = resolve_prompts(v19["prompts"], REPO_ROOT)
+        assert resolved[Role.CURATOR].version == "curator-v9"
+        assert resolved[Role.EXPLORER].version == "explorer-v9"
+        # v18 остаётся ровно прежним canonical (прежние payload'ы не переписываются)
+        assert canonical_sha256(v18).startswith(self.V18_CANONICAL)
 
 
 class TestDevStandReasoningProfile:
@@ -712,7 +742,7 @@ class TestDevStandReasoningProfile:
         text = BOOTSTRAP.read_text(encoding="utf-8")
         assert 'NOEZEMA_DEV_LLM_REASONING_PROFILE:-none' in text
 
-        payload = json.loads((REPO_ROOT / "docs" / "eval" / "config-v18-payload.json").read_text(encoding="utf-8"))
+        payload = json.loads((REPO_ROOT / "docs" / "eval" / "config-v19-payload.json").read_text(encoding="utf-8"))
         assert sorted(payload["model"]["reasoning_by_phase"]) == [
             "consolidation",
             "exploration",

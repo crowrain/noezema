@@ -190,6 +190,11 @@ TOOL_REPEAT_DENY_LIMIT = 2
 RATIONALE_SIGNAL_STEPS = 8
 RATIONALE_SIGNAL_CHARS = 6_000
 
+#: T7.82 (B), ADR-0032: host-side cap on relied claim ids recorded per session
+#: (куратор может перечислять много — карточка и payload должны оставаться
+#: предсказуемыми; сверх потолка id честно записывается отказной причиной).
+RELIED_CLAIMS_LIMIT = 8
+
 
 def filter_offered_tools(base_tools: list[str], *, has_message: bool) -> list[str]:
     """T7.13 (EVAL-3b P.6): the per-step tool list the explorer is shown.
@@ -2737,6 +2742,36 @@ class Orchestrator:
                 reverify_anchor_types[i] = str(anchor_type[0])
                 claims_for_validation[i]["claim_type"] = str(anchor_type[0])
 
+        # T7.82 (B), ADR-0032: опора на существующее знание (факультативное поле
+        # curator-v9). Хост принимает ТОЛЬКО id, видимые в контекст-паке этой сессии —
+        # тот же разрешатель, что у перепроверки (полный UUID или единственный
+        # hex-префикс). Это не перепроверка: ни claim_reverified, ни новой оценки, ни
+        # staging-операций. Разрешённые id и честные отказы записываются в payload уже
+        # существующего события CLAIM_CREATED — нового типа события и миграции нет,
+        # отказ отдельных id не отменяет остальное предложение (в отличие от того же
+        # гейта перепроверки: там спорный id блокирует всё предложение).
+        relied_claim_ids: list[str] = []
+        relied_claims_rejected: list[str] = []
+        if proposal.relied_claim_ids:
+            from packages.memory.service import resolve_claim_reference as _resolve_relied
+
+            visible_pack_ids = _pack_claim_ids(knowledge)
+            seen_relied: set[uuid.UUID] = set()
+            for k, raw_ref in enumerate(proposal.relied_claim_ids):
+                ref_id, ref_problem = _resolve_relied(raw_ref, visible_pack_ids)
+                if ref_id is None or ref_problem is not None:
+                    relied_claims_rejected.append(f"rely[{k}]: {ref_problem}")
+                    continue
+                if ref_id in seen_relied:
+                    continue  # дубл одного id — не повод шуметь в отказы
+                if len(relied_claim_ids) >= RELIED_CLAIMS_LIMIT:
+                    relied_claims_rejected.append(
+                        f"rely[{k}]: more than {RELIED_CLAIMS_LIMIT} relied ids"
+                    )
+                    continue
+                seen_relied.add(ref_id)
+                relied_claim_ids.append(str(ref_id))
+
         # T7.9 (EVAL-3b post-mortem P.2, §14.1): the rules engine
         # pre-commit check — a proposal the rules engine would reject
         # (a support evidence of a kind the claim-type rule does not
@@ -2819,15 +2854,23 @@ class Orchestrator:
                 proposed_questions=1,
             )
 
+        claim_event_payload: JsonDict = {
+            "claims": [c.model_dump(mode="json") for c in proposal.claims],
+            "evidence_links": [link.model_dump() for link in proposal.evidence_links],
+            "new_questions": [q.model_dump(mode="json") for q in proposal.new_questions],
+            "summary": proposal.summary,
+        }
+        # T7.82 (B), ADR-0032: факт «ответ оперся на эти строки знания» живёт в payload
+        # уже существующего события; ключи появляются только когда поле было непустым —
+        # прежние сессии и их аудит остаются байт-в-байт прежними.
+        if relied_claim_ids:
+            claim_event_payload["relied_claim_ids"] = relied_claim_ids
+        if relied_claims_rejected:
+            claim_event_payload["relied_claims_rejected"] = relied_claims_rejected[:10]
         await audit.record(
             AuditEventType.CLAIM_CREATED,
             session_id=session.id,
-            payload={
-                "claims": [c.model_dump(mode="json") for c in proposal.claims],
-                "evidence_links": [link.model_dump() for link in proposal.evidence_links],
-                "new_questions": [q.model_dump(mode="json") for q in proposal.new_questions],
-                "summary": proposal.summary,
-            },
+            payload=claim_event_payload,
             public_summary=f"curator: {len(proposal.claims)} claims, {len(proposal.new_questions)} questions",
         )
         return len(proposal.claims), len(proposal.new_questions)

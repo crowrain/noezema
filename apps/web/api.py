@@ -569,7 +569,8 @@ _ANSWER_HTML = """<!doctype html>
  <div class="muted" id="q-meta"></div></div>
 <div class="card"><b>Ответ</b><div id="answer"></div>
  <p class="muted" id="answer-note"></p>
- <div id="other-answers"></div></div>
+ <div id="other-answers"></div>
+ <div id="relied-answers"></div></div>
 <div class="card"><b>Как это получено</b><ol id="steps"></ol>
  <p class="muted" id="steps-note"></p>
  <details id="engineer-details"><summary>подробно (для инженера)</summary>
@@ -653,6 +654,11 @@ function render(d){
     otherBox.appendChild(head);
     for(const claim of others) otherBox.appendChild(renderClaim(claim,true));
   }
+  // T7.82 (B): «использовано из знаний» — серверная подпись отношения у каждой строки,
+  // своей надписи в JS нет; блок идёт под записанными выводами этого вопроса.
+  const reliedBox=document.getElementById('relied-answers');
+  reliedBox.innerHTML='';
+  for(const claim of (d.relied_claims||[])) reliedBox.appendChild(renderClaim(claim,false));
   const steps=document.getElementById('steps'); steps.innerHTML='';
   for(const step of (d.steps||[])){ const li=document.createElement('li');
     li.textContent=step.text; steps.appendChild(li); }

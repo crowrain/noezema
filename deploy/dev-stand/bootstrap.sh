@@ -106,7 +106,7 @@ LLM_REASONING_PROFILE="${NOEZEMA_DEV_LLM_REASONING_PROFILE:-none}"
 LLM_MAX_OUTPUT_TOKENS="${NOEZEMA_DEV_LLM_MAX_OUTPUT_TOKENS:-8192}"
 LLM_TIMEOUT_SECONDS="${NOEZEMA_DEV_LLM_TIMEOUT_SECONDS:-600}"
 
-# Activated config (T7.59(в), T7.71, T7.73, T7.76; дефолт с T7.77 — config-v17, см. ниже):
+# Activated config (T7.59(в), T7.71, T7.73, T7.76; дефолт с T7.82 — config-v19, см. ниже):
 # config-v16 = config-v15 with exactly two changes —
 # the explorer prompt pin (explorer-v8: правило 10 — спорное число проверяется двумя сторонами поиска,
 # официальным первоисточником И независимым исследованием, расхождение называется открыто либо честно
@@ -148,11 +148,18 @@ LLM_TIMEOUT_SECONDS="${NOEZEMA_DEV_LLM_TIMEOUT_SECONDS:-600}"
 # фиксированную комнату ответа (~1000 токенов), поэтому raising потолок не убирает обрезку длинного
 # JSON — он переносит место среза (замер T7.80). Сама возможность выключить рассуждение задаётся НЕ
 # payload'ом, а окружением стенда (`NOEZEMA_DEV_LLM_REASONING_PROFILE` выше): payload описывает
-# намерение, движок — способность. Откат теперь config-v17 (canonical 5c402f4d…, сам v18 —
-# b5605e4e…) и задаётся строкой `NOEZEMA_DEV_CONFIG_PAYLOAD=$REPO_ROOT/docs/eval/config-v17-payload.json`;
-# v17, v16 и v15 остаются в репо и не переписываются.
-CONFIG_PAYLOAD="${NOEZEMA_DEV_CONFIG_PAYLOAD:-$REPO_ROOT/docs/eval/config-v18-payload.json}"
-CONFIG_REASON="${NOEZEMA_DEV_CONFIG_REASON:-T7.80 dev-stand: activate config-v18 (model.reasoning_by_phase: the curator, extractor and verifier answers are asked without engine reasoning because those answers are long structured JSON under a fixed output limit; explorer and planner keep it; step limit, curator-v8, explorer-v9, thresholds and token budgets unchanged from config-v17)}"
+# намерение, движок — способность. Сам v18 (canonical b5605e4e…) остаётся в репо и не переписывается.
+# config-v19 (T7.82(б), ADR-0032) = config-v18 ровно с одной правкой: пин `prompts.curator` →
+# curator-v9 (факультативное поле ответа `relied_claim_ids` — честный перечень УЖЕ ЗАПИСАННЫХ
+# утверждений из контекст-пака, на которые опирается ответ, без перепроверки и без новой оценки;
+# хост принимает только видимые id, остальное — отказной причиной в payload уже существующего
+# события claim_created). Пороги, `reasoning_by_phase`, claim_type_rules, token-бюджеты, лимит
+# шагов (16), окна модели, research_proxy, список инструментов и explorer-v9 — байт в байт v18.
+# Откат теперь config-v18 (canonical b5605e4e…, сам v19 — 4d76c000…) и задаётся строкой
+# `NOEZEMA_DEV_CONFIG_PAYLOAD=$REPO_ROOT/docs/eval/config-v18-payload.json`;
+# v18, v17, v16 и v15 остаются в репо и не переписываются.
+CONFIG_PAYLOAD="${NOEZEMA_DEV_CONFIG_PAYLOAD:-$REPO_ROOT/docs/eval/config-v19-payload.json}"
+CONFIG_REASON="${NOEZEMA_DEV_CONFIG_REASON:-T7.82 dev-stand: activate config-v19 (= config-v18 with one change: prompts.curator pin curator-v9 — optional output field relied_claim_ids, honest listing of already-recorded claims the answer relies on, no reverify and no new assessment; reasoning_by_phase, step limit 16, explorer-v9, thresholds and token budgets unchanged from config-v18)}"
 NODE_OWNER="${NOEZEMA_DEV_NODE_OWNER:-dev-stand}"
 
 DRY_RUN=false

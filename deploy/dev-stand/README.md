@@ -24,7 +24,7 @@
 | `searxng/settings.yml` | ШАБЛОН настроек поиска (formats html+json, limiter off); `secret_key` здесь — плейсхолдер, настоящего секрета в репозитории нет |
 | `searxng-settings.sh` | рендер настроек из шаблона: генерирует `secret_key` (не печатает), повторный запуск ключ не ротирует |
 | `status.sh` | состояние: юниты, docker, очередь вопросов, последняя сессия, доступность LLM, версия кода, режим исполнителя инструментов, поиск (SearXNG + режим research_proxy снапшота) |
-| `reset-db.sh` | пересоздание dev-базы с явным подтверждением + миграции + повторная активация config-v18 |
+| `reset-db.sh` | пересоздание dev-базы с явным подтверждением + миграции + повторная активация config-v19 |
 | `README.md` | этот файл |
 
 ## Деплой (делает менеджер)
@@ -56,7 +56,7 @@ systemctl start noezema-dev.target            # web + unit-state и maint (ти�
 | приложение | репозиторий как есть (`$APP_DIR`), venv в `$APP_DIR/.venv`, зависимости **только через uv** и только prod-extras (AGENTS §6) |
 | база | docker-контейнер `noezema-dev-db` (образ `postgres:15`), том `noezema-dev-pgdata`, публикация **только на 127.0.0.1**, база `noezema-dev`, пользователь `noezema`. Порт выбирается до записи env-файла: 5432, а если на хосте он уже занят (нативный `postgresql.service`) — первый свободный из 5433..5440; выбранный порт пишется в env-файл (`NOEZEMA_DEV_DB_PORT`), повторный запуск переиспользует порт существующего контейнера. `NOEZEMA_DEV_DB_PORT=<порт>` задаёт явно: занят → понятная ошибка, а не молчаливый переезд |
 | миграции | `alembic upgrade head` из venv (URL из env-файла) |
-| конфигурация | активация `docs/eval/config-v18-payload.json` через `hostctl activate-online` (config-v18 = config-v17 ровно с одной правкой: `model.reasoning_by_phase` — куратору, экстрактору и верификатору ответ запрашивается БЕЗ рассуждения движка, исследователю и планировщику оставляется; `session_limits.max_explorer_steps = 16`, пины explorer-v9 и curator-v8, пороги, бюджеты, окно EXL3 131072 и `model.max_output_tokens = 8192` — байт в байт config-v17; пропускается, если снапшот уже активен; переход v17→v18 — STATUS.md T7.80) |
+| конфигурация | активация `docs/eval/config-v19-payload.json` через `hostctl activate-online` (config-v19 = config-v18 ровно с одной правкой: пин `prompts.curator` → **curator-v9** — факультативное поле ответа `relied_claim_ids`, честный перечень уже записанных утверждений из контекста, на которые опирается ответ, без перепроверки и без новой оценки; `model.reasoning_by_phase`, `session_limits.max_explorer_steps = 16`, пин explorer-v9, пороги, бюджеты, окно EXL3 131072 и `model.max_output_tokens = 8192` — байт в байт config-v18; canonical v19 — `4d76c000…`, откат — payload `docs/eval/config-v18-payload.json` с canonical `b5605e4e…`; пропускается, если снапшот уже активен; переход v18→v19 — STATUS.md T7.82(б), ADR-0032) |
 | данные сессий | `/var/lib/noezema-dev` (+ `sandbox` — work_root контейнерного исполнителя) |
 | host-контур стенда | `/var/lib/noezema-dev/host`, снимок юнитов: `/var/lib/noezema-dev/host/unit-state.json` |
 | секреты/настройки | `/etc/noezema/dev.env`, режим **0600**, владелец — пользователь стенда; в отчёты и чат не попадают (AGENTS §5) |
@@ -109,7 +109,7 @@ systemctl start noezema-dev.target            # web + unit-state и maint (ти�
    Postgres остаётся: `docker stop noezema-dev-db`).
 9. **Сброс:** `./deploy/dev-stand/reset-db.sh` — просит вписать имя базы (защита от «а вдруг это
    прод-база»), останавливает таймеры, пересоздаёт `noezema-dev`, накатывает миграции, заново
-   активирует config-v18, поднимает таймеры. С защитой по состоянию: если в базе есть незавершённая
+   активирует config-v19, поднимает таймеры. С защитой по состоянию: если в базе есть незавершённая
    сессия, reset откажется — сначала дождаться её терминации (или остановить tick-таймер).
 
 ## Юниты стенда (8 файлов)
@@ -493,6 +493,47 @@ sudo systemctl restart noezema-dev-web.service noezema-dev-tick.service noezema-
 .venv/bin/python -m hostctl.cli activate-online \
   --payload docs/eval/config-v17-payload.json \
   --reason "T7.80 rollback: config-v17 (no phase reasoning policy)" \
+  --drain-wait-seconds 120
+```
+
+### Опора на уже записанное знание: активация config-v19 (T7.82(б), ADR-0032)
+
+`config-v19` = `config-v18` ровно с одной правкой: пин `prompts.curator` → **curator-v9**.
+Тело промпта curator-v8 сохранено байт в байт; добавлены один пункт протокола и правило 10 —
+факультативное поле ответа `relied_claim_ids`: куратор честно перечисляет id УЖЕ ЗАПИСАННЫХ
+утверждений из своего контекста, на которые опирается ответ. Это не операция: строка claim не
+меняется, оценка не пересчитывается, `claim_reverified` не пишется. Хост принимает только id,
+видимые в контекст-паке этой сессии (тот же разрешатель, что у перепроверки: полный UUID или
+однозначный hex-префикс); выдуманный или неоднозначный id записывается отказной причиной в payload
+уже существующего события `claim_created` и не отменяет остальное предложение. Карточка вопроса
+показывает такие строки отдельной связью «использовано из знаний» под записанными выводами.
+
+Для узла, уже работавшего на v18, активации достаточно — нового окружения, миграций и рестарта
+юнитов правка не требует (промпт читается из снапшота):
+
+```bash
+cd ~/noezema && git pull            # пакет с docs/eval/config-v19-payload.json и prompts/curator/curator-v9.md
+.venv/bin/python -m hostctl.cli activate-online \
+  --payload docs/eval/config-v19-payload.json \
+  --reason "T7.82(б): curator-v9 pin — relied_claim_ids (reliance on already-recorded claims, no reverify)" \
+  --drain-wait-seconds 120
+```
+
+Что видно после активации: `./status.sh` показывает снапшот по canonical-префиксу `4d76c000`
+(полный canonical config-v19 — `4d76c000a87395b0887eedfcee4a25f58c3c3dde2f390b7dbe2140c189a8ce3d`;
+в `config_snapshots.payload_sha256` попадает canonical, не хеш файла), а у сессий curator-v9 в
+ленте `claim_created` payload может содержать `relied_claim_ids` (и `relied_claims_rejected` —
+честные отказы). Проверочный вопрос — тот же, что выявил дефект на сессии f0d7e844: годовая
+инфляция 2025 по независимым оценкам; если ответ опирается на уже записанное утверждение, карточка
+вопроса показывает его строкой с подписью «использовано из знаний», а не только два новых claims.
+
+Откат — активация payload'а v18 (он закоммичен и не менялся, canonical
+`b5605e4eb04d610ca387f732bfa35f4571750fd4370013f2f2a0e8e7e45f9dec`):
+
+```bash
+.venv/bin/python -m hostctl.cli activate-online \
+  --payload docs/eval/config-v18-payload.json \
+  --reason "T7.82(б) rollback: config-v18 (curator-v8, no relied_claim_ids field)" \
   --drain-wait-seconds 120
 ```
 
