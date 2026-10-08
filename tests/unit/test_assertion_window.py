@@ -52,6 +52,7 @@ from pathlib import Path
 
 from apps.orchestrator.assertion_window import (
     AssertionWindow,
+    anchor_signals,
     extract_terms,
     question_value_terms,
     researcher_quote_terms,
@@ -73,6 +74,7 @@ UN_ORG_SHA = "14b070da98f1de9ef58f0591d552083473aa3544f10c7212a32da8eb91dd82eb"
 CBR_SHA = "7ba64093e4f4ded43a712c89a61ac5e11e26c51d700e09e9bfd7be27ad80971c"
 ARTIFACTS = Path(__file__).resolve().parent.parent / "fixtures" / "artifacts"
 BUDGET = 2_000  # == apps.orchestrator.evidence.SOURCE_ASSERTION_TEXT_BUDGET
+LEAD = 300  # == assertion_window._LEAD: хвост текста перед и после точного якоря
 
 
 def _eu_question() -> str:
@@ -295,6 +297,7 @@ def test_artifact_integrity() -> None:
         WORLD_POPULATION_SHA,
         UN_LIST_SHA,
         HABR_SHA,
+        CBR_CPD_SHA,
     ):
         data = (ARTIFACTS / sha[:2] / sha).read_bytes()
         assert hashlib.sha256(data).hexdigest() == sha, f"fixture {sha[:12]} corrupt"
@@ -872,3 +875,322 @@ def test_researcher_quote_terms_caps_and_filters_chrome() -> None:
     assert _folded("абзац источника с длинной фразой, которую исследователь процитировал дословно") not in quotes
     # слишком короткая подстрока — не цитата
     assert researcher_quote_terms("коротко", source) == []
+
+
+# ─── T7.79a (ADR-0011 §10 уточнение): цитата фиксирует окно, границы числа, специфичность ───
+#
+# Стенд .92, сессия 9c4d3a24 (halogen), страница
+# cbr.ru/analytics/dkp/dinamic/CPD_2025-12/ (сохранённый нормализованный текст —
+# фикстура CBR_CPD_SHA): вопрос называет и точное значение (5,59%), и округлённое
+# (5,6%); исследователь цитирует фразу источника с точным значением. Терминальное
+# окно легло в таблицу/комментарий (старт 3782), «5,59» стоит на 3238 — то есть
+# ЕДИНСТВЕННОЕ вхождение значения даёт окно [2938..4938), которое пересекается с
+# терминальным. T7.79 на этом месте выбрасывал якорь entirely и слот доставался
+# общему value-якорю: второе окно начиналось на 140 (телефоны, «№ 12 (120)»,
+# даты). В фрагменте не было ни 5,59, ни процитированной фразы.
+
+CBR_CPD_SHA = "218e9a1ea998f5483b128725c7582a850695f07672976308cfdf6488feaff4ea"
+
+CBR_CPD_QUESTION = (
+    "Публикует ли Банк России точное значение годовой инфляции за 2025 год — 5,59% — или во всех "
+    "материалах только округлённое 5,6%? Укажи, в каких именно материалах ЦБ какое значение приводится."
+)
+
+# публичная rationale исследователя из сессии 9c4d3a24 (сокращена до цитаты источника):
+# дословная фраза страницы с точным значением
+CBR_CPD_QUOTE = "Годовая инфляция в декабре уменьшилась до 5,59% (в ноябре – 6,64%)"
+
+
+def _real_cbr_page() -> str:
+    return _read_artifact(CBR_CPD_SHA)
+
+
+def test_real_cbr_page_term_window_alone_misses_the_exact_value() -> None:
+    """Исходный факт, на котором построен разбор: термины вопроса плотнее всего в
+    таблице/комментарии НИЖЕ по тексту, а точное значение — выше края окна."""
+    page = _real_cbr_page()
+    value_at = page.index("5,59")
+    primary = select_assertion_window(page, CBR_CPD_QUESTION, BUDGET)
+    assert primary.start > value_at  # окно начинается после значения
+    assert "5,59" not in primary.text
+
+
+def test_real_cbr_page_quote_and_value_pin_the_window_that_carries_559() -> None:
+    """Полный вопрос + дословная цитата исследователя: одно из окон содержит «5,59%»
+    и саму процитированную фразу. Это и есть критерий whole-case: куратор должен
+    увидеть то, на что опёрся исследователь."""
+    page = _real_cbr_page()
+    quotes = researcher_quote_terms(f"В материале прямо сказано: «{CBR_CPD_QUOTE}».", page)
+    assert len(quotes) >= 1, "цитата не распознана на реальном тексте (NBSP в фразе)"
+    windows = select_assertion_windows(
+        page,
+        CBR_CPD_QUESTION,
+        BUDGET,
+        value_terms=question_value_terms(CBR_CPD_QUESTION),
+        quote_terms=quotes,
+    )
+    assert len(windows) == 2, windows
+    anchored = [w for w in windows if "5,59%" in w.text]
+    assert anchored, [w.start for w in windows]
+    for window in anchored:
+        # окно — дословный вырез оригинала: NBSP и переводы строк страницы сохранены
+        assert window.text == page[window.start : window.start + len(window.text)]
+        assert "уменьшилась" in window.text and "6,64%" in window.text
+    starts = sorted(w.start for w in windows)
+    assert all(b - a >= BUDGET for (a, b) in itertools.pairwise(starts)), starts
+
+
+def test_real_cbr_page_without_the_quote_anchors_the_exact_value_too() -> None:
+    """Тот же вопрос без цитаты: значение вопроса само по себе фиксирует окно."""
+    page = _real_cbr_page()
+    windows = select_assertion_windows(
+        page, CBR_CPD_QUESTION, BUDGET, value_terms=question_value_terms(CBR_CPD_QUESTION)
+    )
+    assert any("5,59%" in w.text for w in windows), [w.start for w in windows]
+
+
+def test_real_cbr_page_displacement_keeps_the_window_count_and_budget() -> None:
+    """Вытеснение терминального окна не добавляет третье окно и не удлиняет фрагмент:
+    суммарно ≤ 2 × budget + разделитель (ADR-0011 §5, тест бюджета секции)."""
+    page = _real_cbr_page()
+    quotes = researcher_quote_terms(f"«{CBR_CPD_QUOTE}»", page)
+    windows = select_assertion_windows(
+        page,
+        CBR_CPD_QUESTION,
+        BUDGET,
+        value_terms=question_value_terms(CBR_CPD_QUESTION),
+        quote_terms=quotes,
+    )
+    assert len(windows) == 2
+    total = sum(len(w.text) for w in windows)
+    assert total <= 2 * BUDGET + len("\n[…]\n")
+    assert max(len(w.text) for w in windows) <= BUDGET
+
+
+def test_real_cbr_page_quote_that_is_not_in_the_source_is_ignored() -> None:
+    """Цитаты из ДРУГОГО материала (в этом источнике её нет) не «дотягивают» окно:
+    поведение совпадает с запуском только по значению вопроса."""
+    page = _real_cbr_page()
+    alien = "По данным Росстата, индекс потребительских цен ускорился до 6,7% в декабре"
+    assert researcher_quote_terms(alien, page) == []
+    with_alien = select_assertion_windows(
+        page,
+        CBR_CPD_QUESTION,
+        BUDGET,
+        value_terms=question_value_terms(CBR_CPD_QUESTION),
+        quote_terms=researcher_quote_terms(alien, page),
+    )
+    without = select_assertion_windows(
+        page, CBR_CPD_QUESTION, BUDGET, value_terms=question_value_terms(CBR_CPD_QUESTION)
+    )
+    assert with_alien == without
+
+
+def test_anchor_signals_order_quotes_then_specific_values_then_dates() -> None:
+    """Порядок сигналов второго окна (ADR-0011 §10): цитата → значение → дата; внутри
+    значений более специфичное («5,59») раньше менее специфичного («5,6»), независимо
+    от того, в каком порядке вопрос их назвал."""
+    signals = anchor_signals(
+        quote_terms=["годоваяинфляциявдекабреуменьшиласьдо5,59%(вноябре–6,64%)"],
+        value_terms=["5,6", "5,59", "21.01.2026"],
+    )
+    assert [(s.kind, s.needle) for s in signals] == [
+        ("quote", "годоваяинфляциявдекабреуменьшиласьдо5,59%(вноябре–6,64%)"),
+        ("value", "5,59"),
+        ("value", "5,6"),
+        ("date", "21.01.2026"),
+    ]
+    # дата — якорь низшего класса: она есть в навигации почти каждой страницы
+    assert [(s.kind, s.needle) for s in anchor_signals((), ["21.01.2026", "5,6"])] == [
+        ("value", "5,6"),
+        ("date", "21.01.2026"),
+    ]
+
+
+def test_more_specific_value_anchors_before_the_rounded_one() -> None:
+    """Вопрос называет округлённое значение РАНЬШЕ точного; страница содержит оба, и оба стоят
+    отдельно. Якорь обязан взяться за более специфичное («5,59»): иначе окно уезжает в сводку
+    с округлением, а точное значение в фрагмент не попадает."""
+    page = (
+        "\n".join(
+            f"Банк России официально публикует точное значение годовой инфляции и пресс-релиз {i}." for i in range(28)
+        )
+        + "\n\n"
+        + "\n".join(f"Нейтральный абзац {i}: сводка без терминов вопроса." for i in range(30))
+        + "\n\nВ краткой сводке приводится округлённое значение 5,6% по итогам года.\n\n"
+        + "\n".join(f"Отдельный блок {i}: оценка устойчивости публикуется позже без цифр." for i in range(40))
+        + "\n\nГодовая инфляция в декабре снизилась до 5,59% (в ноябре – 6,64%)."
+    )
+    question = "Банк России указывает только округлённое 5,6% или точное значение 5,59%?"
+    terms = question_value_terms(question)
+    assert terms == ["5,6", "5,59"], "порядок значений в вопросе должен оставаться порядком упоминания"
+    rounded_at, exact_at = page.index("5,6"), page.index("5,59")
+    windows = select_assertion_windows(page, question, BUDGET, value_terms=terms)
+    specific = [w for w in windows if "5,59%" in w.text]
+    assert specific, [w.start for w in windows]
+    # якорь стоит на точном значении (вырез начинается не позже него и не раньше, чем за _LEAD),
+    # а отдельное округлённое значение слот не заняло
+    assert all(max(0, exact_at - LEAD) <= w.start <= exact_at for w in specific), [w.start for w in specific]
+    assert all(w.start != max(0, rounded_at - LEAD) for w in windows), [w.start for w in windows]
+
+
+def test_number_anchor_never_splits_a_larger_number() -> None:
+    """Граница числа (ADR-0011 §10 (б)): «5,6» не цепляет «15,6», «5,64» и «5,60».
+    Если ОТДЕЛЬНОГО значения на странице нет, точного якоря нет вовсе — поведение прежнее."""
+    page = (
+        "Навигация: Материалы раздела, Отобразить/Скрыть подраздел. "
+        + " ".join(["15,6%", "5,64%", "5,60%"] * 20)
+        + "\n" + "\n".join(f"Абзац {i}: мониторинг ценовой динамики продолжается." for i in range(60))
+    )
+    question = "Какое значение годовых цен приводит страница — 5,6%?"
+    terms = question_value_terms(question)
+    assert terms == ["5,6"]
+    anchored_only = select_assertion_windows(page, question, BUDGET, value_terms=terms)
+    plain = select_assertion_windows(page, question, BUDGET)
+    assert anchored_only == plain, "якорь взялся за число внутри большего числа"
+
+
+def test_number_anchor_reads_a_table_cell_as_its_own_number() -> None:
+    """Граница числа проверяется по ОРИГИНАЛЬНОМУ тексту (T7.79a (б)): ячейки таблицы
+    разделены неразрывным пробелом («8,1\\xa05,6»), а складка выбрасывает его и склеивает цифры в
+    один ряд («8,15,69,3») — на странице ЦБ «5,6» из-за этого считалась частью чужого числа и
+    точный якорь вовсе не находил значения."""
+    page = (
+        "\n".join(
+            f"Банк России официально публикует точное значение годовой инфляции и пресс-релиз {i}." for i in range(30)
+        )
+        + "\n\nПоказатели устойчивой инфляции по видам товаров, %:\n11,4\xa07,4\n9,5\xa08,8\n8,1\xa05,6\n9,3\xa05,2"
+        + "\n\nПроверочные строки: 15,6% и 5,64% и 115,6.\n\n"
+        + "\n".join(
+            f"Абзац {i}: мониторинг ценовой динамики и структура потребительских цен без цифр." for i in range(30)
+        )
+    )
+    question = "Какое значение годовой инфляции по всем товарам указано в таблице — 5,6%?"
+    cell_at = page.index("8,1\xa05,6") + 4
+    windows = select_assertion_windows(page, question, BUDGET, value_terms=question_value_terms(question))
+    anchored = [w for w in windows if "8,1\xa05,6" in w.text]
+    assert anchored, [w.start for w in windows]
+    # окно начинается у самой ячейки (не позже значения и не дальше хвоста), а не в склейке выше
+    assert all(max(0, cell_at - LEAD) <= w.start <= cell_at for w in anchored), [w.start for w in anchored]
+
+
+def test_value_already_inside_the_term_window_is_not_duplicated() -> None:
+    """Значение, которое УЖЕ целиком показывает терминальное окно, не вытесняет его:
+    дубль в доказательстве не нужен, слот остаётся за общим value-окном T7.22."""
+    page = (
+        "\n".join(f"Раздел {i}: главная страница, контакты, реклама, архив новостей." for i in range(30))
+        + "\n\n"
+        + (
+            "Мониторинг цен: годовая инфляция в декабре. Точное значение публикуется в таблице; "
+            "годовая инфляция составила 5,59% при округлённом значении показателя. "
+            "Инфляция ожиданий и динамика потребительских цен разбираются отдельно. "
+        ) * 3
+        + "\n\n"
+        + "\n".join(f"Статистика {i}: отдельный блок без терминов вопроса и без цифр." for i in range(40))
+    )
+    question = "Какое точное значение годовой инфляции публикует мониторинг — 5,59%?"
+    primary = select_assertion_window(page, question, BUDGET)
+    assert primary.start >= 0 and "5,59%" in primary.text
+    windows = select_assertion_windows(page, question, BUDGET, value_terms=question_value_terms(question))
+    assert windows[0] == primary  # терминальное окно не смещено ради значения-дубля
+
+
+def _overlap_page() -> str:
+    """Тот же дефект, что на странице ЦБ, но компактно: ключевая фраза стоит НАД
+    термино-плотным блоком, поэтому терминальное окно начинается ПОСЛЕ значения и
+    пересекается с его собственным окном. Именно это T7.79 считал основанием отбросить
+    якорь — и значение терялось совсем."""
+    chrome = "\n".join(
+        f"Контакты {i}: 8 800 300-30-00, выпуск № {12 + i % 30} (120), показатель {40 + i % 40},{i % 10}%."
+        for i in range(60)
+    )
+    filler = " ".join(f"Нейтральный абзац без терминов вопроса номер {i}." for i in range(10))
+    dense = "\n".join(
+        f"Материал {i}: Банк России официально публикует точное значение годовой инфляции и ожидания по ценам."
+        for i in range(30)
+    )
+    tail = "\n".join(f"Отдельный блок {i}: оценка устойчивости будет опубликована позже." for i in range(25))
+    key_line = f"Ключевые показатели:\n{OVERLAP_KEY_SENTENCE}"
+    return chrome + "\n\n" + key_line + "\n" + filler + "\n" + dense + "\n\n" + tail
+
+
+OVERLAP_QUESTION = (
+    "Банк России публикует ли официально точное значение 5,59%, или во всех материалах только округлённое 5,6%?"
+)
+
+OVERLAP_KEY_SENTENCE = "Годовая инфляция в декабре уменьшилась до 5,59% (в ноябре – 6,64%)."
+
+
+def test_overlap_case_without_signals_loses_the_value() -> None:
+    """Репродюсер на компактной странице: ни терминальное окно, ни общий value-якорь
+    значения не берут (это и был стендовый отказ)."""
+    page = _overlap_page()
+    primary = select_assertion_window(page, OVERLAP_QUESTION, BUDGET)
+    assert primary.start > page.index(OVERLAP_KEY_SENTENCE)  # окно начинается после фразы
+    joined = _joined(select_assertion_windows(page, OVERLAP_QUESTION, BUDGET))
+    assert "5,59%" not in joined
+
+
+def test_overlap_case_exact_signal_displaces_the_term_window() -> None:
+    """T7.79a (а): если единственное вхождение цитаты/значения даёт окно, пересекающееся с
+    терминальным, якорь ФИКСИРУЕТ это окно, а освобождённый слот занимает value-якорь."""
+    page = _overlap_page()
+    windows = select_assertion_windows(
+        page, OVERLAP_QUESTION, BUDGET, value_terms=question_value_terms(OVERLAP_QUESTION)
+    )
+    assert len(windows) == 2
+    assert any("5,59%" in w.text for w in windows), [w.start for w in windows]
+    starts = sorted(w.start for w in windows)
+    assert all(b - a >= BUDGET for (a, b) in itertools.pairwise(starts)), starts
+
+    with_quote = select_assertion_windows(
+        page,
+        OVERLAP_QUESTION,
+        BUDGET,
+        value_terms=question_value_terms(OVERLAP_QUESTION),
+        quote_terms=researcher_quote_terms(f"«{OVERLAP_KEY_SENTENCE}»", page),
+    )
+    anchored = [w for w in with_quote if OVERLAP_KEY_SENTENCE in w.text]
+    assert anchored, [w.start for w in with_quote]
+    assert len(with_quote) == 2
+
+
+def test_date_signal_yields_to_the_asked_value() -> None:
+    """Дата из формулировки вопроса — якорь низшего класса (ADR-0011 §10): список дат в
+    навигационной хронологии стоит раньше и ближе к началу, чем предложение со спрашиваемым
+    значением. Прежний код брал сигналы по порядку упоминания, и окном становилась хронология."""
+    page = (
+        "\n".join(
+            f"Материал {i}: Банк России официально публикует точное значение годовой инфляции." for i in range(26)
+        )
+        + "\n\n"
+        + "\n".join(f"Наблюдение {i} без терминов вопроса и цифр." for i in range(30))
+        + "\n\nХронология обновлений раздела: 21.01.2026, 20.01.2026, 19.01.2026, 15.01.2026.\n\n"
+        + "\n".join(f"Запись {i} без терминов вопроса и цифр." for i in range(45))
+        + "\n\nГодовая инфляция в декабре снизилась до 5,59% (в ноябре – 6,64%)."
+    )
+    question = "Банк России публиковал точное значение годовой инфляции после 21.01.2026 — какое именно: 5,59%?"
+    terms = question_value_terms(question)
+    assert terms == ["21.01.2026", "5,59"], "порядок упоминания сохранён и здесь"
+    windows = select_assertion_windows(page, question, BUDGET, value_terms=terms)
+    anchored = [w for w in windows if "5,59%" in w.text]
+    assert anchored, [w.start for w in windows]
+    # окно хронологии дат слот не заняло: в нём нет спрашиваемого значения
+    assert all("Хронология обновлений" not in w.text for w in anchored), [w.text[:80] for w in anchored]
+
+
+def test_real_cbr_page_specific_value_wins_when_question_names_the_rounded_one_first() -> None:
+    """Тот же дефект на реальном тексте в обратной формулировке вопроса (округлённое значение
+    названо раньше точного): прежнее окно уезжало в таблицу (старт 4390) плюс навигационный хром
+    (140), и «5,59%» в фрагменте отсутствовало."""
+    page = _real_cbr_page()
+    question = (
+        "Банк России во всех материалах указывает только округлённое 5,6%? Уточни, публикуется ли "
+        "где-нибудь точное значение годовой инфляции — 5,59%."
+    )
+    terms = question_value_terms(question)
+    assert terms == ["5,6", "5,59"]
+    windows = select_assertion_windows(page, question, BUDGET, value_terms=terms)
+    anchored = [w for w in windows if "5,59%" in w.text]
+    assert anchored, [w.start for w in windows]
+    assert len(windows) == 2 and max(len(w.text) for w in windows) <= BUDGET

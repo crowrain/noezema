@@ -97,7 +97,7 @@ PAGE_RELEASE = (
 
 class _PageHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
-        body = {"/": PAGE_RELEASE, "/long": PAGE_LONG_ANALYTICS}.get(self.path)
+        body = {"/": PAGE_RELEASE, "/long": PAGE_LONG_ANALYTICS, "/overlap": PAGE_OVERLAPPING_VALUE}.get(self.path)
         if body is None:
             self.send_response(404)
             self.send_header("Content-Length", "0")
@@ -328,3 +328,82 @@ async def test_researcher_quote_pulls_the_deep_sentence_of_a_second_page(
     prompts = _curator_prompts(fake_llm)
     assert any(KEY_SENTENCE in prompt for prompt in prompts), prompts
     assert outcome.claims_proposed == 1, outcome
+
+
+# ─── T7.79a (ADR-0011 §10 уточнение): значение, окно которого пересекается с
+# терминальным, не должно выбрасываться совсем ────────────────────────────────
+#
+# Стенд .92, сессия 9c4d3a24 (страница cbr.ru/analytics/dkp/dinamic/CPD_2025-12/):
+# термины вопроса плотнее всего в таблице ниже по тексту (терминальное окно стартует с
+# 3782), а «5,59%» встречается ОДИН РАЗ выше — на 3238. Единственное окно вокруг этого
+# значения ([2938..4938)) пересекается с терминальным, и T7.79 на этом основании отбрасывал
+# якорь: слот достался общему value-якорю, который выбрал блок с телефонами и «№ 12 (120)»
+# (старт 140). В фрагмент не попало ни значение, ни процитированная исследователем фраза.
+# Здесь тот же геометризмен воспроизведён на склеенной странице: ключевая фраза стоит НАД
+# термино-плотным блоком.
+
+OVERLAP_KEY_SENTENCE = "Годовая инфляция в декабре уменьшилась до"
+CHROME_WITH_NUMBERS = "\n".join(
+    f"Контакты {i}: 8 800 300-30-00, выпуск № {12 + i % 30} (120), показатель {40 + i % 40},{i % 10}%."
+    for i in range(60)
+)
+TERM_DENSE_BLOCK = "\n".join(
+    f"Материал {i}: Банк России официально публикует точное значение годовой инфляции и ожидания по ценам."
+    for i in range(30)
+)
+NEUTRAL_FILLER = " ".join(f"Наблюдение без терминов вопроса номер {i}." for i in range(24))
+
+PAGE_OVERLAPPING_VALUE = (
+    "<html><body><h1>Денежно-кредитная политика: динамика цен</h1>"
+    f"<p>{CHROME_WITH_NUMBERS}</p>"
+    f"<p>Ключевые показатели: {OVERLAP_KEY_SENTENCE} {VALUE} (в ноябре – 6,64%).</p>"
+    f"<p>{NEUTRAL_FILLER}</p>"
+    f"<p>{TERM_DENSE_BLOCK}</p>"
+    "<p>Оценка устойчивости будет опубликована в следующем отчёте.</p></body></html>"
+)
+
+OVERLAP_QUESTION = (
+    "Публикует ли Банк России точное значение годовой инфляции — 5,59% — или во всех материалах только "
+    "округлённое 5,6%?"
+)
+
+
+@pytest.mark.asyncio
+async def test_exact_value_whose_window_overlaps_the_term_window_still_reaches_the_curator(
+    migrated_db: tuple[str, Any],
+    origin: FakeOrigin,
+    fake_llm: FakeLLM,
+    tmp_path: Path,
+) -> None:
+    scratch_url, engine = migrated_db
+    await _activate(engine, origin)
+    question_id = await _seed_question(scratch_url, OVERLAP_QUESTION)
+
+    overlap_url = origin.url("/overlap")
+    fake_llm.script(
+        [
+            _fetch(overlap_url, f"В материале прямо сказано: «{OVERLAP_KEY_SENTENCE} {VALUE} (в ноябре – 6,64%)»"),
+            _COMPLETE,
+            _curator(f"Годовая инфляция в декабре уменьшилась до {VALUE}"),
+        ]
+    )
+    outcome = await _run(scratch_url, fake_llm, origin, tmp_path, question_id)
+    assert outcome.final_state.value == "succeeded", outcome
+
+    fragments = [str(item["payload"].get("assertion_text") or "") for item in await _report_evidence(scratch_url)]
+    windows = [window for fragment in fragments for window in fragment.split("\n[…]\n") if window]
+    # (1) значение дошло до улики, хотя его окно пересекается с терминальным
+    anchored = [window for window in windows if f"{OVERLAP_KEY_SENTENCE} {VALUE}" in window]
+    assert anchored, fragments
+    # (2) слотов не стало больше и окно не длиннее бюджета: вытеснение не добавляет третье окно
+    assert len(windows) <= 2 * len(fragments), fragments
+    assert all(len(window) <= 2_000 for window in windows), [len(w) for w in windows]
+    # (3) промпт куратора собран из фрагментов: модель видит именно процитированную фразу
+    prompts = _curator_prompts(fake_llm)
+    assert prompts, "кураторский запрос к модели не найден"
+    assert any(f"{OVERLAP_KEY_SENTENCE} {VALUE}" in prompt for prompt in prompts), [p[:200] for p in prompts]
+
+    row = await _scalar(
+        scratch_url, "SELECT statement FROM claims WHERE created_in_session = :s", {"s": str(outcome.session_id)}
+    )
+    assert row is not None and VALUE in str(row[0]), row
