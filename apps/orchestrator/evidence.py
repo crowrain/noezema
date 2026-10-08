@@ -50,6 +50,8 @@ the 8192-token section).
 from __future__ import annotations
 
 from apps.orchestrator.assertion_window import (
+    explorer_value_terms,
+    has_exact_anchor,
     question_value_terms,
     researcher_quote_terms,
     select_assertion_windows,
@@ -245,3 +247,47 @@ def observation_to_evidence(
         )
 
     return None  # memory.search / question.create / message.reply / failures
+
+
+def reselect_assertion_fragment(
+    normalized_text: str,
+    question: str,
+    plan: str,
+    explorer_signal: str,
+) -> str | None:
+    """T7.82 (A): перебор окон source_assertion-улики ПОСЛЕ конца исследования.
+
+    Дефект стенда .92 (сессия f0d7e844): окно выбирается в момент чтения страницы по
+    сигналам, накопленным ДО того, как шаг прочитал ключевой факт; куратор получает
+    фрагмент без него («наблюдаемая населением годовая инфляция … 14,5%» на смещении
+    2452 остался за обоими окнами). После конца exploration (включая финальный
+    complete-раунд) хост пересобирает окно тем же модулем ``assertion_window`` — уже
+    по сигналам финальной публичной rationale: дословные цитаты исследователя и
+    названные им числа, которые ДОСЛОВНО присутствуют в этом источнике (границы
+    числа, оглавление/навигация — те же фильтры T7.79/T7.82).
+
+    Честность: ``None`` возвращается, когда точного якоря из текста исследователя в
+    этом источнике нет — окна остаются как при чтении; ничего не «дотягивается».
+    Текст модели содержимым окна не становится никогда: окно остаётся дословным
+    вырезом того же нормализованного текста. Ни бюджет окна, ни число окон, ни
+    разделение окон, ни идентичность улики (§14.3: хеш по ORIGINAL-содержимому) не
+    меняются — меняется только то, что попало в тот же слот.
+    """
+    if not normalized_text or not explorer_signal.strip():
+        return None
+    quote_terms = researcher_quote_terms(explorer_signal, normalized_text)
+    value_terms = explorer_value_terms(explorer_signal)
+    if not has_exact_anchor(
+        normalized_text, quote_terms=quote_terms, explorer_value_terms=value_terms
+    ):
+        return None  # точного якоря из вывода исследователя в этом источнике нет
+    windows = select_assertion_windows(
+        normalized_text,
+        f"{question}\n{plan}",
+        SOURCE_ASSERTION_TEXT_BUDGET,
+        max_windows=SOURCE_ASSERTION_MAX_WINDOWS,
+        value_terms=question_value_terms(f"{question}\n{plan}"),
+        quote_terms=quote_terms,
+        explorer_value_terms=value_terms,
+    )
+    return _FRAGMENT_SEPARATOR.join(w.text for w in windows)

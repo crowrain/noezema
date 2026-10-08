@@ -33,7 +33,7 @@ from typing import Any
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from apps.orchestrator.evidence import observation_to_evidence
+from apps.orchestrator.evidence import observation_to_evidence, reselect_assertion_fragment
 from apps.orchestrator.executor import arguments_hash
 from apps.orchestrator.search_view import render_search_results
 from apps.orchestrator.source_coverage import SourceCoverageTracker, named_source_urls
@@ -225,6 +225,12 @@ class SessionContext:
     # consolidation until the coverage is complete (§3.7, §5.4, §11.2)
     named_sources: tuple[str, ...] = ()
     source_coverage: SourceCoverageTracker | None = None
+    # T7.82 (A): память сессии о нормализованном тексте каждого source_assertion
+    # фрагмента (identity_hash → ровно тот бюджетированный текст, из которого окно
+    # был вырезан при чтении) и финальный сигнал публичной rationale. Нужны для
+    # реселекции окон после конца exploration; в БД ничего нового не пишется.
+    evidence_source_texts: dict[str, str] = field(default_factory=dict)
+    final_rationale_signal: str = ""
 
 
 @dataclass(frozen=True)
@@ -802,6 +808,12 @@ class Orchestrator:
             )
         if stopped:
             await self._transition(db, audit, session, SessionState.STOPPING)
+
+        # T7.82 (A): реселекция окон source_assertion-улик по финальной rationale —
+        # ДО того, как улики уйдут верификатору, куратору и в staging. Окна меняются
+        # только внутри уже существующих записей ctx.evidence (тот же бюджет, то же
+        # число окон, та же идентичность); новая строка в БД при этом не появляется.
+        self._reselect_evidence_windows(ctx)
 
         # verifying: MVP no-op, or the verifier role's structured
         # report of organized deterministic checks (T5.3, stage 4)
@@ -2078,6 +2090,12 @@ class Orchestrator:
             )
             if evidence is not None:
                 ctx.evidence.append(evidence)
+                # T7.82 (A): host keeps the exact budgeted normalized text this
+                # window was cut from — re-selection later must judge the SAME text
+                # the explorer saw, and only its identity as the key.
+                source_text = str((obs.data or {}).get("normalized_text") or "")
+                if source_text:
+                    ctx.evidence_source_texts[evidence.identity_hash] = source_text
             if tool_name == "memory.search" and obs.ok:
                 # T7.7 (EVAL-2): memory.search results are knowledge, not
                 # observations — they are NOT evidence records (a search
@@ -2121,6 +2139,12 @@ class Orchestrator:
         else:
             # loop exhausted without complete
             ctx.complete_reason = CompleteReason.BUDGET_EXHAUSTED.value
+        # T7.82 (A): финальный сигнал — та же оконная функция сигнала, что и при
+        # чтении (RATIONALE_SIGNAL_STEPS/CHARS), но снятая ПОСЛЕ последнего шага:
+        # в ней уже есть complete-rationale, которую шаги написали, прочитав страницы.
+        ctx.final_rationale_signal = "\n".join(rationale_lines[-RATIONALE_SIGNAL_STEPS:])[
+            -RATIONALE_SIGNAL_CHARS:
+        ]
         return steps, stop_requested, abort_requested
 
     # ── helpers ───────────────────────────────────────────────────────────
@@ -2381,6 +2405,38 @@ class Orchestrator:
             "утверждения с оценкой достоверности, которую присваивает rules "
             "engine. Я не выдумываю факты и не повышаю свою уверенность."
         )
+
+    def _reselect_evidence_windows(self, ctx: SessionContext) -> None:
+        """T7.82 (A): перебор окон source_assertion-улик по финальной rationale.
+
+        Окна улики выбираются в момент чтения страницы — сигналами, накопленными до
+        того, как шаг прочитал ключевой факт; на стенде куратор получал фрагмент без него.
+        После конца exploration хост пересобирает фрагмент тем же модулем окон по
+        финальной публичной rationale (включая complete-раунд): дословные цитаты и
+        названные исследователем числа, которые действительно есть в этом источнике.
+        Точного якоря нет — фрагмент остаётся как при чтении (честный отказ, ничего
+        не дотягивается). Меняется только payload["assertion_text"]: идентичность
+        (§14.3), бюджет, число окон и вербатим nature окна — прежние; в БД на этом
+        шаге не пишется ничего. Нормализованный текст берётся из памяти сессии —
+        ровно тот бюджетированный текст, который видел исследователь (перечитывать
+        артефакт целиком нельзя: окно за пределами виденного шагу текста было бы
+        якорем по тексту, которого модель не читала)."""
+        signal = ctx.final_rationale_signal
+        if not signal.strip():
+            return
+        question_plan_question = ctx.question_text
+        for record in ctx.evidence:
+            if record.kind is not EvidenceKind.SOURCE_ASSERTION:
+                continue
+            source_text = ctx.evidence_source_texts.get(record.identity_hash)
+            if not source_text:
+                continue  # нет текста в памяти сессии — окна остаются как при чтении
+            fragment = reselect_assertion_fragment(
+                source_text, question_plan_question, ctx.plan, signal
+            )
+            if fragment is None or fragment == record.payload.get("assertion_text"):
+                continue
+            record.payload["assertion_text"] = fragment
 
     async def _value_attribution(
         self, db: AsyncSession, record: EvidenceRecord, claim_statement: str
