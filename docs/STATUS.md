@@ -6370,3 +6370,159 @@ Scenario, `tests/scenario/test_assertion_value_anchor_session.py` (3 теста,
   вопрос, где дата и есть спрашиваемое значение, теперь выигрывает только если десятичного значения в
   вопросе нет. Отдельного сигнала «вопрос именно про дату» в данных наблюдения нет — это кандидат
   отдельной задачи.
+
+## T7.80 — профиль рассуждения движка по фазам вызова и обрезанный лимитом ответ: анализ до правок
+
+Решение пользователя от 2026-10-08 («Запускай задачу B + C»). Замеры стенда предоставлены
+пользователем (подставка .92, модель `halogen-flash-next` на `192.168.1.141`); агент к `.92`, к `.42`,
+`.141` и `.48` не обращался, eval-run/смоуков не запускал: ни одного живого запроса к LLM в этой задаче
+не было — вся проверка сделана на fake-сервере и тестовой БД.
+
+### 1. Улика: три попытки куратора, которые не были тремя разными попытками
+
+Сессия `1d0886fa`: каждая из трёх попыток куратора вернула **ровно 8192** completion tokens
+(`model.max_output_tokens` = 8192) за 143–175 с, JSON оборван внутри строки («Unterminated string …
+char 3350») → `LLMSchemaError «failed schema after 3 attempts»` → `curator_error_kind = "unavailable"` →
+claims = 0. В `model_runs` ни одной из этих попыток нет: журнал получил только итоговый
+синтетический ряд, а значит вопрос «почему куратор молчит» по БД unanswered — он был answerable только
+через дамп HTTP-ответов.
+
+Три факта определяют решение:
+
+1. **Комната ответа halogen фиксирована**: рассуждение закрывается «by answer_room» примерно за ~1000
+   токенов до потолка (`reasoning_closed_by`, `reasoning_closed_at` в `completion_tokens_details`).
+   Поднимать `max_output_tokens` бесполезно для длинного JSON: срез переезжает, но остаётся.
+2. **Выключается рассуждение двумя разными ключами**: `reasoning_effort: "none"` (halogen) и
+   `chat_template_kwargs: {"enable_thinking": false}` (llama.cpp Qwen3.x) → `reasoning_tokens = 0` и
+   валидный schema-JSON за доли секунды. `reasoning_effort: "low"` и `thinking_budget` движок игнорирует.
+3. **Повтор прежнего запроса — это тот же запрос**: шлюз слал только `model`, `max_tokens`, `messages`,
+   `response_format`; при `HALOGEN_TEMPERATURE = 0` ответ идентичен, то есть ретрай схемной осечки ничего
+   не менял и только сжигал Attempt-бюджет и lease-время.
+
+### 2. Что решено (детали — ADR-0030)
+
+| решение | где | почему так |
+|---|---|---|
+| фаза вызова замкнута: `exploration`, `planning`, `extraction`, `verification`, `consolidation` | `packages/llm_gateway/reasoning_compat.py::REASONING_PHASES` | словарь совпадает с уже существующим `model.sampling.temperature_by_phase`; неизвестная фаза — `ValueError`, а не отсутствие политики |
+| возможность движка отключить рассуждение — профиль в **env** (`NOEZEMA_LLM_REASONING_PROFILE`: `none` \| `halogen` \| `chat-template`) | `packages/llm_gateway/config.py` (+ `field_validator`) | это свойство движка и сборки, а не политика узла: ровно та же граница, что у `NOEZEMA_LLM_SCHEMA_PROFILE` (ADR-0012 §3); unknown профиль — отказ при старте |
+| режим фазы — в **снапшоте** (`model.reasoning_by_phase`), разрешается на каждом вызове | `apps/orchestrator/orchestrator.py::_reasoning_mode` → `resolve_reasoning_policy(dict(snapshot.model))` | effective config (§3): сессия воспроизводима по снапшоту; кэшировать нельзя — head может смениться |
+| профиль `none` не добавляет в запрос **ничего** | `reasoning_body_additions` возвращает `{}` | прежние прогоны (EVAL/EVAL-2/смоуки) остаются байт в байт: без этого сравнивость замеров ADR-0011 §7 теряется |
+| обрезка — отдельный исход `LLMTruncatedResponseError`, не «схемная осечка» | `client.py` (`_TRUNCATED`, `completion_was_truncated`) | `finish_reason == "length"` либо упор в `max_output_tokens`; обрезанный документ отказывается, даже если он чудом оказался синтаксически целым |
+| ровно один повтор ДРУГИМ запросом (режим `off`), без backoff; иначе немедленная честная ошибка | `client.py` (ветка после основного цикла) | повтор того же запроса при температуре 0 идентичен; движок обязан измениться, иначе смысл теряется |
+| unusable-попытка получает строку `model_runs` (`finish_reason`, `output_tokens`, `output_schema_valid=false`) и на отказе, и на успехе после повтора | `orchestrator.py::_record_unusable_attempts` (5 точек успеха + fallback-ветки) | улика обрезки должна читаться из БД без дампа HTTP; recovery не стирает следы |
+| маркер куратора `curator_error_kind = "truncated_output"` — значение payload'а, `AuditEventType` не расширяем | `orchestrator.py` (новая ветка `except LLMTruncatedResponseError`) | стоп-критерий: миграции и нового enum-значения не делал; `phase` в `model_runs` остаётся состоянием сессии |
+| кривой `model.reasoning_by_phase` отвергается активацией до публикации снапшота | `packages/memory/activation.py::_validate_payload_reasoning` | §5.4.1 fail-closed: узел не должен получить снапшот, из-за которого все его сессии упадут в ValueError |
+
+### 3. Карты фаз и что реально меняет провод
+
+| фаза вызова | место в коде | есть ли вызов при config-v17/v18 | режим v18 |
+|---|---|---|---|
+| `exploration` | `_explore` (один шаг исследователя) | да (`payload.explorer.mode`) | `on` |
+| `planning` | `_propose_plan` | нет (`planning.mode = "template"` → MVP-шаблон) | `on` — задекларировано заранее |
+| `extraction` | `_extract` | нет (`extraction.mode = "off"`) | `off` — заранее |
+| `verification` | `_verify` | нет (`verification.mode = "off"` → host no-op) | `off` — заранее |
+| `consolidation` | `_curator` | да | `off` |
+
+То есть при текущем снапшоте config-v18 меняет провод **только кураторского вызова** (и то лишь при
+профиле, который умеет выключать рассуждение). Остальные режимы — предзадекларированы: включать эти
+фазы будет другая задача, и её payload не должен менять политику «на ходу».
+
+`model.sampling.temperature_by_phase` в payload'ах есть, но **не реализован**: ни один код его не читает.
+Реализовать его в этой задаче означало бы поменять температуру реальных прогонов без замера (при
+`temperature = 0` ретраи идентичны — факт 3 выше), поэтому он описан в ADR-0030 §6 и оставлен как есть.
+
+### 4. config-v18 против config-v17
+
+Единственная правка — новый ключ `model.reasoning_by_phase`:
+`{"consolidation": "off", "extraction": "off", "exploration": "on", "planning": "on", "verification": "off"}`.
+Все прочие разделы, включая `model.max_output_tokens = 8192`, `session_limits.max_explorer_steps = 16`,
+пины explorer-v9 и curator-v8, пороги, `claim_type_rules`, бюджеты (Σ=26624) и окна модели — байт в байт
+config-v17; ничего не удалено.
+
+| payload | хеш файла | canonical (попадает в `config_snapshots.payload_sha256`) |
+|---|---|---|
+| config-v18 | `3cbd70840ad6c7454234666daf44d9e2befde9281cc822b554fa71d7f28b2009` | `b5605e4eb04d610ca387f732bfa35f4571750fd4370013f2f2a0e8e7e45f9dec` |
+| config-v17 (откат) | `3d51cefc6c2193ad61627325f70bc433156495455c9eef80a60c0f9d38304a86` | `5c402f4d75ae000c61d824ba2a4407bbfe8d94e0946311ff9ef90b06db721717` |
+
+### 5. Тесты (+55) и их краснота на прежнем коде
+
+- `tests/unit/test_reasoning_compat.py` (26): словарь фаз и режимов, профили и их additions (`none` → пусто),
+  fail-closed неизвестного профиля и неизвестной фазы, предикат обрезки (`length`, упор в потолок, «stop» ниже
+  потолка — не обрезка), проверка политики payload'а.
+- `tests/unit/test_llm_truncation.py` (14): fake-сервер с `finish_reason = "length"` и **оборванным** JSON —
+  второй запрос содержит `reasoning_effort="none"` (halogen) или `chat_template_kwargs.enable_thinking=false`
+  (chat-template), `attempts_detail = [output_schema_valid False, True]`; профиль `none` → один запрос и
+  немедленная `LLMTruncatedResponseError`; unknown профиль → `ValidationError` при построении конфигурации шлюза.
+- `tests/scenario/test_curator_truncation.py` (5): сценарий куратора до `model_runs` и аудита — маркер
+  `truncated_output`, строка с `finish_reason='length'`, `output_tokens=4096` (потолок тестового gateway) и
+  `phase='consolidating'`; halogen-recovery применяет утверждение и сохраняет оборванную строку рядом с
+  валидной; политика из снапшота попадает на провод до всякой обрезки; профиль `none` игнорирует политику,
+  а не угадывает ключ.
+- `tests/scenario/test_config_v18_activation.py` (3): активация v18 (canonical в БД, политика читается из
+  эффективного снапшота тем же кодом, что и вызовы, `max_output_tokens` не поднят, прочие разделы дословно
+  v17); кривая политика → `ActivationError` и head не сдвинут; откат v17 → прежний canonical и `None` у всех фаз.
+- unit: `test_freeze_payloads.py` (+4: ровно один новый ключ, byte-stability и оба хеша, та же проверка,
+  которой политику проверяет активация, прежние payload'ы не переписаны), `test_dev_stand_scripts.py`
+  (дефолт v18 и откат v17 перепривязаны; +3 новых теста: env-строка профиля в bootstrap и сводке, профили в
+  README, разделение payload/окружение).
+
+Краснота на прежнем коде. Прежний `apps/orchestrator/orchestrator.py` + `packages/memory/activation.py`
+(HEAD до правки) при новых тестах: **4 провала / 1 passing** — «the truncated attempt vanished from
+model_runs: ['stop', 'stop', 'stop']», `assert None == 'none'` (на провод не попал ни один параметр
+рассуждения: тело запроса было `{'model': …, 'max_tokens': 4096}`), `Failed: DID NOT RAISE ActivationError`.
+На уровне шлюза прежний код краснеет самим импортом (`ImportError: cannot import name
+'LLMTruncatedResponseError'`) и тестом unknown-профиля (`DID NOT RAISE ValidationError`). Тесты стендовых
+скриптов краснеют на прежних файлах по существу: `git show HEAD~2:deploy/dev-stand/bootstrap.sh` не содержит
+ни одной строки `LLM_REASONING_PROFILE` и активирует config-v17. Ни один прежний тест не ослаблен: из
+изменённых тестовых файлов удалены только две строки ожиданий в `TestDevStandConfigVersion` (дефолт v17 → v18),
+остальные его проверки сохранены; правок прежних проверок в сценариях нет.
+
+### 6. Полный прогон §6
+
+Перед коммитом кода (`c75f7dc`): ruff — чисто; mypy — «Success: no issues found in 147 source files»;
+образ `noezema-sandbox:test` на месте; `-n auto -q -m "not timing"` — **1697 passed, 12 skipped** (базовое
+значение T7.79a было 1652 + 12: +45 новых тестов, скипы те же); `-q -m timing` — **4 passed**. Перед
+коммитом конфигурации и стенда (`e3cbc87`): тот же прогон — **1707 passed, 12 skipped** (+10) и **4 passed**.
+Перед документным коммитом этого раздела — четыре зелёных прогона того же дерева: параллельная стадия
+**1707 passed, 12 skipped** (183.58 с / 149.00 с / 205.69 с / 184.01 с) и последовательная `-q -m timing` —
+**4 passed** (53.37 с / 47.47 с / 47.48 с / 47.50 с); ruff чисто во всех, mypy «Success: no issues found in 147
+source files». Правки только документные, число тестов не изменилось. Известный flake `fake LLM server exited
+during startup` ни в одном из этих прогонов не воспроизводился.
+
+### 7. Шаги менеджера на стенде .92 (агент к .92 не обращается)
+
+1. `cd ~/noezema && git pull` (пакет содержит `docs/eval/config-v18-payload.json`).
+2. В `/etc/noezema/dev.env` (0600) одна строка: `NOEZEMA_LLM_REASONING_PROFILE=halogen` — значение по
+   фактическому движку узла; для llama.cpp Qwen3.x — `chat-template`; сомнение → оставить `none` и
+   проверить одним запросом к `/v1/chat/completions` до активации профиля (тот же порядок, что ADR-0012 §5).
+3. `sudo systemctl restart noezema-dev-web.service noezema-dev-tick.service noezema-dev-maint.service`
+   (профиль читается при старте процесса).
+4. `.venv/bin/python -m hostctl.cli activate-online --payload docs/eval/config-v18-payload.json
+   --reason "T7.80: model.reasoning_by_phase (curator without engine reasoning)" --drain-wait-seconds 120`.
+5. Проверка: `./deploy/dev-stand/status.sh` — снапшот по canonical-префиксу `b5605e4e`; проверочный вопрос с
+   длинным кураторским ответом (например «ключевая ставка ЦБ РФ на последнем заседании»): второй кураторский
+   запрос содержит `reasoning_effort="none"`, утверждение появляется, а в `model_runs` видна оборванная строка
+   с `finish_reason='length'`.
+
+Откат: активация payload'а `docs/eval/config-v17-payload.json` (canonical `5c402f4d…`) + удалить строку
+профиля из `dev.env` + рестарт юнитов. Прежние payload'ы (v13–v17) не переписаны; история коммитов не
+переписывалась (`git reflog`: только `commit:`).
+
+### 8. Что осталось непроверенным и что это меняет
+
+- Профиль `halogen` на реальном движке в этой задаче **не проверялся** (LLM недоступен по условию задачи):
+  замеры предоставлены пользователем, проверка — fake-сервером. Первый стендовый прогон с v18 обязан
+  описать фактическое поведение (ADR-0011 §7: новый EVAL-прогон требует новой заморозки).
+- С профилем `none` обрезанный ответ больше не «спасается» флуктуацией длины: прежний цикл из трёх
+  идентичных попыток иногда случайно получала более короткий JSON, и сессия выживала. Теперь это честный отказ
+  (`truncated_output`) — меньше ложных «unavailable», но и меньше случайных recovery; сравнивать прежние
+  прогоны с новыми нужно с учётом этого (ADR-0030 §3).
+- Строки `model_runs` для unusable-попыток добавляются **только** там, где attempt не прошёл схему: тесты,
+  считающие строки журнала на чистых сценариях (`test_prompt_pinning.py`, `test_planning.py`,
+  `test_verification.py`, `test_web_standalone_search_v14.py`), не сдвинулись; продуктовые гейты `model_runs`
+  не читают. Метрика «три попытки куратора» в наблюдаемом виде заменена «одна попытка + один повтор либо
+  немедленный отказ» — это изменение формы наблюдения, а не порогов (пороги и rules engine не тронуты).
+- `temperature_by_phase` по-прежнему не читается кодом; K2 (`llamacpp-rocmfpx`) профиля рассуждения не получил:
+  по замеру он почти не рассуждает, поэтому для него остаётся `none`, пока нет отдельного замера.
+- Новых классов обрезки (например `finish_reason = "content_filter"`) предикат не считает обрезкой — они
+  остаются прежними исходами; замкнутому списку нужен замер, чтобы расширяться.
