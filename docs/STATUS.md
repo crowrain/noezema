@@ -6609,3 +6609,84 @@ registrable domains, один — пересказ релиза другого; 
 `reliability.level == verified`. На HEAD до правок новые тесты краснеют по существу: эндпоинта спора нет
 (404), CLI-команды нет (click «No such command»), блок «оспорено» на странице утверждения отсутствует.
 Ни один прежний тест не ослабляется; число тестов только растёт.
+
+### 6. Реализация (а): что именно сделано
+
+| часть | где | как |
+|---|---|---|
+| сервис спора | `packages/memory/dispute.py` (новый модуль: чистые функции + рабочий контур) | `dispute_claim(...)`: проверить причину → зафиксировать утверждение (`SELECT … FOR UPDATE`) → взять **источники именно этого claim'а** из его улик → разрешить пару «первоисточник ← пересказ» по адресам → событие `operator_command_received` с причиной в payload → строка `source_graph_corrections{merge}` (создать или воскресить ранее снятую) → `apply_source_graph_change(source_ids = {пересказ, первоисточник})` → вопрос на перепроверку (`put_operator_question`, origin `message`, цитата statement'а) → `operator_command_completed`. `cancel_dispute(...)`: `valid = false` (строка не удаляется) + второй каскад по той же паре. `list_claim_disputes(...)` — чтение для витрины, в том числе «кем снят» |
+| Command API | `apps/web/api.py`: `POST /api/v1/knowledge/claims/{claim_id}/dispute`, `POST …/dispute/cancel` | admin-токен и гейт здоровья юнитов (423) — ровно как у команд и приёма вопроса; 201 новый спор / 200 повтор (`replayed: true`) / 200 отмена; отказ → 404 или 409 с подписанной причиной |
+| CLI | `hostctl/cli.py`: `noezemactl claim-dispute` и `claim-dispute-cancel` | тот же сервис, актор `operator:hostctl`; идемпотентный повтор назван повтором; отказ → exit 2 и строка «отказ (<код>) <подробность>», без трейсов |
+| подписи | `apps/web/labels.py`: категории `graph_correction_kind`, `dispute_state` («оспорено оператором» / «спор снят»), `dispute_actor` (веб-витрина / хостовая консоль) + 8 подписанных отказов спора | полнота проверяется из кода: значения вида коррекции — из CHECK таблицы, акторы и коды отказов — из констант модуля спора (`tests/unit/test_web_labels.py`) |
+| витрина | `apps/web/knowledge.py::claim_source_corrections` → ключ `operator_corrections` в provenance; форма спора и лента споров на `/claim/{id}` | presentation ничего не назначает: показывает строку коррекции, актора, время, причину из журнала и состояние («оспорено оператором» / «спор снят»); бейдж по-прежнему считает `reliability.py` по оценке правил |
+
+Формат запроса API (доп. поля запрещены, `extra="forbid"`):
+
+```json
+POST /api/v1/knowledge/claims/{claim_id}/dispute      заголовок: X-Admin-Token
+{"primary_uri": "rosstat.example/press/inflation-sep-2026",
+ "retelling_uri": "https://sbercib.example/economy/pochemu-inflyatsiya-5-6?utm=1",
+ "reason": "Страница банка дословно повторяет абзацы пресс-выпуска и его таблицу"}
+→ 201 {"claim_id","replayed":false,"correction_id","actor":"operator:web","reason",
+       "assessments_requeued":1,"claims_touched":1,"recheck_jobs_created":1,
+       "question_id","question_created":true,"operator_corrections":[…]}
+
+POST /api/v1/knowledge/claims/{claim_id}/dispute/cancel
+{"reason": "первоисточник всё-таки отдельный: разные таблицы и даты"}   (поле можно опустить)
+→ 200 {"cancelled":true,"correction_id", …, "operator_corrections":[…]}   (та же строка, valid=false)
+
+отказ → 409 | {"rejected":true,"reason":"dispute_source_not_found","detail":"retelling: https://…"}
+```
+
+Формат CLI (нужен `NOEZEMA_DATABASE_URL`; адрес можно вставить без схемы и с query — он нормируется тем же
+`normalize_uri`, что и группировка источников):
+
+```
+noezemactl claim-dispute --claim <полный uuid> \
+    --primary <адрес первоисточника> --retelling <адрес пересказа> --reason "<причина>"
+  claim-dispute: оспорено
+    утверждение   <uuid>            коррекция     <uuid> (merge: <пересказ> → <первоисточник>)
+    актор         operator:hostctl  причина       <текст оператора>
+    перепроверка  снятых оценок: 1, затронутых утверждений: 1, заведённых задач пересчёта: 1
+    вопрос        <uuid> (новый, позиция N)
+noezemactl claim-dispute-cancel --claim <uuid> [--reason "<почему спор снимается>"]
+отказ: exit 2, «claim-dispute: отказ (dispute_source_not_found) retelling: https://…»
+```
+
+### 7. Отменимость и пределы механизма — честно
+
+- Спор отменяется (`…/dispute/cancel`, `claim-dispute-cancel`): строка коррекции остаётся с `valid = false`,
+  повторный каскад + пересчёт возвращают прежнюю оценку; в provenance видно и исходный спор с причиной, и снятие
+  (кем, когда, почему). Знание, улики и все прежде сделанные оценки не удаляются (§14).
+- Предел честности: каскад §11.3 инвалидирует те утверждения, **чьи улики затрагивают эти источники**. Утверждение,
+  связанное с спорным только через `claim_dependencies`, остаётся `current` — это существующая семантика
+  `apply_source_graph_change`, и она не расширена (тест `test_every_claim_that_used_those_sources_is_requeued`).
+- Спор работает лишь там, где у хоста есть артефакт прочтения пересказывающей страницы: `basis_artifact_id`
+  берётся из улики. Без него коррекция — attestation без provenance‑цепочки; fail-closed требование артефакта
+  оставлено отдельной задачей (ADR-0031 §8).
+- Ручное «снять утверждение» (б) **не реализовано**: стоп-критерий задачи + самоуничтожение прямого `invalid`
+  за один maint-тик. Варианты 1–4 и рекомендация — ADR-0031 §6; решение за пользователем.
+
+### 8. Тесты и прогоны
+
+| тест | что закрепляет |
+|---|---|
+| `tests/unit/test_claim_dispute.py` (12) | границы причины (3…500), нормирование адреса (`http↔https`, query, хвостовой слэш, порт, www-хост), fail-closed выбор пары среди улик утверждения и отказ «это один и тот же источник», текст вопроса (цитата statement'а, потолок, детерминизм), подписи всех отказов спора, отсутствие новых значений в CHECK `claim_assessment_heads_prepared_by_check` миграции 0022, отмена = `valid = false` без удаления |
+| `tests/scenario/test_claim_dispute.py` (10) | реальный HTTP: 201 + коррекция с актором/видом/основанием + пара событий ленты с причиной + head→pending с NULL‑парой + задача пересчёта `source_graph_change` + вопрос в очереди; бейдж `verified` → «нет» **только** после рабочего переоценки (`insufficient_independence`, одна группа с основанием `correction:merge`); повтор = 200 `replayed` без дубликов; затронуты оба утверждения с этими источниками, связанное через зависимость — нет; отказ подписан и не пишет ни строки; второй оператор на той же паре получает отказ (откат целиком); отмена возвращает E3/2 группы и сохраняет прежнюю причину; 401 без токена и 423 при открытом переходе юнитов; provenance называет спор высказыванием оператора |
+| `tests/scenario/test_cli_claim_dispute.py` (6) | CLI-контракт: exit 0 с id коррекции/вопроса и актором `operator:hostctl`, повтор назван повтором, cancel → прежняя E3 после пересчёта, отказ = exit 2 с кодом и без трейсов, требуется полный uuid, cancel без спора → отказ |
+| `tests/unit/test_web_labels.py` (+1) | краснота полноты по построению: новый актор спора или новый код отказа без подписи падают тот же тест полноты |
+
+Прогоны §6 (после правок): ruff — All checks passed; mypy strict — Success, no issues found in 148 source
+files; `pytest -n auto -q -m "not timing"` — **1736 passed, 12 skipped** (до правок было 1707 passed, 12
+skipped: добавлено ровно 29 тестов, ни один прежний не ослаблен); `pytest -q -m timing` — **4 passed, 1748
+deselected**. Контейнеров и тестовых баз стало ровно столько же, сколько до правок (замеры в отчёте по задаче:
+`docker ps -a` = прежнее число, `noezema_mig_*` = прежнее число); ни одного форсированного `DROP DATABASE` в
+хождении новых тестов.
+
+### 9. Что делает менеджер на `.92` (агент к `.92` не обращался)
+
+Раздел «Как оспорить утверждение оператору» в `deploy/dev-stand/README.md`: найти id утверждения в ленте
+(`GET /api/v1/knowledge/claims` или страница `/claim/…`), проверить адреса источников в provenance, вызвать
+`noezemactl claim-dispute …` (или ту же форму на карточке утверждения), дождаться maint‑тика (60 с) и увидеть
+исход пересчёта; откат — `claim-dispute-cancel`. Ни миграций, ни перезапуска юнитов, ни смены снапшота правил для
+этого не требуется.
