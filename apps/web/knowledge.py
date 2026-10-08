@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, Final
 
 from fastapi import HTTPException
 from sqlalchemy import text
@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from apps.web.labels import describe
 from apps.web.reliability import describe_verification, reliability
 from packages.domain.models.base import JsonDict
+from packages.memory.dispute import list_claim_disputes
 
 # the effective snapshot pointer (fail-closed: the view is served from
 # the same head the runtime reads)
@@ -33,6 +34,13 @@ _EFF_SNAP = (
 EFFECTIVE_SNAPSHOT_SQL = _EFF_SNAP
 
 HEAD_STATES = ("current", "pending", "invalid", "none")
+
+#: Состояния операторского спора (T7.81) — закрытый набор витрины: он подписан
+#: словарём и выводится из строки коррекции (`valid`), а не из догадки. Сам
+#: спор живёт в `source_graph_corrections`; здесь только то, что видит человек.
+DISPUTED_STATE: Final = "disputed"
+WITHDRAWN_STATE: Final = "withdrawn"
+DISPUTE_STATES: Final[tuple[str, str]] = (DISPUTED_STATE, WITHDRAWN_STATE)
 
 
 def _iso(value: Any) -> str | None:
@@ -576,12 +584,60 @@ async def claim_provenance(db: AsyncSession, claim_id: uuid.UUID) -> JsonDict:
         "source_groups": source_groups,
         "environment_groups": env_groups,
         "assessment_evidence_roles": roles,
+        # Операторские исправления графа источников этого утверждения (T7.81):
+        # только уже записанные строки коррекции + причина из журнала; view ничего
+        # не оценивает и действующую оценку не прячет.
+        "operator_corrections": await claim_source_corrections(db, claim_id),
         # «как проверено»: независимость групп источников упоминается только
         # когда эти группы действительно зафиксированы действующей оценкой.
         "verification": describe_verification(
             evidence_items, source_groups=source_groups, environment_groups=env_groups
         ),
     }
+
+
+async def claim_source_corrections(db: AsyncSession, claim_id: uuid.UUID) -> list[JsonDict]:
+    """Оспорено ли утверждение оператором и по какому основанию (T7.81).
+
+    Строки `source_graph_corrections` уже лежат в базе; причина читается из
+    payload'а события журнала, на которое указывает коррекция. Подписи — только
+    из единого словаря: вид (склейка/разделение), состояние (оспорено/снято) и
+    вход оператора. Grade здесь не назначается и не меняет ничего.
+    """
+    rows = await list_claim_disputes(db, claim_id)
+    items: list[JsonDict] = []
+    for row in rows:
+        state = DISPUTED_STATE if row["valid"] else WITHDRAWN_STATE
+        entry = describe("graph_correction_kind", row["kind"])
+        state_entry = describe("dispute_state", state)
+        actor_entry = describe("dispute_actor", row["actor"])
+        items.append(
+            {
+                "correction_id": row["correction_id"],
+                "kind": row["kind"],
+                "kind_label": entry["label"],
+                "kind_hint": entry["hint"],
+                "state": state,
+                "state_label": state_entry["label"],
+                "state_hint": state_entry["hint"],
+                "actor": row["actor"],
+                "actor_label": actor_entry["label"],
+                "reason": row["reason"],
+                "retelling_uri": row["retelling_uri"],
+                "primary_uri": row["primary_uri"],
+                "rules_version": row["rules_version"],
+                "created_at": row["created_at"],
+                "withdrawn_by": row["withdrawn_by"],
+                "withdrawn_by_label": (
+                    describe("dispute_actor", row["withdrawn_by"])["label"]
+                    if row["withdrawn_by"]
+                    else None
+                ),
+                "withdrawn_at": row["withdrawn_at"],
+                "withdraw_reason": row["withdraw_reason"],
+            }
+        )
+    return items
 
 
 async def list_dependencies(

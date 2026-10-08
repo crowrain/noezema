@@ -1207,6 +1207,177 @@ def ask(text: str, priority: int) -> None:
     sys.exit(code)
 
 
+@main.command("claim-dispute")
+@click.option("--claim", "claim_ref", required=True, help="Утверждение: uuid или начало uuid из списка знания.")
+@click.option(
+    "--primary",
+    required=True,
+    help="Адрес первоисточника — как он записан среди источников этого утверждения.",
+)
+@click.option(
+    "--retelling",
+    required=True,
+    help="Адрес страницы-пересказа, которую оператор считает второй «независимой» опорой.",
+)
+@click.option(
+    "--reason",
+    required=True,
+    help="Причина спора своими словами: почему это пересказ. Остаётся в истории и видна людям.",
+)
+def claim_dispute(claim_ref: str, primary: str, retelling: str, reason: str) -> None:
+    """T7.81: оспорить действующее утверждение фактом о происхождении источника (§11.3).
+
+    Operator instrument for a contested claim on the stand. The operator does not
+    grade anything: they assert a FACT about a source ("this page retells that one"),
+    which becomes a `source_graph_corrections` row with this host as actor, the read
+    artifact of the retelling page as basis and an audit event carrying the reason —
+    exactly the operator lever §11.3 allows. The existing cascade then requeues every
+    affected assessment for recomputation and queues a recheck question that quotes the
+    statement; the rules engine decides the outcome (fewer independence groups →
+    `insufficient_independence` → E1/hypothesis, so the «Проверено» badge goes away
+    because independence went away). Idempotent by the correction's natural key: a
+    repeat says so instead of duplicating anything. Reversible with
+    `noezemactl claim-dispute-cancel`. Needs NOEZEMA_DATABASE_URL; exit 2 on refusal.
+    """
+    import asyncio
+    import os
+
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    url = os.environ.get("NOEZEMA_DATABASE_URL", "")
+    if not url:
+        click.echo("NOEZEMA_DATABASE_URL is not set", err=True)
+        sys.exit(EXIT_USAGE_ERROR)
+
+    from packages.domain.db.uow import transaction
+    from packages.domain.services.audit import AuditService
+    from packages.domain.services.question_intake import queue_position
+    from packages.memory.dispute import ACTOR_HOSTCTL, DisputeError, dispute_claim
+
+    claim_id = _claim_uuid(claim_ref)
+    engine = create_async_engine(url)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    async def _run() -> int:
+        from packages.domain.models.questions import ORMQuestion
+
+        try:
+            async with factory() as db, transaction(db):
+                outcome = await dispute_claim(
+                    db,
+                    AuditService(db),
+                    claim_id=claim_id,
+                    primary_uri=primary,
+                    retelling_uri=retelling,
+                    reason=reason,
+                    actor=ACTOR_HOSTCTL,
+                )
+                question = await db.get(ORMQuestion, outcome.question_id)
+                position = await queue_position(db, question) if question is not None else None
+        except DisputeError as exc:
+            click.echo(f"claim-dispute: отказ ({exc.code}) {exc.detail}".rstrip(), err=True)
+            return EXIT_USAGE_ERROR
+        label = "уже оспорено этим оператором (идемпотентный повтор)" if outcome.replayed else "оспорено"
+        click.echo(f"claim-dispute: {label}")
+        click.echo(f"  утверждение   {outcome.claim_id}")
+        pair = f"{outcome.retelling_uri} → {outcome.primary_uri}"
+        click.echo(f"  коррекция     {outcome.correction_id} (merge: {pair})")
+        click.echo(f"  актор         {outcome.actor}")
+        click.echo(f"  причина       {outcome.reason}")
+        click.echo(
+            f"  перепроверка  снятых оценок: {outcome.invalidated}, затронутых утверждений: "
+            f"{outcome.affected_claims}, заведённых задач пересчёта: {outcome.jobs_created}"
+        )
+        state = "новый" if outcome.question_created else "уже в очереди"
+        suffix = f", позиция {position}" if position is not None else ""
+        click.echo(f"  вопрос        {outcome.question_id} ({state}{suffix})")
+        click.echo(
+            "  дальше        оценку пересчитают правила на ближайшем maint-тике "
+            "(noezemactl reassessment-tick); бейдж меняется только вместе с ней"
+        )
+        return 0
+
+    try:
+        code = asyncio.run(_run())
+    finally:
+        asyncio.run(engine.dispose())
+    sys.exit(code)
+
+
+@main.command("claim-dispute-cancel")
+@click.option("--claim", "claim_ref", required=True, help="Утверждение: uuid или начало uuid.")
+@click.option("--reason", default=None, help="Почему спор снимается (по желанию; записывается в журнал).")
+def claim_dispute_cancel(claim_ref: str, reason: str | None) -> None:
+    """T7.81: снять операторский спор, не удаляя ни знание, ни прежнюю оценку (§14).
+
+    Cancels the operator's own source-graph correction the same way it was made:
+    the row is not deleted — `valid = false` plus a second §11.3 cascade over the
+    same pair of sources. The rules engine then recomputes independence without
+    the merge, so a previous grade comes back if it is again supported by enough
+    independent groups. History (the claim, its evidence, every assessment ever
+    made) stays in the database untouched.
+    """
+    import asyncio
+    import os
+
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    url = os.environ.get("NOEZEMA_DATABASE_URL", "")
+    if not url:
+        click.echo("NOEZEMA_DATABASE_URL is not set", err=True)
+        sys.exit(EXIT_USAGE_ERROR)
+
+    from packages.domain.db.uow import transaction
+    from packages.domain.services.audit import AuditService
+    from packages.memory.dispute import ACTOR_HOSTCTL, DisputeError, cancel_dispute
+
+    claim_id = _claim_uuid(claim_ref)
+    engine = create_async_engine(url)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    async def _run() -> int:
+        try:
+            async with factory() as db, transaction(db):
+                outcome = await cancel_dispute(
+                    db,
+                    AuditService(db),
+                    claim_id=claim_id,
+                    reason=reason,
+                    actor=ACTOR_HOSTCTL,
+                )
+        except DisputeError as exc:
+            click.echo(f"claim-dispute-cancel: отказ ({exc.code}) {exc.detail}".rstrip(), err=True)
+            return EXIT_USAGE_ERROR
+        click.echo("claim-dispute-cancel: спор снят")
+        click.echo(f"  утверждение   {outcome.claim_id}")
+        click.echo(f"  коррекция     {outcome.correction_id} (valid = false, строка осталась)")
+        click.echo(f"  актор         {outcome.actor}")
+        click.echo(
+            f"  перепроверка  оценок снято: {outcome.invalidated}, утверждений затронуто: "
+            f"{outcome.affected_claims}, задач пересчёта заведено: {outcome.jobs_created}"
+        )
+        click.echo(
+            "  дальше        оценку пересчитают правила на ближайшем maint-тике; "
+            "если независимости снова достаточно, прежняя оценка вернётся сама"
+        )
+        return 0
+
+    try:
+        code = asyncio.run(_run())
+    finally:
+        asyncio.run(engine.dispose())
+    sys.exit(code)
+
+
+def _claim_uuid(raw: str) -> uuid.UUID:
+    """Утверждение по uuid или по его началу (как его показывает витрина)."""
+    try:
+        return uuid.UUID(raw.strip())
+    except ValueError:
+        click.echo(f"нужен полный uuid утверждения, получено: {raw}", err=True)
+        sys.exit(EXIT_USAGE_ERROR)
+
+
 @main.command("eval-run")
 @click.option("--label", required=True, help="Run label (e.g. EVAL-1).")
 @click.option(

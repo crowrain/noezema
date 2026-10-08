@@ -83,6 +83,7 @@ from packages.domain.models.questions import ORMQuestion
 from packages.domain.models.sessions import ORMSession
 from packages.domain.repositories.inbox import MessageRepository, OperatorCommandRepository
 from packages.domain.repositories.sessions import SessionRepository
+from packages.domain.services.audit import AuditService
 from packages.domain.services.config import ConfigError, ConfigService
 from packages.domain.services.question_intake import (
     MAX_QUESTION_TEXT_CHARS,
@@ -92,9 +93,26 @@ from packages.domain.services.question_intake import (
     put_operator_question,
     queue_position,
 )
+from packages.memory.dispute import (
+    ACTOR_WEB,
+    REASON_MAX_CHARS,
+    REASON_MIN_CHARS,
+    REFUSAL_CLAIM_NOT_FOUND,
+    REFUSAL_CORRECTION_NOT_FOUND,
+    DisputeError,
+    cancel_dispute,
+    dispute_claim,
+)
 
 NODE_STATE_KEY = "node_state"
 NODE_STATES = ("idle", "paused", "session_running")
+
+# codes → HTTP: спор — это конфликт с текущим состоянием знания (409);
+# «нет такого утверждения» и «нет действующего спора» отвечают 404.
+_DISPUTE_REFUSAL_STATUS: dict[str, int] = {
+    REFUSAL_CLAIM_NOT_FOUND: 404,
+    REFUSAL_CORRECTION_NOT_FOUND: 404,
+}
 
 
 def annotate_reasons(result: object) -> JsonDict:
@@ -837,9 +855,102 @@ async function tick(){
         h += '<br><b>Группы окружений:</b> ' + p.environment_groups.map(g => `<code>${g.group_id}</code>`).join(', ');
       }
       h += '</ul></div>';
+      h += disputeCard(p);
     }
     document.getElementById('box').innerHTML = h;
+    wireForm();
   }catch(e){ document.getElementById('box').textContent='ошибка чтения'; }
+}
+const TOKEN_KEY = 'noezema.admin.token';
+function disputeCard(p){
+  const corr = p.operator_corrections || [];
+  const uris = sourceUris(p);
+  let h = '<div class="card"><b>Отношение оператора к этому утверждению:</b>';
+  const active = corr.filter(c => c.state === 'disputed');
+  const past = corr.filter(c => c.state !== 'disputed');
+  if(!active.length && !past.length){
+    h += '<br>операторских споров нет: утверждение стоит так, как его оценили правила.';
+  }
+  for(const c of active){
+    h += `<div class="warn"><br><b>${esc(c.state_label)}</b> — ${esc(c.kind_hint)}`+
+      `<br>пересказ: <code>${esc((c.retelling_uri||'').slice(0,80))}</code>`+
+      ` ← первоисточник: <code>${esc((c.primary_uri||'').slice(0,80))}</code>`+
+      `<br>причина: ${esc(c.reason||'—')}`+
+      `<br><small>${esc(c.actor_label)} · ${esc((c.created_at||'').slice(0,19))} · ${esc(c.state_hint)}`+
+      `</small></div>`;
+  }
+  for(const c of past){
+    h += `<div><br><b>${esc(c.state_label)}</b> (история): <code>${esc((c.retelling_uri||'').slice(0,60))}</code>`+
+      ` ← <code>${esc((c.primary_uri||'').slice(0,60))}</code>`+
+      `<br><small>${esc(c.actor_label)} · ${esc((c.created_at||'').slice(0,19))} · ${esc(c.state_hint)}`;
+    if(c.withdrawn_by_label){
+      h += `<br>снял спор: ${esc(c.withdrawn_by_label)} · ${esc((c.withdrawn_at||'').slice(0,19))}`+
+        (c.withdraw_reason ? ` · почему: ${esc(c.withdraw_reason)}` : '');
+    }
+    h += '</small></div>';
+  }
+  if(uris.length){
+    const opts = uris.map(u => `<option value="${esc(u)}">${esc(u.slice(0,70))}</option>`).join('');
+    h += '<br><b>Оспорить (фактом о происхождении источника):</b>'+
+      '<div><label>первоисточник <select id="d-primary">'+opts+'</select></label>'+
+      ' <label>пересказ <select id="d-retelling">'+opts+'</select></label>'+
+      '<br><label>причина своими словами <input id="d-reason" size="40"></label>'+
+      ' <label>admin token <input id="d-token" type="password" size="18" placeholder="X-Admin-Token"></label>'+
+      '<br><button id="d-do">Оспорить</button> <button id="d-cancel">Снять спор</button>'+
+      '<br><small>Здесь не выбирают оценку: спор убавляет независимость источников, а оценку и бейдж '+
+      'пересчитывают правила на ближайшем тике перепроверки. Действующая оценка видна до пересчёта.</small>'+
+      '<pre id="d-out">—</pre></div>';
+  }
+  h += '</div>';
+  return h;
+}
+function sourceUris(p){
+  const seen = new Set(); const out = [];
+  for(const e of p.evidence || []){
+    const u = e.source && e.source.canonical_uri;
+    if(u && !seen.has(u)){ seen.add(u); out.push(u); }
+  }
+  return out;
+}
+function wireForm(){
+  const out = document.getElementById('d-out');
+  if(!out) return;
+  const tok = document.getElementById('d-token');
+  const saved = sessionStorage.getItem(TOKEN_KEY);
+  if(saved && tok && !tok.value) tok.value = saved;
+  async function call(path, body){
+    const t = ((tok && tok.value) || '').trim();
+    if(t) sessionStorage.setItem(TOKEN_KEY, t);
+    let r;
+    try{
+      r = await fetch('/api/v1/knowledge/claims/'+cid+path, {
+        method:'POST', headers:{'Content-Type':'application/json','X-Admin-Token':t},
+        body: JSON.stringify(body),
+      });
+    }catch(err){ out.textContent='узел не ответил'; return; }
+    const j = await r.json().catch(() => ({}));
+    if(r.status===401){ out.textContent='нужен admin token (заголовок X-Admin-Token)'; return; }
+    if(j.rejected){
+      out.textContent = [j.reason_label || 'отказ', j.reason_hint || '', j.detail || ''].filter(Boolean).join('\\n');
+      return;
+    }
+    out.textContent = linesFor(j);
+  }
+  document.getElementById('d-do').onclick = () => call('/dispute', {
+    primary_uri: document.getElementById('d-primary').value,
+    retelling_uri: document.getElementById('d-retelling').value,
+    reason: document.getElementById('d-reason').value,
+  });
+  document.getElementById('d-cancel').onclick = () => call('/dispute/cancel', {});
+}
+function linesFor(j){
+  const rows = (j.operator_corrections || []).filter(c => c.state === 'disputed');
+  const head = j.cancelled ? 'спор снят' : (j.replayed ? 'уже оспорено этим оператором (повтор)' : 'оспорено');
+  const counts = 'снятых оценок: ' + (j.assessments_requeued ?? 0) +
+    ', затронутых утверждений: ' + (j.claims_touched ?? 0) +
+    ', заведённых задач пересчёта: ' + (j.recheck_jobs_created ?? 0);
+  const state = rows.length ? rows.map(c => c.state_label + ' — ' + c.kind_hint).join('; ') : 'действующего спора нет';
+  return [head, state, counts].join('\\n');
 }
 tick(); setInterval(tick, 5000);
 </script></body></html>
@@ -1071,6 +1182,32 @@ class QuestionIn(BaseModel):
 
     text: str = Field(min_length=1, max_length=MAX_QUESTION_TEXT_CHARS)
     priority: int = Field(default=0, ge=PRIORITY_MIN, le=PRIORITY_MAX)
+
+
+class ClaimDisputeIn(BaseModel):
+    """T7.81: операторский спор об утверждении (§11.3).
+
+    Оператор называет ФАКТ о происхождении источника («эта страница — пересказ
+    той») и причину. Ни grade, ни `epistemic_status`, ни состояние головы здесь
+    не принимаются: их назначает rules engine после пересчёта независимости.
+    Границы причины — у сервиса `packages/memory/dispute.py` (один источник для
+    CLI и API), сервис перепроверяет их сам. Клиентского `idempotency_key` нет:
+    повтор опознаётся по естественному ключу коррекции (§20.10).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    primary_uri: str = Field(min_length=1, max_length=500)
+    retelling_uri: str = Field(min_length=1, max_length=500)
+    reason: str = Field(min_length=REASON_MIN_CHARS, max_length=REASON_MAX_CHARS)
+
+
+class ClaimDisputeCancelIn(BaseModel):
+    """Снятие спора той же операцией, что и сам спор (отмена обратима)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str | None = Field(default=None, max_length=REASON_MAX_CHARS)
 
 
 class CommandIn(BaseModel):
@@ -1899,6 +2036,137 @@ def create_app(
     async def knowledge_claim_provenance(claim_id: uuid.UUID) -> JsonDict:
         async with factory() as db:
             return await knowledge_queries.claim_provenance(db, claim_id)
+
+    # ── T7.81: операторский спор об утверждении (§11.3, ADR-0031) ───────────
+
+    @app.post("/api/v1/knowledge/claims/{claim_id}/dispute", response_model=None)
+    async def post_claim_dispute(
+        claim_id: uuid.UUID, body: ClaimDisputeIn, request: Request
+    ) -> JSONResponse:
+        """Оспорить действующее утверждение фактом о происхождении источника.
+
+        Что происходит (всё — существующими механизмами): коррекция графа
+        источников `merge` (актор = вход оператора, основание = артефакт
+        прочитанной страницы пересказа, причина = событие журнала) → каскад
+        §11.3 (`apply_source_graph_change`: головы действующих оценок затронутых
+        утверждений уходят в pending и заводятся долговременные задачи пересчёта)
+        → вопрос на перепроверку, цитирующий statement якоря. Оценка и бейдж
+        меняются только после пересчёта правилами: независимых групп стало меньше
+        → `insufficient_independence` → E1/hypothesis. Действующая оценка при этом
+        остаётся видимой и подписанной «перепроверяется» — ничего не прячется.
+
+        Идемпотентность — естественный ключ коррекции (UNIQUE актёр+пара+вид+
+        версия правил): повтор тем же оператором по той же паре отвечает 200 с
+        `replayed=True` и не заводит ни второй строка графа, ни второго вопроса.
+        Отказ — 409 (конфликт с состоянием знания) или 404, подписанный словарём.
+        Токен оператора и здоровый служебный контур обязательны, как у команд.
+        """
+        _check_admin(request)
+        host = host_adapter.read()
+        if not host.healthy:
+            return JSONResponse(
+                status_code=423,
+                content=annotate_reasons(
+                    annotate_host_status(
+                        {
+                            "rejected": True,
+                            "reason": "host_not_healthy",
+                            "recovery_state": host.recovery_state,
+                            "warnings": host.warnings,
+                        }
+                    )
+                ),
+            )
+        try:
+            async with factory() as db, transaction(db):
+                outcome = await dispute_claim(
+                    db,
+                    AuditService(db),
+                    claim_id=claim_id,
+                    primary_uri=body.primary_uri,
+                    retelling_uri=body.retelling_uri,
+                    reason=body.reason,
+                    actor=ACTOR_WEB,
+                )
+                corrections = await knowledge_queries.claim_source_corrections(db, claim_id)
+        except DisputeError as exc:
+            return JSONResponse(
+                status_code=_DISPUTE_REFUSAL_STATUS.get(exc.code, 409),
+                content=annotate_reasons({"rejected": True, "reason": exc.code, "detail": exc.detail}),
+            )
+        return JSONResponse(
+            status_code=200 if outcome.replayed else 201,
+            content={
+                "claim_id": str(outcome.claim_id),
+                "replayed": outcome.replayed,
+                "correction_id": str(outcome.correction_id),
+                "actor": outcome.actor,
+                "reason": outcome.reason,
+                "assessments_requeued": outcome.invalidated,
+                "claims_touched": outcome.affected_claims,
+                "recheck_jobs_created": outcome.jobs_created,
+                "question_id": str(outcome.question_id),
+                "question_created": outcome.question_created,
+                "operator_corrections": corrections,
+            },
+        )
+
+    @app.post("/api/v1/knowledge/claims/{claim_id}/dispute/cancel", response_model=None)
+    async def post_claim_dispute_cancel(
+        claim_id: uuid.UUID, body: ClaimDisputeCancelIn, request: Request
+    ) -> JSONResponse:
+        """Снять операторский спор тем же механизмом, которым он был сделан.
+
+        Строка коррекции не удаляется: `valid = false` + повторный каскад §11.3
+        по той же паре источников, дальше правила пересчитывают независимость
+        без склейки (прежний grade возвращается, если групп снова достаточно).
+        История — знание и прежняя оценка — остаётся в базе целиком (§14).
+        """
+        _check_admin(request)
+        host = host_adapter.read()
+        if not host.healthy:
+            return JSONResponse(
+                status_code=423,
+                content=annotate_reasons(
+                    annotate_host_status(
+                        {
+                            "rejected": True,
+                            "reason": "host_not_healthy",
+                            "recovery_state": host.recovery_state,
+                            "warnings": host.warnings,
+                        }
+                    )
+                ),
+            )
+        try:
+            async with factory() as db, transaction(db):
+                outcome = await cancel_dispute(
+                    db,
+                    AuditService(db),
+                    claim_id=claim_id,
+                    reason=body.reason,
+                    actor=ACTOR_WEB,
+                )
+                corrections = await knowledge_queries.claim_source_corrections(db, claim_id)
+        except DisputeError as exc:
+            return JSONResponse(
+                status_code=_DISPUTE_REFUSAL_STATUS.get(exc.code, 409),
+                content=annotate_reasons({"rejected": True, "reason": exc.code, "detail": exc.detail}),
+            )
+        return JSONResponse(
+            status_code=200,
+            content={
+                "claim_id": str(outcome.claim_id),
+                "cancelled": True,
+                "correction_id": str(outcome.correction_id),
+                "actor": outcome.actor,
+                "reason": outcome.reason,
+                "assessments_requeued": outcome.invalidated,
+                "claims_touched": outcome.affected_claims,
+                "recheck_jobs_created": outcome.jobs_created,
+                "operator_corrections": corrections,
+            },
+        )
 
     # ── T7.1: diagnostics (reconciliation, invalidation, jobs) ────────────
 

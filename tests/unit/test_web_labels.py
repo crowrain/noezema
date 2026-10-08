@@ -24,6 +24,8 @@ import apps.orchestrator.scheduler as scheduler
 import apps.web.answer as web_answer
 import apps.web.api as web_api
 import apps.web.host_status as host_status
+import apps.web.knowledge as knowledge
+import packages.memory.dispute as memory_dispute
 import packages.memory.rules_engine as rules_engine
 import packages.policy.tools as policy_tools
 from apps.web import labels
@@ -105,6 +107,29 @@ def _rules_engine_reasons() -> list[str]:
     return sorted(found)
 
 
+def _graph_correction_kinds() -> list[str]:
+    """Виды коррекций графа источников (T7.81): закрытый CHECK самой таблицы,
+    а не список в тесте — новый вид коррекции без подписи краснит полноту."""
+    from packages.domain.models.memory import ORMSourceGraphCorrection
+
+    texts = [
+        str(getattr(check, "sqltext", check))
+        for check in ORMSourceGraphCorrection.__table_args__
+        if "kind IN" in str(getattr(check, "sqltext", check))
+    ]
+    assert texts, "не найден CHECK вида коррекции графа — тест полноты сломан"
+    return sorted({m for text in texts for m in re.findall(r"'([a-z_]+)'", text)})
+
+
+def _dispute_refusal_constants() -> list[str]:
+    """Коды отказов операторского спора берутся из модуля спора (T7.81)."""
+    return sorted(
+        value
+        for name, value in vars(memory_dispute).items()
+        if name.startswith("REFUSAL_") and isinstance(value, str)
+    )
+
+
 def _sources() -> dict[str, list[str]]:
     return {
         "question_state": [e.value for e in QuestionState],
@@ -151,6 +176,16 @@ def _sources() -> dict[str, list[str]]:
         # T7.73 (ADR-0018): причины текущей оценки — закрытый набор rules engine;
         # карточка обязана подписать каждую, включая причину понижения.
         "assessment_reason": _rules_engine_reasons(),
+        # T7.81: операторский спор. Вид коррекции — закрытый CHECK таблицы,
+        # состояние витрины — закрытый набор читающей модели, актор — константы
+        # модуля спора (их два входа: веб-витрина и хостовая консоль).
+        "graph_correction_kind": _graph_correction_kinds(),
+        "dispute_state": [knowledge.DISPUTED_STATE, knowledge.WITHDRAWN_STATE],
+        "dispute_actor": sorted(
+            value
+            for name, value in vars(memory_dispute).items()
+            if name.startswith("ACTOR_") and isinstance(value, str)
+        ),
     }
 
 
@@ -158,12 +193,14 @@ def _refusal_literals_from_code() -> list[str]:
     """Строки отказа Command API, найденные в исходнике apps/web/api.py.
 
     Тест не переписывает фразы: он вытаскивает их из рабочего кода, поэтому
-    новая фраза отказа без подписи краснит проверку.
+    новая фраза отказа без подписи краснит проверку. Отказы операторского спора
+    (T7.81) объявлены константами модуля `packages/memory/dispute.py` и приходят
+    в API через `exc.code` — их источник там же.
     """
     source = Path(web_api.__file__).read_text(encoding="utf-8")
     literals = re.findall(r'"reason": "([^"]+)"', source)
     prefixes = re.findall(r'"reason": f"([^"{]+)', source)
-    return sorted({*literals, *prefixes})
+    return sorted({*literals, *prefixes, *_dispute_refusal_constants()})
 
 
 # ─── полнота ──────────────────────────────────────────────────────────────
@@ -262,6 +299,25 @@ def test_new_tool_without_a_label_reddens_the_completeness_check(monkeypatch) ->
     assert "brand.new_tool" in values, "источник названий не читается из реестра"
     missing = [name for name in values if not labels.describe("action_tool", name)["hint"]]
     assert missing == ["brand.new_tool"]
+
+
+def test_new_dispute_value_without_a_label_reddens_the_completeness_check(monkeypatch) -> None:
+    """Краснота по построению (T7.81): новый вход оператора или новый отказ спора
+    без подписи попадают в ту же проверку полноты, потому что их источник — код
+    модуля спора, а не список в тесте."""
+    monkeypatch.setattr(memory_dispute, "ACTOR_DESKTOP", "operator:desktop", raising=False)
+    actors = _sources()["dispute_actor"]
+    assert "operator:desktop" in actors, "источник акторов спора не читается из модуля"
+    missing = [value for value in actors if not labels.describe("dispute_actor", value)["hint"]]
+    assert missing == ["operator:desktop"]
+
+    monkeypatch.setattr(
+        memory_dispute, "REFUSAL_SOURCE_MOVED", "dispute_source_moved", raising=False
+    )
+    refusals = _refusal_literals_from_code()
+    assert "dispute_source_moved" in refusals, "источник отказов спора не читается из модуля"
+    unlabeled = [code for code in refusals if not labels.describe_refusal(code)["hint"]]
+    assert unlabeled == ["dispute_source_moved"]
 
 
 def test_answer_builder_keys_are_all_labelled() -> None:
