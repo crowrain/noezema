@@ -48,6 +48,7 @@ from apps.orchestrator.tool_context import (
 from apps.orchestrator.value_duplicate import (
     ValueDuplicateCandidate,
     ValueDuplicateClaim,
+    declared_scope_metric,
     find_value_duplicates,
 )
 from apps.research_proxy.derivative_pointer import resolve_primary_source
@@ -2777,16 +2778,23 @@ class Orchestrator:
                 seen_relied.add(ref_id)
                 relied_claim_ids.append(str(ref_id))
 
-        # T7.83 (ADR-0033): дубли по значению — честная склейка или честное молчание.
-        # Операция без existing_claim_id, у которой РОВНО ОДИН кандидат контекст-пака
-        # с тем же claim_type, тем же непустым множеством значимых чисел и покрытым
-        # периодом, конвертируется в перепроверку этого кандидата (variant (i)):
-        # свежая поддерживающая улика уходит в union-оценку кандидата (monotone по
-        # support/groups — см. ADR-0033: понизить E4/0.95 фикстуры она не может),
-        # якорные as_of/scope сохраняет packages/memory/reverify.py. Нет строгого
-        # совпадения, совпадений несколько, или в связях есть counters — операция
-        # остаётся как предложена (variant (ii)), а честная причина пишется в payload
-        # уже существующего события CLAIM_CREATED: нового типа события и миграции нет,
+        # T7.83 (ADR-0033) + T7.83a: дубли по значению — честная склейка или честное
+        # молчание. Операция без existing_claim_id, у которой РОВНО ОДИН кандидат
+        # контекст-пака с тем же claim_type, тем же непустым множеством значимых чисел
+        # и покрытым периодом, конвертируется в перепроверку этого кандидата
+        # (variant (i)): свежая поддерживающая улика уходит в union-оценку кандидата
+        # (monotone по support/groups — см. ADR-0033: понизить E4/0.95 фикстуры она не
+        # может), якорные as_of/scope сохраняет packages/memory/reverify.py.
+        # T7.83a сужает склейку (замечание приёмки T7.83: «13,7%» инфляционных ожиданий
+        # был пристёгнут к ключевой ставке — чужая улика у чужого утверждения и нечестный
+        # бейдж): склеивается ТОЛЬКО кандидат, объявленный куратором в relied_claim_ids
+        # (T7.82/ADR-0032: то же утверждение, которое модель вправе была бы склеить
+        # явным existing_claim_id), и ТОЛЬКО если это тот же показатель (метка scope или
+        # словарь значимых слов формулировок — apps/orchestrator/value_duplicate.py).
+        # Нет строгого совпадения, совпадений несколько, кандидат не объявлен опорой,
+        # показатель другой, или в связях есть counters — операция остаётся как
+        # предложена (variant (ii)), а честная причина пишется в payload уже
+        # существующего события CLAIM_CREATED: нового типа события и миграции нет,
         # отказ/конверсия одной операции не отменяет остальное предложение, а операции
         # с явным existing_claim_id гейт не трогает вообще (их ведёт T7.34).
         # Исходное предложение в аудит не переписывается: staged-копия отдельна.
@@ -2800,7 +2808,16 @@ class Orchestrator:
                 (
                     await db.execute(
                         text(
-                            "SELECT c.id::text AS id, c.statement, c.claim_type, c.as_of "
+                            "SELECT c.id::text AS id, c.statement, c.claim_type, c.as_of, "
+                            # метка показателя кандидата: единственный scope, который хост
+                            # реально видит у строки знания — assessed_scope текущей головы
+                            # этого снапшота (тот же источник, что у перепроверки T7.73).
+                            # У host-scope-v1 метки показателя нет → None, и тогда решает
+                            # словарь значимых слов формулировок гейта.
+                            "(SELECT a.assessed_scope FROM claim_assessment_heads mh "
+                            "JOIN claim_assessments a ON a.id = mh.current_assessment_id "
+                            "WHERE mh.claim_id = c.id AND mh.config_snapshot_id = :s) "
+                            "AS head_scope "
                             f"FROM claims c WHERE c.id IN ({id_placeholders}) AND EXISTS "
                             "(SELECT 1 FROM claim_assessment_heads h "
                             "WHERE h.claim_id = c.id AND h.config_snapshot_id = :s)"
@@ -2820,6 +2837,7 @@ class Orchestrator:
                         claim_type=str(row["claim_type"]),
                         as_of_year=(row["as_of"].year if row["as_of"] is not None else None),
                         relied=(str(row["id"]) in relied_set),
+                        metric=declared_scope_metric(row["head_scope"]),
                     )
                     for row in candidate_rows
                 ]
@@ -2836,6 +2854,7 @@ class Orchestrator:
                         has_counter_link=any(
                             rel != "supports" for rel in links_by_claim.get(i, [])
                         ),
+                        metric=declared_scope_metric(c.scope),
                     )
                     for i, c in enumerate(proposal.claims)
                     if c.existing_claim_id is None

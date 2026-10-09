@@ -207,10 +207,13 @@ def _compare_curator(
     *,
     with_duplicate: bool,
     explicit_reverify: bool = False,
+    relied_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     """Ответ куратора — форма предложения f452a978 (существующие id взяты из
     контекст-пака). `with_duplicate=False` — контроль без дубля;
-    `explicit_reverify=True` — куратор сам оформил перепроверку (гейт не вмешивается)."""
+    `explicit_reverify=True` — куратор сам оформил перепроверку (гейт не вмешивается);
+    `relied_ids` — что именно куратор объявил опорой своего ответа (T7.83a: гейт
+    склеивает только объявленное)."""
     claims: list[dict[str, Any]] = [
         {
             "statement": NEW_OBSERVED_CLAIM,
@@ -248,7 +251,7 @@ def _compare_curator(
         "claims": claims,
         "evidence_links": links,
         "new_questions": [],
-        "relied_claim_ids": [str(official_id), str(observed_id)],
+        "relied_claim_ids": [str(official_id), str(observed_id)] if relied_ids is None else relied_ids,
     }
 
 
@@ -261,6 +264,7 @@ async def _run_compare_session(
     *,
     with_duplicate: bool,
     explicit_reverify: bool = False,
+    relied_ids: list[str] | None = None,
 ) -> Any:
     qid = await _seed_question(scratch_url, COMPARE_QUESTION)
     fake_llm.script(
@@ -271,7 +275,7 @@ async def _run_compare_session(
             {
                 "content": _compare_curator(
                     official_id, observed_id, with_duplicate=with_duplicate,
-                    explicit_reverify=explicit_reverify,
+                    explicit_reverify=explicit_reverify, relied_ids=relied_ids,
                 )
             },
         ]
@@ -508,3 +512,240 @@ async def test_explicit_reverify_reference_is_left_to_the_existing_gate(
     )
     assert len(rev) == 1
     assert dict(rev[0]["payload"])["resolved"] == str(official_id)
+
+
+# ── T7.83a: кандидат вне relied_claim_ids не склеивается, даже при идеальном совпадении
+
+
+@pytest.mark.asyncio
+async def test_value_duplicate_of_an_unrelied_candidate_is_left_as_proposed(
+    migrated_db: tuple[str, Any],
+    fake_llm: FakeLLM,
+    fake_fetch: None,
+    tmp_path: Path,
+) -> None:
+    """Тот же дубль, что и в главном сценарии, но куратор объявил опорой только
+    наблюдение 14,5%: хост не решает за модель, к какому утверждению относится вывод,
+    и оставляет операцию как предложено — кандидат не тронут ни на байт."""
+    scratch_url, engine = migrated_db
+    activation = await _run_online(engine, _payload())
+    assert activation.state == "active"
+
+    official_id, observed_id = await _seed_corpus(scratch_url, fake_llm, tmp_path)
+    before = await _scalar(
+        scratch_url,
+        "SELECT c.as_of::text, a.effective_grade, a.epistemic_status, a.confidence::text "
+        "FROM claims c JOIN claim_assessment_heads h ON h.claim_id = c.id "
+        "JOIN claim_assessments a ON a.id = h.current_assessment_id WHERE c.id = :c",
+        {"c": str(official_id)},
+    )
+    assert before is not None and (before[1], before[2]) == ("E4", "supported")
+
+    outcome, _qid = await _run_compare_session(
+        scratch_url, fake_llm, tmp_path, official_id, observed_id,
+        with_duplicate=True, relied_ids=[str(observed_id)],
+    )
+    assert outcome.final_state.value == "succeeded"
+    session_id = outcome.session_id
+
+    # (а) дубль записан как новое утверждение: он не был пристёгнут к кандидату
+    dup_count = await _scalar(
+        scratch_url, "SELECT count(*) FROM claims WHERE statement = :t", {"t": DUP_CLAIM}
+    )
+    assert dup_count is not None and dup_count[0] == 1
+    rows = await _all(scratch_url, "SELECT id::text, statement FROM claims")
+    assert len(rows) == 4
+
+    # (б) перепроверки нет, кандидат не тронут этой сессией: дата, оценка, улики прежние
+    rev = await _all(
+        scratch_url,
+        "SELECT id FROM audit_events WHERE session_id = :s AND type = 'claim_reverified'",
+        {"s": str(session_id)},
+    )
+    assert rev == []
+    assessments = await _scalar(
+        scratch_url,
+        "SELECT count(*) FROM claim_assessments WHERE claim_id = :c AND created_in_session = :s",
+        {"c": str(official_id), "s": str(session_id)},
+    )
+    assert assessments is not None and assessments[0] == 0
+    after = await _scalar(
+        scratch_url,
+        "SELECT c.as_of::text, a.effective_grade, a.epistemic_status, a.confidence::text "
+        "FROM claims c JOIN claim_assessment_heads h ON h.claim_id = c.id "
+        "JOIN claim_assessments a ON a.id = h.current_assessment_id WHERE c.id = :c",
+        {"c": str(official_id)},
+    )
+    assert after == before  # байт в байт: ни даты, ни бейджа не сдвинулись
+    ev_count = await _scalar(
+        scratch_url, "SELECT count(*) FROM evidence WHERE claim_id = :c", {"c": str(official_id)}
+    )
+    assert ev_count is not None and ev_count[0] == 4  # чужая улика к нему не добавлена
+
+    # (в) честная причина в payload уже существующего события
+    payload = await _curator_event_payload(scratch_url, session_id)
+    decisions = payload.get("value_duplicates")
+    assert decisions is not None and len(decisions) == 1
+    entry = decisions[0]
+    assert entry["claim_index"] == 1
+    assert entry["target"] is None
+    assert entry["action"] == "kept"
+    assert "relied_claim_ids" in entry["reason"]
+
+
+# ── T7.83a: то же число ДРУГОГО показателя — склейки нет (дефект приёмки) ─────
+
+KEYRATE_CANDIDATE = "Средняя ключевая ставка Банка России по итогам 2025 года составила 13,7%."
+EXPECTATIONS_CLAIM = "Инфляционные ожидания населения в декабре 2025 года составили 13,7% (опрос)."
+
+KEYRATE_QUESTION = (
+    "Средняя ключевая ставка Банка России по итогам 2025 года: приведи цифру и первоисточник. "
+    "Источники: http://theta.example/keyrate"
+)
+EXPECTATIONS_QUESTION = (
+    "Сравни инфляционные ожидания населения за декабрь 2025 года со средней ключевой ставкой "
+    "Банка России по итогам 2025 года: приведи обе цифры и первоисточник каждой. "
+    "Источники: http://iota.example/expectations"
+)
+
+_PAGES.update(
+    {
+        "http://theta.example/keyrate": (
+            "Central bank decision record: the average key rate for 2025 was 13.7 percent."
+        ),
+        "http://iota.example/expectations": (
+            "Opinion poll of household inflation expectations, December 2025: 13.7 percent."
+        ),
+    }
+)
+
+
+async def _seed_keyrate_corpus(
+    scratch_url: str, fake_llm: FakeLLM, tmp_path: Path
+) -> uuid.UUID:
+    """Кандидат — записанная ставка 13,7% (один первоисточник)."""
+    qid = await _seed_question(scratch_url, KEYRATE_QUESTION)
+    fake_llm.script(
+        [
+            _fetch("http://theta.example/keyrate"),
+            _COMPLETE,
+            {
+                "content": {
+                    "summary": "Средняя ключевая ставка за 2025 год.",
+                    "claims": [
+                        {
+                            "statement": KEYRATE_CANDIDATE,
+                            "claim_type": "temporal_fact",
+                            "as_of": "2025-12-31T00:00:00",
+                            "scope": {},
+                        }
+                    ],
+                    "evidence_links": [
+                        {"evidence_index": 0, "claim_index": 0, "relation": "supports"}
+                    ],
+                    "new_questions": [],
+                }
+            },
+        ]
+    )
+    outcome = await _run_session(
+        scratch_url, fake_llm, tmp_path / "ws-kbr", tmp_path / "art-kbr", qid
+    )
+    assert outcome.final_state.value == "succeeded"
+
+    rows = await _all(scratch_url, "SELECT id::text, statement FROM claims")
+    assert len(rows) == 1 and rows[0]["statement"] == KEYRATE_CANDIDATE
+    return uuid.UUID(rows[0]["id"])
+
+
+@pytest.mark.asyncio
+async def test_same_number_of_another_indicator_is_not_merged(
+    migrated_db: tuple[str, Any],
+    fake_llm: FakeLLM,
+    fake_fetch: None,
+    tmp_path: Path,
+) -> None:
+    """Форма дефекта приёмки T7.83 (стенд .92): куратор перепроверяет «13,7%» инфляционных
+    ожиданий утверждением о средней ключевой ставке и объявляет её опорой ответа. Тип,
+    значения и период совпадают идеально — но это ДРУГОЙ показатель, поэтому хост не
+    имеет права привязывать улику ожидания к ставке: ставка остаётся как записана,
+    ожидание заводится отдельным утверждением."""
+    scratch_url, engine = migrated_db
+    activation = await _run_online(engine, _payload())
+    assert activation.state == "active"
+
+    keyrate_id = await _seed_keyrate_corpus(scratch_url, fake_llm, tmp_path)
+    before = await _scalar(
+        scratch_url,
+        "SELECT c.as_of::text, a.effective_grade, a.epistemic_status, a.confidence::text "
+        "FROM claims c JOIN claim_assessment_heads h ON h.claim_id = c.id "
+        "JOIN claim_assessments a ON a.id = h.current_assessment_id WHERE c.id = :c",
+        {"c": str(keyrate_id)},
+    )
+    assert before is not None
+
+    qid = await _seed_question(scratch_url, EXPECTATIONS_QUESTION)
+    fake_llm.script(
+        [
+            _fetch("http://iota.example/expectations"),
+            _COMPLETE,
+            {
+                "content": {
+                    "summary": "Ожидания населения и ключевая ставка: обе 13,7%.",
+                    "claims": [
+                        {
+                            "statement": EXPECTATIONS_CLAIM,
+                            "claim_type": "temporal_fact",
+                            "as_of": "2025-12-31T00:00:00",
+                            "scope": {},
+                        }
+                    ],
+                    "evidence_links": [
+                        {"evidence_index": 0, "claim_index": 0, "relation": "supports"}
+                    ],
+                    "new_questions": [],
+                    "relied_claim_ids": [str(keyrate_id)],
+                }
+            },
+        ]
+    )
+    outcome = await _run_session(
+        scratch_url, fake_llm, tmp_path / "ws-exp", tmp_path / "art-exp", qid
+    )
+    assert outcome.final_state.value == "succeeded"
+    session_id = outcome.session_id
+
+    # (а) склейки нет: оба утверждения живут отдельно, ставки как было — одна строка
+    rows = await _all(scratch_url, "SELECT id::text, statement FROM claims")
+    assert len(rows) == 2
+    assert {row["statement"] for row in rows} == {KEYRATE_CANDIDATE, EXPECTATIONS_CLAIM}
+
+    # (б) ставка не перепроверялась и не получила чужую улику: дата, оценка, улики прежние
+    rev = await _all(
+        scratch_url,
+        "SELECT id FROM audit_events WHERE session_id = :s AND type = 'claim_reverified'",
+        {"s": str(session_id)},
+    )
+    assert rev == []
+    after = await _scalar(
+        scratch_url,
+        "SELECT c.as_of::text, a.effective_grade, a.epistemic_status, a.confidence::text "
+        "FROM claims c JOIN claim_assessment_heads h ON h.claim_id = c.id "
+        "JOIN claim_assessments a ON a.id = h.current_assessment_id WHERE c.id = :c",
+        {"c": str(keyrate_id)},
+    )
+    assert after == before
+    ev_count = await _scalar(
+        scratch_url, "SELECT count(*) FROM evidence WHERE claim_id = :c", {"c": str(keyrate_id)}
+    )
+    assert ev_count is not None and ev_count[0] == 1
+
+    # (в) причина записана честно и называет причину отказа — показатель, а не «не нашли»
+    payload = await _curator_event_payload(scratch_url, session_id)
+    decisions = payload.get("value_duplicates")
+    assert decisions is not None and len(decisions) == 1
+    entry = decisions[0]
+    assert entry["claim_index"] == 0
+    assert entry["target"] is None
+    assert entry["action"] == "kept"
+    assert "indicator does not match" in entry["reason"]
