@@ -205,7 +205,8 @@ def test_actor_or_estimate_sign_refuses_pairing(
 # ─── версия метода: поведение изменилось, записи v2 пересматриваются переатрибуцией ──
 
 
-def test_method_version_is_v3() -> None:
-    """T7.85a меняет решение окна публикации → номер метода поднят; переатрибуция по нему
-    пересматривает и записи эпохи v2 (STATUS T7.85a)."""
-    assert VALUE_ATTRIBUTION_METHOD_VERSION == "host-value-attribution-v3"
+def test_method_version_is_v4() -> None:
+    """T7.85a поднял номер на v3 (вето «другого источника числа» в окне), T7.85b — на v4
+    (сокращённое имя организации вне словаря и глагол фиксации как действие другого лица).
+    Переатрибуция по этому номеру пересматривает и записи эпохи v2, и записи эпохи v3."""
+    assert VALUE_ATTRIBUTION_METHOD_VERSION == "host-value-attribution-v4"

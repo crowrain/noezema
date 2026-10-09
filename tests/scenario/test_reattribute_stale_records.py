@@ -61,8 +61,11 @@ V1_VALUE_METHOD = "host-value-attribution-v1"
 #: метка эпохи T7.85 (окно публикации без вето); переатрибуция T7.85a обязана пересматривать
 #: записи и с этой меткой — основание ровно то же, что для v1: метка ≠ текущий метод
 V2_VALUE_METHOD = "host-value-attribution-v2"
-#: текущий метод значений (T7.85a): им пишется запись после пересмотра прежней
-CURRENT_VALUE_METHOD = "host-value-attribution-v3"
+#: метка эпохи T7.85a (окно публикации с вето «другого источника числа»): с T7.85b она тоже
+#: ПРЕЖНЯЯ и обязана пересматриваться тем же предикатом, что v1 и v2
+V3_VALUE_METHOD = "host-value-attribution-v3"
+#: текущий метод значений (T7.85b): им пишется запись после пересмотра прежней
+CURRENT_VALUE_METHOD = "host-value-attribution-v4"
 
 # ─── тексты: та же синтаксическая форма, что у стендовых страниц (фикстуры T7.85) ───
 # абзац нормализованного текста = одна строка; страница первоисточника — на своём home host
@@ -614,3 +617,101 @@ async def test_records_tagged_v2_method_are_reconsidered_by_current_version(
     # повторный прогон идемпотентен: записи текущего метода не перезаписываются никогда
     again = await _run_backfill(scratch_url, store)
     assert again.changed_evidence == 0 and not again.changed_source_ids, again.rows
+
+
+# ─── 8: T7.85b — прежние метки v2 И v3 пересматриваются одним и тем же предикатом ─────
+
+
+async def _relabel_value_method(scratch_url: str, canonical_uri: str, method: str) -> None:
+    """Точечная смена метки метода в записи улики: так выглядит страница, переатрибутированная
+    эпохой v3, рядом со страницей эпохи v2 (тот же приём моделирования прежней эпохи, что
+    `_backfill_as_v1`, но на одном адресе)."""
+
+    engine = create_async_engine(scratch_url)
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "UPDATE evidence SET scope = jsonb_set(scope, '{value_attribution,method}', "
+                    "CAST(:method AS jsonb)) WHERE id IN ("
+                    "  SELECT e.id FROM evidence e JOIN sources s ON s.id = e.source_id "
+                    "  WHERE s.canonical_uri = :uri AND e.evidence_kind = 'source_assertion' "
+                    "    AND jsonb_typeof(e.scope -> 'value_attribution') = 'object')"
+                ),
+                {"method": f'"{method}"', "uri": canonical_uri},
+            )
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_records_tagged_v2_and_v3_methods_are_reconsidered_by_current_version(
+    migrated_db: tuple[str, Any], tmp_path: Path, live_fetch: None
+) -> None:
+    """T7.85b поднял метод значений до v4: в том же окне публикации добавлены сокращённое имя
+    организации вне словаря и глагол фиксации/измерения как действие другого лица. В базе рядом
+    лежат записи ДВУХ прежних эпох — v2 (окно без новых признаков) и v3 (вето T7.85a). Предикат
+    отбора не менялся: метка записи ≠ текущий метод, поэтому обе обязаны быть пересмотрены, а не
+    пропущены как «уже решено» (STATUS T7.85b)."""
+
+    import apps.research_proxy.reattribution as reattr
+
+    assert reattr.CURRENT_VALUE_METHOD_VERSION == CURRENT_VALUE_METHOD, "отбор устаревших меток"
+
+    scratch_url, _engine = migrated_db
+    store = FilesystemArtifactStore(tmp_path / "artifacts")
+
+    await _seed_claim(scratch_url, store, POLL_URLS, STATEMENT_145)
+    assert len(await _group_ids(scratch_url, STATEMENT_145)) == 3
+
+    era = await _backfill_as_v1(scratch_url, store, stale_method=V2_VALUE_METHOD)
+    assert era.changed_evidence == 2, era.rows
+    await _relabel_value_method(scratch_url, URL_FORBES, V3_VALUE_METHOD)
+    written_era = {
+        str(r["canonical_uri"]): dict(r["origin"])
+        for r in await _records_of(scratch_url, STATEMENT_145)
+        if r["origin"] is not None
+    }
+    assert written_era[URL_FORBES]["method"] == V3_VALUE_METHOD, written_era
+    assert written_era[URL_KOMMERSANT]["method"] == V2_VALUE_METHOD, written_era
+
+    # обе метки прежние → обе строки в плане пересмотра; «было» печатается со своей меткой
+    plan = await _run_backfill(scratch_url, store, dry_run=True)
+    stale = {
+        str(row.canonical_uri): row
+        for row in plan.rows
+        if row.canonical_uri in (URL_FORBES, URL_KOMMERSANT)
+    }
+    assert set(stale) == {URL_FORBES, URL_KOMMERSANT}, plan.rows
+    assert stale[URL_FORBES].was_method == V3_VALUE_METHOD, stale
+    assert stale[URL_KOMMERSANT].was_method == V2_VALUE_METHOD, stale
+    assert all(
+        row.was_status == f"derivative → Банк России ({row.was_method})" for row in stale.values()
+    ), stale
+    # страницы подставки чисты: новые признаки вето на них не сработали, решение то же — пересмотренное
+    assert all(
+        row.action == "будет записано прежнее происхождение значения улики" for row in stale.values()
+    ), stale
+    assert plan.dry_run and plan.changed_evidence == 0 and not plan.changed_source_ids, plan.rows
+
+    report = await _run_backfill(scratch_url, store)
+    assert report.changed_evidence == 2, report.rows
+    written_after = {
+        str(r["canonical_uri"]): dict(r["origin"])
+        for r in await _records_of(scratch_url, STATEMENT_145)
+        if r["origin"] is not None
+    }
+    assert set(written_after) == {URL_FORBES, URL_KOMMERSANT}, written_after
+    assert all(rec["method"] == CURRENT_VALUE_METHOD for rec in written_after.values()), written_after
+    assert all(rec["primary_key"] == "cbr" for rec in written_after.values()), written_after
+    assert all(rec["pairing"] == "publication_window" for rec in written_after.values()), written_after
+    assert len(await _group_ids(scratch_url, STATEMENT_145)) == 1
+    assert await _current_assessment(scratch_url, STATEMENT_145) == ("E1", "hypothesis")
+
+    # повторный прогон идемпотентен: ни v2-, ни v3-метка больше не считается устаревшей
+    again = await _run_backfill(scratch_url, store)
+    assert again.changed_evidence == 0 and not again.changed_source_ids, again.rows
+    retouched = [row for row in again.rows if row.canonical_uri in (URL_FORBES, URL_KOMMERSANT)]
+    assert len(retouched) == 2, again.rows
+    assert all(row.was_method == CURRENT_VALUE_METHOD for row in retouched), retouched
+    assert all(row.action == "изменений нет: решение уже записано ранее" for row in retouched), retouched

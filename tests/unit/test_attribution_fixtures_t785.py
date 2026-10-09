@@ -205,7 +205,7 @@ def test_value_decisions_on_stand_texts(
     )
     assert (decision.status, decision.primary_key) == (status, primary), (name, statement[:40])
     assert decision.pairing == pairing, (name, statement[:40])
-    assert VALUE_ATTRIBUTION_METHOD_VERSION == "host-value-attribution-v3"
+    assert VALUE_ATTRIBUTION_METHOD_VERSION == "host-value-attribution-v4"
 
 
 def test_publication_window_never_overrides_a_refusal_of_its_own_kind() -> None:
