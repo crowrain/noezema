@@ -45,6 +45,11 @@ from apps.orchestrator.tool_context import (
     render_step_budget,
     render_tool_argument_schemas,
 )
+from apps.orchestrator.value_duplicate import (
+    ValueDuplicateCandidate,
+    ValueDuplicateClaim,
+    find_value_duplicates,
+)
 from apps.research_proxy.derivative_pointer import resolve_primary_source
 from apps.research_proxy.normalization import PARSER_FINGERPRINT
 from apps.research_proxy.source_attribution import primary_source
@@ -2772,6 +2777,77 @@ class Orchestrator:
                 seen_relied.add(ref_id)
                 relied_claim_ids.append(str(ref_id))
 
+        # T7.83 (ADR-0033): дубли по значению — честная склейка или честное молчание.
+        # Операция без existing_claim_id, у которой РОВНО ОДИН кандидат контекст-пака
+        # с тем же claim_type, тем же непустым множеством значимых чисел и покрытым
+        # периодом, конвертируется в перепроверку этого кандидата (variant (i)):
+        # свежая поддерживающая улика уходит в union-оценку кандидата (monotone по
+        # support/groups — см. ADR-0033: понизить E4/0.95 фикстуры она не может),
+        # якорные as_of/scope сохраняет packages/memory/reverify.py. Нет строгого
+        # совпадения, совпадений несколько, или в связях есть counters — операция
+        # остаётся как предложена (variant (ii)), а честная причина пишется в payload
+        # уже существующего события CLAIM_CREATED: нового типа события и миграции нет,
+        # отказ/конверсия одной операции не отменяет остальное предложение, а операции
+        # с явным existing_claim_id гейт не трогает вообще (их ведёт T7.34).
+        # Исходное предложение в аудит не переписывается: staged-копия отдельна.
+        value_duplicates: list[JsonDict] = []
+        staged_claims = list(proposal.claims)
+        pack_claim_ids = _pack_claim_ids(knowledge)
+        if pack_claim_ids and proposal.claims:
+            id_params = {f"vd{i}": cid for i, cid in enumerate(pack_claim_ids)}
+            id_placeholders = ", ".join(f":vd{i}" for i in range(len(pack_claim_ids)))
+            candidate_rows = list(
+                (
+                    await db.execute(
+                        text(
+                            "SELECT c.id::text AS id, c.statement, c.claim_type, c.as_of "
+                            f"FROM claims c WHERE c.id IN ({id_placeholders}) AND EXISTS "
+                            "(SELECT 1 FROM claim_assessment_heads h "
+                            "WHERE h.claim_id = c.id AND h.config_snapshot_id = :s)"
+                        ),
+                        {**id_params, "s": session.config_snapshot_id},
+                    )
+                )
+                .mappings()
+                .all()
+            )
+            if candidate_rows:
+                relied_set = set(relied_claim_ids)
+                candidates_input = [
+                    ValueDuplicateCandidate(
+                        claim_id=str(row["id"]),
+                        statement=str(row["statement"]),
+                        claim_type=str(row["claim_type"]),
+                        as_of_year=(row["as_of"].year if row["as_of"] is not None else None),
+                        relied=(str(row["id"]) in relied_set),
+                    )
+                    for row in candidate_rows
+                ]
+                links_by_claim: dict[int, list[str]] = {}
+                for link in proposal.evidence_links:
+                    links_by_claim.setdefault(link.claim_index, []).append(link.relation.value)
+                claims_input = [
+                    ValueDuplicateClaim(
+                        index=i,
+                        statement=c.statement,
+                        claim_type=str(c.claim_type.value),
+                        as_of_year=(c.as_of.year if c.as_of is not None else None),
+                        has_support_link=("supports" in links_by_claim.get(i, [])),
+                        has_counter_link=any(
+                            rel != "supports" for rel in links_by_claim.get(i, [])
+                        ),
+                    )
+                    for i, c in enumerate(proposal.claims)
+                    if c.existing_claim_id is None
+                ]
+                value_duplicates = find_value_duplicates(claims_input, candidates_input)
+                for entry in value_duplicates:
+                    if entry["action"] == "reverified" and entry["target"]:
+                        claim_i = int(entry["claim_index"])
+                        staged_claims[claim_i] = proposal.claims[claim_i].model_copy(
+                            update={"existing_claim_id": str(entry["target"])}
+                        )
+
         # T7.9 (EVAL-3b post-mortem P.2, §14.1): the rules engine
         # pre-commit check — a proposal the rules engine would reject
         # (a support evidence of a kind the claim-type rule does not
@@ -2806,7 +2882,9 @@ class Orchestrator:
             return 0, 0
 
         # T2.13: proposals go to session_staging, applied at commit
-        for claim in proposal.claims:
+        # (T7.83: staged_claims — копия списка; конвертированные дубли подменены
+        #  операциями с existing_claim_id, остальные объекты — те же самые)
+        for claim in staged_claims:
             await staging.record(
                 db,
                 audit,
@@ -2867,6 +2945,10 @@ class Orchestrator:
             claim_event_payload["relied_claim_ids"] = relied_claim_ids
         if relied_claims_rejected:
             claim_event_payload["relied_claims_rejected"] = relied_claims_rejected[:10]
+        # T7.83 (ADR-0033): ключ появляется только при непустом решении гейта —
+        # прежние сессии и их аудит остаются байт-в-байт прежними
+        if value_duplicates:
+            claim_event_payload["value_duplicates"] = value_duplicates
         await audit.record(
             AuditEventType.CLAIM_CREATED,
             session_id=session.id,
