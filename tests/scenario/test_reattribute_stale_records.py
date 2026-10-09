@@ -20,11 +20,15 @@
    получает честную строку «проверьте вручную»;
 5. пересчёт делает только существующий каскад §11.3 (`apply_source_graph_change` + рабочий переоценки),
    а повторный прогон идемпотентен;
-6. «первоисточник + два его пересказа» не оценивается выше, чем одна независимая группа.
+6. «первоисточник + два его пересказа» не оценивается выше, чем одна независимая группа;
+7. (T7.85a) записи, помеченные методом v2 (то окно публикации, поведение которого изменилось),
+   пересматриваются текущим методом v3 на том же основании «метки различаются».
 
 Сеть подменена детерминированным FakeFetchClient (§6); staging, `MemoryService`, группировка, правила и
-переатрибуция — настоящие. «Эпоха v1» моделируется тем же приёмом, что `broken_v1_fetch` в T7.77/T7.81:
-подменяется метка метода, которой пишется запись. Прямых UPDATE доменных таблиц в тесте нет.
+переатрибуция — настоящие. «Эпоха v1» (и, с T7.85a, эпоха v2) моделируется тем же приёмом, что
+`broken_v1_fetch` в T7.77/T7.81: подменяется метка метода, которой пишется запись. Прямых UPDATE
+доменных таблиц в тесте нет.
+
 """
 
 from __future__ import annotations
@@ -54,7 +58,11 @@ pytestmark = [pytest.mark.scenario]
 
 SINCE_ISO = "2000-01-01T00:00:00+00:00"
 V1_VALUE_METHOD = "host-value-attribution-v1"
+#: метка эпохи T7.85 (окно публикации без вето); переатрибуция T7.85a обязана пересматривать
+#: записи и с этой меткой — основание ровно то же, что для v1: метка ≠ текущий метод
 V2_VALUE_METHOD = "host-value-attribution-v2"
+#: текущий метод значений (T7.85a): им пишется запись после пересмотра прежней
+CURRENT_VALUE_METHOD = "host-value-attribution-v3"
 
 # ─── тексты: та же синтаксическая форма, что у стендовых страниц (фикстуры T7.85) ───
 # абзац нормализованного текста = одна строка; страница первоисточника — на своём home host
@@ -233,8 +241,11 @@ async def _run_page_backfill(
         await engine.dispose()
 
 
-async def _backfill_as_v1(scratch_url: str, store: FilesystemArtifactStore) -> Any:
-    """Тот же прогон, но запись помечена ПРЕЖНЕЙ версией метода — состояние эпохи v1.
+async def _backfill_as_v1(
+    scratch_url: str, store: FilesystemArtifactStore, *, stale_method: str = V1_VALUE_METHOD
+) -> Any:
+    """Тот же прогон, но запись помечена ПРЕЖНЕЙ версией метода — состояние эпохи `stale_method`
+    (v1 по умолчанию; с T7.85a тем же приёмом моделируется эпоха v2).
 
     Метод значений v1 не знал окна публикации; здесь моделируется ровно то, от чего зависит
     переатрибуция: метка записи, отличная от текущей (тот же приём, что `broken_v1_fetch`)."""
@@ -246,8 +257,8 @@ async def _backfill_as_v1(scratch_url: str, store: FilesystemArtifactStore) -> A
     factory = async_sessionmaker(engine, expire_on_commit=False)
     current_value_method = reattr.VALUE_ATTRIBUTION_METHOD_VERSION
     current_page_method = reattr.CURRENT_VALUE_METHOD_VERSION
-    reattr.CURRENT_VALUE_METHOD_VERSION = V1_VALUE_METHOD
-    reattr.VALUE_ATTRIBUTION_METHOD_VERSION = V1_VALUE_METHOD
+    reattr.CURRENT_VALUE_METHOD_VERSION = stale_method
+    reattr.VALUE_ATTRIBUTION_METHOD_VERSION = stale_method
     try:
         return await reattribute_evidence_window(factory, store, since=_since())
     finally:
@@ -349,7 +360,7 @@ async def test_stale_value_record_is_reconsidered_and_existing_parent_survives(
     }
     for uri in (URL_VEDOMOSTI, URL_EXPERT):
         record = written[uri]
-        assert record["method"] == V2_VALUE_METHOD, record
+        assert record["method"] == CURRENT_VALUE_METHOD, record
         assert record["primary_key"] == "rosstat", record
         # тот же первоисточник → тот же родитель: существующий указатель не подменяется новым якорем
         assert str(record["parent_source_id"]) == anchor, record
@@ -376,7 +387,7 @@ async def test_stale_value_record_is_reconsidered_and_existing_parent_survives(
     for uri in (URL_VEDOMOSTI, URL_EXPERT):
         row = next(r for r in again.rows if r.canonical_uri == uri)
         assert row.action == "изменений нет: решение уже записано ранее", row
-        assert row.was_method == V2_VALUE_METHOD, row
+        assert row.was_method == CURRENT_VALUE_METHOD, row
     assert (again.affected_claims, again.invalidated_heads, again.jobs_created) == (0, 0, 0)
 
 
@@ -416,7 +427,7 @@ async def test_primary_plus_two_retellings_is_not_graded_above_one_group(
     assert all(rec["primary_key"] == "cbr" for rec in decided.values()), decided
     # слабое основание видно оператору: это окно публикации, а не строгий pairing
     assert all(rec["pairing"] == "publication_window" for rec in decided.values()), decided
-    assert all(rec["method"] == V2_VALUE_METHOD for rec in decided.values()), decided
+    assert all(rec["method"] == CURRENT_VALUE_METHOD for rec in decided.values()), decided
     assert len({str(rec["parent_source_id"]) for rec in decided.values()}) == 1, decided
 
     own = next(r for r in origins if r["canonical_uri"] == URL_CBR_HOME)
@@ -540,3 +551,66 @@ async def test_refusal_of_current_method_keeps_the_previous_record(
     }
     for uri in (URL_VEDOMOSTI, URL_EXPERT):
         assert written_after[uri] == written_era[uri], "запись удалена или перезаписана отказом"
+
+
+# ─── 7: T7.85a — записи эпохи v2 пересматриваются точно так же, как эпоха v1 ───────
+
+
+@pytest.mark.asyncio
+async def test_records_tagged_v2_method_are_reconsidered_by_current_version(
+    migrated_db: tuple[str, Any], tmp_path: Path, live_fetch: None
+) -> None:
+    """T7.85a поднял метод значений до v3 (в окне публикации действует вето «другого источника
+    числа»). Записи, помеченные v2 — решения того же оконного режима, поведение которого
+    изменилось, — обязаны быть пересмотрены, а не пропущены как «уже решено»: основание отбора
+    ровно то же, что для эпохи v1 (метка записи ≠ текущий метод)."""
+
+    import apps.research_proxy.reattribution as reattr
+
+    assert reattr.CURRENT_VALUE_METHOD_VERSION == CURRENT_VALUE_METHOD, "отбор устаревших меток"
+
+    scratch_url, _engine = migrated_db
+    store = FilesystemArtifactStore(tmp_path / "artifacts")
+
+    await _seed_claim(scratch_url, store, POLL_URLS, STATEMENT_145)
+    assert len(await _group_ids(scratch_url, STATEMENT_145)) == 3
+
+    # эпоха v2: те же страницы, то же окно публикации — но запись помечена v2
+    era = await _backfill_as_v1(scratch_url, store, stale_method=V2_VALUE_METHOD)
+    assert era.changed_evidence == 2, era.rows
+    written_era = {
+        str(r["canonical_uri"]): dict(r["origin"])
+        for r in await _records_of(scratch_url, STATEMENT_145)
+        if r["origin"] is not None
+    }
+    assert set(written_era) == {URL_FORBES, URL_KOMMERSANT}, written_era
+    assert all(rec["method"] == V2_VALUE_METHOD for rec in written_era.values()), written_era
+    assert all(rec["pairing"] == "publication_window" for rec in written_era.values()), written_era
+
+    # текущий метод (v3) не считает их «уже решёнными»: пересмотр прежнего решения виден в плане
+    plan = await _run_backfill(scratch_url, store, dry_run=True)
+    stale = [row for row in plan.rows if row.canonical_uri in (URL_FORBES, URL_KOMMERSANT)]
+    assert len(stale) == 2, plan.rows
+    assert all(row.was_method == V2_VALUE_METHOD for row in stale), stale
+    assert all(
+        row.was_status == f"derivative → Банк России ({V2_VALUE_METHOD})" for row in stale
+    ), stale
+    # синтетические страницы подставки чисты: вето не сработало, решение то же — пересмотренное
+    assert all(row.action == "будет записано прежнее происхождение значения улики" for row in stale), stale
+
+    report = await _run_backfill(scratch_url, store)
+    assert report.changed_evidence == 2, report.rows
+    written_after = {
+        str(r["canonical_uri"]): dict(r["origin"])
+        for r in await _records_of(scratch_url, STATEMENT_145)
+        if r["origin"] is not None
+    }
+    assert all(rec["method"] == CURRENT_VALUE_METHOD for rec in written_after.values()), written_after
+    assert all(rec["primary_key"] == "cbr" for rec in written_after.values()), written_after
+    assert all(rec["pairing"] == "publication_window" for rec in written_after.values()), written_after
+    assert len(await _group_ids(scratch_url, STATEMENT_145)) == 1
+    assert await _current_assessment(scratch_url, STATEMENT_145) == ("E1", "hypothesis")
+
+    # повторный прогон идемпотентен: записи текущего метода не перезаписываются никогда
+    again = await _run_backfill(scratch_url, store)
+    assert again.changed_evidence == 0 and not again.changed_source_ids, again.rows
