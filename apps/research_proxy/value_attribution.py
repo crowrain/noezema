@@ -50,13 +50,25 @@ from apps.research_proxy.source_attribution import (
     _basis,
     _fragments,
     is_home_host,
+    named_primary_keys,
     normalize_scan_text,
     primary_source,
+)
+from packages.memory.scope import (
+    VALUE_ATTRIBUTION_PAIRING_PUBLICATION,
+    VALUE_ATTRIBUTION_PAIRING_STRICT,
 )
 
 #: версия метода поуровневой атрибуции: попадает в запись улики и в аудит, чтобы решение можно было
 #: отличить от страничного решения детектора (у него своя версия) и от последующих версий.
-VALUE_ATTRIBUTION_METHOD_VERSION: Final = "host-value-attribution-v1"
+#: v2 (T7.85): добавлен узкий второй режим pairing — «атрибуция публикации» (см. `_publication_basis`):
+#: значение утверждения и указание на публикацию первоисточника могут стоять в одном блоке
+#: страницы, но в разных предложениях (замер kommersant.ru/forbes.ru: «…следует из опубликованных
+#: 17 декабря данных опроса, проводимого „инФОМ“ по заказу Банка России. … Оценка текущих темпов
+#: роста цен при этом осталась на уровне 14,5%»). Строгий режим не ослаблен: он по-прежнему
+#: решает первым и первым же отказывает; запись несёт поле `pairing`, поэтому решение v2
+#: отличается от решения v1 и переатрибуция обязана его пересмотреть.
+VALUE_ATTRIBUTION_METHOD_VERSION: Final = "host-value-attribution-v2"
 
 #: честный отказ этого детектора: первоисточник в основании назван, но значение там другое — не то,
 #: на котором стоит утверждение. Отличие от `no_value_attribution` (атрибуции нет вовсе) нужно,
@@ -97,6 +109,43 @@ _UNIT_SCAN: Final = re.compile(
 #  внутри («п. п.»), поэтому окно чуть шире самой короткой единицы
 _UNIT_TAIL_CHARS: Final = 8
 
+#: T7.85: второй, более узкий режим pairing — «атрибуция публикации». Страница нередко объявляет
+#: источник всех приводимых чисел одним указанием на публикацию первоисточника («…следует из
+#: опубликованных 17 декабря данных опроса, проводимого „инФОМ“ по заказу Банка России»,
+#: «…следует из опроса „инФОМ“, опубликованного ЦБ»), а нужное значение называет в следующем
+#: предложении. Строгий режим («значение и первоисточник в одном фрагменте») не ослаблен: он
+#: решает первым, и только его честный отказ даёт право рассмотреть окно публикации. Окно
+#: ограничено блоком вёрстки (одиночный перевод строки — граница блока: за неё окно не уходит)
+#: и длиной PUBLICATION_WINDOW_CHARS от числа назад.
+PUBLICATION_WINDOW_CHARS: Final = 400
+_PUBLICATION_TAIL_CHARS: Final = 40
+_BLOCK_BREAK: Final = "\n"
+
+#: маркеры публикации первоисточника — указание на материал, который первоисточник опубликовал
+#: или провёл. Сам шаблон атрибуции («по данным») маркером не считается: иначе окно публикации
+#: разрешало бы склейку по любому упоминанию ведомства рядом с чужим числом.
+PUBLICATION_MARKERS: Final[tuple[str, ...]] = (
+    r"\bопрос[а-яё]*",
+    r"\bопубликов[а-яё]*",
+    r"\bпубликац[а-яё]*",
+    r"\bмониторинг[а-яё]*",
+    r"\bобзор[а-яё]*",
+    r"\bисследовани[а-яё]*",
+    r"\bотч[ёе]т[а-яё]*",
+    r"\bрелиз[а-яё]*",
+    r"\bsurvey\w*",
+    r"\bpublicat\w*",
+    r"\breport\w*",
+)
+_PUBLICATIONS: Final = tuple(re.compile(pattern, re.IGNORECASE) for pattern in PUBLICATION_MARKERS)
+
+#: какой pairing дал решение — записывается в улику, чтобы более слабый режим был виден оператору.
+#: Словарь значений и проверка формы живёт в одном месте — `packages/memory/scope.py`
+#: (`VALUE_ATTRIBUTION_PAIRINGS`): у детектора и у записи не должно быть двух мнений о том,
+#: как называется режим pairing.
+PAIRING_VALUE_AND_PRIMARY: Final = VALUE_ATTRIBUTION_PAIRING_STRICT
+PAIRING_PUBLICATION_WINDOW: Final = VALUE_ATTRIBUTION_PAIRING_PUBLICATION
+
 
 @dataclass(frozen=True)
 class ValueAttributionDecision:
@@ -111,6 +160,9 @@ class ValueAttributionDecision:
     #: значения утверждения, по которым выбран фрагмент; пусто — когда утверждение не называет
     #: измеренного значения, и тогда выбор идёт по всему основанию улики (строже к отказу)
     claim_values: tuple[str, ...] = ()
+    #: какой pairing дал решение: строгий режим или окно публикации (T7.78/T7.85). Записывается
+    #: в улику (`packages/memory/scope.py`), чтобы более слабое основание было видно оператору
+    pairing: str = PAIRING_VALUE_AND_PRIMARY
 
     @property
     def is_derivative(self) -> bool:
@@ -141,6 +193,97 @@ def claim_value_numbers(statement: str | None) -> tuple[str, ...]:
     if not statement:
         return ()
     return tuple(sorted(_measured_numbers(normalize_scan_text(statement))))
+
+
+def _measured_value_spans(text: str, values: set[str]) -> list[tuple[int, int]]:
+    """Позиции в тексте каждого измеренного числа утверждения (то же сравнение чисел, что и
+    `_measured_numbers`): окно публикации привязывается к месту, где значение стоит на странице."""
+    return [
+        (match.start(), match.end())
+        for match in VALUE_NUMBER_PATTERN.finditer(text)
+        if _UNIT_SCAN.match(text[match.end() : match.end() + _UNIT_TAIL_CHARS])
+        and _canonical_number(match.group()) in values
+    ]
+
+
+def _publication_window(text: str, start: int, end: int) -> str:
+    """Окно второго режима вокруг значения: не дальше `PUBLICATION_WINDOW_CHARS` назад от числа,
+    не дальше `PUBLICATION_TAIL_CHARS` вперёд, и не за границу блока (одиночный перевод строки —
+    граница блока вёрстки нормализованного текста)."""
+    lower = max(0, start - PUBLICATION_WINDOW_CHARS)
+    break_before = text.rfind(_BLOCK_BREAK, 0, start)
+    if break_before >= lower:
+        lower = break_before + 1
+    upper = min(len(text), end + _PUBLICATION_TAIL_CHARS)
+    break_after = text.find(_BLOCK_BREAK, end)
+    if 0 <= break_after < upper:
+        upper = break_after
+    return text[lower:upper]
+
+
+def _publication_decision(
+    *, scanned: str, canonical_uri: str | None, values: tuple[str, ...]
+) -> ValueAttributionDecision | None:
+    """Второй режим pairing (T7.85): страница объявила публикацию первоисточника в предыдущих
+    предложениях того же блока, а значение называет позже.
+
+    Условия строже строгого режима по всем остальным пунктам: то же окно «шаблон + алиас»
+    (`ATTRIBUTION_WINDOW_CHARS`), то же требование измеренного числа и маркера измерения, то же
+    правило «страница первоисточника не бывает его пересказом», тот же отказ при разночтении.
+    Дополнительно: в окне обязано быть название публикации первоисточника (`PUBLICATION_MARKERS`),
+    и если в одном окне назван хоть один второй первоисточник — решение не принимается вовсе."""
+    if not values:
+        return None  # значения нет: расширять pairing нечем (строгий режим строже)
+    candidates: dict[str, str] = {}
+    ambiguity_basis: str | None = None
+    for start, end in _measured_value_spans(scanned, set(values)):
+        window = _publication_window(scanned, start, end)
+        if not any(pattern.search(window) for pattern in _PUBLICATIONS):
+            continue  # публикация первоисточника не названа: окно не расширяем
+        attributed = _attributed_keys(window)
+        if not attributed:
+            continue
+        named = set(named_primary_keys(window))
+        if len(named) > 1:
+            # в одном окне с значением названы два разных первоисточника — разночтение
+            ambiguity_basis = window
+            continue
+        candidates.update(
+            {
+                key: basis
+                for key, basis in attributed.items()
+                if not is_home_host(canonical_uri, _home_hosts(key))
+            }
+        )
+    if ambiguity_basis is not None:
+        return ValueAttributionDecision(
+            status=STATUS_AMBIGUOUS,
+            basis_fragment=_basis(ambiguity_basis),
+            claim_values=values,
+            pairing=PAIRING_PUBLICATION_WINDOW,
+        )
+    if not candidates:
+        return None
+    if len(candidates) > 1:
+        return ValueAttributionDecision(
+            status=STATUS_AMBIGUOUS,
+            basis_fragment=_basis(next(iter(candidates.values()))),
+            claim_values=values,
+            pairing=PAIRING_PUBLICATION_WINDOW,
+        )
+    key, basis = next(iter(candidates.items()))
+    spec = primary_source(key)
+    if spec is None:  # защита: решение не строится на несуществующей записи словаря
+        return None
+    return ValueAttributionDecision(
+        status=STATUS_DERIVATIVE,
+        primary_key=spec.key,
+        primary_name=spec.name,
+        parent_uri=spec.home_uri,
+        basis_fragment=_basis(basis),
+        claim_values=values,
+        pairing=PAIRING_PUBLICATION_WINDOW,
+    )
 
 
 def attribute_value_in_fragment(
@@ -177,8 +320,23 @@ def attribute_value_in_fragment(
             continue  # «другое число»: первоисточник назван, но не про значение утверждения
         matched.update(dict.fromkeys(keys, fragment))
 
+    def fallback(refusal: ValueAttributionDecision) -> ValueAttributionDecision:
+        """Честный отказ строгого режима ещё не значит «пересказа нет»: страница могла объявить
+        публикацию первоисточника в предыдущих предложениях того же блока. Второй режим
+        рассматривается ТОЛЬКО после отказа строгого — строгий режим не ослаблен ни на пункт.
+
+        `own_assessment` и `self_primary` сюда не приходят: первое — вето на весь документ,
+        второе уже утверждает, что значение принадлежит прочитанной странице (отрицательный
+        контроль T7.85: собственная страница ЦБ по опросу «инФОМ» не становится пересказом)."""
+        wider = _publication_decision(
+            scanned=scanned, canonical_uri=canonical_uri, values=values
+        )
+        return refusal if wider is None else wider
+
     if not attributed:
-        return ValueAttributionDecision(status=STATUS_NO_VALUE_ATTRIBUTION, claim_values=values)
+        return fallback(
+            ValueAttributionDecision(status=STATUS_NO_VALUE_ATTRIBUTION, claim_values=values)
+        )
 
     # страница самого первоисточника не бывает его пересказом
     candidates = {
@@ -189,14 +347,18 @@ def attribute_value_in_fragment(
     if not candidates:
         if not matched:
             # атрибуции в основании были, но все — про другие числа утверждения
-            return ValueAttributionDecision(
-                status=STATUS_VALUE_NOT_ATTRIBUTED, claim_values=values
+            return fallback(
+                ValueAttributionDecision(status=STATUS_VALUE_NOT_ATTRIBUTED, claim_values=values)
             )
         own_only = all(is_home_host(canonical_uri, _home_hosts(key)) for key in matched)
-        return ValueAttributionDecision(
-            # значение утверждения приписано самой прочитанной странице — она первоисточник
-            status=STATUS_SELF_PRIMARY if own_only else STATUS_VALUE_NOT_ATTRIBUTED,
-            claim_values=values,
+        if own_only:
+            return ValueAttributionDecision(
+                # значение утверждения приписано самой прочитанной странице — она первоисточник
+                status=STATUS_SELF_PRIMARY,
+                claim_values=values,
+            )
+        return fallback(
+            ValueAttributionDecision(status=STATUS_VALUE_NOT_ATTRIBUTED, claim_values=values)
         )
 
     if len(candidates) > 1:

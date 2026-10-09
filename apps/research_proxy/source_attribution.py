@@ -34,7 +34,13 @@ from packages.domain.sanitization import mask_nul
 #: слова и перевод строки внутри фразы (факт подставки: «По\xa0данным Росстата» на
 #: sbercib.ru остался no_value_attribution). Это различие версий использует
 #: переатрибуция (`apps/research_proxy/reattribution.py`).
-ATTRIBUTION_METHOD_VERSION: Final = "host-source-attribution-v2"
+#: v3 (T7.85): словарь и шаблоны расширены по замерам живых страниц подставки (замеры —
+#: docs/STATUS.md, раздел T7.85): «следует из данных Росстата» (expert.ru, ria.ru),
+#: репортажные формы «ЦБ сообщил» (заголовок forbes.ru) и «из сообщения Росстата», голое
+#: «ЦБ» без «РФ». Правило пары не изменилось: значение + шаблон + измеренное число + алиас
+#: в одном фрагменте и в окне ATTRIBUTION_WINDOW_CHARS — расширен только словарь, поэтому
+#: решения v3 отличаются от решений v2 и переатрибуция обязана их пересмотреть.
+ATTRIBUTION_METHOD_VERSION: Final = "host-source-attribution-v3"
 
 #: статусы решения. `derivative` — единственный, при котором хост ставит указатель;
 #: остальные четыре означают «не помечаем» и записываются в аудит как честный отказ.
@@ -125,6 +131,10 @@ PRIMARY_SOURCES: Final[tuple[PrimarySource, ...]] = (
             r"банк[а-яё]* росс[а-яё]*",
             r"центр[а-яё]* банк[а-яё]* росс[а-яё]*",
             r"\bцб\s*рф\b",
+            #: T7.85: живой репортаж называет Банк России голом «ЦБ» («ЦБ сообщил о росте
+            #  инфляционных ожиданий», "опубликованного ЦБ") — замер forbes.ru с подставки.
+            #  `\b` не даёт матчить «цбрф» как отдельный алиас и любые слова с «цб» внутри.
+            r"\bцб\b",
             r"центробанк[а-яё]*",
             r"bank of russia",
             r"central bank of the russian federation",
@@ -173,6 +183,15 @@ ATTRIBUTION_TEMPLATES: Final[tuple[str, ...]] = (
     r"ссылка[а-яё]* на",
     r"по оценк[а-яё]*",
     r"релиз[а-яё]*",
+    #: T7.85 (замеры живых страниц подставки): форма придаточного изложения — «составила 5,59%,
+    #  следует из данных Росстата» (expert.ru, ria.ru), «ухудшились, следует из опубликованных
+    #  17 декабря данных опроса … по заказу Банка России» (kommersant.ru). Существительные и
+    #  глаголы репортажа без предлога: «ЦБ сообщил о росте ожиданий», «следует из сообщения
+    #  Росстата». Пара по-прежнему требует измеренного числа и алиаса в окне — голое упоминание
+    #  («Росстат опубликовал релиз 16 января … и сообщил о графике публикаций») остаётся отказом.
+    r"следует из",
+    r"\bсообщил[а-яё]*",
+    r"\bсообщени[а-яё]*",
     r"according to",
     r"as reported by",
     r"per data from",
@@ -313,13 +332,19 @@ def is_home_host(uri: str | None, home_hosts: tuple[str, ...]) -> bool:
 def _fragments(text: str) -> list[str]:
     """Фрагменты сканируемого текста. Разделители с окончанием предложения (или пустая
     строка) закрывают фрагмент; одиночный перевод строки склеивает соседние куски —
-    типографический перенос внутри фразы не разрывает пару «шаблон + алиас» (T7.77)."""
+    типографический перенос внутри фразы не разрывает пару «шаблон + алиас» (T7.77).
+
+    T7.85: живая страница rupt.ru/kommersant.ru рвёт фразу атрибуции переводом строки прямо
+    посреди шаблона («…по итогам 2024 года, \nследует\n из данных Росстата»). Склейка вставляет
+    свой пробел там, где он уже есть, — и шаблон перестаёт мататься. Склеенный фрагмент
+    нормализуется тем же правилом, что и весь документ (`_CONSECUTIVE_SPACES`): одно мнение о
+    том, что такое промежуток между словами."""
     tokens = _FRAGMENT_SPLIT.split(text)
     fragments: list[str] = []
     current = ""
     for index in range(0, len(tokens), 2):
         piece = tokens[index]
-        current = f"{current} {piece}" if current else piece
+        current = _CONSECUTIVE_SPACES.sub(" ", f"{current} {piece}") if current else piece
         separator = tokens[index + 1] if index + 1 < len(tokens) else ""
         hard_break = separator == "" or any(char in ".!?\u2026" for char in separator) or "\n\n" in separator
         if hard_break:
@@ -336,6 +361,18 @@ def _basis(fragment: str) -> str:
     for marker in ("<<<UNTRUSTED DATA BEGIN>>>", "<<<UNTRUSTED DATA END>>>"):
         text = text.replace(marker, "[fence-маркер в данных заменён]")
     return " ".join(text.split())[:BASIS_FRAGMENT_CHARS]
+
+
+def named_primary_keys(text: str) -> tuple[str, ...]:
+    """Ключи словаря, чей алиас встречается в тексте (шаблон атрибуции не требуется).
+
+    Нужно узкому режиму поуровневой атрибуции (`apps/research_proxy/value_attribution.py`):
+    если рядом с заявленным значением названы два разных первоисточника, решение — отказ даже
+    тогда, когда шаблон стоит только у одного из них (ADR-0029: разночтение трактуется в пользу
+    независимости, ложная склейка дороже пропуска)."""
+    return tuple(
+        key for key, (_spec, patterns) in _ALIASES.items() if any(p.search(text) for p in patterns)
+    )
 
 
 def _attributed_keys(fragment: str) -> dict[str, str]:

@@ -83,7 +83,9 @@ def test_retelling_of_a_release_is_derivative(uri: str, text: str) -> None:
     assert "http" in decision.parent_uri
     # основание решения записывается: оператор может проверить, чем хост руководствовался
     assert decision.basis_fragment
-    assert ATTRIBUTION_METHOD_VERSION == "host-source-attribution-v2"
+    # версия метода закреплена: T7.85 поднял её (алиасы/шаблоны по замерам живых страниц и
+    # схлопывание пробела при склейке фрагмента). Само это решение — из v1, оно не изменилось.
+    assert ATTRIBUTION_METHOD_VERSION == "host-source-attribution-v3"
 
 
 # ─── пересказ опознаётся и по-английски ──────────────────────────────────
@@ -390,5 +392,8 @@ def test_published_data_without_a_named_primary_stays_honest() -> None:
 
 def test_typography_fix_bumps_the_method_version() -> None:
     # решения v2 отличаются от решений битого v1 по методу в metadata и аудите —
-    # на этом различии построена переатрибуция (apps/research_proxy/reattribution.py)
-    assert ATTRIBUTION_METHOD_VERSION == "host-source-attribution-v2"
+    # на этом различии построена переатрибуция (apps/research_proxy/reattribution.py).
+    # T7.85 поднял версию до v3 тем же способом: словарь и склейка фрагмента исправлены по
+    # замерам живых страниц подставки, прежние решения остаются валидными записями — их
+    # пересматривает переатрибуция, а не отмена (STATUS T7.85, ADR-0029 дополнение).
+    assert ATTRIBUTION_METHOD_VERSION == "host-source-attribution-v3"

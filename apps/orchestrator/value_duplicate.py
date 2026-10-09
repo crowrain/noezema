@@ -54,6 +54,15 @@ honest reason recorded (variant (ii) territory: without new supporting evidence 
 justifies touching the candidate, and a dispute must remain a dispute). Zero suspects →
 silent: the payload stays byte-identical to pre-T7.83.
 
+T7.85 adds a second, narrower detector in this module — `find_identical_statement_duplicates`:
+an op whose statement is BYTE-identical to exactly one context-pack claim but whose `claim_type`
+differs. Dedup T7.9 (it requires equal statement AND equal type) and the numeric gate (its first
+condition is equal type) both cannot see it, so the stand wrote the same sentence twice with
+different grades (2d010d53 external_fact / 58e2d5d4 temporal_fact). Byte-exactness is what makes
+this rule safe without T7.83a's `relied_claim_ids` filter: identical text means identical
+indicator, period and values by construction, so the host is not choosing between two different
+formulations — it keeps the one claim the curator already stated.
+
 The module decides; applying the conversion (staged copies + audit annotation) is the
 host's job in apps/orchestrator/orchestrator.py — ops with an explicit `existing_claim_id`
 are never passed here (T7.34 already owns them).
@@ -394,6 +403,111 @@ def _entry(
         "action": action,
         "reason": reason,
     }
+
+
+# ── T7.85 (ADR-0033 дополнение): побайтово та же формулировка при другом claim_type ─────
+#
+# Стендовая форма (сессия a09977e1, .92): одно и то же предложение записано дважды — как
+# `external_fact` 2d010d53 и как `temporal_fact` 58e2d5d4; формулировки совпадают побайтово, а
+# `existing_claim_id` куратор не указал. Дедуп T7.9 (`packages/memory/service.py`: равенство
+# `statement` И равенство `claim_type`) такого дубля не видит — типы разные. Числовой гейт
+# T7.83/T7.83a тоже не видит: его первое условие — тот же `claim_type`. На карточке появляется
+# второе утверждение того же факта с другой оценкой.
+#
+# Правило аддитивно к числовому гейту и намеренно уже его: формулировки обязаны совпасть
+# ПОБАЙТОВО (та же канонизация, что у дедупа T7.9 — сравнение строк без нормализаций), поэтому
+# «похожести» здесь быть не может: если текст тот же, то и показатель, и период, и значения те
+# же. Из этого же следует, что фильтр `relied_claim_ids` (T7.83a) этому правилу НЕ нужен: он
+# запрещал хосту решать за куратора склейку ДВУХ РАЗНЫХ формулировок; побайтовая идентичность
+# снимает неопределённость — хост не выбирает чужой факт, он остаётся на том же утверждении.
+# Операция конвертируется в перепроверку этого claim, и оценка считается по ТИПУ ЯКОРЯ
+# (T7.34/ADR-0018: тип предложения при перепроверке не волен), а не по типу, который модель
+# выдумала вторым проходом. Побайтовое совпадение с claim того же типа — территория дедупа T7.9,
+# хост туда не лезет; операции с явным `existing_claim_id` сюда не передаются вообще (T7.34).
+
+
+def find_identical_statement_duplicates(
+    claims: Sequence[ValueDuplicateClaim],
+    candidates: Sequence[ValueDuplicateCandidate],
+) -> list[JsonDict]:
+    """Решения только для операций, чья формулировка побайтово совпадает с утверждением
+    контекст-пака, а `claim_type` — другой. Остальное молчит (пустой список → нет ключа в
+    payload → прежние аудит-события байт-в-байт прежние).
+
+    Ровно один кандидат → перепроверка этого claim (`reverified`). Два и больше → операция
+    остаётся как предложена: какой из них «тот же самый» — решает куратор, не хост. Тот же текст
+    при том же типе → молчание: это ведёт дедуп T7.9. Ограничения по связям те же, что у
+    числового гейта: улика-опровержение не пристёгивается к чужой записи, а без поддерживающей
+    улики кандидату нечего добавить."""
+    decisions: list[JsonDict] = []
+    ordered = sorted(candidates, key=lambda candidate: candidate.claim_id)
+    for claim in claims:
+        if not claim.statement:
+            continue
+        same_text = [candidate for candidate in ordered if candidate.statement == claim.statement]
+        if not same_text:
+            continue  # побайтового совпадения нет — это территория числового гейта выше
+        if any(candidate.claim_type == claim.claim_type for candidate in same_text):
+            continue  # тот же текст и тот же тип ведёт дедуп T7.9, хост его не подменяет
+        different = [c for c in same_text if c.claim_type != claim.claim_type]
+        if len(different) >= 2:
+            decisions.append(
+                _entry(
+                    claim,
+                    action="kept",
+                    target=None,
+                    reason=(
+                        f"the statement is byte-identical to {len(different)} context-pack claims "
+                        f"of another type ({', '.join(c.claim_id for c in different)}) — which one "
+                        "is the same claim cannot be decided by the host; left as proposed"
+                    ),
+                )
+            )
+            continue
+        target = different[0]
+        if claim.has_counter_link:
+            decisions.append(
+                _entry(
+                    claim,
+                    action="kept",
+                    target=None,
+                    reason=(
+                        f"byte-identical statement of {target.claim_id}, but the op carries "
+                        "counterevidence links — a dispute stays a dispute, the candidate is "
+                        "not touched"
+                    ),
+                )
+            )
+            continue
+        if not claim.has_support_link:
+            decisions.append(
+                _entry(
+                    claim,
+                    action="kept",
+                    target=None,
+                    reason=(
+                        f"byte-identical statement of {target.claim_id}, but the op has no "
+                        "supporting evidence — nothing new to add to the candidate"
+                    ),
+                )
+            )
+            continue
+        decisions.append(
+            _entry(
+                claim,
+                action="reverified",
+                target=target.claim_id,
+                reason=(
+                    f"same statement, type relabelled {claim.claim_type} → {target.claim_type}: "
+                    f"the formulation is byte-identical to {target.claim_id}, so the value, the "
+                    "period and the indicator are the same by construction (the reliance filter "
+                    "of T7.83a is not needed here — it exists to keep the host from choosing "
+                    "between two different formulations); converted to a reverify of that claim, "
+                    "assessed under its own claim type"
+                ),
+            )
+        )
+    return decisions
 
 
 def find_value_duplicates(

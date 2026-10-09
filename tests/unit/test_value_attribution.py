@@ -96,8 +96,13 @@ def test_other_value_of_the_same_page_is_a_retelling_of_the_bank_of_russia() -> 
 
 
 def test_decision_is_not_the_page_status() -> None:
-    """Поуровневое решение не подменяет страничное: у него своя версия метода."""
-    assert VALUE_ATTRIBUTION_METHOD_VERSION == "host-value-attribution-v1"
+    """Поуровневое решение не подменяет страничное: у него своя версия метода.
+
+    T7.85: v2 = строгий pairing (значение и первоисточник в одном фрагменте) плюс узкий второй
+    режим «окно публикации». Маркер формы записи (`VALUE_ATTRIBUTION_SCHEMA`) при этом НЕ менялся:
+    записи v1 читаются по-прежнему, отличается только `method` — на этом различии переатрибуция
+    пересматривает прежние решения (STATUS T7.85)."""
+    assert VALUE_ATTRIBUTION_METHOD_VERSION == "host-value-attribution-v2"
 
 
 # ── границы консервативности ────────────────────────────────────────────────────────────────

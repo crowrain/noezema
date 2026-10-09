@@ -50,6 +50,7 @@ from apps.orchestrator.value_duplicate import (
     ValueDuplicateCandidate,
     ValueDuplicateClaim,
     declared_scope_metric,
+    find_identical_statement_duplicates,
     find_value_duplicates,
 )
 from apps.research_proxy.derivative_pointer import resolve_primary_source
@@ -2490,6 +2491,9 @@ class Orchestrator:
             parent_source_id=parent_id,
             method=VALUE_ATTRIBUTION_METHOD_VERSION,
             basis_fragment=decision.basis_fragment,
+            # T7.85: какое pairing дало решение — часть записи, чтобы оператор видел, что
+            # пересказ признан по окну публикации, а не по одному фрагменту
+            pairing=decision.pairing,
         )
         if attribution is None:
             return None
@@ -2875,13 +2879,35 @@ class Orchestrator:
                     for i, c in enumerate(proposal.claims)
                     if c.existing_claim_id is None
                 ]
-                value_duplicates = find_value_duplicates(claims_input, candidates_input)
+                # T7.85 (ADR-0033 дополнение): сначала побайтовая идентичность формулировки при
+                # другом claim_type — это более узкое и более надёжное основание, чем числовой
+                # гейт (текст тот же → показатель, период и значения те же по построению).
+                # Операции, решённые этим правилом (и те, где хост честно отказался склеивать),
+                # дальше числовым гейтом не перешумовываются: у одной операции должно быть ровно
+                # одно решение в отчёте.
+                identical_decisions = find_identical_statement_duplicates(
+                    claims_input, candidates_input
+                )
+                identical_indices = {int(entry["claim_index"]) for entry in identical_decisions}
+                numeric_claims = [c for c in claims_input if c.index not in identical_indices]
+                value_duplicates = sorted(
+                    identical_decisions + find_value_duplicates(numeric_claims, candidates_input),
+                    key=lambda entry: int(str(entry["claim_index"])),
+                )
+                candidate_types = {str(row["id"]): str(row["claim_type"]) for row in candidate_rows}
                 for entry in value_duplicates:
                     if entry["action"] == "reverified" and entry["target"]:
                         claim_i = int(entry["claim_index"])
                         staged_claims[claim_i] = proposal.claims[claim_i].model_copy(
                             update={"existing_claim_id": str(entry["target"])}
                         )
+                        # оценка перепроверки считается по типу ЯКОРЯ (T7.34/ADR-0018), и предпроверка
+                        # правил обязана видеть именно он: при релейбеле тип второго прохода модели
+                        # другой, и проверка по нему отвергла бы законную перепроверку.
+                        relabel_type = candidate_types.get(str(entry["target"]))
+                        if relabel_type is not None:
+                            reverify_anchor_types[claim_i] = relabel_type
+                            claims_for_validation[claim_i]["claim_type"] = relabel_type
 
         # T7.84 (часть B, ADR-0033 §8): проверка опорной даты `temporal_fact` — отдельным
         # шагом СРАЗУ ПОСЛЕ того, как хост окончательно определил вид каждой операции:

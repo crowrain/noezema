@@ -284,7 +284,9 @@ async def test_evidence_level_decision_merges_the_page_with_the_primary(
     assert record["schema"] == "host-value-attribution-v1"
     assert record["primary_key"] == "rosstat"
     assert record["primary_name"] == "Росстат"
-    assert record["method"] == "host-value-attribution-v1"
+    # T7.85: метод значений v2 (строгое pairing осталось, но после честного отказа возможно
+    # оконное); схема записи при этом остаётся host-value-attribution-v1
+    assert record["method"] == "host-value-attribution-v2"
     assert "По данным Росстата" in record["basis_fragment"]
     # эффективный родитель — тот же якорь первоисточника, что уже создан страничным указателем
     anchor = await _scalar(scratch_url, "SELECT id::text AS id FROM sources WHERE canonical_uri = :u", {"u": "https://rosstat.gov.ru/"})

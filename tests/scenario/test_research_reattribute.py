@@ -231,8 +231,9 @@ async def test_reattribute_marks_parents_and_regrades_honestly(
     for row in after:
         assert str(row["parent_source_id"]) == str(anchors[0]["id"])
         record = dict(row["d"])
-        # решение принято детектором v2 отложенным прогоном — видно из provenance
-        assert record["method"] == "host-source-attribution-v2"
+        # решение принято отложенным прогоном текущим страничным детектором — видно из provenance
+        # (T7.85: метод v3; окно пересмотра с этой же правки — «любой метод, кроме текущего»)
+        assert record["method"] == "host-source-attribution-v3"
         assert record["written_by"] == "research-reattribute"
         assert "Росстат" in record["basis_fragment"]
 

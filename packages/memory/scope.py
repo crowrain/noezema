@@ -54,6 +54,7 @@ import re
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
+from typing import Final
 
 from packages.domain.models.base import JsonDict
 from packages.domain.models.enums import ClaimDateAnchor
@@ -437,8 +438,23 @@ def derive_evidence_scope(
 
 #: дополнительный ключ evidence scope (хостовый, модель его не пишет)
 EVIDENCE_VALUE_ATTRIBUTION_KEY = "value_attribution"
-#: маркер формы записи внутри ключа: решение можно отличить от записи другой версии детектора
+#: маркер формы записи внутри ключа: решение можно отличить от записи другой версии детектора.
+#: С T7.85 маркер НЕ поднимается, хотя поле записи появилось новое (`pairing`): прежние улики
+#: обязаны остаться читаемыми (`parse_value_attribution` fail-closed), а отклонение прежних
+#: записей поднятием схемы молча повысило бы независимость уже склеенных пересказов — ослабление,
+#: замаскированное под смену версии. Отличаются версии МЕТОДА (`method` в записи), именно
+#: на этом различии переатрибуция пересматривает прежние решения.
 VALUE_ATTRIBUTION_SCHEMA = "host-value-attribution-v1"
+
+#: какой pairing дал решение о происхождении значения (T7.85). `value_and_primary_in_fragment` —
+#: строгий режим ADR-0029 (значение и первоисточник в одном фрагменте); `publication_window` —
+#: узкий второй режим: публикация первоисточника объявлена в предыдущих предложениях того же
+#: блока страницы. Поле записывается, чтобы более слабое основание было видно оператору.
+VALUE_ATTRIBUTION_PAIRING_STRICT: Final = "value_and_primary_in_fragment"
+VALUE_ATTRIBUTION_PAIRING_PUBLICATION: Final = "publication_window"
+VALUE_ATTRIBUTION_PAIRINGS: Final[frozenset[str]] = frozenset(
+    {VALUE_ATTRIBUTION_PAIRING_STRICT, VALUE_ATTRIBUTION_PAIRING_PUBLICATION}
+)
 
 @dataclass(frozen=True)
 class ValueAttribution:
@@ -451,6 +467,8 @@ class ValueAttribution:
     parent_source_id: str
     method: str
     basis_fragment: str
+    #: аддитивное поле T7.85: какой pairing дал решение (`VALUE_ATTRIBUTION_PAIRINGS`)
+    pairing: str = VALUE_ATTRIBUTION_PAIRING_STRICT
 
     def as_scope(self) -> JsonDict:
         return {
@@ -461,6 +479,7 @@ class ValueAttribution:
             "parent_source_id": self.parent_source_id,
             "method": self.method,
             "basis_fragment": self.basis_fragment,
+            "pairing": self.pairing,
         }
 
 
@@ -472,6 +491,7 @@ def build_value_attribution(
     parent_source_id: str,
     method: str,
     basis_fragment: str = "",
+    pairing: str = VALUE_ATTRIBUTION_PAIRING_STRICT,
 ) -> ValueAttribution | None:
     """Собрать запись об улике. Строго: нестроковые/пустые поля, не-UUID родителя и слишком
     длинные значения — отказ (None): решение о склейке не строится на битой записи."""
@@ -498,6 +518,8 @@ def build_value_attribution(
     basis = mask_nul(basis_fragment).strip()
     if len(basis) > 1_000:
         basis = basis[:1_000]
+    if pairing not in VALUE_ATTRIBUTION_PAIRINGS:
+        return None  # неизвестный режим pairing — битая запись, склейки не будет
     return ValueAttribution(
         primary_key=cleaned["primary_key"],
         primary_name=cleaned["primary_name"],
@@ -505,16 +527,21 @@ def build_value_attribution(
         parent_source_id=cleaned["parent_source_id"],
         method=cleaned["method"],
         basis_fragment=basis,
+        pairing=pairing,
     )
 
 
 def parse_value_attribution(scope: JsonDict | None) -> ValueAttribution | None:
     """Прочитать запись из evidence scope. Нет ключа / не та форма / не UUID — None
-    (fail-closed: отсутствие решения означает «не склеиваем»)."""
+    (fail-closed: отсутствие решения означает «не склеиваем»). Записи прежних версий поля
+    `pairing` не имеют: у них строгий режим (тогда решал только он)."""
     if not isinstance(scope, dict):
         return None
     raw = scope.get(EVIDENCE_VALUE_ATTRIBUTION_KEY)
     if not isinstance(raw, dict) or raw.get("schema") != VALUE_ATTRIBUTION_SCHEMA:
+        return None
+    pairing = raw.get("pairing", VALUE_ATTRIBUTION_PAIRING_STRICT)
+    if not isinstance(pairing, str):
         return None
     return build_value_attribution(
         primary_key=str(raw.get("primary_key", "")),
@@ -523,6 +550,7 @@ def parse_value_attribution(scope: JsonDict | None) -> ValueAttribution | None:
         parent_source_id=str(raw.get("parent_source_id", "")),
         method=str(raw.get("method", "")),
         basis_fragment=str(raw.get("basis_fragment", "")),
+        pairing=pairing,
     )
 
 
