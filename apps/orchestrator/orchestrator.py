@@ -35,6 +35,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from apps.orchestrator.evidence import observation_to_evidence, reselect_assertion_fragment
 from apps.orchestrator.executor import arguments_hash
+from apps.orchestrator.rejected_proposal import rejected_proposal_digest
 from apps.orchestrator.search_view import render_search_results
 from apps.orchestrator.source_coverage import SourceCoverageTracker, named_source_urls
 from apps.orchestrator.state_machine import transition
@@ -2672,7 +2673,14 @@ class Orchestrator:
             await audit.record(
                 AuditEventType.SESSION_STATE_CHANGED,
                 session_id=session.id,
-                payload={"curator_rejected": problems[:10]},
+                payload={
+                    "curator_rejected": problems[:10],
+                    # T7.84 (часть A): отказ обязан называть ОТКЛОНЁННОЕ предложение, а не
+                    # только причину (стенд ed36f4a0: два temporal_fact без as_of — чем именно
+                    # они были, нельзя узнать ниоткуда: claim_created не написан, сырой ответ
+                    # модели не сохраняется). Тот же event, прежние ключи, нового типа нет.
+                    "rejected_proposal": rejected_proposal_digest(proposal),
+                },
                 public_summary="curator proposal rejected by host validation",
             )
             return 0, 0
@@ -2705,6 +2713,8 @@ class Orchestrator:
                                 f"claim[{i}]: reverify reference {ref_problem}"
                             ],
                             "curator_reject_kind": "reverify_unresolved",
+                            # T7.84 (часть A): тот же снимок отклонённого предложения
+                            "rejected_proposal": rejected_proposal_digest(proposal),
                         },
                         public_summary=(
                             "curator proposal rejected: reverify reference "
@@ -2738,6 +2748,8 @@ class Orchestrator:
                                 f"claim[{i}]: reverify target {ref_id} has no head in the session snapshot"
                             ],
                             "curator_reject_kind": "reverify_unresolved",
+                            # T7.84 (часть A): тот же снимок отклонённого предложения
+                            "rejected_proposal": rejected_proposal_digest(proposal),
                         },
                         public_summary=(
                             "curator proposal rejected: reverify target has no "
@@ -2893,7 +2905,14 @@ class Orchestrator:
             await audit.record(
                 AuditEventType.SESSION_STATE_CHANGED,
                 session_id=session.id,
-                payload={"curator_rejected_by_rules": rule_problems[:10]},
+                payload={
+                    "curator_rejected_by_rules": rule_problems[:10],
+                    # T7.84 (часть A): тот же снимок отклонённого предложения + решения
+                    # гейта дублей, если они были (иначе причина отказа читается неполностью:
+                    # именно `kept`-запись объясняет, почему хост не склеил значение)
+                    "rejected_proposal": rejected_proposal_digest(proposal),
+                    **({"value_duplicates": value_duplicates} if value_duplicates else {}),
+                },
                 public_summary=(
                     f"curator proposal rejected by the rules engine: {rule_problems[0][:200]}"
                 ),
