@@ -290,8 +290,10 @@ def test_publication_window_gates_are_unchanged() -> None:
     assert va.ATTRIBUTION_WINDOW_CHARS == 120
 
 
-def test_method_version_is_v4_after_t785b() -> None:
-    """Поведение метода изменилось → номер поднят; переатрибуция пересматривает записи эпохи v2 и v3
-    по тому же предикату «метка записи ≠ текущий метод» (tests/scenario/test_reattribute_stale_records.py)."""
+def test_method_version_is_v5_after_t785c() -> None:
+    """Поведение метода изменилось снова (T7.85c: окно публикации только для русского текста и
+    латинское имя собственного вне словаря) → номер поднят; переатрибуция пересматривает записи
+    эпох v2, v3 и v4 по тому же предикату «метка записи ≠ текущий метод»
+    (tests/scenario/test_reattribute_stale_records.py)."""
 
-    assert VALUE_ATTRIBUTION_METHOD_VERSION == "host-value-attribution-v4"
+    assert VALUE_ATTRIBUTION_METHOD_VERSION == "host-value-attribution-v5"

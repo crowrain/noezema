@@ -117,8 +117,8 @@ async def test_session_writes_the_value_origin_when_the_page_refuses(
     by_origin_uri = {str(o["canonical_uri"]): o["origin"] for o in origins}
     retail = dict(by_origin_uri[two.URL_RETAIL] or {})
     assert retail.get("primary_name") == "Росстат", retail
-    # T7.85a/T7.85b: запись несёт текущий метод значений v4 и pairing; схема остаётся v1
-    assert retail.get("method") == "host-value-attribution-v4", retail
+    # T7.85a/T7.85b/T7.85c: запись несёт текущий метод значений v5 и pairing; схема остаётся v1
+    assert retail.get("method") == "host-value-attribution-v5", retail
     assert "По данным Росстата" in retail.get("basis_fragment", ""), retail
     official_id = await _scalar(
         scratch_url, "SELECT id::text AS id FROM sources WHERE canonical_uri = :u", {"u": two.URL_OFFICIAL}

@@ -22,10 +22,12 @@
    а повторный прогон идемпотентен;
 6. «первоисточник + два его пересказа» не оценивается выше, чем одна независимая группа;
 7. (T7.85a) записи, помеченные методом v2 (то окно публикации, поведение которого изменилось),
-   пересматриваются текущим методом v3 на том же основании «метки различаются».
+   пересматриваются текущим методом на том же основании «метки различаются»; с T7.85b и T7.85c
+   тем же предикатом пересматриваются и метки v3, и v4 — прежних эпох в базе может быть несколько.
 
 Сеть подменена детерминированным FakeFetchClient (§6); staging, `MemoryService`, группировка, правила и
-переатрибуция — настоящие. «Эпоха v1» (и, с T7.85a, эпоха v2) моделируется тем же приёмом, что
+переатрибуция — настоящие. «Эпоха v1» (и, с T7.85a/T7.85b/T7.85c, эпохи v2…v4) моделируется
+тем же приёмом, что
 `broken_v1_fetch` в T7.77/T7.81: подменяется метка метода, которой пишется запись. Прямых UPDATE
 доменных таблиц в тесте нет.
 
@@ -64,8 +66,11 @@ V2_VALUE_METHOD = "host-value-attribution-v2"
 #: метка эпохи T7.85a (окно публикации с вето «другого источника числа»): с T7.85b она тоже
 #: ПРЕЖНЯЯ и обязана пересматриваться тем же предикатом, что v1 и v2
 V3_VALUE_METHOD = "host-value-attribution-v3"
-#: текущий метод значений (T7.85b): им пишется запись после пересмотра прежней
-CURRENT_VALUE_METHOD = "host-value-attribution-v4"
+#: метка эпохи T7.85b (окно публикации плюс сокращённое имя организации и глагол фиксации):
+#: с T7.85c она тоже ПРЕЖНЯЯ и пересматривается тем же предикатом, что v1, v2 и v3
+V4_VALUE_METHOD = "host-value-attribution-v4"
+#: текущий метод значений (T7.85c): им пишется запись после пересмотра прежних эпох v2…v4
+CURRENT_VALUE_METHOD = "host-value-attribution-v5"
 
 # ─── тексты: та же синтаксическая форма, что у стендовых страниц (фикстуры T7.85) ───
 # абзац нормализованного текста = одна строка; страница первоисточника — на своём home host
@@ -645,14 +650,15 @@ async def _relabel_value_method(scratch_url: str, canonical_uri: str, method: st
 
 
 @pytest.mark.asyncio
-async def test_records_tagged_v2_and_v3_methods_are_reconsidered_by_current_version(
+async def test_records_tagged_v3_and_v4_methods_are_reconsidered_by_current_version(
     migrated_db: tuple[str, Any], tmp_path: Path, live_fetch: None
 ) -> None:
-    """T7.85b поднял метод значений до v4: в том же окне публикации добавлены сокращённое имя
-    организации вне словаря и глагол фиксации/измерения как действие другого лица. В базе рядом
-    лежат записи ДВУХ прежних эпох — v2 (окно без новых признаков) и v3 (вето T7.85a). Предикат
-    отбора не менялся: метка записи ≠ текущий метод, поэтому обе обязаны быть пересмотрены, а не
-    пропущены как «уже решено» (STATUS T7.85b)."""
+    """T7.85b поднял метод значений до v4 (сокращённое имя организации вне словаря и глагол
+    фиксации/измерения в том же окне), T7.85c — до v5 (окно публикации только для русского текста
+    и латинское имя собственного вне словаря). В базе рядом лежат записи ДВУХ прежних эпох — v3
+    (окно с вето T7.85a) и v4 (окно с признаками T7.85b); эпоха v2 закреплена предыдущим тестом.
+    Предикат отбора не менялся: метка записи ≠ текущий метод, поэтому обе обязаны быть пересмотрены,
+    а не пропущены как «уже решено» (STATUS T7.85b, STATUS T7.85c)."""
 
     import apps.research_proxy.reattribution as reattr
 
@@ -667,15 +673,16 @@ async def test_records_tagged_v2_and_v3_methods_are_reconsidered_by_current_vers
     era = await _backfill_as_v1(scratch_url, store, stale_method=V2_VALUE_METHOD)
     assert era.changed_evidence == 2, era.rows
     await _relabel_value_method(scratch_url, URL_FORBES, V3_VALUE_METHOD)
+    await _relabel_value_method(scratch_url, URL_KOMMERSANT, V4_VALUE_METHOD)
     written_era = {
         str(r["canonical_uri"]): dict(r["origin"])
         for r in await _records_of(scratch_url, STATEMENT_145)
         if r["origin"] is not None
     }
     assert written_era[URL_FORBES]["method"] == V3_VALUE_METHOD, written_era
-    assert written_era[URL_KOMMERSANT]["method"] == V2_VALUE_METHOD, written_era
+    assert written_era[URL_KOMMERSANT]["method"] == V4_VALUE_METHOD, written_era
 
-    # обе метки прежние → обе строки в плане пересмотра; «было» печатается со своей меткой
+    # обе метки прежние (v3 и v4) → обе строки в плане пересмотра; «было» печатается со своей меткой
     plan = await _run_backfill(scratch_url, store, dry_run=True)
     stale = {
         str(row.canonical_uri): row
@@ -684,7 +691,7 @@ async def test_records_tagged_v2_and_v3_methods_are_reconsidered_by_current_vers
     }
     assert set(stale) == {URL_FORBES, URL_KOMMERSANT}, plan.rows
     assert stale[URL_FORBES].was_method == V3_VALUE_METHOD, stale
-    assert stale[URL_KOMMERSANT].was_method == V2_VALUE_METHOD, stale
+    assert stale[URL_KOMMERSANT].was_method == V4_VALUE_METHOD, stale
     assert all(
         row.was_status == f"derivative → Банк России ({row.was_method})" for row in stale.values()
     ), stale
@@ -708,7 +715,7 @@ async def test_records_tagged_v2_and_v3_methods_are_reconsidered_by_current_vers
     assert len(await _group_ids(scratch_url, STATEMENT_145)) == 1
     assert await _current_assessment(scratch_url, STATEMENT_145) == ("E1", "hypothesis")
 
-    # повторный прогон идемпотентен: ни v2-, ни v3-метка больше не считается устаревшей
+    # повторный прогон идемпотентен: ни v3-, ни v4-метка больше не считается устаревшей
     again = await _run_backfill(scratch_url, store)
     assert again.changed_evidence == 0 and not again.changed_source_ids, again.rows
     retouched = [row for row in again.rows if row.canonical_uri in (URL_FORBES, URL_KOMMERSANT)]
