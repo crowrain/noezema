@@ -2668,7 +2668,11 @@ class Orchestrator:
         )
 
         max_questions = int(snapshot.session_limits.get("max_new_questions_per_session", 4))
-        problems = proposal.validate_against(len(ctx.evidence), questions_max=max_questions)
+        # T7.84 (часть B, ADR-0033 §8): первым — только то, чему безразлично, каким ВИДОМ
+        # операция закончит (индексы связей, бюджеты вопросов, search_statements, дубли
+        # dependencies). Проверка опорной `as_of` отсюда убрана: она зависит от вида операции и
+        # обязана идти после его окончательного определения (та же ловушка, что у T7.73).
+        problems = proposal.structural_problems(len(ctx.evidence), questions_max=max_questions)
         if problems:
             await audit.record(
                 AuditEventType.SESSION_STATE_CHANGED,
@@ -2878,6 +2882,35 @@ class Orchestrator:
                         staged_claims[claim_i] = proposal.claims[claim_i].model_copy(
                             update={"existing_claim_id": str(entry["target"])}
                         )
+
+        # T7.84 (часть B, ADR-0033 §8): проверка опорной даты `temporal_fact` — отдельным
+        # шагом СРАЗУ ПОСЛЕ того, как хост окончательно определил вид каждой операции:
+        # перепроверки разрешены (ADR-0018), `relied_claim_ids` разрешены (ADR-0032), гейт
+        # дублей по значению отработал (ADR-0033) и часть операций уже превращена в
+        # перепроверку. Та же ловушка, что у T7.73: проверка, зависящая от вида операции, не
+        # может идти до того, как этот вид известен — иначе честная датless-перепроверка
+        # законно собранного дубля отвергалась бы как «новый temporal_fact без даты» (замер
+        # ed36f4a0: оба утверждения 5,59% лежали в контекст-паке, опора объявлена, склейка
+        # была бы законной — и всё предложение падало из-за отсутствующей as_of).
+        # Политика не меняется: операция, оставшаяся НОВОЙ temporal_fact без даты, по-прежнему
+        # красит всё предложение (fail-closed, тот же текст причины) — но теперь с дайджестом
+        # отклонённого предложения и с решением гейта дублей рядом.
+        reverify_indices = frozenset(
+            index for index, staged in enumerate(staged_claims) if staged.existing_claim_id is not None
+        )
+        as_of_problems = proposal.temporal_as_of_problems(reverify_indices)
+        if as_of_problems:
+            await audit.record(
+                AuditEventType.SESSION_STATE_CHANGED,
+                session_id=session.id,
+                payload={
+                    "curator_rejected": as_of_problems[:10],
+                    "rejected_proposal": rejected_proposal_digest(proposal),
+                    **({"value_duplicates": value_duplicates} if value_duplicates else {}),
+                },
+                public_summary="curator proposal rejected by host validation",
+            )
+            return 0, 0
 
         # T7.9 (EVAL-3b post-mortem P.2, §14.1): the rules engine
         # pre-commit check — a proposal the rules engine would reject

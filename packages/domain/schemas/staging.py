@@ -15,6 +15,7 @@ record, bound to the session) — the gate-5 "reverified" path.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Set as AbstractSet
 from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -110,7 +111,64 @@ class CuratorProposal(BaseModel):
 
     def validate_against(self, evidence_count: int, questions_max: int = 4) -> list[str]:
         """Host-side validation of references and budgets. Returns problem
-        list (empty = valid)."""
+        list (empty = valid).
+
+        T7.84 (часть B, ADR-0033 §8): состав и порядок строк этого метода сохранены прежними
+        (проверено тестом) — он остаётся точкой, где проверка опорной `as_of` ещё идёт по
+        ВИДУ ОПЕРАЦИИ ИЗ ПРЕДЛОЖЕНИЯ. Оркестратор вызывает вместо него два отдельных шага:
+        `structural_problems` (тому безразличен вид операции) и `temporal_as_of_problems`
+        (после того, как вид операции определён окончательно)."""
+        return self._walk(evidence_count, questions_max, check_as_of=True)
+
+    def structural_problems(self, evidence_count: int, questions_max: int = 4) -> list[str]:
+        """T7.84 (часть B): проверки, которым безразлично, каким ВИДОМ операция закончит —
+        новой записью или перепроверкой. Это индексы уликовых связей, бюджеты новых
+        вопросов, пустые/слишком длинные search_statements и дубли dependencies: ни одна из
+        них не зависит от разрешённых перепроверок, подмены типа якоря и гейта дублей по
+        значению, поэтому они продолжают отказывать всё предложение первыми (ADR-0032 §4:
+        бюджет — свойство предложения целиком, выбрасывать операции по частям тут нельзя).
+
+        Порядок строк — тот же, что у `validate_against`, минус строка про `as_of`."""
+        return self._walk(evidence_count, questions_max, check_as_of=False)
+
+    def temporal_as_of_problems(self, as_of_exempt: AbstractSet[int] = frozenset()) -> list[str]:
+        """T7.84 (часть B): проверка опорной даты `temporal_fact` как отдельный шаг — после
+        разрешения перепроверок (ADR-0018), разрешения `relied_claim_ids` (ADR-0032) и гейта
+        дублей по значению (ADR-0033).
+
+        Причина отдельного шага та же, что у T7.73 (ловушка AGENTS §7): проверка зависит от
+        вида операции, значит обязана идти ПОСЛЕ того, как хост этот вид определил. Операция,
+        которую гейт дублей превратил в перепроверку (`action: "reverified"`), передаётся в
+        `as_of_exempt`: дата якоря принадлежит `packages/memory/reverify.py`, а не модели.
+        Операция, оставшаяся новой и датless, называется той же строкой, что раньше, — политика
+        «temporal_fact без даты красит всё предложение» не меняется."""
+        problems: list[str] = []
+        for i, claim in enumerate(self.claims):
+            if self._needs_reference_date(claim, index=i, exempt=as_of_exempt):
+                problems.append(f"claim[{i}]: temporal_fact requires as_of")
+        return problems
+
+    @staticmethod
+    def _needs_reference_date(
+        claim: ClaimProposal, *, index: int, exempt: AbstractSet[int]
+    ) -> bool:
+        """Опорная дата требуется, если это `temporal_fact` без даты и операция НЕ перепроверка.
+
+        T7.73 (ADR-0018 уточнение): перепроверка существующего claim может не приносить дату —
+        хост сохраняет якорную (`packages/memory/reverify.py`). Прежняя ловушка: проверка
+        шла ДО подмены типа якоря и DO гейта дублей, поэтому датless-перепроверка гарантированно
+        давала `as_of_missing`. `exempt` — индексы операций, которые хост уже ведёт как
+        перепроверку (явный `existing_claim_id` модели или конверсия гейта)."""
+        return (
+            claim.claim_type is ClaimType.TEMPORAL_FACT
+            and claim.as_of is None
+            and claim.existing_claim_id is None
+            and index not in exempt
+        )
+
+    def _walk(self, evidence_count: int, questions_max: int, *, check_as_of: bool) -> list[str]:
+        """Один обход структурных проверок — общий для `validate_against` и
+        `structural_problems`, чтобы порядок и формулировки строк не разъезжались."""
         problems: list[str] = []
         for i, link in enumerate(self.evidence_links):
             if link.evidence_index >= evidence_count:
@@ -118,17 +176,7 @@ class CuratorProposal(BaseModel):
             if link.claim_index >= len(self.claims):
                 problems.append(f"evidence_link[{i}]: claim index {link.claim_index} out of range")
         for i, claim in enumerate(self.claims):
-            if (
-                claim.claim_type is ClaimType.TEMPORAL_FACT
-                and claim.as_of is None
-                # T7.73 (ADR-0018 уточнение): a reverify of an EXISTING claim may
-                # omit the reference date — the host keeps the anchor's own
-                # (packages/memory/reverify.py). Requiring it here was the trap
-                # that pushed the model to relabel a temporal reverify as
-                # external_fact and lose the date: the check ran BEFORE the
-                # orchestrator substitutes the anchor's claim type.
-                and claim.existing_claim_id is None
-            ):
+            if check_as_of and self._needs_reference_date(claim, index=i, exempt=frozenset()):
                 problems.append(f"claim[{i}]: temporal_fact requires as_of")
             for k, alt in enumerate(claim.search_statements):
                 if not alt.strip():
