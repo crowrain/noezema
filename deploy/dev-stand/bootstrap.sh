@@ -106,7 +106,7 @@ LLM_REASONING_PROFILE="${NOEZEMA_DEV_LLM_REASONING_PROFILE:-none}"
 LLM_MAX_OUTPUT_TOKENS="${NOEZEMA_DEV_LLM_MAX_OUTPUT_TOKENS:-8192}"
 LLM_TIMEOUT_SECONDS="${NOEZEMA_DEV_LLM_TIMEOUT_SECONDS:-600}"
 
-# Activated config (T7.59(в), T7.71, T7.73, T7.76; дефолт с T7.82 — config-v19, см. ниже):
+# Activated config (T7.59(в), T7.71, T7.73, T7.76; дефолт с T7.83(б) — config-v20, см. ниже):
 # config-v16 = config-v15 with exactly two changes —
 # the explorer prompt pin (explorer-v8: правило 10 — спорное число проверяется двумя сторонами поиска,
 # официальным первоисточником И независимым исследованием, расхождение называется открыто либо честно
@@ -155,11 +155,22 @@ LLM_TIMEOUT_SECONDS="${NOEZEMA_DEV_LLM_TIMEOUT_SECONDS:-600}"
 # хост принимает только видимые id, остальное — отказной причиной в payload уже существующего
 # события claim_created). Пороги, `reasoning_by_phase`, claim_type_rules, token-бюджеты, лимит
 # шагов (16), окна модели, research_proxy, список инструментов и explorer-v9 — байт в байт v18.
-# Откат теперь config-v18 (canonical b5605e4e…, сам v19 — 4d76c000…) и задаётся строкой
-# `NOEZEMA_DEV_CONFIG_PAYLOAD=$REPO_ROOT/docs/eval/config-v18-payload.json`;
+# Откатом v19 был config-v18 (canonical b5605e4e…, сам v19 — 4d76c000…);
 # v18, v17, v16 и v15 остаются в репо и не переписываются.
-CONFIG_PAYLOAD="${NOEZEMA_DEV_CONFIG_PAYLOAD:-$REPO_ROOT/docs/eval/config-v19-payload.json}"
-CONFIG_REASON="${NOEZEMA_DEV_CONFIG_REASON:-T7.82 dev-stand: activate config-v19 (= config-v18 with one change: prompts.curator pin curator-v9 — optional output field relied_claim_ids, honest listing of already-recorded claims the answer relies on, no reverify and no new assessment; reasoning_by_phase, step limit 16, explorer-v9, thresholds and token budgets unchanged from config-v18)}"
+# config-v20 (T7.83(б), ADR-0033) = config-v19 ровно с одной правкой: пин `prompts.curator` →
+# curator-v10 (к правилу 7 добавлен разбор перефразы: то же значение того же показателя за тот же
+# период — уже записанный факт, перепроверка оформляется existing_claim_id независимо от совпадения
+# формулировок; стендовый случай f452a978: «официальная инфляция … 5,59% (по данным Росстата)»
+# против уже записанного E4/0.95 утверждения про те же 5,59%). Хостовый гейт дублей по значению
+# (T7.83(а), ADR-0033) работает при любой конфигурации и без этой правки; пин curator-v10 нужен,
+# чтобы модель сама оформляла перепроверку, а не полагалась на хост. Пороги, `reasoning_by_phase`,
+# claim_type_rules, token-бюджеты, лимит шагов (16), окна модели, research_proxy, список
+# инструментов и explorer-v9 — байт в байт v19.
+# Откат теперь config-v19 (canonical 4d76c000…, сам v20 — 2b065470…) и задаётся строкой
+# `NOEZEMA_DEV_CONFIG_PAYLOAD=$REPO_ROOT/docs/eval/config-v19-payload.json`;
+# v19, v18, v17 и v16 остаются в репо и не переписываются.
+CONFIG_PAYLOAD="${NOEZEMA_DEV_CONFIG_PAYLOAD:-$REPO_ROOT/docs/eval/config-v20-payload.json}"
+CONFIG_REASON="${NOEZEMA_DEV_CONFIG_REASON:-T7.83 dev-stand: activate config-v20 (= config-v19 with one change: prompts.curator pin curator-v10 — rule 7 extended for paraphrases: the same value of the same indicator for the same period is an already-recorded fact, a reverify must carry existing_claim_id regardless of wording; host value-duplicate gate ships in T7.83(а); thresholds, reasoning_by_phase, step limit 16, explorer-v9 and token budgets unchanged from config-v19)}"
 NODE_OWNER="${NOEZEMA_DEV_NODE_OWNER:-dev-stand}"
 
 DRY_RUN=false

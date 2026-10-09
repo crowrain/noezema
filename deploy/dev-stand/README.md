@@ -24,7 +24,7 @@
 | `searxng/settings.yml` | ШАБЛОН настроек поиска (formats html+json, limiter off); `secret_key` здесь — плейсхолдер, настоящего секрета в репозитории нет |
 | `searxng-settings.sh` | рендер настроек из шаблона: генерирует `secret_key` (не печатает), повторный запуск ключ не ротирует |
 | `status.sh` | состояние: юниты, docker, очередь вопросов, последняя сессия, доступность LLM, версия кода, режим исполнителя инструментов, поиск (SearXNG + режим research_proxy снапшота) |
-| `reset-db.sh` | пересоздание dev-базы с явным подтверждением + миграции + повторная активация config-v19 |
+| `reset-db.sh` | пересоздание dev-базы с явным подтверждением + миграции + повторная активация config-v20 |
 | `README.md` | этот файл |
 
 ## Деплой (делает менеджер)
@@ -56,7 +56,7 @@ systemctl start noezema-dev.target            # web + unit-state и maint (ти�
 | приложение | репозиторий как есть (`$APP_DIR`), venv в `$APP_DIR/.venv`, зависимости **только через uv** и только prod-extras (AGENTS §6) |
 | база | docker-контейнер `noezema-dev-db` (образ `postgres:15`), том `noezema-dev-pgdata`, публикация **только на 127.0.0.1**, база `noezema-dev`, пользователь `noezema`. Порт выбирается до записи env-файла: 5432, а если на хосте он уже занят (нативный `postgresql.service`) — первый свободный из 5433..5440; выбранный порт пишется в env-файл (`NOEZEMA_DEV_DB_PORT`), повторный запуск переиспользует порт существующего контейнера. `NOEZEMA_DEV_DB_PORT=<порт>` задаёт явно: занят → понятная ошибка, а не молчаливый переезд |
 | миграции | `alembic upgrade head` из venv (URL из env-файла) |
-| конфигурация | активация `docs/eval/config-v19-payload.json` через `hostctl activate-online` (config-v19 = config-v18 ровно с одной правкой: пин `prompts.curator` → **curator-v9** — факультативное поле ответа `relied_claim_ids`, честный перечень уже записанных утверждений из контекста, на которые опирается ответ, без перепроверки и без новой оценки; `model.reasoning_by_phase`, `session_limits.max_explorer_steps = 16`, пин explorer-v9, пороги, бюджеты, окно EXL3 131072 и `model.max_output_tokens = 8192` — байт в байт config-v18; canonical v19 — `4d76c000…`, откат — payload `docs/eval/config-v18-payload.json` с canonical `b5605e4e…`; пропускается, если снапшот уже активен; переход v18→v19 — STATUS.md T7.82(б), ADR-0032) |
+| конфигурация | активация `docs/eval/config-v20-payload.json` через `hostctl activate-online` (config-v20 = config-v19 ровно с одной правкой: пин `prompts.curator` → **curator-v10** — дополнение правила 7: то же значение того же показателя за тот же период перепроверяется по `existing_claim_id` независимо от формулировки; хостовый гейт дублей по значению работает при любой конфигурации — T7.83(а), ADR-0033; `model.reasoning_by_phase`, `session_limits.max_explorer_steps = 16`, пин explorer-v9, пороги, бюджеты, окно EXL3 131072 и `model.max_output_tokens = 8192` — байт в байт config-v19; canonical v20 — `2b065470…`, откат — payload `docs/eval/config-v19-payload.json` с canonical `4d76c000…`; пропускается, если снапшот уже активен; переход v19→v20 — STATUS.md T7.83(б), ADR-0033) |
 | данные сессий | `/var/lib/noezema-dev` (+ `sandbox` — work_root контейнерного исполнителя) |
 | host-контур стенда | `/var/lib/noezema-dev/host`, снимок юнитов: `/var/lib/noezema-dev/host/unit-state.json` |
 | секреты/настройки | `/etc/noezema/dev.env`, режим **0600**, владелец — пользователь стенда; в отчёты и чат не попадают (AGENTS §5) |
@@ -109,7 +109,7 @@ systemctl start noezema-dev.target            # web + unit-state и maint (ти�
    Postgres остаётся: `docker stop noezema-dev-db`).
 9. **Сброс:** `./deploy/dev-stand/reset-db.sh` — просит вписать имя базы (защита от «а вдруг это
    прод-база»), останавливает таймеры, пересоздаёт `noezema-dev`, накатывает миграции, заново
-   активирует config-v19, поднимает таймеры. С защитой по состоянию: если в базе есть незавершённая
+   активирует config-v20, поднимает таймеры. С защитой по состоянию: если в базе есть незавершённая
    сессия, reset откажется — сначала дождаться её терминации (или остановить tick-таймер).
 
 ## Юниты стенда (8 файлов)
@@ -534,6 +534,56 @@ cd ~/noezema && git pull            # пакет с docs/eval/config-v19-payload
 .venv/bin/python -m hostctl.cli activate-online \
   --payload docs/eval/config-v18-payload.json \
   --reason "T7.82(б) rollback: config-v18 (curator-v8, no relied_claim_ids field)" \
+  --drain-wait-seconds 120
+```
+
+### Дубль по значению: активация config-v20 (T7.83(б), ADR-0033)
+
+`config-v20` = `config-v19` ровно с одной правкой: пин `prompts.curator` → **curator-v10**.
+Тело промпта curator-v9 сохранено байт в байт; к правилу 7 добавлен абзац про перефразу: то же
+значение того же показателя за тот же период — уже записанный факт, и перепроверка оформляется
+`existing_claim_id` независимо от совпадения формулировок (стендовый случай f452a978: «официальная
+годовая инфляция … 5,59% (по данным Росстата)» рядом с записанным E4/0.95 утверждением про те же
+5,59% за тот же 2025 год).
+
+Хостовый гейт дублей по значению (T7.83(а)) работает при любой конфигурации и без этой правки: он
+сравнивает новые кураторские операции с утверждениями контекст-пака (тот же тип, равное непустое
+множество десятичных значений формулировок, покрытый период). Ровно один кандидат и все связи
+`supports` → операция честной склейкой становится перепроверкой: значение на карточке остаётся
+один раз, свежее evidence усиливает уже записанное утверждение (monotонно по группам независимости,
+якорная дата сохраняется), оценка не может ни понизиться, ни подделаться. Кандидатов несколько,
+есть counterevidence или период не покрыт → операция остаётся как предложена: спор остаётся
+спором. Решение записывается ключом `value_duplicates` в payload уже существующего события
+`claim_created`; при отсутствии дублей payload сессии байт в байт прежний.
+
+Для узла, уже работавшего на v19, активации достаточно — нового окружения, миграций и рестарта
+юнитов правка не требует (промпт читается из снапшота):
+
+```bash
+cd ~/noezema && git pull            # пакет с docs/eval/config-v20-payload.json и prompts/curator/curator-v10.md
+.venv/bin/python -m hostctl.cli activate-online \
+  --payload docs/eval/config-v20-payload.json \
+  --reason "T7.83(б): curator-v10 pin — value-duplicate reverify (same value of the same indicator for the same period, ADR-0033)" \
+  --drain-wait-seconds 120
+```
+
+Что видно после активации: `./status.sh` показывает снапшот по canonical-префиксу `2b065470`
+(полный canonical config-v20 — `2b065470677e167dceecb9c91240c94a7c54d91408000e44e51e97feb3c18f9f`;
+в `config_snapshots.payload_sha256` попадает canonical, не хеш файла), а в ленте сессий у
+`claim_created` payload может появиться ключ `value_duplicates` со списком решений гейта
+(`claim_index`, `target`, `action`, `reason`). Проверочный вопрос — тот же, что выявил дефект на
+сессии f452a978: официальная годовая инфляция 2025 (Росстат) против наблюдаемой населением
+(инФОМ); карточка обязана показать «5,59» один раз — связью «перепроверено этим вопросом» — и не
+дублировать её вторым утверждением, а опертое наблюдение (14,5%-аналог) остаться отдельной строкой
+«использовано из знаний».
+
+Откат — активация payload'а v19 (он закоммичен и не менялся, canonical
+`4d76c000a87395b0887eedfcee4a25f58c3c3dde2f390b7dbe2140c189a8ce3d`):
+
+```bash
+.venv/bin/python -m hostctl.cli activate-online \
+  --payload docs/eval/config-v19-payload.json \
+  --reason "T7.83(б) rollback: config-v19 (curator-v9, no paraphrase rule)" \
   --drain-wait-seconds 120
 ```
 
