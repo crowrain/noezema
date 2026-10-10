@@ -468,9 +468,15 @@ def source_values_match(source: EstimateSource, candidate: EstimateCandidate) ->
     """Значения записей одинаковы (канонические наборы СОПОСТАВЛЯЕМЫХ значений, §13).
 
     У смешанной записи сравнивается её реализованное значение: прогнозная часть формулировки в
-    сравнение не входит (`_comparison_values`).
+    сравнение не входит (`_comparison_values`). Пустой набор сопоставлять нельзя: у записи, чьи значения
+    только неоднозначны, витрина не знает ни одного значения — «совпадает» она утверждать не имеет права
+    (иначе строка сказала бы «значение — совпадает с» без чисел).
     """
-    return _comparison_values(source.statement) == _comparison_values(candidate.statement)
+    source_values = _comparison_values(source.statement)
+    candidate_values = _comparison_values(candidate.statement)
+    if not source_values or not candidate_values:
+        return False
+    return source_values == candidate_values
 
 
 def _decimal_places(value: str) -> int:
@@ -542,14 +548,27 @@ def _snippet(statement: str) -> str | None:
 def _same_indicator_row(
     source: EstimateSource, candidate: EstimateCandidate, kind: str
 ) -> EstimateRow | None:
+    """Строка про ту же метку показателя (`independent` / `other_record`).
+
+    Если у кандидата нет ни одного сопоставляемого значения (каждое его число записано и прогнозом, и
+    фактом — §13), отношение к показателю это не отменяет: его вывел различитель по меткам. Но про
+    значения строка обязана молчать честно: «единицы значений неясны», без перечня чисел и без «совпадает».
+    """
     lead = describe("estimate_row", kind)["label"]
     snippet = _snippet(candidate.statement)
     if snippet is None:  # conservative-исключение (см. _snippet)
         return None
+    candidate_comparable = _comparison_values(candidate.statement)
+    if not candidate_comparable:
+        return EstimateRow(
+            kind=kind,
+            text=f"{lead}: {snippet} — {_phrase('units_unclear')}",
+            candidate_id=candidate.claim_id,
+        )
     candidate_percent = _is_percent(candidate.statement)
     value_part = (
         f"{_phrase('value_word')} "
-        f"{_display_values(_comparison_values(candidate.statement), candidate_percent)}"
+        f"{_display_values(candidate_comparable, candidate_percent)}"
     )
     verdict = _values_verdict(source, candidate)
     return EstimateRow(

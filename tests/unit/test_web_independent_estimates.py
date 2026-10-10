@@ -109,6 +109,11 @@ SYNTH_HEAD_RULE_MIXED = (
     "Прогноз аналитиков по годовой инфляции России на конец 2025 года по данным декабрьского опроса "
     "Банка России составил 6,3%, фактическая инфляция по итогам года — 5,59%"
 )
+# единственное число записано дважды: сначала как измерение, потом как прогноз → ролей нет
+SYNTH_AMBIGUOUS_SAME_METRIC = (
+    "Годовая инфляция в России по итогам 2025 года (декабрь 2025 к декабрю 2024) составила 5,59%; "
+    "прогноз годовой инфляции в России на 2025 год — 5,59%"
+)
 
 # даты как на стенде (claims_live.tsv: as_of есть не у всех записей)
 AS_OF_SOURCE = 2026  # 9266248e: as_of 2026-01-21
@@ -1085,3 +1090,28 @@ def test_forecast_window_and_head_constants_are_pinned() -> None:
     отрезка (ADR-0035 §13)."""
     assert estimates.FORECAST_BASIS_WINDOW_CHARS == 60
     assert estimates.FORECAST_HEAD_CHARS == 12
+
+
+def test_ambiguous_only_record_makes_no_value_claim() -> None:
+    """Запись, где единственное число названо дважды — как измерение и как прогноз, — не получает ни
+    одной роли: сопоставлять нечего. Такая запись остаётся нейтрально связанной и не утверждает ни
+    совпадения, ни расхождения (ADR-0035 §13)."""
+    roles = estimates.value_roles(SYNTH_AMBIGUOUS_SAME_METRIC)
+    assert roles.ambiguous == frozenset({"5.59"})
+    assert roles.realized == frozenset() and roles.forecast == frozenset()
+    rows = _rows(_source(), _candidate("c-ambig", SYNTH_AMBIGUOUS_SAME_METRIC))
+    assert [kind for kind, _text in rows] == ["adjacent_metric", "no_independent"]
+    assert "совпадает" not in rows[0][1] and "расходятся" not in rows[0][1]
+
+
+def test_two_ambiguous_records_are_still_other_record_but_without_values() -> None:
+    """Отношение к показателю выведено различителем, а не значениями: две записи с неоднозначными
+    числами остаются «другой записью того же показателя», но про значения говорят честно — «единицы
+    значений неясны», без перечня чисел и без «совпадает» (пустые наборы сопоставлять нельзя)."""
+    source = _source(statement=SYNTH_AMBIGUOUS_SAME_METRIC)
+    candidate = _candidate("c-ambig2", f"{SYNTH_AMBIGUOUS_SAME_METRIC} (другая запись)")
+    assert estimates.source_values_match(source, candidate) is False
+    rows = _rows(source, candidate)
+    assert [kind for kind, _text in rows] == ["other_record", "no_independent"]
+    assert rows[0][1].endswith("единицы значений неясны"), rows[0][1]
+    assert "совпадает" not in rows[0][1]
