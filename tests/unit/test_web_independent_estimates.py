@@ -20,6 +20,14 @@ T7.88a (дополнение ADR-0035 §12): частичное пересече
 независимой оценки. Формулировки взяты дословно из дампа карточки стенда —
 `fixtures-t788a/claims_live.tsv` (10 утверждений карт 7ceb8047 и 22d1748e); id в
 комментариях — первые 8 знаков uuid той записи.
+
+T7.88b (дополнение ADR-0035 §13): прогноз — свойство ЗНАЧЕНИЯ, а не формулировки. Роль
+значения разбирает `estimates.value_roles`: основа прогноза должна относиться к этому
+значению (стоять перед ним в том же отрезке не дальше `FORECAST_BASIS_WINDOW_CHARS`, либо
+вести весь отрезок из своей головы). Утверждение — «прогноз» только если прогнозны ВСЕ его
+значения; смешанная запись сопоставляется своим реализованным значением, прогнозные числа
+при сравнении игнорируются. Отсюда новая проверка `7cc2b578`: её 5,59% — измерение, а
+6,5–7%, 6,8% и 6,6% — прогнозы Банка России, Минэкономразвития и консенсус-прогноз ЦБ.
 """
 
 from __future__ import annotations
@@ -66,6 +74,40 @@ COMMENT_E2C52955 = (
 FACT_BELOW_FORECAST_7CC2B578 = (
     "Фактическая годовая инфляция в России по итогам 2025 года (5,59%) оказалась ниже всех прогнозов "
     "аналитиков: прогноз Банка России — 6,5–7%, Минэкономразвития — 6,8%, консенсус-прогноз ЦБ — 6,6%"
+)
+
+# ─── T7.88b: синтетические формулировки на то же правило (ADR-0035 §13) ───────
+SYNTH_FORECAST_SHORT = "Прогноз ЦБ на 2025 год — 4,5%"
+SYNTH_MIXED_REALIZED_FIRST = "Инфляция в России составила 5,59%, тогда как прогноз был 4,5%"
+SYNTH_MIXED_SAME_WORDING = (
+    "Годовая инфляция в России по итогам 2025 года (декабрь 2025 к декабрю 2024) составила 5,59%, "
+    "тогда как прогноз Банка России был 6,5–7%."
+)
+SYNTH_FORECAST_RANGE_SAME_METRIC = (
+    "Прогноз Банка России по годовой инфляции в России по итогам 2025 года (декабрь 2025 к декабрю "
+    "2024) — 6,5–7%."
+)
+SYNTH_FORECAST_INTEGERS_ONLY = "По прогнозу Минэкономразвития, инфляция в России составит 4% и усилится до 5%."
+SYNTH_EXPECTATION_SURVEY = "Инфляционные ожидания населения России — 13,7%"
+SYNTH_FORECAST_IN_OTHER_CLAUSE = (
+    "В начале года аналитики опубликовали прогноз по инфляции. Годовая инфляция в России по итогам "
+    "2025 года (декабрь 2025 к декабрю 2024) составила 5,59%."
+)
+SYNTH_REALIZED_MARKER_CLOSER = (
+    "В отчёте есть прогноз Банка России и фактическая годовая инфляция в России по итогам 2025 года "
+    "(декабрь 2025 к декабрю 2024) — 5,59%."
+)
+SYNTH_SAME_NUMBER_TWICE = (
+    "Прогноз аналитиков по годовой инфляции в России по итогам 2025 года (декабрь 2025 к декабрю 2024) "
+    "— 6,3%, и фактическая инфляция составила 6,3%."
+)
+SYNTH_TWO_MEASURED_VALUES = (
+    "Годовая инфляция в России по итогам 2025 года (декабрь 2025 к декабрю 2024) составила 5,59% по "
+    "Росстату и 5,61% по независимой оценке."
+)
+SYNTH_HEAD_RULE_MIXED = (
+    "Прогноз аналитиков по годовой инфляции России на конец 2025 года по данным декабрьского опроса "
+    "Банка России составил 6,3%, фактическая инфляция по итогам года — 5,59%"
 )
 
 # даты как на стенде (claims_live.tsv: as_of есть не у всех записей)
@@ -143,6 +185,15 @@ ROW_FORECAST_2D010D53 = (
     "Смежный прогноз, не измерение: Прогноз аналитиков по годовой инфляции в России на конец 2025 "
     "года по данным… — прогноз реализованного значения; независимым измерением этого показателя он "
     "не является."
+)
+# T7.88b: `7cc2b578` больше не прогноз — её реализованное значение 5,59% участвует в сравнении
+ROW_LIKELY_7CC2B578 = (
+    "Запись, вероятно, о том же показателе: Фактическая годовая инфляция в России по итогам 2025 года "
+    "(5,59%) оказалась…, значение 5,59% совпадает с 5,59%; независимость не установлена."
+)
+ROW_LINKED_PRESS = (
+    "Связанная запись: В пресс-релизе Банка России (event id 28251) годовая инфляция в 2025 году… — "
+    "показатель автоматически не сопоставлен; независимым измерением не считается."
 )
 
 
@@ -696,12 +747,32 @@ def test_several_decimal_places_more_than_the_constant_is_not_rounding() -> None
     assert estimates.ROUNDING_MAX_PLACE_GAP == 2
 
 
-def test_multi_valued_record_is_never_called_the_same_indicator() -> None:
-    """`7cc2b578` (claims_live.tsv) содержит и 5,59%, и четыре прогноза: выбрать, какое из
-    значений относится к показателю карточки, нельзя → «вероятно тот же показатель» не
-    утверждается. Формулировка при этом прогнозная — остаётся отдельной категорией прогноза."""
+def test_mixed_record_is_named_by_its_realized_value() -> None:
+    """`7cc2b578` (claims_live.tsv): в формулировке и измерение 5,59%, и три прогноза
+    (6,5–7%, 6,8%, 6,6%). До T7.88b витрина видела stem «прогноз» в тексте и прятала запись в
+    категорию прогноза — против карточки, у которой значение ровно 5,59%. По ролям значений
+    (ADR-0035 §13) 5,59% — реализованное значение: ближайшая основа стоит ПЕРЕД ним
+    («Фактическая … по итогам», 48 знаков), а «прогнозов» — после него; прогнозные числа в
+    сравнение не входят. Значение совпадает со значением карточки, период совместим →
+    «вероятно, тот же показатель» с честной оговоркой про независимость. Ожидание
+    `forecast_adjacent` на 0feec09 красное."""
+    roles = estimates.value_roles(FACT_BELOW_FORECAST_7CC2B578)
+    assert roles.realized == frozenset({"5.59"})
+    assert roles.forecast == frozenset({"6.5", "6.6", "6.8"})
+    assert roles.is_forecast_only is False
     rows = _rows(_source(as_of_year=AS_OF_SOURCE), _candidate("c-7cc2b578", FACT_BELOW_FORECAST_7CC2B578))
-    assert rows == [("forecast_adjacent", ROW_FORECAST_7CC2B578), ("no_independent", NO_INDEPENDENT)]
+    assert rows == [("likely_same_indicator", ROW_LIKELY_7CC2B578), ("no_independent", NO_INDEPENDENT)]
+
+
+def test_multi_valued_measurement_record_is_never_called_the_same_indicator() -> None:
+    """Гарантия T7.88a на месте: если реализованных значений ДВА (5,59% и 5,61%), витрина не знает,
+    какое из них относится к показателю карточки, — категория «вероятно тот же показатель» со
+    значением не появляется, а строка той же записи остаётся без числового вывода."""
+    rows = _rows(_source(as_of_year=AS_OF_SOURCE), _candidate("c-two-values", SYNTH_TWO_MEASURED_VALUES))
+    kinds = [kind for kind, _text in rows]
+    assert "likely_same_indicator" not in kinds
+    assert rows[0][1].startswith("Другая запись того же показателя")
+    assert "единицы значений неясны" in rows[0][1]
 
 
 def test_multi_valued_record_without_forecast_stays_related() -> None:
@@ -781,7 +852,13 @@ def test_stand_card_rows_are_capped_and_the_rest_is_counted() -> None:
     """Карта 7ceb8047 целиком (9 утверждений из claims_live.tsv против `9266248e`):
     независимых оценок нет; другая запись того же показателя — вне потолка; связанных строк
     не больше трёх, приоритет «вероятно тот же → прогноз → связанная»; остаток — одна строка
-    со счётчиком без текстов записей; честная строка последняя."""
+    со счётчиком без текстов записей; честная строка последняя.
+
+    T7.88a держал здесь три исхода сразу (пересказ/прогноз/связанная): `e2c52955` показывался
+    третьей связанной строкой, а `7cc2b578` — строкой прогноза. Теперь реализованное значение
+    `7cc2b578` (5,59%) совпадает со значением карточки, и в потолок попадают три пересказа того
+    же показателя (`73d52835`, `7cc2b578`, `c970bc08`); прогноз `2d010d53` и нейтральные записи
+    (`391c4388`, `6d9a12ff`) свёрнуты в счётчик — их ровно столько же, сколько и раньше (4)."""
     rows = _rows(_source(as_of_year=AS_OF_SOURCE), *_stand_candidates())
     kinds = [kind for kind, _text in rows]
     assert kinds == [
@@ -793,7 +870,7 @@ def test_stand_card_rows_are_capped_and_the_rest_is_counted() -> None:
         "no_independent",
     ]
     assert rows[0][1].startswith("Другая запись того же показателя: Официальная годовая инфляция")
-    assert [row[1] for row in rows[1:4]] == [ROW_LIKELY_PRESS, ROW_LIKELY_SBER, ROW_LIKELY_COMMENT]
+    assert [row[1] for row in rows[1:4]] == [ROW_LIKELY_PRESS, ROW_LIKELY_7CC2B578, ROW_LIKELY_SBER]
     assert rows[4][1] == ROW_OVERFLOW_4
     assert rows[-1][1] == NO_INDEPENDENT
 
@@ -812,8 +889,15 @@ def test_overflow_row_carries_only_a_count() -> None:
 
 def test_observed_inflation_claim_is_capped_the_same_way() -> None:
     """`391c4388` (14,5% наблюдаемой инфляции) против тех же девяти записей: независимых
-    измерений нет → связанных строк три (прогнозы приоритетнее нейтральных записей),
-    остаток — счётчик, честная строка последняя."""
+    измерений нет → связанных строк три (прогноз приоритетнее нейтральной записи), остаток —
+    счётчик, честная строка последняя.
+
+    T7.88b меняет только состав этой тройки: `7cc2b578` больше не прогноз (её единственное
+    реализованное значение 5,59% не округляется до 14,5%) и становится нейтральной связанной
+    записью; порядок подбора по id (2d010d53 < 6d9a12ff < 73d52835 < 7cc2b578 < …) оставляет в
+    окне прогноз и две первые нейтральные записи, а `7cc2b578` — как и прежде — уходит в
+    счётчик. Скрытых записей ровно четыре, как и до правки; строки «Смежный прогноз» с текстом
+    `7cc2b578` на карте больше нет."""
     candidates = [c for c in _stand_candidates() if c.claim_id != "c-391c4388"]
     # в реальном пуле карты есть и запись `9266248e`: в юнит-слое она — сам источник,
     # поэтому здесь её добавляю явно, чтобы подсчёт скрытых записей совпал с картой
@@ -822,14 +906,182 @@ def test_observed_inflation_claim_is_capped_the_same_way() -> None:
     kinds = [kind for kind, _text in rows]
     assert kinds == [
         "forecast_adjacent",
-        "forecast_adjacent",
+        "adjacent_metric",
         "adjacent_metric",
         "related_overflow",
         "no_independent",
     ]
-    assert [row[1] for row in rows[:3]] == [ROW_FORECAST_2D010D53, ROW_FORECAST_7CC2B578, ROW_LINKED_MEDIAN]
+    assert [row[1] for row in rows[:3]] == [ROW_FORECAST_2D010D53, ROW_LINKED_MEDIAN, ROW_LINKED_PRESS]
     assert rows[3][1] == ROW_OVERFLOW_4
+    # прогнозная категория больше не содержит текст смешанной записи
+    assert all(text != ROW_FORECAST_7CC2B578 for _kind, text in rows)
 
 
 def test_related_cap_constant() -> None:
     assert estimates.MAX_ADJACENT_ROWS_PER_CLAIM == 3
+
+
+# ─── T7.88b (ADR-0035 §13): прогноз — свойство ЗНАЧЕНИЯ, а не формулировки ──────
+
+def test_stand_forecast_claim_is_forecast_by_its_value() -> None:
+    """`2d010d53` и `58e2d5d4` (claims_live.tsv, «Прогноз аналитиков … составил 6,3%») остаются
+    прогнозами. Основа прогноза начинает весь отрезок (её смещение от начала отрезка — 0), а между
+    ней и значением нет другого существенного значения: этого достаточно, хотя расстояние от слова
+    «Прогноз» до 6,3% и больше окна (132 знака против FORECAST_BASIS_WINDOW_CHARS=60)."""
+    roles = estimates.value_roles(FORECAST_2D010D53)
+    assert roles.forecast == frozenset({"6.3"})
+    assert roles.realized == frozenset()
+    assert roles.is_forecast_only is True
+
+
+def test_forecast_basis_inside_the_window_marks_the_value() -> None:
+    """«Прогноз ЦБ на 2025 год — 4,5%»: основа прогноза стоит в том же отрезке перед значением и
+    всего в 18 знаках от него → значение прогнозное, всё утверждение — прогноз."""
+    roles = estimates.value_roles(SYNTH_FORECAST_SHORT)
+    assert roles.forecast == frozenset({"4.5"})
+    assert roles.realized == frozenset()
+    assert roles.is_forecast_only is True
+
+
+def test_range_with_forecast_basis_stays_a_forecast_and_not_two_numbers() -> None:
+    """Диапазон «6,5–7%» с основой прогноза: существенным значением остаётся одно число 6,5
+    (целое 7 после разделителя — не значение, то же сканирование, что у гейта T7.83a), роль его —
+    прогнозная, и вся запись — прогноз. Прогноз приоритетнее независимой оценки: здесь для этого
+    есть и вторая группа независимости (разные записанные группы g0/g1), но строка всё равно
+    прогнозная — прогноз не является измерением реализованного значения."""
+    roles = estimates.value_roles(SYNTH_FORECAST_RANGE_SAME_METRIC)
+    assert estimates.statement_values(SYNTH_FORECAST_RANGE_SAME_METRIC) == frozenset({"6.5"})
+    assert roles.forecast == frozenset({"6.5"})
+    assert roles.is_forecast_only is True
+    source = _source(metric=METRIC, snapshot_id="snap-1", groups=frozenset({"g0"}))
+    candidate = _candidate(
+        "c-range", SYNTH_FORECAST_RANGE_SAME_METRIC, metric=METRIC, snapshot_id="snap-1",
+        groups=frozenset({"g1"}),
+    )
+    rows = _rows(source, candidate)
+    assert rows[0][0] == "forecast_adjacent"
+    assert "independent" not in [kind for kind, _text in rows]
+
+
+def test_mixed_record_is_compared_by_its_realized_value_only() -> None:
+    """Смешанная запись с той же формулировкой показателя, что у карточки: «…составила 5,59%, тогда
+    как прогноз Банка России был 6,5–7%». Сравнивается только реализованное значение 5,59%, число
+    прогноза в строке не участвует — иначе витрина показала бы расхождение там, где его нет."""
+    roles = estimates.value_roles(SYNTH_MIXED_SAME_WORDING)
+    assert roles.realized == frozenset({"5.59"})
+    assert roles.forecast == frozenset({"6.5"})
+    assert roles.is_forecast_only is False
+    rows = _rows(_source(), _candidate("c-mixed", SYNTH_MIXED_SAME_WORDING))
+    assert rows[0][0] == "likely_same_indicator"
+    assert "значение 5,59% совпадает с 5,59%" in rows[0][1]
+    assert "6,5" not in rows[0][1]
+
+
+def test_mixed_statement_splits_its_values_by_nearest_marker() -> None:
+    """«Инфляция в России составила 5,59%, тогда как прогноз был 4,5%»: у каждого значения своя
+    ближайшая основа перед ним → 5,59% реализованное, 4,5% прогнозное; утверждение — НЕ прогноз,
+    поэтому оно не может ни называться прогнозом карточки, ни прятаться в прогнозную категорию."""
+    roles = estimates.value_roles(SYNTH_MIXED_REALIZED_FIRST)
+    assert roles.realized == frozenset({"5.59"})
+    assert roles.forecast == frozenset({"4.5"})
+    assert roles.is_forecast_only is False
+
+
+def test_head_rule_marks_a_long_forecast_lead_clause() -> None:
+    """Длинная голова отрезка с прогнозом и фактическая часть после запятой: 6,3% — прогноз
+    (основа в голове отрезка), 5,59% — реализованное значение (перед ним «фактическая»). Витрина
+    сопоставляет записи по 5,59% и честно называет запись вероятным пересказом того же показателя."""
+    roles = estimates.value_roles(SYNTH_HEAD_RULE_MIXED)
+    assert roles.forecast == frozenset({"6.3"})
+    assert roles.realized == frozenset({"5.59"})
+    assert roles.is_forecast_only is False
+    rows = _rows(_source(), _candidate("c-head-rule", SYNTH_HEAD_RULE_MIXED))
+    assert [kind for kind, _text in rows] == ["likely_same_indicator", "no_independent"]
+
+
+def test_forecast_basis_in_another_clause_does_not_mark_the_value() -> None:
+    """Основа прогноза стоит в ДРУГОМ предложении («… опубликовали прогноз по инфляции. Годовая
+    инфляция … составила 5,59%»): сильная граница отрезка — точка (двоеточие и запятая границей не
+    считаются, иначе развалился бы стенд `7cc2b578` со списком прогнозов после двоеточия), поэтому
+    значение остаётся реализованным и запись участвует в сравнении."""
+    roles = estimates.value_roles(SYNTH_FORECAST_IN_OTHER_CLAUSE)
+    assert roles.realized == frozenset({"5.59"})
+    assert roles.forecast == frozenset()
+    assert roles.is_forecast_only is False
+
+
+def test_realized_marker_closer_than_the_forecast_basis_wins() -> None:
+    """Если в одном отрезке перед значением стоят обе основы — «прогноз Банка России» и
+    «фактическая …», — роль берётся у ближайшей: 5,59% реализованное значение. Само слово «прогноз»
+    где-то в формулировке прогнозом не делает ничего."""
+    roles = estimates.value_roles(SYNTH_REALIZED_MARKER_CLOSER)
+    assert roles.realized == frozenset({"5.59"})
+    assert roles.forecast == frozenset()
+
+
+def test_one_value_with_both_roles_is_not_compared() -> None:
+    """Одно и то же число названо дважды — прогнозом и фактом («… — 6,3%, и фактическая инфляция
+    составила 6,3%»): роль значения не определена → значение не участвует ни в каком сравнении,
+    витрина остаётся нейтральной связанной записью и не утверждает ни прогноз, ни совпадение."""
+    roles = estimates.value_roles(SYNTH_SAME_NUMBER_TWICE)
+    assert roles.ambiguous == frozenset({"6.3"})
+    assert roles.realized == frozenset() and roles.forecast == frozenset()
+    assert roles.is_forecast_only is False
+    rows = _rows(_source(), _candidate("c-both", SYNTH_SAME_NUMBER_TWICE))
+    assert [kind for kind, _text in rows] == ["adjacent_metric", "no_independent"]
+
+
+def test_integer_only_forecast_claim_produces_no_value_row() -> None:
+    """«По прогнозу Минэкономразвития, инфляция в России составит 4% и усилится до 5%»: целые числа
+    существенными значениями не считаются (то же сканирование, что у гейта дублей T7.83a), поэтому
+    кандидат отфильтрован ещё до разбора ролей — в подразделе только честная строка. Стендовые
+    формулировки с целыми прогнозами правка не ломает и не превращает в измерения."""
+    assert estimates.statement_values(SYNTH_FORECAST_INTEGERS_ONLY) == frozenset()
+    rows = _rows(_source(), _candidate("c-integers", SYNTH_FORECAST_INTEGERS_ONLY))
+    assert rows == [("no_independent", NO_INDEPENDENT)]
+
+
+def test_measurement_of_another_indicator_is_not_a_forecast() -> None:
+    """«Инфляционные ожидания населения России — 13,7%»: основы прогноза в формулировке нет вовсе →
+    значение измерение. Словарь показателя у неё другой (показания ожиданий), поэтому строка
+    остаётся нейтрально связанной; категорию «Смежный прогноз» правка ей не выдаёт."""
+    roles = estimates.value_roles(SYNTH_EXPECTATION_SURVEY)
+    assert roles.realized == frozenset({"13.7"})
+    assert roles.forecast == frozenset()
+    rows = _rows(_source(), _candidate("c-expect", SYNTH_EXPECTATION_SURVEY))
+    assert [kind for kind, _text in rows] == ["adjacent_metric", "no_independent"]
+    assert "Смежный прогноз" not in rows[0][1]
+
+
+def test_forecast_source_claim_keeps_the_t788_behaviour() -> None:
+    """Тот же закон для утверждения-источника: если само утверждение карты — прогноз (`2d010d53`),
+    витрина ведёт себя как в T7.88/T7.88a. Значения чистой прогнозной записи — все её значения
+    (6,3%), поэтому сравнение не «пустеет», а запись-измерение (`9266248e`, 5,59%) не становится ни
+    независимой оценкой, ни вероятным пересказом прогноза: 5,59% не округляется до 6,3% → нейтральная
+    связанная строка. Другой прогноз (`6,5–7%`) по-прежнему помечается как прогноз."""
+    source = _source(FORECAST_2D010D53, as_of_year=AS_OF_FORECAST)
+    rows = estimates.estimate_rows_for_source(
+        source,
+        [
+            _candidate("c-9266248e", CPI_9266248E, as_of_year=AS_OF_SOURCE),
+            _candidate("c-7cc2b578", FACT_BELOW_FORECAST_7CC2B578),
+            _candidate("c-range", SYNTH_FORECAST_RANGE_SAME_METRIC),
+        ],
+    )
+    kinds = [row.kind for row in rows]
+    assert kinds == ["forecast_adjacent", "adjacent_metric", "adjacent_metric", "no_independent"]
+    by_id = {row.candidate_id: row.kind for row in rows}
+    assert by_id["c-range"] == "forecast_adjacent"
+    assert by_id["c-7cc2b578"] == "adjacent_metric" and by_id["c-9266248e"] == "adjacent_metric"
+    assert "likely_same_indicator" not in kinds and "independent" not in kinds
+
+
+def test_forecast_window_and_head_constants_are_pinned() -> None:
+    """Окно основы прогноза и глубина головы отрезка закреплены числами, измеренными на стендовых
+    формулировках: реализованное значение `7cc2b578` стоит в 48 знаках от маркера «Фактическая»,
+    его прогнозные значения — в 6, 16 и 44 знаках от своих основ; голова «Прогноз аналитиков …
+    составил» ведёт отрезок длиной 132 знака. Новых порогов масштаба, правил ранжирования или
+    группировки это не вводит: окно ограничивает только привязку маркера к значению внутри одного
+    отрезка (ADR-0035 §13)."""
+    assert estimates.FORECAST_BASIS_WINDOW_CHARS == 60
+    assert estimates.FORECAST_HEAD_CHARS == 12

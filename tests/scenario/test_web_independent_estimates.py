@@ -607,6 +607,15 @@ STAND_FORECAST_7CC2B578 = (
     "Смежный прогноз, не измерение: Фактическая годовая инфляция в России по итогам 2025 года (5,59%) "
     "оказалась… — прогноз реализованного значения; независимым измерением этого показателя он не является."
 )
+# T7.88b (ADR-0035 §13): у `7cc2b578` есть реализованное значение 5,59% — оно и участвует в сравнении
+STAND_LIKELY_7CC2B578 = (
+    "Запись, вероятно, о том же показателе: Фактическая годовая инфляция в России по итогам 2025 года "
+    "(5,59%) оказалась…, значение 5,59% совпадает с 5,59%; независимость не установлена."
+)
+STAND_LINKED_PRESS = (
+    "Связанная запись: В пресс-релизе Банка России (event id 28251) годовая инфляция в 2025 году… — "
+    "показатель автоматически не сопоставлен; независимым измерением не считается."
+)
 STAND_OVERFLOW = "Ещё связанных записей: 4."
 # категории, которые потолок связанных строк касается (ADR-0035 §12)
 LINKED_KINDS = {"likely_same_indicator", "adjacent_metric", "forecast_adjacent"}
@@ -662,7 +671,14 @@ async def test_stand_card_with_all_ten_claims_shows_three_related_rows_and_hones
     """Вся карта 7ceb8047 целиком (10 утверждений из дампа): независимых измерений нет ни у
     одного утверждения карты; связанных строк не больше трёх; пересказы того же значения
     названы вероятными, а не «другим показателем»; остаток свёрнут в счётчик; честная строка
-    есть у обоих утверждений карты и стоит последней."""
+    есть у обоих утверждений карты и стоит последней.
+
+    T7.88b меняет состав видимой тройки `9266248e`: пересказом того же значения становится и
+    запись `7cc2b578` (её реализованное значение 5,59% равно значению карточки), поэтому в окне
+    оказываются три «вероятно тот же показатель», а комментарий `e2c52955` уходит в счётчик.
+    Для `391c4388` прогноз остаётся один (`2d010d53`): `7cc2b578` больше не прогноз, её 5,59% не
+    округляется до 14,5% → нейтральная связанная запись в счётчике. Скрытых записей по четыре —
+    ровно как при T7.88a."""
     scratch_url, engine = migrated_db
     app, app_engine = await _make(scratch_url, tmp_path / "host", tmp_path / "unit.json")
 
@@ -689,7 +705,11 @@ async def test_stand_card_with_all_ten_claims_shows_three_related_rows_and_hones
             "related_overflow",
             "no_independent",
         ], rows
-        assert [row["text"] for row in rows[1:4]] == [STAND_LIKELY_PRESS, STAND_LIKELY_SBER, STAND_LIKELY_COMMENT]
+        assert [row["text"] for row in rows[1:4]] == [
+            STAND_LIKELY_PRESS,
+            STAND_LIKELY_7CC2B578,
+            STAND_LIKELY_SBER,
+        ]
         assert rows[0]["text"] == ROW_OFFICIAL_DUP_MATCH
         assert rows[4]["text"] == STAND_OVERFLOW and "claim_id" not in rows[4]
         assert rows[-1]["text"] == NO_INDEPENDENT
@@ -700,15 +720,15 @@ async def test_stand_card_with_all_ten_claims_shows_three_related_rows_and_hones
         observed_rows = _card_claim(card, OBSERVED)["estimates"]["rows"]
         assert [row["kind"] for row in observed_rows] == [
             "forecast_adjacent",
-            "forecast_adjacent",
+            "adjacent_metric",
             "adjacent_metric",
             "related_overflow",
             "no_independent",
         ], observed_rows
         assert [row["text"] for row in observed_rows[:3]] == [
             ROW_FORECAST_2D0,
-            STAND_FORECAST_7CC2B578,
             STAND_LINKED_MEDIAN,
+            STAND_LINKED_PRESS,
         ]
         assert observed_rows[3]["text"] == STAND_OVERFLOW
         assert observed_rows[-1]["text"] == NO_INDEPENDENT
@@ -720,5 +740,50 @@ async def test_stand_card_with_all_ten_claims_shows_three_related_rows_and_hones
                 assert "другой показатель" not in row["text"], row["text"]
         # десять записей знания в пуле не добавили ни одного запроса: бюджет карточки тот же
         assert selects <= 11, selects
+    finally:
+        await app_engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_record_with_forecasts_mentioned_is_not_labeled_forecast_on_the_card(
+    migrated_db: tuple[str, AsyncEngine], tmp_path: Any
+) -> None:
+    """Репродуктор дефекта витрины (запись `7cc2b578` карты 7ceb8047): её формулировка называет и
+    реализованное значение (5,59% «по итогам 2025 года»), и чужие прогнозы (6,5–7%, 6,8%, 6,6%).
+    Слово «прогнозов» в тексте не делает запись прогнозом.
+
+    Для `9266248e` (значение карточки ровно 5,59%) запись обязана быть строкой «вероятно, тот же
+    показатель» со своим значением и честной оговоркой про независимость: независимость между двумя
+    записями из этих формулировок не выводится (ни записанных групп, ни производителей), поэтому
+    «независимой оценкой» она тоже не названа. Для `391c4388` (14,5% наблюдаемой инфляции) её
+    значение 5,59% не округляется до 14,5% → нейтральная связанная запись, свёрнутая в счётчик;
+    единственный прогноз этого утверждения — `2d010d53`. Ни одна строка всей карты не показывает
+    прежнюю прогнозную подпись `7cc2b578`."""
+    scratch_url, engine = migrated_db
+    app, app_engine = await _make(scratch_url, tmp_path / "host", tmp_path / "unit.json")
+    try:
+        question_id = await _stand_card(engine)
+
+        async with _client(app) as client:
+            card = (await client.get(f"/api/v1/questions/{question_id}/answer")).json()
+
+        def _claim_id(prefix: str) -> str:
+            return next(str(uuid.UUID(claim_uuid)) for claim_uuid, *_ in STAND_CLAIMS if claim_uuid.startswith(prefix))
+
+        cpi_rows = _card_claim(card, CPI_FULL)["estimates"]["rows"]
+        mixed_rows = [row for row in cpi_rows if row.get("claim_id") == _claim_id("7cc2b578")]
+        assert len(mixed_rows) == 1, [(row["kind"], row.get("claim_id")) for row in cpi_rows]
+        assert mixed_rows[0]["kind"] == "likely_same_indicator", mixed_rows
+        assert mixed_rows[0]["text"] == STAND_LIKELY_7CC2B578
+        assert "значение 5,59% совпадает с 5,59%" in mixed_rows[0]["text"]
+        assert "независимость не установлена" in mixed_rows[0]["text"]
+
+        observed_rows = _card_claim(card, OBSERVED)["estimates"]["rows"]
+        forecast_ids = {row.get("claim_id") for row in observed_rows if row["kind"] == "forecast_adjacent"}
+        assert forecast_ids == {_claim_id("2d010d53")}, observed_rows
+
+        for item in card["claims"]:
+            for row in (item.get("estimates") or {}).get("rows", []):
+                assert row["text"] != STAND_FORECAST_7CC2B578, row["text"]
     finally:
         await app_engine.dispose()
