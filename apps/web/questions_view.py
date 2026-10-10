@@ -31,6 +31,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping, Sequence
 from typing import Any, Final
 
@@ -43,7 +44,14 @@ from apps.web.answer import (
     known_label,
     touched_claims_cte,
 )
-from apps.web.knowledge import EFFECTIVE_SNAPSHOT_SQL, assessment_view, effective_claim_rules
+from apps.web.knowledge import (
+    ASSESSMENT_EVENT_TYPES_SQL,
+    EFFECTIVE_SNAPSHOT_SQL,
+    assessment_view,
+    current_assessment_evidence_joins,
+    effective_claim_rules,
+)
+from apps.web.producer_view import producer_publication_name
 from packages.domain.models.base import JsonDict
 from packages.domain.models.enums import QuestionOrigin, QuestionState
 from packages.domain.sanitization import mask_nul
@@ -97,6 +105,37 @@ def summary_statement(value: object, cap: int = SUMMARY_STATEMENT_CHARS) -> str:
     return collapsed[: cap - 1].rstrip() + "…"
 
 
+def _json_array(raw: Any) -> list[Any]:
+    """Массив из jsonb-колонки: асинхронный драйвер декодирует jsonb сам (list), текстовый
+    путь отдаёт строку. Оба вида читаются одинаково; всё остальное — пустой список, правило
+    молчит, а не додумывает."""
+    if isinstance(raw, list):
+        return raw
+    if not isinstance(raw, str) or not raw:
+        return []
+    try:
+        decoded = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    return decoded if isinstance(decoded, list) else []
+
+
+def _assessment_facts(row: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    """Записанные улики действующей оценки одной строки списка вопросов.
+
+    Список вопросов получает их одним `jsonb_agg` внутри уже существующего запроса
+    утверждений: отдельного запроса ради бейджа нет (бюджет страницы ≤4 SELECT закреплён
+    тестом), а факты берутся теми же JOIN'ами, что у карточки и списка знаний. Строка без
+    агрегата или битый JSON дают пустой список — правило молчит, а не додумывает.
+    """
+    return [item for item in _json_array(row.get("assessment_facts")) if isinstance(item, Mapping)]
+
+
+def _grade_reasons(row: Mapping[str, Any]) -> list[str]:
+    """Причины действующей оценки этой строки — из того события, которое их записало."""
+    return [str(item) for item in _json_array(row.get("grade_reasons"))]
+
+
 def build_answer_summary(
     *,
     question_state: object,
@@ -131,6 +170,7 @@ def build_answer_summary(
             effective_grade=first.get("effective_grade"),
             freshness_status=first.get("freshness_status"),
             rules=rules,
+            single_producer=first.get("single_producer"),
         )["reliability"]
         # T7.74: та же связь, что показывает карточка (подпись — из словаря).
         summary["relation"] = first.get("relation")
@@ -208,10 +248,31 @@ async def list_question_rows(
             await db.execute(
                 text(
                     f"""
-                    WITH {touched_claims_cte(scope)}
+                    WITH {touched_claims_cte(scope)},
+                    facts AS (
+                        SELECT e.claim_id,
+                               jsonb_agg(
+                                   jsonb_build_object(
+                                       'assessment_role', cur_ae.role,
+                                       'group_id', cur_sim.group_id,
+                                       'scope', e.scope,
+                                       'parent_source_id', s.parent_source_id,
+                                       'parent_uri', ps.canonical_uri
+                                   )
+                                   ORDER BY e.created_at, e.id
+                               ) AS assessment_facts
+                        FROM evidence e
+                        LEFT JOIN sources s ON s.id = e.source_id
+                        LEFT JOIN sources ps ON ps.id = s.parent_source_id
+                        {current_assessment_evidence_joins("e.claim_id", "e.id", "e.source_id")}
+                        WHERE e.claim_id IN (SELECT claim_id FROM ranked)
+                        GROUP BY e.claim_id
+                    )
                     SELECT r.question_id, r.relation, c.id, c.statement, c.claim_type,
                            c.freshness_status, c.created_at,
-                           h.epistemic_status, a.effective_grade
+                           h.epistemic_status, a.effective_grade,
+                           f.assessment_facts,
+                           assess_event.payload->'reasons' AS grade_reasons
                     FROM ranked r
                     JOIN claims c ON c.id = r.claim_id
                     JOIN claim_assessment_heads h
@@ -219,6 +280,16 @@ async def list_question_rows(
                           AND h.config_snapshot_id = {EFFECTIVE_SNAPSHOT_SQL}
                           AND h.assessment_state = 'current'
                     LEFT JOIN claim_assessments a ON a.id = h.current_assessment_id
+                    LEFT JOIN facts f ON f.claim_id = c.id
+                    LEFT JOIN LATERAL (
+                        SELECT ae.payload
+                        FROM audit_events ae
+                        WHERE ae.type IN ({ASSESSMENT_EVENT_TYPES_SQL})
+                          AND ae.payload->>'assessment_id' = a.id::text
+                          AND ae.occurred_at >= c.created_at
+                        ORDER BY ae.occurred_at DESC, ae.sequence DESC
+                        LIMIT 1
+                    ) assess_event ON TRUE
                     ORDER BY r.question_id ASC, c.created_at ASC, c.id ASC
                     """,
                 ),
@@ -230,7 +301,14 @@ async def list_question_rows(
     )
     per_question_claims: dict[str, list[Mapping[str, Any]]] = {}
     for row in claim_rows:
-        per_question_claims.setdefault(str(row["question_id"]), []).append(dict(row))
+        # T7.87 (ADR-0035 вариант A): список вопросов обязан показывать ТОТ ЖЕ бейдж, что и
+        # карточка ответа, поэтому имя производителя считается здесь той же чистой функцией
+        # (`apps.web.producer_view`) из записанных фактов этой же оценки. Ничего не пересчитывается.
+        item = dict(row)
+        item["single_producer"] = producer_publication_name(
+            _assessment_facts(item), reasons=_grade_reasons(item)
+        )
+        per_question_claims.setdefault(str(row["question_id"]), []).append(item)
 
     rules = await effective_claim_rules(db)
 

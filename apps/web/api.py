@@ -621,6 +621,13 @@ function renderClaim(claim,inactive){
     const lead = claim.verification_lead||'чем подтверждено';
     checked.textContent = lead+': '+lines.join('; '); row.appendChild(checked);
   }
+  // T7.87 (ADR-0035 §6.1): почему оценка именно такая. Всю строку составляет сервер
+  // («причина: …» + подпись rules engine), JS только печатает то, что пришло.
+  for(const reason of (claim.grade_reason_lines||[])){
+    if(!reason) continue;
+    const line=document.createElement('div'); line.className='muted';
+    line.textContent=reason; row.appendChild(line);
+  }
   const meta=[claim.type_label,claim.grade_label,claim.freshness_label].filter(Boolean).join(' · ');
   if(meta){ const m=document.createElement('div'); m.className='muted'; m.textContent=meta; row.appendChild(m); }
   const link=document.createElement('a'); link.href='/claim/'+esc(claim.id);
@@ -833,6 +840,14 @@ async function tick(){
         `${hd.activation_state||hd.activation_mode||'?'})</li>`;
     }
     h += '</ul></div>';
+    // T7.87 (ADR-0035 §6.1): та же причина, что показывает карточка ответа: строку целиком
+    // составляет сервер («причина: …» + подпись rules engine), здесь её только печатают.
+    const reasons = (d.grade_reason_lines || []).filter(Boolean);
+    if(reasons.length){
+      h += '<div class="card"><b>Почему оценка такая:</b><ul>';
+      for(const reason of reasons) h += `<li>${esc(reason)}</li>`;
+      h += '</ul></div>';
+    }
     h += '<div class="card"><b>Зависимости:</b><ul>';
     for(const x of d.depends_on)
       h += `<li>зависит от: <a href="/claim/${x.claim_id}">${esc(x.statement.slice(0,80))}</a> (${x.kind})</li>`;

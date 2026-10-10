@@ -38,10 +38,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.web import labels as ui_labels
 from apps.web.knowledge import (
+    CURRENT_ASSESSMENT_FACT_COLUMNS,
     EFFECTIVE_SNAPSHOT_SQL,
+    assessment_reason_lines,
+    assessment_reason_rows,
     assessment_view,
+    current_assessment_evidence_joins,
     effective_claim_rules,
+    grade_reason_view,
 )
+from apps.web.producer_view import producer_publication_name
 from apps.web.reliability import LEVEL_VERIFIED, describe_verification
 from packages.domain.models.base import JsonDict
 from packages.domain.models.enums import AuditEventType, QuestionState, SessionState
@@ -553,69 +559,24 @@ def touched_claims_cte(session_scope_sql: str) -> str:
 async def _assessment_reasons(
     db: AsyncSession, assessment_ids: Sequence[str], floor: datetime | None
 ) -> dict[str, list[str]]:
-    """Причины текущих оценок — из ленты `claim_assessed` (T7.73, ADR-0018).
+    """Причины текущих оценок — из того события ленты, которое их записало (T7.73, T7.87).
 
-    Rules engine записывает причины в событие оценки (`packages/memory/service.py`);
-    долговременной колонки причин нет и миграции не добавляются. Карточка берёт их
-    отткак есть: она только подписывает уже вычисленное (ADR-0026), ничего не
-    пересчитывает и не придумывает.
+    Rules engine записывает причины в payload события оценки; долговременной колонки
+    причин нет и миграции не добавляются. Таких событий два: `claim_assessed` (commit
+    сессии, `packages/memory/service.py`) и `reassessment_job_completed` (рабочий
+    переоценки, `packages/memory/reassessment.py`). Карточка обязана читать причину из
+    того события, которое её выдало: иначе оценка, пересчитанная рабочим, остаётся без
+    объяснения ровно там, где понижение уровня и нужно объяснить (ловушка ADR-0035 §3).
 
-    Хронология — `occurred_at` + `sequence` (AGENTS §7: `created_at` строк одной
-    долгой транзакции не упорядочивает). Нижняя граница времени — самая ранняя из
-    этих claim-строк: оценка не может быть записана раньше claim'а, поэтому выборка
-    идёт по индексу `occurred_at`, а не полным сканом ленты.
+    Общая выборка — `apps.web.knowledge.assessment_reason_rows`: тот же источник причин
+    для карточки, списка знаний и карточки утверждения (расхождение объяснений между
+    витринами запрещено). Она только подписывает уже вычисленное (ADR-0026): ничего не
+    пересчитывает и не придумывает причину там, где её нет. Хронология — `occurred_at` +
+    `sequence` (AGENTS §7: `created_at` строк одной долгой транзакции не упорядочивает);
+    нижняя граница времени — самая ранняя из этих claim-строк, чтобы выборка шла по
+    индексу `occurred_at`, а не полным сканом ленты.
     """
-    if not assessment_ids:
-        return {}
-    clause, params = _in_params("aid", assessment_ids)
-    time_floor = ""
-    if floor is not None:
-        # динамическое условие: параметр присутствует в SQL только когда он есть
-        # (ловушка AGENTS §7 — asyncpg не выводит тип из None)
-        time_floor = "AND occurred_at >= :floor"
-        params["floor"] = floor
-    rows = list(
-        (
-            await db.execute(
-                text(
-                    f"""
-                    WITH latest AS (
-                        SELECT DISTINCT ON (payload->>'assessment_id') payload
-                        FROM audit_events
-                        WHERE type = 'claim_assessed'
-                          AND payload->>'assessment_id' IN ({clause})
-                          {time_floor}
-                        ORDER BY payload->>'assessment_id', occurred_at DESC, sequence DESC
-                    )
-                    SELECT l.payload->>'assessment_id' AS assessment_id, r.reason
-                    FROM latest l
-                    LEFT JOIN LATERAL jsonb_array_elements_text(
-                        COALESCE(l.payload->'reasons', '[]'::jsonb)
-                    ) WITH ORDINALITY AS r(reason, n) ON TRUE
-                    ORDER BY 1, r.n
-                    """
-                ),
-                params,
-            )
-        )
-        .mappings()
-        .all()
-    )
-    reasons: dict[str, list[str]] = {}
-    for row in rows:
-        reason = row["reason"]
-        if reason is None:
-            continue
-        reasons.setdefault(str(row["assessment_id"]), []).append(str(reason))
-    return reasons
-
-
-def grade_reason_view(reasons: Sequence[str]) -> list[JsonDict]:
-    """Подписанные причины оценки для API карточки (T7.73). Порядок — как их записал
-    rules engine; подписи — только из словаря, выдуманных причин здесь нет."""
-    return [
-        {"code": code, **ui_labels.describe("assessment_reason", code)} for code in reasons
-    ]
+    return await assessment_reason_rows(db, assessment_ids, floor)
 
 
 def _side_view(grade: object, status: object) -> JsonDict | None:
@@ -900,11 +861,14 @@ async def question_answer(db: AsyncSession, question_id: uuid.UUID) -> JsonDict 
                             SELECT e.claim_id, e.relation, e.evidence_kind, e.scope,
                                    e.source_id, e.chunk_id, e.observation_artifact_id,
                                    s.source_type, s.canonical_uri, ar.sha256 AS artifact_sha256,
-                                   s.parent_source_id, ps.canonical_uri AS parent_uri
+                                   s.parent_source_id, ps.canonical_uri AS parent_uri,
+                                   cur_a.current_assessment_id AS assessment_id,
+                                   {CURRENT_ASSESSMENT_FACT_COLUMNS}
                             FROM evidence e
                             LEFT JOIN sources s ON s.id = e.source_id
                             LEFT JOIN sources ps ON ps.id = s.parent_source_id
                             LEFT JOIN artifacts ar ON ar.id = e.observation_artifact_id
+                            {current_assessment_evidence_joins("e.claim_id", "e.id", "e.source_id")}
                             WHERE e.claim_id IN ({evidence_clause})
                             ORDER BY e.created_at, e.id
                             """
@@ -930,6 +894,7 @@ async def question_answer(db: AsyncSession, question_id: uuid.UUID) -> JsonDict 
         # остаться без названия причины. Причины прежней оценки (T7.74) — оттуда же.
         reason_ids = [
             *[str(row["assessment_id"]) for row in claim_rows if row["assessment_id"] is not None],
+            *[str(row["assessment_id"]) for row in relied_rows if row["assessment_id"] is not None],
             *[str(row["old_id"]) for row in history_rows if row["old_id"] is not None],
         ]
         reason_by_assessment = await _assessment_reasons(
@@ -938,6 +903,23 @@ async def question_answer(db: AsyncSession, question_id: uuid.UUID) -> JsonDict 
             min((row["created_at"] for row in claim_rows if row["created_at"] is not None), default=None),
         )
         history = reverify_history_view(history_rows, reason_by_assessment)
+
+        # T7.87 (ADR-0035 вариант A): карточка и список знаний обязаны показывать один и тот же
+        # бейдж, поэтому имя производителя для обеих витрин выводит одна функция
+        # (`apps.web.producer_view`) из одних и тех же записанных фактов этой же оценки —
+        # роли улик в оценке, её записанные группы независимости, атрибутции значения и якоря.
+        # Отдельного запроса ради этого нет: факты пришли вместе с уликами карточки (бюджет T7.74).
+        assessment_id_by_claim = {
+            str(row["id"]): ("" if row["assessment_id"] is None else str(row["assessment_id"]))
+            for row in [*claim_rows, *relied_rows]
+        }
+        producer_by_claim = {
+            claim_id: producer_publication_name(
+                rows,
+                reasons=reason_by_assessment.get(assessment_id_by_claim.get(claim_id, ""), ()),
+            )
+            for claim_id, rows in by_claim.items()
+        }
 
         for row in claim_rows:
             claim_id = str(row["id"])
@@ -964,6 +946,8 @@ async def question_answer(db: AsyncSession, question_id: uuid.UUID) -> JsonDict 
                 "relation_label": _phrase("claim_relation", relation),
                 "relation_hint": ui_labels.describe("claim_relation", relation)["hint"],
             }
+            assessment_id = str(row["assessment_id"]) if row["assessment_id"] is not None else ""
+            reasons = reason_by_assessment.get(assessment_id, [])
             item.update(
                 assessment_view(
                     claim_type=row["claim_type"],
@@ -972,15 +956,14 @@ async def question_answer(db: AsyncSession, question_id: uuid.UUID) -> JsonDict 
                     effective_grade=row["effective_grade"],
                     freshness_status=row["freshness_status"],
                     rules=rules,
+                    single_producer=producer_by_claim.get(claim_id),
                 )
             )
             item["verification"] = describe_verification(by_claim.get(claim_id, []))
             # T7.73 (ADR-0018): текущая оценка объяснена — карточка показывает
             # причины, записанные rules engine (только подписи, без пересчёта).
-            assessment_id = str(row["assessment_id"]) if row["assessment_id"] is not None else ""
-            item["grade_reasons"] = grade_reason_view(
-                reason_by_assessment.get(assessment_id, [])
-            )
+            item["grade_reasons"] = grade_reason_view(reasons)
+            item["grade_reason_lines"] = assessment_reason_lines(reasons)
             # T7.74: если эта сессия перепроверила утверждение и оценка изменилась,
             # карточка называет это прямо («было → стало») с причинами обеих оценок.
             item["reverify_history"] = history.get(claim_id, [])
@@ -1016,6 +999,8 @@ async def question_answer(db: AsyncSession, question_id: uuid.UUID) -> JsonDict 
                 "relation_label": _phrase("claim_relation", "relied"),
                 "relation_hint": ui_labels.describe("claim_relation", "relied")["hint"],
             }
+            assessment_id = str(row["assessment_id"]) if row["assessment_id"] is not None else ""
+            reasons = reason_by_assessment.get(assessment_id, [])
             item.update(
                 assessment_view(
                     claim_type=row["claim_type"],
@@ -1024,9 +1009,14 @@ async def question_answer(db: AsyncSession, question_id: uuid.UUID) -> JsonDict 
                     effective_grade=row["effective_grade"],
                     freshness_status=row["freshness_status"],
                     rules=rules,
+                    single_producer=producer_by_claim.get(claim_id),
                 )
             )
             item["verification"] = describe_verification(by_claim.get(claim_id, []))
+            # T7.87: «использовано из знаний» подписывается теми же причинами и тем же
+            # правилом про производителя, что и записанные выводы этого вопроса.
+            item["grade_reasons"] = grade_reason_view(reasons)
+            item["grade_reason_lines"] = assessment_reason_lines(reasons)
             badge = item.get("reliability")
             level = badge.get("level") if isinstance(badge, Mapping) else None
             lead_key = "verified" if level == LEVEL_VERIFIED else "unconfirmed"

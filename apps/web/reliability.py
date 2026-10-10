@@ -23,8 +23,11 @@ ARCHITECTURE §3.7, §8.7); здесь уже вычисленные значе�
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Iterable, Mapping
 from typing import Any, Final
+
+from apps.web.labels import MAX_HINT_CHARS
 
 LEVEL_VERIFIED: Final = "verified"
 LEVEL_WEAK: Final = "weak"
@@ -97,6 +100,63 @@ TYPE_REQUIREMENT: Final[dict[str, str]] = {
 #: Уровни, при которых предположение показывается жёлтым («частично подтверждено»).
 _WEAK_GRADES: Final[frozenset[str]] = frozenset({"E1", "E2"})
 
+# ─── случай «кластер вокруг производителя» (ADR-0035 вариант A, T7.87) ───────
+#
+# Когда действующая оценка объяснена нехваткой независимости, а факты графа этой же
+# оценки сводят все подтверждения к одному производителю (`apps.web.producer_view`),
+# витрина называет это публикацией производителя, а не «предположением» в том же
+# смысле, что непроверенная городская легенда (ADR-0035 §5 п.2). Уровень оценки,
+# grade и пороги при этом НЕ меняются: остаётся `weak`, поэтому и цвет остаётся
+# жёлтым — тот же токен, что у «Подтверждено слабо». Зелёный зарезервирован за
+# уровнем `verified` («Проверено»), серый означает «данных оценки нет»: окрасить
+# публикацию производителя зелёным — значит прочитать её как проверенную, что
+# запрещено ADR-0035 §5 п.1 и AGENTS §7 (T7.65).
+PRODUCER_LABEL: Final = "Опубликовано производителем"  # 27 знаков
+
+#: Имя производителя в подписи — только человеческое и только из словаря атрибуции:
+# буквы, пробел, дефис и косая черта; всё остальное (цифры, скобки, коды) наружу не
+# выводится — при сомнительном имени подпись остаётся без него.
+_PRODUCER_NAME: Final = re.compile(r"^[А-Яа-яЁё][А-Яа-яЁё \-/]{1,59}$")
+
+#: Запасная подсказка, когда имя вписать нельзя (длиннее потолка или не читается).
+_PRODUCER_HINT_NO_NAME: Final = (
+    "Производитель опубликовал это значение: все подтверждения этой оценки — один кластер. "
+    "Независимых измерений нет — истинность не проверена."
+)
+
+
+def _producer_hint(name: str) -> str:
+    """Подсказка случая «кластер вокруг производителя» (ADR-0035 §6.1/§6.2).
+
+    Дословно повторяется только то, что действительно следует из данных: имя
+    производителя — из записанной атрибуции, «один кластер» — из ровно одной
+    записанной группы независимости этой оценки. Никаких «сообщений ЦБ» и прочих
+    деталей, которых в строках оценки нет (запрет выдумки, ADR-0035 §6).
+    """
+    named = (
+        f"Производитель ({name}) опубликовал это значение: все подтверждения этой оценки "
+        "— один кластер. Независимых измерений нет — истинность не проверена."
+    )
+    if len(named) <= MAX_HINT_CHARS:
+        return named
+    short = (
+        f"Производитель ({name}) опубликовал это значение; независимых измерений нет "
+        "— истинность не проверена."
+    )
+    return short if len(short) <= MAX_HINT_CHARS else _PRODUCER_HINT_NO_NAME
+
+
+def _producer_badge(name: object) -> dict[str, str]:
+    """Бейдж «опубликовано производителем»: уровень `weak` и цвет сохранены, подписи другие."""
+    label = str(name).strip() if isinstance(name, str) else ""
+    return {
+        "level": LEVEL_WEAK,
+        "label": PRODUCER_LABEL,
+        "hint": _producer_hint(label) if _PRODUCER_NAME.match(label) else _PRODUCER_HINT_NO_NAME,
+        "color": _LEVEL_COLOR[LEVEL_WEAK],
+    }
+
+
 _HEAD_STATE_HINT: Final[dict[str, str]] = {
     "none": "Оценки нет: подтверждений по действующим правилам не зафиксировано.",
     "pending": "Новая оценка подготовлена, но действующей ещё не стала — опираться на неё нельзя.",
@@ -113,6 +173,7 @@ def reliability(
     *,
     head_state: str | None = None,
     min_grade_for_supported: str | None = None,
+    single_producer: str | None = None,
 ) -> dict[str, str]:
     """{"level","label","hint","color"} по уже вычисленной оценке.
 
@@ -121,6 +182,13 @@ def reliability(
     показывает «не проверено» с объяснением, а не выдумывает уровень.
     Порог типа берётся из переданного снапшота правил, иначе из запасной
     таблицы этого модуля.
+
+    `single_producer` (T7.87, ADR-0035 вариант A) — имя производителя, которое
+    `apps.web.producer_view` вывел из уже записанных фактов этой же оценки (одна группа
+    независимости и все указатели сводятся к одному производителю). Оно меняет ТОЛЬКО
+    подписи случая «hypothesis + слабый уровень»: уровень остаётся `weak`, grade и пороги
+    никто не пересматривает. Для `supported` (`Проверено`) и для спорно/опровергнуто/
+    отложено имя не участвует: там бейдж уже назван другим исходом оценки.
     """
     grade = effective_grade if isinstance(effective_grade, str) and effective_grade else None
     status = epistemic_status if isinstance(epistemic_status, str) and epistemic_status else None
@@ -146,6 +214,8 @@ def reliability(
                 "Пригодных для оценки подтверждений пока нет: уровень подтверждения E0.",
             )
         if grade in _WEAK_GRADES:
+            if single_producer:
+                return _producer_badge(single_producer)
             key = str(claim_type or "")
             threshold = min_grade_for_supported or TYPE_MIN_GRADE.get(key, "")
             requirement = TYPE_REQUIREMENT.get(key) or (
