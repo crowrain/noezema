@@ -28,7 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from apps.web.producer_view import INDEPENDENCE_SHORTFALL_REASONS
 from apps.web.reliability import PRODUCER_LABEL
-from tests.scenario.test_web_answer_api import _client, _make, _seed_claim
+from tests.scenario.test_web_answer_api import _client, _make, _seed_claim, _seed_question, _seed_session
 from tests.scenario.test_web_producer_badge import (
     CBR_URI,
     _attribution_scope,
@@ -82,8 +82,8 @@ NO_INDEPENDENT = "В знаниях системы нет независимых
 
 # дословно ожидаемые строки (выведены из словаря подписей; закреплены и в юнит-слое)
 ROW_ADJACENT_OBSERVED = (
-    "Смежный показатель: Наблюдаемая населением годовая инфляция в России в декабре 2025 года "
-    "составила… — другой показатель, не является независимым измерением этого показателя."
+    "Связанная запись: Наблюдаемая населением годовая инфляция в России в декабре 2025 года "
+    "составила… — показатель автоматически не сопоставлен; независимым измерением не считается."
 )
 ROW_FORECAST_2D0 = (
     "Смежный прогноз, не измерение: Прогноз аналитиков по годовой инфляции в России на конец 2025 "
@@ -95,12 +95,12 @@ ROW_OTHER_MATCH = (
     "к декабрю 2024)…, значение 5,59% — совпадает с 5,59%"
 )
 ROW_ADJACENT_OFFICIAL = (
-    "Смежный показатель: Официальная годовая инфляция в России по итогам 2025 года (декабрь 2025 к… "
-    "— другой показатель, не является независимым измерением этого показателя."
+    "Связанная запись: Официальная годовая инфляция в России по итогам 2025 года (декабрь 2025 к… "
+    "— показатель автоматически не сопоставлен; независимым измерением не считается."
 )
 ROW_ADJACENT_CANDIDATE = (
-    "Смежный показатель: Годовая инфляция в России по итогам 2025 года (декабрь 2025 к декабрю 2024)… "
-    "— другой показатель, не является независимым измерением этого показателя."
+    "Связанная запись: Годовая инфляция в России по итогам 2025 года (декабрь 2025 к декабрю 2024)… "
+    "— показатель автоматически не сопоставлен; независимым измерением не считается."
 )
 ROW_INDEP_MATCH = (
     "Независимая оценка того же показателя: Банк России: годовая инфляция в России по итогам 2025 "
@@ -203,11 +203,11 @@ async def test_stand_card_shape_shows_honest_row_with_marked_adjacents(
         estimates = _card_claim(card, CPI_FULL)["estimates"]
         assert estimates["heading"] == HEADING
         rows = estimates["rows"]
-        assert [row["kind"] for row in rows] == ["adjacent_metric", "forecast_adjacent", "no_independent"]
-        assert [row["text"] for row in rows] == [ROW_ADJACENT_OBSERVED, ROW_FORECAST_2D0, NO_INDEPENDENT]
-        # смежный и прогнозный кандидаты показаны вместе со своей подписью надёжности — это их
+        assert [row["kind"] for row in rows] == ["forecast_adjacent", "adjacent_metric", "no_independent"]
+        assert [row["text"] for row in rows] == [ROW_FORECAST_2D0, ROW_ADJACENT_OBSERVED, NO_INDEPENDENT]
+        # связанный и прогнозный кандидаты показаны вместе со своей подписью надёжности — это их
         # собственная голова, витрина ничего не пересчитывает
-        assert rows[0]["claim_id"] == str(observed) and rows[1]["claim_id"] == str(forecast)
+        assert rows[0]["claim_id"] == str(forecast) and rows[1]["claim_id"] == str(observed)
         assert rows[0]["reliability"]["label"] == "Подтверждено слабо", rows[0]
         assert rows[1]["reliability"]["label"] == "Подтверждено слабо", rows[1]
         # ни один кандидат не назван независимым измерением (кроме честной строки, где это и есть смысл)
@@ -270,18 +270,18 @@ async def test_official_duplicate_card_shows_other_record_with_matching_value(
         official = _card_claim(card, OFFICIAL_DUP)
         rows = official["estimates"]["rows"]
         # официальная запись карточки: дубль 9266248e — «другая запись того же показателя» со
-        # значением «совпадает», наблюдаемая инфляция — смежный показатель; независимого измерения
-        # нет, но честная строка не нужна (запись того же показателя найдена)
-        assert [row["kind"] for row in rows] == ["other_record", "adjacent_metric"]
-        # смежный кандидат здесь — наблюдаемая инфляция (её запись карточки)
-        assert [row["text"] for row in rows] == [ROW_OTHER_MATCH, ROW_ADJACENT_OBSERVED]
-        # слово «независимая» в этой строке запрещено: группы/производители кандидатов пересекаются
-        # (атрибуция обеих записей ведёт к Росстату), независимость не выводится
+        # значением «совпадает», наблюдаемая инфляция — нейтральная связанная запись. T7.88a:
+        # честная строка остаётся — соседство с дублем того же показателя не значит, что
+        # независимое измерение найдено (в knowledge ничего независимого для этой карты нет).
+        assert [row["kind"] for row in rows] == ["other_record", "adjacent_metric", "no_independent"]
+        assert [row["text"] for row in rows] == [ROW_OTHER_MATCH, ROW_ADJACENT_OBSERVED, NO_INDEPENDENT]
+        # слово «независимая» в строке кандидата запрещено: группы/производители кандидатов
+        # пересекаются (атрибуция обеих записей ведёт к Росстату), независимость не выводится
         assert "независим" not in ROW_OTHER_MATCH
         assert rows[0]["claim_id"] == str(known)
         assert rows[0]["reliability"]["label"] == PRODUCER_LABEL, rows[0]  # подпись T7.87 на кандидате
-        # строка «нет независимых измерений» здесь не нужна: запись того же показателя найдена
-        assert all(row["kind"] != "no_independent" for row in rows)
+        # строка «нет независимых измерений» обязательна и стоит последней
+        assert rows[-1]["kind"] == "no_independent" and rows[-1]["text"] == NO_INDEPENDENT
 
         observed = _card_claim(card, OBSERVED)
         kinds = [row["kind"] for row in observed["estimates"]["rows"]]
@@ -511,5 +511,214 @@ async def test_answer_page_renders_section_from_api_field(
         # сервер отдал поле — страница печатает его как есть, ничего не добавляя от себя
         assert _card_claim(card, CPI_FULL)["estimates"]["heading"] == HEADING
         assert "claim.estimates" in page and "estRow" in page
+    finally:
+        await app_engine.dispose()
+
+
+# ─── T7.88a: карта 7ceb8047 целиком — десять подлинных утверждений стенда ─────
+
+# Дословно из дампа `fixtures-t788a/claims_live.tsv` (карты 7ceb8047 и 22d1748e):
+# uuid записей, тип и as_of — как на .92, чтобы порядок подборки (по id) и набор строк
+# совпали с тем, что оператор видел на карточке.
+STAND_CLAIMS: tuple[tuple[str, str, str, str | None], ...] = (
+    (
+        "9266248e-2433-4a12-a3f7-b51ff10ad803",
+        CPI_FULL,
+        "temporal_fact",
+        "2026-01-21",
+    ),
+    (
+        "c970bc08-6278-4766-9d74-7e541284be2a",
+        "Независимые оценки Сбера/СберCIB совпали с официальной цифрой Росстата: инфляция в России по "
+        "итогам 2025 года составила 5,6% — расхождений с официальными данными нет",
+        "external_fact",
+        None,
+    ),
+    (
+        "7cc2b578-e1e9-4474-8405-04ca3b9d0ea4",
+        "Фактическая годовая инфляция в России по итогам 2025 года (5,59%) оказалась ниже всех прогнозов "
+        "аналитиков: прогноз Банка России — 6,5–7%, Минэкономразвития — 6,8%, консенсус-прогноз ЦБ — 6,6%",
+        "external_fact",
+        None,
+    ),
+    (
+        "e2c52955-864c-43f1-806b-4e93cfa08d25",
+        "В информационно-аналитическом комментарии Банка России «Инфляция в России» № 12 (120) за декабрь "
+        "2025 г. годовая инфляция за 2025 год приведена как 5,6%.",
+        "external_fact",
+        None,
+    ),
+    (
+        "73d52835-2ed8-4ac3-9505-59845536f2a9",
+        "В пресс-релизе Банка России (event id 28251) годовая инфляция в 2025 году указана как 5,6%.",
+        "external_fact",
+        None,
+    ),
+    (
+        "6d9a12ff-7a60-48ad-8e72-973ff72530b1",
+        "Медианная оценка годовой наблюдаемой инфляции населением России в декабре 2025 года составила 13,1% "
+        "для граждан с накоплениями и 15,6% для граждан без накоплений (по данным опроса «инФОМ»).",
+        "external_fact",
+        "2025-12-31",
+    ),
+    (
+        "2d010d53-8818-4362-9475-387b71b63bb5",
+        FORECAST,
+        "external_fact",
+        "2025-12-24",
+    ),
+    (
+        "391c4388-c0dc-461b-a843-23d4d6bfcd17",
+        OBSERVED,
+        "temporal_fact",
+        "2025-12-31",
+    ),
+    (
+        "e189c80d-8544-443f-b295-681c0d1b6ed4",
+        OFFICIAL_DUP,
+        "temporal_fact",
+        "2025-12-31",
+    ),
+    (
+        "58e2d5d4-fed4-443f-aba3-b5835a61f638",
+        FORECAST,
+        "temporal_fact",
+        "2025-12-24",
+    ),
+)
+
+STAND_LIKELY_PRESS = (
+    "Запись, вероятно, о том же показателе: В пресс-релизе Банка России (event id 28251) годовая инфляция "
+    "в 2025 году…, значение 5,6% совпадает с 5,59% после округления; независимость не установлена."
+)
+STAND_LIKELY_SBER = (
+    "Запись, вероятно, о том же показателе: Независимые оценки Сбера/СберCIB совпали с официальной цифрой "
+    "Росстата:…, значение 5,6% совпадает с 5,59% после округления; независимость не установлена."
+)
+STAND_LIKELY_COMMENT = (
+    "Запись, вероятно, о том же показателе: В информационно-аналитическом комментарии Банка России "
+    "«Инфляция в России» № 12…, значение 5,6% совпадает с 5,59% после округления; независимость не установлена."
+)
+STAND_LINKED_MEDIAN = (
+    "Связанная запись: Медианная оценка годовой наблюдаемой инфляции населением России в декабре 2025… "
+    "— показатель автоматически не сопоставлен; независимым измерением не считается."
+)
+STAND_FORECAST_7CC2B578 = (
+    "Смежный прогноз, не измерение: Фактическая годовая инфляция в России по итогам 2025 года (5,59%) "
+    "оказалась… — прогноз реализованного значения; независимым измерением этого показателя он не является."
+)
+STAND_OVERFLOW = "Ещё связанных записей: 4."
+# категории, которые потолок связанных строк касается (ADR-0035 §12)
+LINKED_KINDS = {"likely_same_indicator", "adjacent_metric", "forecast_adjacent"}
+ROW_OFFICIAL_DUP_MATCH = (
+    "Другая запись того же показателя: Официальная годовая инфляция в России по итогам 2025 года "
+    "(декабрь 2025 к…, значение 5,59% — совпадает с 5,59%"
+)
+
+
+async def _stand_card(engine: AsyncEngine) -> uuid.UUID:
+    """Карточка как на стенде: два утверждения вопроса (`9266248e` и `391c4388`, их настоящие
+    uuid) и восемь записей знания с действующими оценками рабочего. Улик, групп независимости
+    и атрибуций значения здесь нет — ровно как на стенде, где независимость для этих карт не
+    выведена (иначе тест проверял бы другую ситуацию)."""
+    question_id, session_id = uuid.uuid4(), uuid.uuid4()
+    await _seed_question(engine, question_id=question_id, state="verified")
+    await _seed_session(
+        engine, session_id=session_id, question_id=question_id, state="succeeded", termination_reason="goal_reached"
+    )
+    for claim_uuid, statement, claim_type, as_of in STAND_CLAIMS:
+        claim_id = uuid.UUID(claim_uuid)
+        is_card_claim = claim_uuid.startswith(("9266248e", "391c4388"))
+        if is_card_claim:
+            await _seed_claim(engine, claim_id=claim_id, session_id=session_id, statement=statement, head_state="none")
+        else:
+            await _execute(
+                engine,
+                "INSERT INTO claims (id, statement, claim_type, freshness_status) VALUES (:id, :s, :t, 'unknown')",
+                id=claim_id,
+                s=statement,
+                t=claim_type,
+            )
+        if as_of is not None:
+            await _execute(
+                engine,
+                "UPDATE claims SET claim_type = :t, as_of = CAST(:d AS DATE) WHERE id = :c",
+                t=claim_type,
+                d=dt.date.fromisoformat(as_of),  # asyncpg не принимает строку для date-параметра
+                c=claim_id,
+            )
+        else:
+            await _execute(engine, "UPDATE claims SET claim_type = :t WHERE id = :c", t=claim_type, c=claim_id)
+        await _worker_assessment(
+            engine, claim_id=claim_id, grade="E1", epistemic="hypothesis", confidence=0.15, reasons=_SHORTFALL
+        )
+    return question_id
+
+
+@pytest.mark.asyncio
+async def test_stand_card_with_all_ten_claims_shows_three_related_rows_and_honest_row(
+    migrated_db: tuple[str, AsyncEngine], tmp_path: Any
+) -> None:
+    """Вся карта 7ceb8047 целиком (10 утверждений из дампа): независимых измерений нет ни у
+    одного утверждения карты; связанных строк не больше трёх; пересказы того же значения
+    названы вероятными, а не «другим показателем»; остаток свёрнут в счётчик; честная строка
+    есть у обоих утверждений карты и стоит последней."""
+    scratch_url, engine = migrated_db
+    app, app_engine = await _make(scratch_url, tmp_path / "host", tmp_path / "unit.json")
+
+    statements: list[str] = []
+
+    @event.listens_for(app_engine.sync_engine, "before_cursor_execute")
+    def _capture(conn: Any, cursor: Any, stmt: str, params: Any, context: Any, many: Any) -> None:
+        statements.append(stmt.strip())
+
+    try:
+        question_id = await _stand_card(engine)
+
+        async with _client(app) as client:
+            statements.clear()
+            card = (await client.get(f"/api/v1/questions/{question_id}/answer")).json()
+            selects = sum(1 for stmt in statements if stmt.upper().lstrip().startswith(("SELECT", "WITH")))
+
+        rows = _card_claim(card, CPI_FULL)["estimates"]["rows"]
+        assert [row["kind"] for row in rows] == [
+            "other_record",
+            "likely_same_indicator",
+            "likely_same_indicator",
+            "likely_same_indicator",
+            "related_overflow",
+            "no_independent",
+        ], rows
+        assert [row["text"] for row in rows[1:4]] == [STAND_LIKELY_PRESS, STAND_LIKELY_SBER, STAND_LIKELY_COMMENT]
+        assert rows[0]["text"] == ROW_OFFICIAL_DUP_MATCH
+        assert rows[4]["text"] == STAND_OVERFLOW and "claim_id" not in rows[4]
+        assert rows[-1]["text"] == NO_INDEPENDENT
+        # три связанных строки — потолок; скрытых записей ровно столько, сколько не показали
+        linked = [row for row in rows if row["kind"] in LINKED_KINDS]
+        assert len(linked) == 3
+
+        observed_rows = _card_claim(card, OBSERVED)["estimates"]["rows"]
+        assert [row["kind"] for row in observed_rows] == [
+            "forecast_adjacent",
+            "forecast_adjacent",
+            "adjacent_metric",
+            "related_overflow",
+            "no_independent",
+        ], observed_rows
+        assert [row["text"] for row in observed_rows[:3]] == [
+            ROW_FORECAST_2D0,
+            STAND_FORECAST_7CC2B578,
+            STAND_LINKED_MEDIAN,
+        ]
+        assert observed_rows[3]["text"] == STAND_OVERFLOW
+        assert observed_rows[-1]["text"] == NO_INDEPENDENT
+
+        # ни одна строка всей карты не утверждает «другой показатель»
+        for item in card["claims"]:
+            section = item.get("estimates") or {}
+            for row in section.get("rows", []):
+                assert "другой показатель" not in row["text"], row["text"]
+        # десять записей знания в пуле не добавили ни одного запроса: бюджет карточки тот же
+        assert selects <= 11, selects
     finally:
         await app_engine.dispose()
