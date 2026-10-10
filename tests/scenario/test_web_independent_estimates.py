@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import re
 import uuid
 from typing import Any
@@ -28,7 +29,14 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from apps.web.producer_view import INDEPENDENCE_SHORTFALL_REASONS
 from apps.web.reliability import PRODUCER_LABEL
-from tests.scenario.test_web_answer_api import _client, _make, _seed_claim, _seed_question, _seed_session
+from tests.scenario.test_web_answer_api import (
+    _client,
+    _make,
+    _seed_claim,
+    _seed_events,
+    _seed_question,
+    _seed_session,
+)
 from tests.scenario.test_web_producer_badge import (
     CBR_URI,
     _attribution_scope,
@@ -79,6 +87,26 @@ NO_VALUE_KNOWN = "Годовая инфляция в России по итог�
 
 HEADING = "Независимые оценки"
 NO_INDEPENDENT = "В знаниях системы нет независимых измерений этого показателя за этот период."
+# T7.89 (ADR-0035 §14): у утверждения с записанными сессиями честная строка различает два
+# случая — поиск независимых оценок в них выполнялся или нет (по журналу action_started/web.search).
+SEARCH_NOT_DONE_KIND = "independent_search_not_done"
+SEARCH_NOT_DONE = (
+    "В сессиях этого утверждения поиск независимых оценок не выполнялся; "
+    "в знаниях системы нет независимых измерений этого показателя за этот период."
+)
+SEARCH_DONE_KIND = "independent_search_done"
+# подлинные формулировки из журнала сессий стенда (`fixtures-t789/session_searches.tsv`):
+# официальные запросы и research.fetch признаком поиска независимых оценок не считаются
+SEARCH_QUERY_OFFICIAL = "Росстат инфляция 2025 год 5,59%"
+SEARCH_QUERY_SIGNED = "независимые оценки инфляции по итогам 2025 года"
+SEARCH_QUERY_SIGNED_2 = "чек-индекс годовая инфляция 2025 Россия"
+# две цитаты в хронологическом порядке (sequence 30 и 40); официальные запросы и research.fetch
+# признаком не считаются — ожидаемая строка выведена именно из этого правила
+ROW_SEARCH_DONE_2 = (
+    "Поиск независимых оценок в сессиях этого утверждения: выполнялся (2 запроса: "
+    f"«{SEARCH_QUERY_SIGNED}», «{SEARCH_QUERY_SIGNED_2}»); "
+    "независимых измерений этого показателя не записано."
+)
 
 # дословно ожидаемые строки (выведены из словаря подписей; закреплены и в юнит-слое)
 ROW_ADJACENT_OBSERVED = (
@@ -203,8 +231,8 @@ async def test_stand_card_shape_shows_honest_row_with_marked_adjacents(
         estimates = _card_claim(card, CPI_FULL)["estimates"]
         assert estimates["heading"] == HEADING
         rows = estimates["rows"]
-        assert [row["kind"] for row in rows] == ["forecast_adjacent", "adjacent_metric", "no_independent"]
-        assert [row["text"] for row in rows] == [ROW_FORECAST_2D0, ROW_ADJACENT_OBSERVED, NO_INDEPENDENT]
+        assert [row["kind"] for row in rows] == ["forecast_adjacent", "adjacent_metric", SEARCH_NOT_DONE_KIND]
+        assert [row["text"] for row in rows] == [ROW_FORECAST_2D0, ROW_ADJACENT_OBSERVED, SEARCH_NOT_DONE]
         # связанный и прогнозный кандидаты показаны вместе со своей подписью надёжности — это их
         # собственная голова, витрина ничего не пересчитывает
         assert rows[0]["claim_id"] == str(forecast) and rows[1]["claim_id"] == str(observed)
@@ -212,7 +240,7 @@ async def test_stand_card_shape_shows_honest_row_with_marked_adjacents(
         assert rows[1]["reliability"]["label"] == "Подтверждено слабо", rows[1]
         # ни один кандидат не назван независимым измерением (кроме честной строки, где это и есть смысл)
         for row in rows:
-            if row["kind"] != "no_independent":
+            if row["kind"] != SEARCH_NOT_DONE_KIND:
                 assert "независ" not in row["text"].split("—")[0]
         assert "claim_id" not in rows[2] and "reliability" not in rows[2]
         # исходная строка карточки живёт по-прежнему: подпись T7.87 не тронута
@@ -273,21 +301,23 @@ async def test_official_duplicate_card_shows_other_record_with_matching_value(
         # значением «совпадает», наблюдаемая инфляция — нейтральная связанная запись. T7.88a:
         # честная строка остаётся — соседство с дублем того же показателя не значит, что
         # независимое измерение найдено (в knowledge ничего независимого для этой карты нет).
-        assert [row["kind"] for row in rows] == ["other_record", "adjacent_metric", "no_independent"]
-        assert [row["text"] for row in rows] == [ROW_OTHER_MATCH, ROW_ADJACENT_OBSERVED, NO_INDEPENDENT]
+        # T7.89: сессии этого утверждения записаны, поиска независимых оценок в журнале нет —
+        # честная строка называет именно это.
+        assert [row["kind"] for row in rows] == ["other_record", "adjacent_metric", SEARCH_NOT_DONE_KIND]
+        assert [row["text"] for row in rows] == [ROW_OTHER_MATCH, ROW_ADJACENT_OBSERVED, SEARCH_NOT_DONE]
         # слово «независимая» в строке кандидата запрещено: группы/производители кандидатов
         # пересекаются (атрибуция обеих записей ведёт к Росстату), независимость не выводится
         assert "независим" not in ROW_OTHER_MATCH
         assert rows[0]["claim_id"] == str(known)
         assert rows[0]["reliability"]["label"] == PRODUCER_LABEL, rows[0]  # подпись T7.87 на кандидате
-        # строка «нет независимых измерений» обязательна и стоит последней
-        assert rows[-1]["kind"] == "no_independent" and rows[-1]["text"] == NO_INDEPENDENT
+        # строка «поиск не выполнялся; независимых измерений нет» обязательна и стоит последней
+        assert rows[-1]["kind"] == SEARCH_NOT_DONE_KIND and rows[-1]["text"] == SEARCH_NOT_DONE
 
         observed = _card_claim(card, OBSERVED)
         kinds = [row["kind"] for row in observed["estimates"]["rows"]]
         # оба кандидата (официальная запись карточки и запись знания) — смежные показатели,
         # независимого измерения наблюдаемой инфляции здесь нет: плюс честная строка
-        assert kinds == ["adjacent_metric", "adjacent_metric", "no_independent"], observed["estimates"]["rows"]
+        assert kinds == ["adjacent_metric", "adjacent_metric", SEARCH_NOT_DONE_KIND], observed["estimates"]["rows"]
     finally:
         await app_engine.dispose()
 
@@ -361,6 +391,39 @@ async def test_hypothetical_independent_estimates_match_and_diverge(
         # и взаимодействие с T7.87: подпись исходной карточки остаётся «Опубликовано производителем»
         badge = _card_claim(card, CPI_FULL)["reliability"]
         assert badge["label"] == PRODUCER_LABEL, badge
+
+        # T7.89: когда независимая оценка найдена, строка о поиске не нужна — подраздел уже
+        # называет измерение. Проверка на живом журнале: в сессии источника записан разрешённый
+        # и начатый поиск независимых оценок — лишней строки (ни «был», ни «не выполнялся») нет.
+        async with engine.connect() as conn:
+            source_session = (
+                await conn.execute(
+                    text("SELECT id FROM sessions WHERE question_id = :q LIMIT 1"), {"q": question_id}
+                )
+            ).scalar_one()
+        await _seed_events(
+            engine,
+            source_session,
+            [
+                (
+                    30,
+                    "action_started",
+                    {
+                        "action_id": str(uuid.uuid4()),
+                        "tool": "web.search",
+                        "arguments": json.dumps({"query": SEARCH_QUERY_SIGNED}, ensure_ascii=False),
+                    },
+                )
+            ],
+        )
+        async with _client(app) as client:
+            fresh_card = (await client.get(f"/api/v1/questions/{question_id}/answer")).json()
+        search_rows = [
+            row
+            for row in _card_claim(fresh_card, CPI_FULL)["estimates"]["rows"]
+            if row["kind"] in {SEARCH_DONE_KIND, SEARCH_NOT_DONE_KIND}
+        ]
+        assert search_rows == [], _card_claim(fresh_card, CPI_FULL)["estimates"]["rows"]
     finally:
         await app_engine.dispose()
 
@@ -392,8 +455,8 @@ async def test_honest_row_when_only_unsafe_or_valueless_candidates_exist(
             card = (await client.get(f"/api/v1/questions/{question_id}/answer")).json()
 
         rows = _card_claim(card, CPI_FULL)["estimates"]["rows"]
-        assert [row["kind"] for row in rows] == ["no_independent"]
-        assert rows[0]["text"] == NO_INDEPENDENT
+        assert [row["kind"] for row in rows] == [SEARCH_NOT_DONE_KIND]
+        assert rows[0]["text"] == SEARCH_NOT_DONE
         # кандидат со словом «проверено» из карточки исключён целиком (ловушка T7.65),
         # кандидат без десятичного значения гейта — тем более
         cited = {row.get("claim_id") for row in rows}
@@ -401,6 +464,196 @@ async def test_honest_row_when_only_unsafe_or_valueless_candidates_exist(
         # ни одна строка подраздела не утверждает проверку
         for row in rows:
             assert not _VERIFICATION_WORD.search(row["text"])
+    finally:
+        await app_engine.dispose()
+
+
+# ─── T7.89: строка учёта поиска независимых оценок (ADR-0035 §14) ────────────
+
+
+def _search_started(sequence: int, query: str) -> tuple[int, str, Any]:
+    """Записанное начатое действие `web.search` — ровно той формы, что пишет оркестратор
+    после разрешения политики (`action_started.payload.arguments` — каноническая JSON-строка)."""
+    return (
+        sequence,
+        "action_started",
+        {
+            "action_id": str(uuid.uuid4()),
+            "tool": "web.search",
+            "arguments": json.dumps({"query": query}, ensure_ascii=False),
+        },
+    )
+
+
+async def _question_session_id(engine: AsyncEngine, question_id: uuid.UUID) -> uuid.UUID:
+    async with engine.connect() as conn:
+        return (
+            await conn.execute(
+                text("SELECT id FROM sessions WHERE question_id = :q LIMIT 1"), {"q": question_id}
+            )
+        ).scalar_one()
+
+
+@pytest.mark.asyncio
+async def test_card_reports_search_done_from_recorded_queries(
+    migrated_db: tuple[str, AsyncEngine], tmp_path: Any
+) -> None:
+    """Случай (а): в сессиях утверждения записаны начатые поиски независимых оценок —
+    карточка называет это со счётчиком и цитатами, а не общей честной строкой.
+    Официальный запрос и research.fetch в строку не попадают: признак консервативен (ADR-0035 §14)."""
+    scratch_url, engine = migrated_db
+    app, app_engine = await _make(scratch_url, tmp_path / "host", tmp_path / "unit.json")
+    try:
+        question_id, _anchor_claim = await _question_with_worker_assessment(
+            engine,
+            statement=CPI_FULL,
+            grade="E1",
+            epistemic="hypothesis",
+            confidence=0.15,
+            reasons=_SHORTFALL,
+        )
+        session_id = await _question_session_id(engine, question_id)
+        await _seed_events(
+            engine,
+            session_id,
+            [
+                _search_started(10, SEARCH_QUERY_OFFICIAL),
+                (
+                    20,
+                    "action_started",
+                    {
+                        "action_id": str(uuid.uuid4()),
+                        "tool": "research.fetch",
+                        "arguments": json.dumps({"url": "https://rosstat.gov.ru/statistics/inflyaciya"}),
+                    },
+                ),
+                _search_started(30, SEARCH_QUERY_SIGNED),
+                _search_started(40, SEARCH_QUERY_SIGNED_2),
+            ],
+        )
+
+        async with _client(app) as client:
+            card = (await client.get(f"/api/v1/questions/{question_id}/answer")).json()
+
+        rows = _card_claim(card, CPI_FULL)["estimates"]["rows"]
+        assert [row["kind"] for row in rows] == [SEARCH_DONE_KIND], rows
+        assert rows[0]["text"] == ROW_SEARCH_DONE_2
+        # цитаты — ровно записанные формулировки; официальные запросы и fetch в строку не попали
+        assert SEARCH_QUERY_OFFICIAL not in rows[0]["text"]
+        assert "rosstat" not in rows[0]["text"]
+        assert "claim_id" not in rows[0] and "reliability" not in rows[0]
+    finally:
+        await app_engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_card_says_search_not_done_for_official_queries_and_denials(
+    migrated_db: tuple[str, AsyncEngine], tmp_path: Any
+) -> None:
+    """Случай (б): в журнале сессии только официальные запросы, research.fetch и ОТКАЗАННЫЙ
+    политикой поиск. Отказ не пишет `action_started` (оркестратор пишет один `action_failed`,
+    где нет ни инструмента, ни аргументов), значит выполненного поиска независимых оценок
+    не записано — карточка говорит именно это."""
+    scratch_url, engine = migrated_db
+    app, app_engine = await _make(scratch_url, tmp_path / "host", tmp_path / "unit.json")
+    try:
+        question_id, _anchor_claim = await _question_with_worker_assessment(
+            engine,
+            statement=CPI_FULL,
+            grade="E1",
+            epistemic="hypothesis",
+            confidence=0.15,
+            reasons=_SHORTFALL,
+        )
+        session_id = await _question_session_id(engine, question_id)
+        await _seed_events(
+            engine,
+            session_id,
+            [
+                _search_started(10, SEARCH_QUERY_OFFICIAL),
+                (
+                    20,
+                    "action_started",
+                    {
+                        "action_id": str(uuid.uuid4()),
+                        "tool": "research.fetch",
+                        "arguments": json.dumps({"url": "https://cbr.ru/presscenter/key-rate"}),
+                    },
+                ),
+                # отказ политики: ровно та форма, что пишет оркестратор (ни tool, ни arguments),
+                # текст отвергнутого запроса журналом вообще не записывается
+                (
+                    11,
+                    "action_failed",
+                    {
+                        "action_id": str(uuid.uuid4()),
+                        "denied": True,
+                        "reasons": ["tool_repeat_limit_reached"],
+                    },
+                ),
+            ],
+        )
+
+        async with _client(app) as client:
+            card = (await client.get(f"/api/v1/questions/{question_id}/answer")).json()
+
+        rows = _card_claim(card, CPI_FULL)["estimates"]["rows"]
+        assert [row["kind"] for row in rows] == [SEARCH_NOT_DONE_KIND], rows
+        assert rows[0]["text"] == SEARCH_NOT_DONE
+        # ни один запрос не цитирован: выполненного поиска независимых оценок в журнале нет
+        assert "«" not in rows[0]["text"]
+    finally:
+        await app_engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_search_ledger_covers_assessment_session_of_another_question(
+    migrated_db: tuple[str, AsyncEngine], tmp_path: Any
+) -> None:
+    """Сессиями утверждения считаются записанные связи: создавшая сессия И сессии, где его
+    оценивали (`claim_assessments.created_in_session`, тот же источник, что `touched_claims_cte`).
+    На стенде поиск независимой оценки для `391c4388` был записан в сессии другого вопроса,
+    перепроверявшей это утверждение; формулировка строки при этом говорит только «в сессиях
+    этого утверждения» — она не приписывает запрос конкретному вопросу (ADR-0035 §14)."""
+    scratch_url, engine = migrated_db
+    app, app_engine = await _make(scratch_url, tmp_path / "host", tmp_path / "unit.json")
+    try:
+        question_id, claim_id = await _question_with_worker_assessment(
+            engine,
+            statement=CPI_FULL,
+            grade="E1",
+            epistemic="hypothesis",
+            confidence=0.15,
+            reasons=_SHORTFALL,
+        )
+        # другая сессия (вопрос другого вопроса) оценивала это утверждение и вела поиск
+        other_question = uuid.uuid4()
+        await _seed_question(engine, question_id=other_question)
+        assessment_session = uuid.uuid4()
+        await _seed_session(
+            engine, session_id=assessment_session, question_id=other_question, state="succeeded",
+            termination_reason="goal_reached",
+        )
+        await _execute(
+            engine,
+            "INSERT INTO claim_assessments (id, claim_id, effective_grade, epistemic_status, rules_version, "
+            "rules_hash, evidence_set_hash, assessed_scope, confidence, valid, created_in_session) "
+            "VALUES (:a, :c, 'E2', 'supported', 'rules-v2', 'h', 'ev', '{}', 0.85, true, :s)",
+            a=uuid.uuid4(),
+            c=claim_id,
+            s=assessment_session,
+        )
+        await _seed_events(engine, assessment_session, [_search_started(15, SEARCH_QUERY_SIGNED_2)])
+
+        async with _client(app) as client:
+            card = (await client.get(f"/api/v1/questions/{question_id}/answer")).json()
+
+        rows = _card_claim(card, CPI_FULL)["estimates"]["rows"]
+        assert [row["kind"] for row in rows] == [SEARCH_DONE_KIND], rows
+        assert rows[0]["text"] == (
+            "Поиск независимых оценок в сессиях этого утверждения: выполнялся "
+            f"(1 запрос: «{SEARCH_QUERY_SIGNED_2}»); независимых измерений этого показателя не записано."
+        )
     finally:
         await app_engine.dispose()
 
@@ -478,7 +731,10 @@ async def test_card_queries_do_not_grow_with_candidate_pool(
         assert two_claims == with_pool, f"N+1 по утверждениям карточки: {with_pool} → {two_claims}"
         # Потолок закреплён замером (T7.87: 10 SELECT'ов). Подбор оценок добавляет ровно один
         # фиксированный запрос `WITH pool …` на всю карточку — не на утверждение и не на кандидата.
-        assert no_pool <= 11, statements
+        # T7.89: ещё ровно один фиксированный запрос — журнал поиска независимых оценок по
+        # сессиям утверждений карты (`_claim_search_ledger`, один SELECT с ANY(...) на всю
+        # карту). Потолок поднимается на 1 осознанно; N+1 по-прежнему запрещён (равенства выше).
+        assert no_pool <= 12, statements
     finally:
         event.remove(app_engine.sync_engine, "before_cursor_execute", _capture)
         await app_engine.dispose()
@@ -703,7 +959,7 @@ async def test_stand_card_with_all_ten_claims_shows_three_related_rows_and_hones
             "likely_same_indicator",
             "likely_same_indicator",
             "related_overflow",
-            "no_independent",
+            SEARCH_NOT_DONE_KIND,
         ], rows
         assert [row["text"] for row in rows[1:4]] == [
             STAND_LIKELY_PRESS,
@@ -712,7 +968,7 @@ async def test_stand_card_with_all_ten_claims_shows_three_related_rows_and_hones
         ]
         assert rows[0]["text"] == ROW_OFFICIAL_DUP_MATCH
         assert rows[4]["text"] == STAND_OVERFLOW and "claim_id" not in rows[4]
-        assert rows[-1]["text"] == NO_INDEPENDENT
+        assert rows[-1]["text"] == SEARCH_NOT_DONE
         # три связанных строки — потолок; скрытых записей ровно столько, сколько не показали
         linked = [row for row in rows if row["kind"] in LINKED_KINDS]
         assert len(linked) == 3
@@ -723,7 +979,7 @@ async def test_stand_card_with_all_ten_claims_shows_three_related_rows_and_hones
             "adjacent_metric",
             "adjacent_metric",
             "related_overflow",
-            "no_independent",
+            SEARCH_NOT_DONE_KIND,
         ], observed_rows
         assert [row["text"] for row in observed_rows[:3]] == [
             ROW_FORECAST_2D0,
@@ -731,7 +987,7 @@ async def test_stand_card_with_all_ten_claims_shows_three_related_rows_and_hones
             STAND_LINKED_PRESS,
         ]
         assert observed_rows[3]["text"] == STAND_OVERFLOW
-        assert observed_rows[-1]["text"] == NO_INDEPENDENT
+        assert observed_rows[-1]["text"] == SEARCH_NOT_DONE
 
         # ни одна строка всей карты не утверждает «другой показатель»
         for item in card["claims"]:
@@ -739,7 +995,8 @@ async def test_stand_card_with_all_ten_claims_shows_three_related_rows_and_hones
             for row in section.get("rows", []):
                 assert "другой показатель" not in row["text"], row["text"]
         # десять записей знания в пуле не добавили ни одного запроса: бюджет карточки тот же
-        assert selects <= 11, selects
+        # (T7.89: +1 фиксированный SELECT журнала поиска — на всю карту, не на утверждение)
+        assert selects <= 12, selects
     finally:
         await app_engine.dispose()
 

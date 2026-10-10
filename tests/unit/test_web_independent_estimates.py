@@ -660,7 +660,9 @@ def test_adjacent_threshold_is_strictly_below_the_duplicate_gate() -> None:
 def test_row_kinds_are_closed_set() -> None:
     """Закрытый набор категорий строки. Порядок = приоритет подбора и он же порядок показа:
     независимая оценка → другая запись того же показателя → вероятно тот же показатель →
-    прогноз → связанная запись → строка-счётчик → честная строка (ADR-0035 §12)."""
+    прогноз → связанная запись → строка-счётчик → честная строка (ADR-0035 §12).
+    T7.89 (ADR-0035 §14): честный хвост подраздела различает два записанных случая поиска
+    независимых оценок в сессиях утверждения — «выполнялся» и «не выполнялся»."""
     assert estimates.ESTIMATE_ROW_KEYS == (
         "independent",
         "other_record",
@@ -669,6 +671,8 @@ def test_row_kinds_are_closed_set() -> None:
         "adjacent_metric",
         "related_overflow",
         "no_independent",
+        "independent_search_done",
+        "independent_search_not_done",
     )
 
 

@@ -666,7 +666,10 @@ async def test_the_card_does_not_add_queries_per_claim(
         # ровно один фиксированный запрос `WITH pool …` на всю карточку (пул кандидатов «Независимых
         # оценок») — он не растёт ни с числом утверждений, ни с числом кандидатов: тест краснеет,
         # если бюджет вырастет дальше или подборщик уйдёт в N+1. Замер T7.88: ровно 11.
-        assert one_claim <= 11, statements
+        # T7.89 (ADR-0035 §14): ещё ровно один фиксированный запрос на карточку — журнал
+        # поиска независимых оценок по сессиям утверждений (`_claim_search_ledger`: ANY(...)
+        # по id карты, LEFT JOIN к audit_events). Замер T7.89: ровно 12; N+1 запрещён равенством выше.
+        assert one_claim <= 12, statements
     finally:
         event.remove(app_engine.sync_engine, "before_cursor_execute", _capture)
         await app_engine.dispose()

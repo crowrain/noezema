@@ -39,6 +39,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from apps.orchestrator.value_duplicate import declared_scope_metric, statement_values
 from apps.web import estimates as estimate_rules
 from apps.web import labels as ui_labels
+from apps.web import search_ledger
 from apps.web.knowledge import (
     ASSESSMENT_EVENT_TYPES_SQL,
     CURRENT_ASSESSMENT_FACT_COLUMNS,
@@ -896,6 +897,65 @@ def _estimate_row_json(
     return out
 
 
+async def _claim_search_ledger(db: AsyncSession, claim_ids: Sequence[str]) -> dict[str, tuple[str, ...]]:
+    """Учёт поиска независимых оценок в сессиях утверждений карты (T7.89, ADR-0035 §14).
+
+    РОВНО ОДИН SELECT на карточку — бюджет T7.74 (никакого N+1): сессии утверждения —
+    записанные связи `claims.created_in_session` и `claim_assessments.created_in_session`
+    (тот же источник, что `touched_claims_cte`; worker- и активационные оценки с NULL не
+    считаются), LEFT JOIN к журналу `action_started` с `tool = "web.search"`. LEFT JOIN
+    важен: строка без действия доказывает, что сессии у утверждения ЕСТЬ — иначе случай
+    «сессии есть, поиска нет» нельзя отличить от «сессий нет». Запрос считается поиском
+    независимых оценок по консервативному признаку текста (`apps.web.search_ledger`); отказ
+    политики не пишет `action_started`, поэтому в учёт попадает только разрешённое и начатое
+    действие (orchestrator: при отказе пишется один `action_failed`). Порядок —
+    (утверждение, сессия, sequence): детерминирован без часов. Утверждения нет в результате —
+    ни одной связанной сессии не записано: про поиск ничего не утверждается.
+    """
+    if not claim_ids:
+        return {}
+    ids_clause, ids_params = _in_params("sled", claim_ids)
+    rows = list(
+        (
+            await db.execute(
+                text(
+                    f"""
+                    WITH claim_sessions AS (
+                        SELECT c.id AS claim_id, c.created_in_session AS session_id
+                        FROM claims c
+                        WHERE c.id = ANY(ARRAY[{ids_clause}]::uuid[]) AND c.created_in_session IS NOT NULL
+                      UNION
+                        SELECT a.claim_id, a.created_in_session
+                        FROM claim_assessments a
+                        WHERE a.claim_id = ANY(ARRAY[{ids_clause}]::uuid[]) AND a.created_in_session IS NOT NULL
+                    )
+                    SELECT cs.claim_id AS claim_id, ae.sequence AS sequence,
+                           ae.payload ->> 'arguments' AS arguments
+                    FROM claim_sessions cs
+                    LEFT JOIN audit_events ae
+                           ON ae.session_id = cs.session_id
+                          AND ae.type = 'action_started'
+                          AND ae.payload ->> 'tool' = 'web.search'
+                    ORDER BY cs.claim_id, cs.session_id NULLS LAST, ae.sequence NULLS LAST
+                    """
+                ),
+                ids_params,
+            )
+        )
+        .mappings()
+        .all()
+    )
+    ledger: dict[str, list[str]] = {}
+    for row in rows:
+        queries = ledger.setdefault(str(row["claim_id"]), [])
+        if row["sequence"] is None:
+            continue  # сессия без записанных web-запросов: само наличие сессии уже учтено
+        query = search_ledger.recorded_search_query(row["arguments"])
+        if query is not None and search_ledger.search_query_targets_independent_evaluation(query):
+            queries.append(query)
+    return {claim_id: tuple(queries) for claim_id, queries in ledger.items()}
+
+
 async def _attach_estimate_sections(
     db: AsyncSession, *, claims: Sequence[JsonDict], relied_claims: Sequence[JsonDict], rules: Mapping[str, Any]
 ) -> None:
@@ -922,12 +982,17 @@ async def _attach_estimate_sections(
         return  # карточка без ни одной действующей оценки нужного типа — подраздела нет
     pool_by_id = {str(row["claim_id"]): row for row in pool_rows}
     candidates = [estimate_rules.EstimateCandidate(**_estimate_record_of(row)) for row in pool_rows]
+    ledger = await _claim_search_ledger(db, [str(item.get("id") or "") for item in items])
     for item in items:
-        record = pool_by_id.get(str(item.get("id") or ""))
+        claim_id = str(item.get("id") or "")
+        record = pool_by_id.get(claim_id)
         if record is None:
             continue  # действующей оценки этого утверждения нет — ничего не утверждаем
+        source_fields = _estimate_record_of(record)
+        if claim_id in ledger:
+            source_fields["independent_searches"] = ledger[claim_id]
         rows = estimate_rules.estimate_rows_for_source(
-            estimate_rules.EstimateSource(**_estimate_record_of(record)), candidates
+            estimate_rules.EstimateSource(**source_fields), candidates
         )
         item["estimates"] = {
             "heading": estimate_rules.estimate_section_heading(),

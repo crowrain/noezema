@@ -95,6 +95,8 @@ ESTIMATE_ROW_KEYS: tuple[str, ...] = (
     "adjacent_metric",
     "related_overflow",
     "no_independent",
+    "independent_search_done",
+    "independent_search_not_done",
 )
 ESTIMATE_VALUE_KEYS: tuple[str, ...] = (
     "value_word",
@@ -104,6 +106,13 @@ ESTIMATE_VALUE_KEYS: tuple[str, ...] = (
     "unit_pp",
     "differ_plain",
     "units_unclear",
+    "search_sessions_scope",
+    "search_was",
+    "search_queries_one",
+    "search_queries_few",
+    "search_queries_many",
+    "search_queries_more",
+    "search_measurements_absent",
 )
 ESTIMATE_SECTION_KEYS: tuple[str, ...] = ("heading",)
 
@@ -188,6 +197,11 @@ class EstimateSource:
     producers: frozenset[str]  # имена производителей из записанных указателей (пусто = не читается)
     snapshot_id: str | None  # снимок независимости текущей оценки этого утверждения
     groups: frozenset[str]  # группы этого снимка, к которым относятся улики утверждения
+    # T7.89 (ADR-0035 §14): тексты записанных запросов с признаком поиска независимых оценок
+    # в сессиях этого утверждения (журнал `action_started`/web.search). None — связных сессий
+    # у утверждения не найдено (о поиске ничего не утверждаем); пустой кортеж — сессии есть,
+    # записанного поиска независимых оценок в них нет.
+    independent_searches: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -628,6 +642,77 @@ def _honest_row() -> EstimateRow:
     return EstimateRow(kind="no_independent", text=entry["hint"], candidate_id=None)
 
 
+# ─── учёт поиска независимых оценок (T7.89, ADR-0035 §14) ────────────────────
+
+# Цитируем не больше трёх запросов — тот же потолок, что у связанных строк; остальные —
+# числом. Текст запроса — запись журнала, а не формулировка знания: он цитируется с той же
+# безопасностью, что сниппеты утверждений (резка целыми словами и проверка небезопасного
+# текста); небезопасный запрос не цитируется вовсе, но в счёт входит.
+MAX_SEARCH_QUERY_QUOTES: int = 3
+SEARCH_QUOTE_MAX_CHARS: int = 60
+
+# Тот же небезопасный текст, что отбраковывает сниппеты утверждений, плюс `§`:
+# цитата чужого запроса не должна притащить в карточку то, что запрещает сканер страниц.
+_SEARCH_UNSAFE_RE = re.compile(r"(?<!не )\bпроверен|[0-9a-fA-F]{8,}|§")
+
+
+def _search_queries_word(count: int) -> str:
+    """Русская форма счётного слова из закрытых записей словаря (грамматику код не выдумывает)."""
+    if count % 10 == 1 and count % 100 != 11:
+        return _phrase("search_queries_one")
+    if count % 10 in (2, 3, 4) and count % 100 not in (12, 13, 14):
+        return _phrase("search_queries_few")
+    return _phrase("search_queries_many")
+
+
+def _search_quote(query: str) -> str | None:
+    """Цитируемый фрагмент записанного запроса; `None` — процитировать нельзя."""
+    text = _YEAR_SPACING_RE.sub(" ", query.replace("\u00a0", " ").replace("\u202f", " ")).strip()
+    text = text.replace("«", "").replace("»", "")
+    if not text or _SEARCH_UNSAFE_RE.search(text):
+        return None
+    if len(text) > SEARCH_QUOTE_MAX_CHARS:
+        cut = text[:SEARCH_QUOTE_MAX_CHARS]
+        space = cut.rfind(" ")
+        text = (cut[:space] if space > 20 else cut) + "…"
+    return text
+
+
+def _search_done_row(queries: tuple[str, ...]) -> EstimateRow:
+    entry = describe("estimate_row", "independent_search_done")
+    quotes: list[str] = []
+    quoted_texts: set[str] = set()
+    for query in queries:
+        quote = _search_quote(query)
+        if quote is not None and quote not in quoted_texts and len(quotes) < MAX_SEARCH_QUERY_QUOTES:
+            quotes.append(quote)
+            quoted_texts.add(quote)
+    body = f"{len(queries)} {_search_queries_word(len(queries))}"
+    if quotes:
+        body += ": " + ", ".join(f"«{quote}»" for quote in quotes)
+        hidden = len(queries) - len(quotes)
+        if hidden > 0:
+            body += f"; {_phrase('search_queries_more')} {hidden}"
+    tail = describe("estimate_value", "search_measurements_absent")["hint"]
+    text = (
+        f"{entry['label']} {_phrase('search_sessions_scope')}: {_phrase('search_was')} ({body}); {tail}."
+    )
+    return EstimateRow(kind="independent_search_done", text=text, candidate_id=None)
+
+
+def _closing_honest_row(source: EstimateSource) -> EstimateRow:
+    """Последняя честная строка: учёт журнала разделяет два разных записанных случая (T7.89)."""
+    queries = source.independent_searches
+    if queries is None:
+        # Связанных с утверждением сессий не записано: о поиске сказать нечего,
+        # остаётся прежняя общая честная формулировка.
+        return _honest_row()
+    if queries:
+        return _search_done_row(queries)
+    entry = describe("estimate_row", "independent_search_not_done")
+    return EstimateRow(kind="independent_search_not_done", text=entry["hint"], candidate_id=None)
+
+
 # ─── основная чистая функция подбора ─────────────────────────────────────────
 
 
@@ -750,7 +835,9 @@ def estimate_rows_for_source(
         # Честная строка нужна, когда независимой оценки в подразделе нет вообще: соседство с
         # другой записью того же показателя (дублем), вероятным пересказом, прогнозом или
         # связанной записью её не отменяет и не заменяет. Она вне потолков и всегда последняя.
-        rows.append(_honest_row())
+        # С T7.89 честная строка различает два записанных случая: поиск независимых оценок
+        # в сессиях утверждения был (с перечнем запросов) и его не записано (ADR-0035 §14).
+        rows.append(_closing_honest_row(source))
     return tuple(rows)
 
 
