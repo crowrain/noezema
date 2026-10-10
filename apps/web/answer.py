@@ -36,8 +36,11 @@ from typing import Any, Final
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from apps.orchestrator.value_duplicate import declared_scope_metric, statement_values
+from apps.web import estimates as estimate_rules
 from apps.web import labels as ui_labels
 from apps.web.knowledge import (
+    ASSESSMENT_EVENT_TYPES_SQL,
     CURRENT_ASSESSMENT_FACT_COLUMNS,
     EFFECTIVE_SNAPSHOT_SQL,
     assessment_reason_lines,
@@ -47,10 +50,10 @@ from apps.web.knowledge import (
     effective_claim_rules,
     grade_reason_view,
 )
-from apps.web.producer_view import producer_publication_name
+from apps.web.producer_view import evidence_producer_names, producer_publication_name
 from apps.web.reliability import LEVEL_VERIFIED, describe_verification
 from packages.domain.models.base import JsonDict
-from packages.domain.models.enums import AuditEventType, QuestionState, SessionState
+from packages.domain.models.enums import AuditEventType, ClaimType, QuestionState, SessionState
 from packages.domain.sanitization import mask_nul
 
 #: Короткий рассказ о работе: не больше шести шагов (дизайн упрощения интерфейса).
@@ -70,6 +73,18 @@ MAX_EVENTS: Final = 500
 #: (пишущий потолок держит хост в `_curator`; читатель не должен зависеть от того,
 #: что когда-то лежит в payload).
 MAX_RELIED_CLAIMS: Final = 16
+
+# T7.88 (ADR-0035 вариант D): подраздел карточки «Независимые оценки».
+#: Типы утверждений, у которых есть существенное значение для сравнения: только
+#: они подбирают оценки (прогнозные и выведенные типы — отдельный разбор, ADR-0035 §11).
+ESTIMATE_CLAIM_TYPES: Final[frozenset[str]] = frozenset(
+    {ClaimType.TEMPORAL_FACT.value, ClaimType.EXTERNAL_FACT.value}
+)
+#: Потолок единой выборки кандидатов на карточку: ровно один SELECT независимо от
+#: числа утверждений карты (бюджет T7.74, N+1 запрещён). Утверждения самой карты —
+#: в начале порядка выборки, поэтому они попадают в пул всегда и служат источником
+#: фактов для своих же строк подраздела.
+MAX_ESTIMATE_POOL: Final = 60
 
 #: Закрытые наборы ключей этого модуля: тест полноты `tests/unit/test_web_labels.py`
 #: краснеет, если новый ключ появился здесь, но не получил подпись в словаре.
@@ -752,6 +767,174 @@ async def _relied_claims_rows(db: AsyncSession, session_ids: Sequence[str]) -> l
     )
 
 
+async def _estimate_candidate_rows(db: AsyncSession, card_claim_ids: Sequence[str]) -> list[Any]:
+    """Выборка знаний для подраздела «Независимые оценки» (T7.88, ADR-0035 вариант D).
+
+    РОВНО ОДИН SELECT на карточку — бюджет T7.74 (никакого N+1 на утверждение):
+    пул действующих оценок тех же типов, что и проверяемые утверждения, плюс записанные
+    факты каждой оценки (роли улик, группы независимости того же снимка, атрибуции значения,
+    якоря-родители) и записанные причины — тем же приёмом, что `assessment_reason_rows`.
+
+    Утверждения самой карты ставятся в начало порядка (приоритет по id карты), поэтому они
+    попадают в пул всегда (пока их не больше потолка) и служат источником фактов для своих
+    же строк подраздела: отдельного запроса «фактов источника» нет — как и в T7.87, подбор
+    читает только то, что уже пришло.
+    """
+    if not card_claim_ids:
+        return []
+    ids_clause, ids_params = _in_params("estc", card_claim_ids)
+    types_clause, type_params = _in_params("estt", sorted(ESTIMATE_CLAIM_TYPES))
+    params: dict[str, Any] = {**ids_params, **type_params, "pool_limit": MAX_ESTIMATE_POOL}
+    return list(
+        (
+            await db.execute(
+                text(
+                    f"""
+                    WITH pool AS (
+                        SELECT c.id AS claim_id, c.statement, c.claim_type, c.as_of, c.created_at,
+                               c.freshness_status, h.epistemic_status, a.effective_grade,
+                               a.id AS assessment_id,
+                               a.source_independence_snapshot_id AS snapshot_id,
+                               a.assessed_scope
+                        FROM claims c
+                        JOIN claim_assessment_heads h
+                              ON h.claim_id = c.id
+                             AND h.config_snapshot_id = {EFFECTIVE_SNAPSHOT_SQL}
+                        JOIN claim_assessments a ON a.id = h.current_assessment_id
+                        WHERE h.assessment_state = 'current'
+                          AND c.claim_type IN ({types_clause})
+                        ORDER BY (c.id = ANY(ARRAY[{ids_clause}]::uuid[])) DESC, c.id
+                        LIMIT :pool_limit
+                    )
+                    SELECT p.*, f.evidence_facts, COALESCE(rr.reasons, '[]'::jsonb) AS grade_reasons
+                    FROM pool p
+                    JOIN LATERAL (
+                        SELECT COALESCE(jsonb_agg(DISTINCT jsonb_build_object(
+                                   'assessment_role', ae.role,
+                                   'group_id', sim.group_id,
+                                   'scope', e.scope,
+                                   'parent_uri', ps.canonical_uri,
+                                   'parent_source_id', s.parent_source_id
+                               )), '[]'::jsonb) AS evidence_facts
+                        FROM assessment_evidence ae
+                        JOIN evidence e ON e.id = ae.evidence_id
+                        LEFT JOIN sources s ON s.id = e.source_id
+                        LEFT JOIN sources ps ON ps.id = s.parent_source_id
+                        LEFT JOIN source_independence_members sim
+                               ON sim.snapshot_id = p.snapshot_id AND sim.source_id = e.source_id
+                        WHERE ae.assessment_id = p.assessment_id
+                    ) f ON TRUE
+                    LEFT JOIN LATERAL (
+                        SELECT ev.payload -> 'reasons' AS reasons
+                        FROM audit_events ev
+                        WHERE ev.type IN ({ASSESSMENT_EVENT_TYPES_SQL})
+                          AND ev.payload ->> 'assessment_id' = p.assessment_id::text
+                          AND ev.occurred_at >= p.created_at
+                        ORDER BY ev.occurred_at DESC, ev.sequence DESC
+                        LIMIT 1
+                    ) rr ON TRUE
+                    ORDER BY (p.claim_id = ANY(ARRAY[{ids_clause}]::uuid[])) DESC, p.claim_id
+                    """
+                ),
+                params,
+            )
+        )
+        .mappings()
+        .all()
+    )
+
+
+def _estimate_facts(row: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    facts = row.get("evidence_facts")
+    if not isinstance(facts, list):
+        return []
+    return [fact for fact in facts if isinstance(fact, Mapping)]
+
+
+def _estimate_record_of(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Записанные факты одной действующей оценки — форма для чистой функции подбора."""
+    facts = _estimate_facts(row)
+    as_of = row.get("as_of")
+    snapshot_id = row.get("snapshot_id")
+    return {
+        "claim_id": str(row["claim_id"]),
+        "statement": str(row["statement"]),
+        "metric": declared_scope_metric(row.get("assessed_scope")),
+        "as_of_year": as_of.year if isinstance(as_of, datetime) else None,
+        "producers": evidence_producer_names(facts),
+        "snapshot_id": str(snapshot_id) if snapshot_id is not None else None,
+        "groups": frozenset(
+            str(fact["group_id"]) for fact in facts if isinstance(fact.get("group_id"), str) and fact["group_id"]
+        ),
+    }
+
+
+def _estimate_row_json(
+    row: estimate_rules.EstimateRow, pool_by_id: Mapping[str, Mapping[str, Any]], rules: Mapping[str, Any]
+) -> JsonDict:
+    """Строка подраздела: текст собран сервером; бейдж кандидата — перевод уже
+    вычисленной оценки этого кандидата (ADR-0026), тем же `assessment_view`."""
+    out: JsonDict = {"kind": row.kind, "text": row.text}
+    if row.candidate_id is None:
+        return out
+    claim_row = pool_by_id.get(row.candidate_id)
+    if claim_row is None:
+        return out
+    out["claim_id"] = row.candidate_id
+    reasons = [str(reason) for reason in (claim_row.get("grade_reasons") or [])]
+    out.update(
+        assessment_view(
+            claim_type=claim_row["claim_type"],
+            head_state="current",
+            epistemic_status=claim_row["epistemic_status"],
+            effective_grade=claim_row["effective_grade"],
+            freshness_status=claim_row["freshness_status"],
+            rules=rules,
+            single_producer=producer_publication_name(_estimate_facts(claim_row), reasons=reasons),
+        )
+    )
+    return out
+
+
+async def _attach_estimate_sections(
+    db: AsyncSession, *, claims: Sequence[JsonDict], relied_claims: Sequence[JsonDict], rules: Mapping[str, Any]
+) -> None:
+    """Подраздел «Независимые оценки» у утверждений карты (T7.88).
+
+    Кандидатский набор один на всю карту; чистая функция `apps.web.estimates` решает,
+    что является независимой оценкой того же показателя, что — другой записью того же
+    показателя, что — смежным показателем или прогнозом, и где положена честная строка.
+    Утверждения без действующей записи оценки в пуле подраздел не получают: витрина
+    молчит честно, а не выдумывает сравнение.
+    """
+    items = [
+        item
+        for item in [*claims, *relied_claims]
+        if str(item.get("claim_type") or "") in ESTIMATE_CLAIM_TYPES
+        and statement_values(str(item.get("statement") or ""))
+    ]
+    if not items:
+        return
+    pool_rows = await _estimate_candidate_rows(
+        db, [str(item.get("id") or "") for item in [*claims, *relied_claims]]
+    )
+    if not pool_rows:
+        return  # карточка без ни одной действующей оценки нужного типа — подраздела нет
+    pool_by_id = {str(row["claim_id"]): row for row in pool_rows}
+    candidates = [estimate_rules.EstimateCandidate(**_estimate_record_of(row)) for row in pool_rows]
+    for item in items:
+        record = pool_by_id.get(str(item.get("id") or ""))
+        if record is None:
+            continue  # действующей оценки этого утверждения нет — ничего не утверждаем
+        rows = estimate_rules.estimate_rows_for_source(
+            estimate_rules.EstimateSource(**_estimate_record_of(record)), candidates
+        )
+        item["estimates"] = {
+            "heading": estimate_rules.estimate_section_heading(),
+            "rows": [_estimate_row_json(row, pool_by_id, rules) for row in rows],
+        }
+
+
 async def question_answer(db: AsyncSession, question_id: uuid.UUID) -> JsonDict | None:
     """Собрать карточку ответа на вопрос. `None` — вопроса нет (эндпоинт ответит 404).
 
@@ -1023,6 +1206,10 @@ async def question_answer(db: AsyncSession, question_id: uuid.UUID) -> JsonDict 
             item["verification_lead"] = ui_labels.describe("verification_lead", lead_key)["label"]
             item["active"] = head_state == "current"
             relied_claims.append(item)
+
+        # T7.88 (ADR-0035 вариант D): подраздел «Независимые оценки» — одна фиксированная
+        # выборка на всю карту (бюджет T7.74), подбор и тексты — чистый модуль apps.web.estimates.
+        await _attach_estimate_sections(db, claims=claims, relied_claims=relied_claims, rules=rules)
 
     # шаги рассказывают про ТУ работу, которая дала ответ; её нет — про последнюю сессию.
     # T7.74: для перепроверенного или принятого повторно утверждения такая работа — сессия

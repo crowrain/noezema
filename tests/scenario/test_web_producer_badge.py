@@ -661,10 +661,12 @@ async def test_the_card_does_not_add_queries_per_claim(
 
         assert len(card["claims"]) == 2, card["claims"]
         assert two_claims == one_claim, f"N+1: {one_claim} → {two_claims}"
-        # Потолок закреплён по замеру прежнего кода (19c06ca, тот же посев: 10 SELECT'ов на
-        # карточку). Факты производителя и причин добавлены JOIN'ами в уже существующие
-        # запросы, а не отдельными обращениями: тест краснеет, если бюджет вырастет.
-        assert one_claim <= 10, statements
+        # Потолок закреплён по замеру (T7.87: 10 SELECT'ов на карточку). Факты производителя и причин
+        # добавлены JOIN'ами в уже существующие запросы, а не отдельными обращениями. T7.88 добавил
+        # ровно один фиксированный запрос `WITH pool …` на всю карточку (пул кандидатов «Независимых
+        # оценок») — он не растёт ни с числом утверждений, ни с числом кандидатов: тест краснеет,
+        # если бюджет вырастет дальше или подборщик уйдёт в N+1. Замер T7.88: ровно 11.
+        assert one_claim <= 11, statements
     finally:
         event.remove(app_engine.sync_engine, "before_cursor_execute", _capture)
         await app_engine.dispose()

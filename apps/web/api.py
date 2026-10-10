@@ -628,6 +628,20 @@ function renderClaim(claim,inactive){
     const line=document.createElement('div'); line.className='muted';
     line.textContent=reason; row.appendChild(line);
   }
+  // T7.88 (ADR-0035 вариант D): «Независимые оценки» — каждую строку подраздела составил
+  // сервер, JS печатает то, что пришло, и бейдж уже вычисленной оценки кандидата.
+  const est=claim.estimates;
+  if(est&&est.heading&&Array.isArray(est.rows)&&est.rows.length){
+    const estHead=document.createElement('div'); estHead.className='muted';
+    estHead.textContent=est.heading; row.appendChild(estHead);
+    for(const estRow of est.rows){
+      if(!estRow||!estRow.text) continue;
+      const line=document.createElement('div'); line.className='muted';
+      if(estRow.reliability) line.appendChild(badgeFor(estRow.reliability));
+      const txt=document.createElement('span'); txt.textContent=estRow.text; line.appendChild(txt);
+      row.appendChild(line);
+    }
+  }
   const meta=[claim.type_label,claim.grade_label,claim.freshness_label].filter(Boolean).join(' · ');
   if(meta){ const m=document.createElement('div'); m.className='muted'; m.textContent=meta; row.appendChild(m); }
   const link=document.createElement('a'); link.href='/claim/'+esc(claim.id);

@@ -155,3 +155,19 @@ def producer_publication_name(
         return None
 
     return next(iter(names))
+
+
+def evidence_producer_names(evidence_rows: Iterable[Mapping[str, Any]]) -> frozenset[str]:
+    """Записанные имена производителей улик (T7.88, ADR-0035 §11).
+
+    Облегчённое чтение тех же указателей, что читает `producer_publication_name`: только
+    имена из словаря первоисточников; битые и безымянные записи просто ничего не дают.
+    Это НЕ признание случая производителя (полное правило — у `producer_publication_name`):
+    функция отвечает только на вопрос «какие производители в записях названы».
+    """
+    names: set[str] = set()
+    for row in evidence_rows:
+        for pointer in (_attribution_pointer(row), _parent_pointer(row)):
+            if isinstance(pointer, str) and pointer:
+                names.add(pointer)
+    return frozenset(names)

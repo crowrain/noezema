@@ -23,6 +23,7 @@ import pytest
 import apps.orchestrator.scheduler as scheduler
 import apps.web.answer as web_answer
 import apps.web.api as web_api
+import apps.web.estimates as web_estimates
 import apps.web.host_status as host_status
 import apps.web.knowledge as knowledge
 import packages.memory.dispute as memory_dispute
@@ -186,6 +187,11 @@ def _sources() -> dict[str, list[str]]:
             for name, value in vars(memory_dispute).items()
             if name.startswith("ACTOR_") and isinstance(value, str)
         ),
+        # T7.88 (ADR-0035 вариант D): закрытые наборы ключей подраздела карточки
+        # «Независимые оценки» объявлены в коде подборщика apps/web/estimates.py.
+        "estimate_row": list(web_estimates.ESTIMATE_ROW_KEYS),
+        "estimate_value": list(web_estimates.ESTIMATE_VALUE_KEYS),
+        "estimate_section": list(web_estimates.ESTIMATE_SECTION_KEYS),
     }
 
 
@@ -328,6 +334,10 @@ def test_answer_builder_keys_are_all_labelled() -> None:
         ("honesty_note", web_answer.HONESTY_KEYS),
         ("verification_lead", web_answer.VERIFICATION_LEAD_KEYS),
         ("claim_relation", web_answer.RELATION_KEYS),
+        # T7.88: строки подраздела «Независимые оценки» (ADR-0035 вариант D).
+        ("estimate_row", web_estimates.ESTIMATE_ROW_KEYS),
+        ("estimate_value", web_estimates.ESTIMATE_VALUE_KEYS),
+        ("estimate_section", web_estimates.ESTIMATE_SECTION_KEYS),
     ):
         assert keys, f"пустой набор ключей: {category}"
         unlabeled = [key for key in keys if not labels.describe(category, key)["hint"]]
