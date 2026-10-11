@@ -12,6 +12,21 @@ What these tests pin down (each one was verified red on 6ee80c5):
   (в) `close_session`: cancellation during `destroy` still finishes the removal under its own
       ceiling (or names the leak), always removes the session overlay dir, and re-raises the
       cancellation; a repeated cancellation may not hang it.
+
+T7.95a adds the CONFIRMATION layer (verified red on d0e27c1, measurements in docs/STATUS.md T7.95a):
+  (1) an `rm -f` refused with "removal … is already in progress" is NOT a leak — dockerd is removing
+      on its own; the cleanup waits for the engine to confirm absence and names nothing;
+  (2) an `rm -f` that answered rc=0 while the container then appears (a create dockerd finished after
+      our client died) triggers exactly one re-removal, still no LEAKED line;
+  (3) a container the engine keeps reporting present gets exactly ONE LEAKED line saying "present" at
+      the ceiling's expiry; an engine that never gives a conclusive answer gets exactly one line
+      saying "absence UNCONFIRMED";
+  (4) a `start` that ended without a handle — cancelled, ceiling-expired or engine-refused — removes
+      `<work_root>/<session_id>`, keeping its original exception/cancellation byte-identical.
+
+The fake engine now MODELS CONTAINER EXISTENCE (create records it, rm -f clears it, inspect answers
+"no such object" when there is nothing), because a confirmation-only fix cannot be tested against an
+engine that never distinguishes present from absent; measured docker 29 semantics per docs/STATUS.md.
 """
 
 from __future__ import annotations
@@ -44,7 +59,10 @@ CONTAINER_NAME = f"noezema-sb-{str(SESSION_ID).replace('-', '')[:12]}"
 #: because the cancelled call is killed, never because the fake engine grew tired.
 WEDGE_SECONDS = 20.0
 #: Test knobs of the product cleanup ceilings (product values are NOT changed by these tests).
-CLEANUP_CEILING_SECONDS = 1.0
+# T7.95a: the ceiling knob must fit the whole remove→confirm sequence inside it, and a confirmation
+# needs its full absent-window plus room for a re-removal — hence 4.0 s where T7.95 had 1.0 s.
+# Assertions ("< 10 s" bounds) are unchanged; only the knob of the lowered product ceiling grew.
+CLEANUP_CEILING_SECONDS = 4.0
 CREATE_CEILING_SECONDS = 1.0
 START_VERB_CEILING_SECONDS = 1.0
 REAP_CEILING_SECONDS = 1.0
@@ -65,25 +83,83 @@ PROFILE = SandboxProfile(
 # ── fake engine + process probes ────────────────────────────────────────────
 
 
-def _engine(tmp_path: Path, *, wedge_on: str = "", wedge_once: bool = False, fail_on: str = "") -> str:
-    """Path of a fake container engine. It journals every call, and wedges on `wedge_on`.
+def _engine(
+    tmp_path: Path,
+    *,
+    wedge_on: str = "",
+    wedge_once: bool = False,
+    fail_on: str = "",
+    refuse_in_progress_once: bool = False,
+    reappear_after_rm: bool = False,
+    stubborn_rm: bool = False,
+) -> str:
+    """Path of a fake container engine. It journals every call, wedges on `wedge_on`, and MODELS
+    whether the container exists (T7.95a): `create` registers it when it completes; `rm -f` clears it;
+    `inspect` answers presence (`rc 0`) or "error: no such object" (`rc 1`) — the exact shapes measured
+    on docker 29 (docs/STATUS.md T7.95a), which the confirmation fix reads.
+
+    Scenario flags model the measured behaviours that fooled d0e27c1:
+      `refuse_in_progress_once` — the first completed `rm -f` is refused with «removal … already in
+        progress» while dockerd removes the container behind our back (manager probe defect 1);
+      `reappear_after_rm` — `rm -f` answers rc=0 for a name whose create is not finished and the
+        container APPEARS on the next inspect (probe defect 2, measured lag ≤ ~0,13 s);
+      `stubborn_rm` — every `rm -f` answers success but the container never goes away.
 
     A wedged invocation appends its own PID to `engine-pids.log` so the test can prove afterwards
     that every CLI client it cancelled is really gone (killed AND reaped).
     """
     calls = tmp_path / "engine-calls.log"
     pids = tmp_path / "engine-pids.log"
-    lines = ["#!/bin/sh", f'echo "$*" >> "{calls}"']
+    present = tmp_path / ".sb-present"  # marker: the engine currently has this container
+    reap = tmp_path / ".sb-reap"  # a delayed create will materialise the container again
+    reaped = tmp_path / ".sb-reaped"  # the delayed materialisation already happened once
+    refused = tmp_path / ".sb-refused"  # the one "already in progress" refusal has been given
+    lines = [
+        "#!/bin/sh",
+        f'J="{calls}"; P="{pids}"; ST="{present}"; AP="{reap}"; RD="{reaped}"; RQ="{refused}"',
+        'echo "$*" >> "$J"',
+    ]
     if wedge_on:
-        lines.append(f'[ "$1" = {wedge_on} ] || exit 0')
+        lines.append(f'if [ "$1" = {wedge_on} ]; then')
         if wedge_once:
             # only the FIRST such verb wedges; the engine answers every later call normally
-            lines.append(f'[ -e "{pids}.once" ] && exit 0')
-            lines.append(f'touch "{pids}.once"')
-        lines.append(f'echo $$ >> "{pids}"')
-        lines.append(f"exec sleep {WEDGE_SECONDS}")
+            lines.append(
+                f'[ -e "$P.once" ] && echo "engine answered after one wedge"'
+                f' || {{ touch "$P.once"; echo $$ >> "$P"; exec sleep {WEDGE_SECONDS}; }}'
+            )
+        else:
+            lines.append('echo $$ >> "$P"')
+            lines.append(f"exec sleep {WEDGE_SECONDS}")
+        lines.append("fi")
     if fail_on:
         lines.append(f'if [ "$1" = {fail_on} ]; then echo "fake engine says no" >&2; exit 1; fi')
+    lines.append('case "$1" in')
+    lines.append("  create) touch \"$ST\" ;;")  # a create that COMPLETED registers the container
+    lines.append("  start|exec|logs) : ;;")
+    if refuse_in_progress_once:
+        # the FIRST completed rm -f is refused while dockerd removes behind our back; later ones clear normally
+        lines.extend(
+            [
+                '  rm) if [ ! -e "$RQ" ]; then',
+                '      touch "$RQ"; rm -f "$ST"',
+                '      echo "Error response from daemon: removal of container $3 is already in progress" >&2',
+                "      exit 1",
+                "    fi",
+                '    rm -f "$ST" ;;',
+            ]
+        )
+    elif reappear_after_rm:
+        lines.append('  rm) if [ ! -e "$RD" ]; then touch "$RD" "$AP"; else rm -f "$ST"; fi ;;')
+    elif stubborn_rm:
+        lines.append('  rm) touch "$ST" ;;')  # "success" that removes nothing — the container stays
+    else:
+        lines.append('  rm) rm -f "$ST" ;;')
+    lines.append('  inspect)')
+    lines.append('    if [ -e "$AP" ]; then rm -f "$AP"; touch "$ST"; echo created; exit 0; fi')
+    lines.append('    if [ -e "$ST" ]; then echo running; exit 0; fi')
+    lines.append('    echo "error: no such object: $2" >&2; exit 1 ;;')
+    lines.append("  *) : ;;")
+    lines.append("esac")
     lines.append("exit 0")
     script = tmp_path / "engine.sh"
     script.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -391,3 +467,189 @@ async def test_kill_and_reap_is_bounded_when_the_child_watch_wedges(
     assert child.killed is True, "SIGKILL must be delivered synchronously, before any await"
     assert elapsed < 8.0, f"the reap waited out the wedge instead of bounding it ({elapsed:.1f} s)"
     assert "was killed but not reaped" in caplog.text, caplog.text
+
+
+# ── T7.95a: confirmation of absence (all verified red on d0e27c1) ─────────────
+
+
+def _rm_count(tmp_path: Path) -> int:
+    return _journal(tmp_path).count(f"rm -f {CONTAINER_NAME}")
+
+
+async def _open_executor(tmp_path: Path, engine: str) -> SandboxSessionExecutor:
+    """A runtime + executor holding a live fake container (create/start complete normally)."""
+    rt = _runtime(tmp_path, engine)
+    handle = await rt.start(str(SESSION_ID), None, PROFILE)
+    assert handle.container_name == CONTAINER_NAME
+    ex = SandboxSessionExecutor(rt)
+    ex._handle = handle
+    return ex
+
+
+@pytest.mark.asyncio
+async def test_in_progress_refusal_confirms_absence_and_names_no_leak(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Manager probe defect 1 at unit level: killing our `rm -f` client does NOT cancel dockerd's removal.
+
+    The first (destroy) `rm -f` is cancelled mid-call; the helper's `rm -f` then gets docker's measured
+    refusal «removal … is already in progress» while the container disappears behind our back. d0e27c1
+    called this LEAKED on every mid-removal cancellation — with nothing actually leaked (probe: 3/3).
+    """
+    engine = _engine(tmp_path, wedge_on="rm", wedge_once=True, refuse_in_progress_once=True)
+    ex = await _open_executor(tmp_path, engine)
+
+    with caplog.at_level(logging.WARNING):
+        outcome, elapsed = await _cancel_after_wedge(ex.close_session(), tmp_path)
+
+    assert isinstance(outcome, asyncio.CancelledError), outcome
+    assert elapsed < 10.0, f"close_session hung instead of bounding its cleanup ({elapsed:.1f} s)"
+    calls = _journal(tmp_path)
+    assert _rm_count(tmp_path) == 2, f"expected destroy's interrupted rm and exactly one helper rm: {calls}"
+    assert f"LEAKED container {CONTAINER_NAME}" not in caplog.text.replace("closed session", ""), (
+        "a removal that dockerd completed on its own is NOT a leak — the old line was the false alarm: "
+        + caplog.text
+    )
+    assert not (tmp_path / "sandbox" / str(SESSION_ID)).exists(), "the overlay dir must go either way"
+
+
+@pytest.mark.asyncio
+async def test_container_that_reappeared_after_a_successful_rm_is_removed_again_without_leak(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Manager probe defect 2 at unit level: `rm -f` answering rc=0 proves NOTHING (measured docker).
+
+    The cancelled create leaves dockerd completing the container after our client died; the helper's
+    first `rm -f` returns "success" for a name not materialised yet, and the container appears on the
+    confirmation inspect. It must be removed again (visible in the engine's own journal) and confirmed
+    absent — with no LEAKED line. d0e27c1 removed once, never looked, stayed silent, leaked 4/24 probes.
+    """
+    engine = _engine(tmp_path, wedge_on="create", reappear_after_rm=True)
+    rt = _runtime(tmp_path, engine)
+
+    with caplog.at_level(logging.WARNING):
+        outcome, elapsed = await _cancel_after_wedge(rt.start(str(SESSION_ID), None, PROFILE), tmp_path)
+
+    assert isinstance(outcome, asyncio.CancelledError), outcome
+    assert elapsed < 10.0, f"cancelled start must bound its own cleanup ({elapsed:.1f} s)"
+    calls = _journal(tmp_path)
+    assert _rm_count(tmp_path) == 2, (
+        f"the reappeared container must be removed a second time, engine journal: {calls}"
+    )
+    assert "inspect" in "\n".join(calls), "absence must be confirmed by the engine, not assumed from rc=0"
+    assert f"LEAKED container {CONTAINER_NAME}" not in caplog.text, (
+        "confirmed cleanup must stay silent: " + caplog.text
+    )
+
+
+@pytest.mark.asyncio
+async def test_container_never_removed_gets_exactly_one_present_leak_line(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A container the engine keeps reporting present is named ONCE, and the line says it is PRESENT."""
+    engine = _engine(tmp_path, stubborn_rm=True)  # every rm -f "succeeds"; nothing actually disappears
+    rt = _runtime(tmp_path, engine)
+    handle = await rt.start(str(SESSION_ID), None, PROFILE)
+    assert handle.container_name == CONTAINER_NAME
+
+    started = time.monotonic()
+    with caplog.at_level(logging.WARNING):
+        cleaned = await rt.remove_container_best_effort(CONTAINER_NAME, "unit scenario")
+    elapsed = time.monotonic() - started
+
+    assert cleaned is False, "an engine that keeps reporting the container present did not confirm absence"
+    assert elapsed < 10.0, f"cleanup exceeded its bounded sequence ({elapsed:.1f} s)"
+    assert _rm_count(tmp_path) == 2, f"one removal + exactly one re-removal: {_journal(tmp_path)}"
+    leaks = [line for line in caplog.text.splitlines() if f"LEAKED container {CONTAINER_NAME}" in line]
+    assert len(leaks) == 1, f"exactly one leak line per cleanup attempt: {caplog.text}"
+    assert "keeps reporting the container present" in leaks[0], leaks[0]
+
+
+@pytest.mark.asyncio
+async def test_engine_that_never_answers_gives_one_unconfirmed_absence_leak_line(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """LEAKED only at the ceiling's expiry — and it then says the absence stayed UNCONFIRMED."""
+    engine = _engine(tmp_path, wedge_on="inspect")  # rm -f answers; every confirmation question hangs
+    rt = _runtime(tmp_path, engine)
+    handle = await rt.start(str(SESSION_ID), None, PROFILE)
+    assert handle.container_name == CONTAINER_NAME
+
+    started = time.monotonic()
+    with caplog.at_level(logging.WARNING):
+        cleaned = await rt.remove_container_best_effort(CONTAINER_NAME, "unit scenario")
+    elapsed = time.monotonic() - started
+
+    assert cleaned is False, "no conclusive engine answer means the container may well be alive"
+    assert elapsed < 10.0, f"the hung confirmation must end at its own ceiling ({elapsed:.1f} s)"
+    assert _rm_count(tmp_path) == 1, (
+        f"a wedged engine gets no blind re-removal: {_journal(tmp_path)}"
+    )
+    leaks = [line for line in caplog.text.splitlines() if f"LEAKED container {CONTAINER_NAME}" in line]
+    assert len(leaks) == 1, f"exactly one leak line per cleanup attempt: {caplog.text}"
+    assert "absence UNCONFIRMED" in leaks[0], leaks[0]
+    # the wedged confirmation CLIs must be gone too (T7.93 kill-and-reap covers every ceiling call)
+    pids = _cancelled_pids(tmp_path)
+    assert pids, "the fake engine never recorded its wedged inspect PID"
+    await _wait_until(
+        "every wedged confirmation CLI is gone (killed and reaped at the cleanup ceiling)",
+        lambda: all(_process_state(pid) == "gone" for pid in pids),
+    )
+
+
+@pytest.mark.asyncio
+async def test_cancelled_start_leaves_no_session_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T7.95a defect 3: a cancelled `start` used to leave `<work_root>/<session_id>` forever (30/30 probes)."""
+    engine = _engine(tmp_path, wedge_on="create")
+    rt = _runtime(tmp_path, engine)
+
+    outcome, elapsed = await _cancel_after_wedge(rt.start(str(SESSION_ID), None, PROFILE), tmp_path)
+    assert isinstance(outcome, asyncio.CancelledError), outcome
+    assert elapsed < 10.0, f"a cancelled start must return control quickly ({elapsed:.1f} s)"
+    assert not (tmp_path / "sandbox" / str(SESSION_ID)).exists(), "a failed start must remove its session dir"
+    assert list(rt.work_root.iterdir()) == [], rt.work_root
+
+
+@pytest.mark.asyncio
+async def test_ceiling_expired_start_leaves_no_session_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ceiling path of the same rule: SandboxError as before (T7.93), directory gone (T7.95a)."""
+    engine = _engine(tmp_path, wedge_on="create")
+    rt = _runtime(tmp_path, engine)
+
+    with pytest.raises(SandboxError) as raised:
+        await rt.start(str(SESSION_ID), None, PROFILE)
+    assert "engine command timed out" in str(raised.value), str(raised.value)
+    assert f"rm -f {CONTAINER_NAME}" in _journal(tmp_path), "container cleanup stays as T7.95 had it"
+    assert not (tmp_path / "sandbox" / str(SESSION_ID)).exists(), "a ceilinged start must remove its session dir"
+
+
+@pytest.mark.asyncio
+async def test_refused_create_leaves_no_session_dir_and_still_touches_no_container(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The engine-refused (`rc != 0`) path keeps removing NO container name (T7.95 invariant) — but its
+    session directory is not exempt from cleanup anymore."""
+    engine = _engine(tmp_path, fail_on="create")
+    rt = _runtime(tmp_path, engine)
+
+    with pytest.raises(SandboxError) as raised:
+        await rt.start(str(SESSION_ID), None, PROFILE)
+    assert "failed to create sandbox container" in str(raised.value), str(raised.value)
+    calls = _journal(tmp_path)
+    assert _rm_count(tmp_path) == 0, f"a name the engine never confirmed as ours is not removed blindly: {calls}"
+    assert not (tmp_path / "sandbox" / str(SESSION_ID)).exists(), "a refused start must remove its session dir"

@@ -22,6 +22,7 @@ import contextlib
 import logging
 import os
 import shutil
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -173,6 +174,20 @@ _CLEANUP_CEILING_SECONDS = 8.0
 # опускают окна брокера). Продуктовые вызовы используют эти константы как есть.
 _CREATE_CEILING_SECONDS = 60.0
 _START_VERB_CEILING_SECONDS = 60.0
+
+# ── T7.95a: уборка считается завершённой только когда движок ПОДТВЕРДИЛ отсутствие контейнера ──
+# Замеры на docker 29 (.87, docs/STATUS.md T7.95a): `rm -f` с rc=0 НИЧЕГО не доказывает — он бывает и
+# по контейнеру, которого никогда не было, и по ещё незавершённому `docker create` (убитый клиент не
+# отменяет работу в dockerd), после чего контейнер «появляется» — по замерам до ~0,13 с. Отказ rc=1
+# «removal … already in progress» означает, что dockerd удаляет САМ (завершает за 22–86 мс): ждать и
+# перепроверять, а не поднимать тревогу. Значит после каждого `rm -f` идёт серия `inspect`, и отсутствие
+# ПОДТВЕРЖДЁННО, если имя непрерывно отвечает «no such» всё окно; появившийся контейнер удаётся повторно
+# ровно один раз. Все глаголы подтверждения живут ВНУТРИ прежнего `_CLEANUP_CEILING_SECONDS` (8 с),
+# арифметика дренажа не меняется: reap 2 + cleanup 8 = 10 < 20 с.
+_CONFIRM_POLL_INTERVAL_SECONDS = 0.1   # быстрее обоих измеренных окон (появление ≤0,13 с, in-progress ≤86 мс)
+_CONFIRM_ABSENT_WINDOW_SECONDS = 1.5   # ≈10 худших измеренных задержек появления после «успешного» rm -f
+_CONFIRM_MIN_CALL_SECONDS = 0.25       # не начинать подвызов дешевле: сам docker CLI замеряется ≤60 мс
+_MAX_REMOVE_ATTEMPTS = 2               # одна уборка + одна повторная по контейнеру, появившемуся после неё
 
 
 def _consume_detached_task(task: asyncio.Task[Any]) -> None:
@@ -351,43 +366,143 @@ class ContainerSandboxRuntime:
             )
 
     async def remove_container_best_effort(self, name: str, where: str) -> bool:
-        """One bounded `rm -f` for a container whose name is already with the engine (T7.95(б/в)).
+        """Remove the container whose name is already with the engine and CONFIRM its absence (T7.95a).
 
-        Returns True only when the engine confirmed the removal; a cleanup that did not succeed is
-        named here in the log (`LEAKED container …`, the same rule as in `close_session`, T7.58), so
-        the caller's own exception/cancellation stays intact. The ONLY thing that leaves this method
-        as an exception is a fresh asyncio.CancelledError — a cleanup must never swallow a cancellation.
+        Measured on docker 29 (docs/STATUS.md T7.95a): an `rm -f` that answers rc=0 proves NOTHING — it
+        happens for a container that never existed and for one whose `docker create` dockerd has not
+        finished, after which the container appears. So cleanup counts as done only when the series of
+        `inspect` that follows every `rm -f` continuously sees "no such" through the whole confirmation
+        window; an "already in progress" refusal means dockerd is removing on its own (wait and recheck),
+        a container that appeared after a "successful" `rm -f` is removed exactly once more. Every engine
+        verb of this sequence lives inside the same `_CLEANUP_CEILING_SECONDS` — the ceiling is what keeps
+        the shutdown drain safe: T7.63 deliberately lets a shutdown abandon a wedged engine rather than
+        hang on it, and a repeated cancellation only cuts OUR await (the sequence runs as its own shielded
+        task and reaches its own ceiling regardless).
 
-        Defence against a repeated cancellation: the removal runs as its OWN task under
-        `_CLEANUP_CEILING_SECONDS`, and our `await` is shielded — a cancel aimed at our caller stops
-        OUR await but does not abort the engine call, which still finishes (or hits its own ceiling)
-        on its own. The ceiling is what makes this safe to use at all: T7.63 deliberately lets a
-        shutdown abandon a wedged engine rather than hang on it, so an unshielded-and-unbounded
-        cleanup would re-open exactly the hole it closes.
+        Returns True only when the engine confirmed the absence. Otherwise exactly ONE warning names the
+        problem — `LEAKED container …`, and it says which case it is: at the end of the ceiling the engine
+        reports the CONTAINER PRESENT, or the absence remained UNCONFIRMED (that replaced T7.95's naming
+        on an rc that dockerd never really answered; the manager's probes showed the old line was a false
+        alarm on every mid-removal cancellation). The ONLY exception this method lets out stays a fresh
+        asyncio.CancelledError — a cleanup must never swallow a cancellation, and it never replaces what
+        the caller raises.
         """
-        attempt = asyncio.create_task(self._run(self.destroy_command(name), timeout=_CLEANUP_CEILING_SECONDS))
+        attempt = asyncio.create_task(self._remove_and_confirm(name, where))
         attempt.add_done_callback(_consume_detached_task)
         try:
-            rc, _out, err = await asyncio.shield(attempt)
+            return await asyncio.shield(attempt)
         except asyncio.CancelledError:
-            logger.warning(
-                "LEAKED container %s: the cleanup call started during %s was cancelled again and continues on its own",
+            # повторная отмена срывает только НАШ await: detached-последовательность доживает до своего
+            # потолка и напишет про контейнер ровно там, где истечёт потолок (или подтвердит отсутствие)
+            logger.debug(
+                "sandbox cleanup of %s (%s): the caller was cancelled again; the engine sequence runs to its ceiling",
                 name,
                 where,
             )
             raise
-        except SandboxError as exc:  # our own cleanup ceiling (T7.93) or the engine refused `rm -f`
-            logger.warning("LEAKED container %s: cleanup during %s failed: %s", name, where, exc)
-            return False
-        if rc != 0:
+
+    async def _remove_and_confirm(self, name: str, where: str) -> bool:
+        """The bounded remove → confirm → (re-remove if the container appeared) → verdict sequence.
+
+        Runs as its own task under `_CLEANUP_CEILING_SECONDS` so it survives a repeated cancellation of
+        our caller (see `remove_container_best_effort`). Blindly removing a name the engine has never
+        confirmed as ours stays out of reach: this method is only called for names already handed over.
+        """
+        deadline = time.monotonic() + _CLEANUP_CEILING_SECONDS
+        verdict, detail = "unknown", "the ceiling expired before the engine was asked"
+        for attempt_no in range(1, _MAX_REMOVE_ATTEMPTS + 1):
+            if deadline - time.monotonic() < _CONFIRM_MIN_CALL_SECONDS:
+                break  # нет бюджета даже на один глагол — квалифицируем уже известное
+            answered = False  # `rm -f` вернул rc (любой) — в отличие от вызова, до rc не дожившего
+            removal_underway = False  # «already in progress»: dockerd удаляет сам, повторять ему нечем
+            try:
+                rc, _out, err = await self._run(
+                    self.destroy_command(name),
+                    timeout=max(
+                        deadline - time.monotonic() - _CONFIRM_ABSENT_WINDOW_SECONDS,
+                        _CONFIRM_MIN_CALL_SECONDS,
+                    ),
+                )
+                answered = True
+                if rc != 0 and "already in progress" in err.lower():
+                    removal_underway = True
+                elif rc != 0:
+                    detail = err.strip()[:200] or "no reason given"
+            except SandboxError as exc:  # наш собственный потолок (T7.93: CLI убит и пожат) или отказ движка
+                answered = False
+                detail = str(exc)
+
+            may_remove_what_appeared = answered and not removal_underway and attempt_no < _MAX_REMOVE_ATTEMPTS
+            verdict, confirm_detail = await self._confirm_absent(
+                name, deadline, stop_on_present=may_remove_what_appeared
+            )
+            if verdict == "absent":
+                return True  # движок подтвердил отсутствие полным окном — LEAKED нет (rc=0 одного rm -f мало)
+            detail = confirm_detail or detail
+            if verdict == "present" and may_remove_what_appeared:
+                logger.debug(
+                    "sandbox cleanup of %s: the container is present after `rm -f` answered — removing it again", name
+                )
+                continue
+            break  # unknown, или presence без права повторного rm -f: дожидать потолок и назвать итог
+        if verdict == "present":
             logger.warning(
-                "LEAKED container %s: cleanup during %s was refused by the engine: %s",
+                "LEAKED container %s: cleanup during %s ran out its %.1f s ceiling while the engine "
+                "keeps reporting the container present",
                 name,
                 where,
-                err.strip()[:200] or "no reason given",
+                _CLEANUP_CEILING_SECONDS,
             )
-            return False
-        return True
+        else:
+            logger.warning(
+                "LEAKED container %s: cleanup during %s ended with the absence UNCONFIRMED by the engine "
+                "within its %.1f s ceiling: %s",
+                name,
+                where,
+                _CLEANUP_CEILING_SECONDS,
+                detail,
+            )
+        return False
+
+    async def _confirm_absent(self, name: str, deadline: float, stop_on_present: bool) -> tuple[str, str]:
+        """A short bounded `inspect` series after an `rm -f` (T7.95a), inside the same cleanup ceiling.
+
+        Absence is CONFIRMED when consecutive answers keep saying "no such" for at least
+        `_CONFIRM_ABSENT_WINDOW_SECONDS` without a gap: measured docker answers exactly that (`rc != 0`,
+        stderr «error: no such object …»), presence answers `rc == 0`. An answer unrelated to the
+        container being missing (daemon unreachable) restarts the window — it does not assert presence.
+        "present" returns at once only when a re-removal decision must be made now; otherwise the series
+        keeps observing until the ceiling, so that LEAKED describes the state AT THE CEILING'S EXPIRY:
+        last conclusive answer present → "present"; no conclusive answer ever → "unknown".
+        """
+        absent_since: float | None = None
+        last_error = ""
+        last_state = "unknown"
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining < _CONFIRM_MIN_CALL_SECONDS:
+                gap = "" if last_state != "unknown" else "engine gave no conclusive answer within the ceiling"
+                return (last_state, last_error or gap)
+            try:
+                rc, _out, err = await self._run(["inspect", name], timeout=remaining)
+            except SandboxError as exc:
+                last_error, absent_since = str(exc), None
+                await asyncio.sleep(_CONFIRM_POLL_INTERVAL_SECONDS)
+                continue
+            if rc == 0:
+                last_state = "present"
+                absent_since = None
+                if stop_on_present:
+                    return ("present", "")
+            elif "no such" in err.lower():
+                now = time.monotonic()
+                if absent_since is None:
+                    absent_since = now
+                elif now - absent_since >= _CONFIRM_ABSENT_WINDOW_SECONDS:
+                    return ("absent", "")
+            else:
+                last_error, absent_since = err.strip()[:200] or "engine refused to answer", None
+            await asyncio.sleep(_CONFIRM_POLL_INTERVAL_SECONDS)
 
     async def health_check(self) -> None:
         """Engine reachable, image present, a one-shot container runs."""
@@ -415,66 +530,85 @@ class ContainerSandboxRuntime:
         sb_dir = self.work_root / session_id
         base_dir = sb_dir / "base"
         workspace_dir = sb_dir / "work"
-        base_dir.mkdir(parents=True, exist_ok=True)
-        workspace_dir.mkdir(parents=True, exist_ok=True)
-        if base_workspace is not None and base_workspace.exists():
-            shutil.copytree(base_workspace, base_dir, dirs_exist_ok=True)
-
-        # the in-container user (uid 10001) must be able to write the
-        # workspace bind; chown when possible, else make it world-writable
-        # (the dir is disposable and destroyed with the session)
-        try:
-            os.chown(workspace_dir, SANDBOX_UID, SANDBOX_GID)
-        except PermissionError:
-            os.chmod(workspace_dir, 0o777)
-
         name = f"noezema-sb-{session_id.replace('-', '')[:12]}"
-        cmd = self.create_command(name, self.image, profile, base_dir, workspace_dir)
-        # T7.95(б/г): с этой строки имя контейнера УЖЕ выдано движку, а `SandboxHandle` ещё не выдан.
-        # Именно хэндл делает контейнер доступным для `destroy`, а `close_session()` исполнителя при
-        # `handle is None` просто ничего не убирает — значит любой выход отсюда до успешного `start`
-        # (внешняя отмена сессии, истечение потолка вызова по T7.93) обязан закончиться ограниченной
-        # по времени попыткой `rm -f <имя>`; исходное исключение и отмена при этом пробрасываются
-        # без изменений. Оговорка: отказ самого движка (`rc != 0`) уборки НЕ вызывает — там движок
-        # ОТВЕТИЛ, что контейнера нет, а слепо удалять не подтверждённое нам имя было бы единственным
-        # путём, способным зацепить чужой контейнер с тем же префиксом. Разбор: docs/STATUS.md T7.95.
+
+        # T7.95a(3): `<work_root>/<session_id>` создаётся до первого движкового глагола и обязан быть
+        # удалён ЛЮБЫМ выходом из start без выданного хэндла — отменой, истечением потолка, отказом
+        # движка (rc != 0) и хозяйской ошибкой. С T7.95 контейнер после create убирается, но каталог
+        # оставался: исполнитель вызывает close_session только при живом хэндле, а start его не создавал;
+        # проба менеджера после ~30 отменённых start насчитала 30 leftover-каталогов (docs/STATUS.md).
+        # Исключение/отмена пробрасываются без изменений — уборка каталога их не заменяет.
         try:
-            rc, _out, err = await self._run(cmd, timeout=_CREATE_CEILING_SECONDS)
-        except SandboxHealthError:
-            raise  # движок не был запущен вовсе (нет бинаря): к движку не попало ничего
-        except asyncio.CancelledError:
-            await self.remove_container_best_effort(name, "the create call was cancelled")
+            base_dir.mkdir(parents=True, exist_ok=True)
+            workspace_dir.mkdir(parents=True, exist_ok=True)
+            if base_workspace is not None and base_workspace.exists():
+                shutil.copytree(base_workspace, base_dir, dirs_exist_ok=True)
+
+            # the in-container user (uid 10001) must be able to write the
+            # workspace bind; chown when possible, else make it world-writable
+            # (the dir is disposable and destroyed with the session)
+            try:
+                os.chown(workspace_dir, SANDBOX_UID, SANDBOX_GID)
+            except PermissionError:
+                os.chmod(workspace_dir, 0o777)
+
+            cmd = self.create_command(name, self.image, profile, base_dir, workspace_dir)
+            # T7.95(б/г): с этой строки имя контейнера УЖЕ выдано движку, а `SandboxHandle` ещё не выдан.
+            # Именно хэндл делает контейнер доступным для `destroy`, а `close_session()` исполнителя при
+            # `handle is None` просто ничего не убирает — значит любой выход отсюда до успешного `start`
+            # (внешняя отмена сессии, истечение потолка вызова по T7.93) обязан закончиться ограниченной
+            # по времени попыткой убрать контейнер с подтверждением отсутствия (T7.95a); исходное
+            # исключение и отмена при этом пробрасываются без изменений. Оговорка прежняя: отказ самого
+            # движка на `create` (`rc != 0`) уборки НЕ вызывает — там движок ОТВЕТИЛ, что контейнера нет
+            # (замер: rc=1 «No such container» бывает и при незавершённом create, но именно этот путь —
+            # единственный, где мы не знаем подтверждённого имени), а слепо удалять не подтверждённое нам
+            # имя было бы единственным путём, способным зацепить чужой контейнер с тем же префиксом.
+            # Разбор: docs/STATUS.md T7.95/T7.95a.
+            try:
+                rc, _out, err = await self._run(cmd, timeout=_CREATE_CEILING_SECONDS)
+            except SandboxHealthError:
+                raise  # движок не был запущен вовсе (нет бинаря): к движку не попало ничего
+            except asyncio.CancelledError:
+                await self.remove_container_best_effort(name, "the create call was cancelled")
+                raise
+            except SandboxError as exc:  # потолок вызова (T7.93): CLI убит, что успел dockerd — неизвестно
+                await self.remove_container_best_effort(name, f"the create call ended early: {exc}")
+                raise
+            if rc != 0:
+                raise SandboxError(f"failed to create sandbox container: {err[:300]}")
+            try:
+                rc, _out, err = await self._run(["start", name], timeout=_START_VERB_CEILING_SECONDS)
+            except SandboxHealthError:
+                raise  # движок уже ответил на `create`; ветка — та же симметрия, что и выше
+            except asyncio.CancelledError:
+                await self.remove_container_best_effort(name, "the start call was cancelled")
+                raise
+            except SandboxError as exc:
+                await self.remove_container_best_effort(name, f"the start call ended early: {exc}")
+                raise
+            if rc != 0:
+                # поведение прежнее (T2.3): контейнер, который движок отказывается запустить, убирается
+                # здесь. С T7.95 — тем же ограниченным хэлпером: прежде этот `rm -f` имел собственный
+                # вызов на 30 с, и его собственный SandboxError заменял собой «failed to start sandbox
+                # container: …»; теперь уборка ограничена `_CLEANUP_CEILING_SECONDS` и исходную ошибку
+                # заменить уже не может. С T7.95a она ещё и подтверждается движком.
+                await self.remove_container_best_effort(name, "the engine refused to start the container")
+                raise SandboxError(f"failed to start sandbox container: {err[:300]}")
+
+            handle = SandboxHandle(
+                session_id=session_id,
+                container_name=name,
+                base_dir=base_dir,
+                workspace_dir=workspace_dir,
+                profile=profile,
+            )
+        except BaseException:  # отмена, потолок, отказ движка, хозяйская ошибка — любой выход без хэндла
+            try:
+                shutil.rmtree(sb_dir)
+            except OSError as exc:
+                logger.warning("sandbox session dir %s not removed after a failed start: %s", sb_dir, exc)
             raise
-        except SandboxError as exc:  # потолок вызова (T7.93): CLI убит, что успел dockerd — неизвестно
-            await self.remove_container_best_effort(name, f"the create call ended early: {exc}")
-            raise
-        if rc != 0:
-            raise SandboxError(f"failed to create sandbox container: {err[:300]}")
-        try:
-            rc, _out, err = await self._run(["start", name], timeout=_START_VERB_CEILING_SECONDS)
-        except SandboxHealthError:
-            raise  # движок уже ответил на `create`; ветка — та же симметрия, что и выше
-        except asyncio.CancelledError:
-            await self.remove_container_best_effort(name, "the start call was cancelled")
-            raise
-        except SandboxError as exc:
-            await self.remove_container_best_effort(name, f"the start call ended early: {exc}")
-            raise
-        if rc != 0:
-            # поведение прежнее (T2.3): контейнер, который движок отказывается запустить, убирается
-            # здесь. С T7.95 — тем же ограниченным хэлпером: прежде этот `rm -f` имел собственный
-            # вызов на 30 с, и его собственный SandboxError заменял собой «failed to start sandbox
-            # container: …»; теперь уборка ограничена `_CLEANUP_CEILING_SECONDS` и исходную ошибку
-            # заменить уже не может.
-            await self.remove_container_best_effort(name, "the engine refused to start the container")
-            raise SandboxError(f"failed to start sandbox container: {err[:300]}")
-        return SandboxHandle(
-            session_id=session_id,
-            container_name=name,
-            base_dir=base_dir,
-            workspace_dir=workspace_dir,
-            profile=profile,
-        )
+        return handle
 
     async def exec(
         self,
