@@ -84,6 +84,16 @@ UNSAFE_KNOWN = (
     "составила 7,9% (проверено профильным ведомством)."
 )
 NO_VALUE_KNOWN = "Годовая инфляция в России по итогам 2025 года ускорилась до 8%."
+# T7.96 (стенд .92, вопрос 5a68172e, сессия bdd9ef8d): две карты одного опроса инФОМ —
+# наблюдаемая населением инфляция (цены УЖЕ выросли) и инфляционные ожидания (следующие 12 мес.)
+OBSERVED_SEP = (
+    "Наблюдаемая населением годовая инфляция в России в сентябре 2026 года увеличилась до 15,1% "
+    "(по данным опроса ООО «инФОМ»)."
+)
+EXPECTATIONS_SEP = (
+    "Инфляционные ожидания населения России в сентябре 2026 года составили 14,2% "
+    "(по данным опроса ООО «инФОМ»)."
+)
 
 HEADING = "Независимые оценки"
 NO_INDEPENDENT = "В знаниях системы нет независимых измерений этого показателя за этот период."
@@ -464,6 +474,56 @@ async def test_honest_row_when_only_unsafe_or_valueless_candidates_exist(
         # ни одна строка подраздела не утверждает проверку
         for row in rows:
             assert not _VERIFICATION_WORD.search(row["text"])
+    finally:
+        await app_engine.dispose()
+
+
+# ─── T7.96: наблюдаемая инфляция и ожидания одного опроса — не «тот же показатель» ────
+
+
+@pytest.mark.asyncio
+async def test_observed_inflation_card_does_not_call_expectations_another_record(
+    migrated_db: tuple[str, AsyncEngine], tmp_path: Any
+) -> None:
+    """Карточка `7c8c9afe` (15,1% наблюдаемой инфляции сентября 2026) и запись знания
+    `cc75e97f` (14,2% инфляционных ожиданий того же месяца): на витрине нет ни строки
+    «Другая запись того же показателя», ни утверждения о расхождении 0,9 п.п., ни независимой
+    оценки — остаётся только честная строка. Записи знания при этом не удалены и не изменены."""
+    scratch_url, engine = migrated_db
+    app, app_engine = await _make(scratch_url, tmp_path / "host", tmp_path / "unit.json")
+    try:
+        question_id, _anchor = await _question_with_worker_assessment(
+            engine,
+            statement=OBSERVED_SEP,
+            grade="E1",
+            epistemic="hypothesis",
+            confidence=0.15,
+            reasons=_SHORTFALL,
+        )
+        # кандидат — как на стенде: внешний факт с датой сентября 2026 и действующей оценкой
+        expectations = await _knowledge_claim(
+            engine, statement=EXPECTATIONS_SEP, claim_type="external_fact", as_of="2026-09-30"
+        )
+
+        async with _client(app) as client:
+            card = (await client.get(f"/api/v1/questions/{question_id}/answer")).json()
+
+        rows = _card_claim(card, OBSERVED_SEP)["estimates"]["rows"]
+        assert [row["kind"] for row in rows] == [SEARCH_NOT_DONE_KIND], rows
+        assert rows[0]["text"] == SEARCH_NOT_DONE
+        cited = {row.get("claim_id") for row in rows}
+        assert str(expectations) not in cited
+        for row in rows:
+            assert "расходится" not in row["text"]
+            assert "того же показателя" not in row["text"]
+
+        # знание не тронуто: запись на месте, утверждение прежнее (никакого удаления/правки)
+        async with engine.connect() as conn:
+            stored = (
+                (await conn.execute(text("SELECT statement FROM claims WHERE id = :c"), {"c": expectations}))
+                .all()
+            )
+        assert [row.statement for row in stored] == [EXPECTATIONS_SEP]
     finally:
         await app_engine.dispose()
 

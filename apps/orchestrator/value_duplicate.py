@@ -42,7 +42,10 @@ than a foreign piece of evidence under a claim):
   statements must share an indicator vocabulary — significant letters-only words, lower-
   cased, compared by a fixed-length stem prefix, with an overlap at least
   `INDICATOR_OVERLAP_MIN`. Additionally two statements that name DIFFERENT territories
-  (from the closed `_TERRITORY_GROUPS` dictionary) are never the same indicator.
+  (from the closed `_TERRITORY_GROUPS` dictionary) are never the same indicator, and neither
+  are two statements that name mutually exclusive indicator QUALIFIERS of one topic —
+  «наблюдаемая инфляция» (what people already feel) vs «инфляционные ожидания / ожидаемая
+  инфляция» (what they expect for the next 12 months), T7.96, `_INDICATOR_QUALIFIER_GROUPS`.
 
 Decision policy (variant (i)/(ii) of T7.83): exactly ONE candidate matches strictly and
 the op's evidence links are all `supports` → the host converts the op into a reverify of
@@ -171,6 +174,38 @@ _TERRITORY_GROUPS: tuple[frozenset[str], ...] = (
     frozenset({"япон"}),
 )
 
+#: ЗАКРЫТЫЙ словарь групп взаимоисключающих УТОЧНИТЕЛЕЙ показателя (T7.96, по образцу
+#: `_TERRITORY_GROUPS`). Стендовый дефект (карты 7c8c9afe и cc75e97f, вопрос 5a68172e,
+#: сессия bdd9ef8d, .92): один и тот же опрос инФОМ даёт ДВА показателя — «наблюдаемая
+#: населением годовая инфляция» (насколько цены УЖЕ выросли за прошедший год) и
+#: «инфляционные ожидания населения» (какими они видятся на следующие 12 месяцев).
+#: Формулировки различаются ровно одним словом при остальной идентичной лексике, поэтому
+#: одного порога перекрытия не хватает: 7c8c9afe↔cc75e97f = 3/4, 391c4388↔7c8c9afe (тот же
+#: показатель, другой месяц) = 3/4, «наблюдаемая 14,5%»↔«ожидания 14,5%» = ровно 3/5 —
+#: все три выше `INDICATOR_OVERLAP_MIN`. Значит различие обязано решать словарь уточнителей,
+#: а не доля общих слов.
+#: Правило одностороннее, как у территорий: конфликт засчитывается ТОЛЬКО когда обе
+#: формулировки называют уточнитель из этого словаря и множества групп не пересекаются.
+#: Неполнота словаря никогда не создаёт ложной склейки и не создаёт ложного отказа — она
+#: лишь не видит конфликта (сравнение ведёт тот же conservative-выбор, что и территории).
+#: Уточнитель — ИМЕННО имя измеряемой величины: месяцы/«год»/«с начала года» сюда не входят
+#: (это период, его отсекает правило периода гейта и `_MONTH_PREFIXES`), «медианная/средняя»
+#: не входят (это агрегация одного и того же измерения, а не другой показатель), «прогноз»
+#: не входит (роль значения разбирает `apps/web/estimates.value_roles`, T7.88b/T7.94 — тот
+#: же замкнутый список точных форм, расширять его без замера живых формулировок нельзя).
+#: Формы словаря — начала слов той же парадигмы, что мерится на стенде: «наблюдаем*» покрывает
+#: «наблюдаемая/наблюдаемой/наблюдаемые», но НЕ «наблюдение/наблюдает»; слова атрибуции
+#: («по данным», «опрос», «ООО», названия организаций) из словаря показателя НЕ исключены:
+#: замер всех 15 формулировок дампа claims_live.tsv (STATUS T7.96) показывает, что их
+#: исключение не чинит этот дефект (пара остаётся ≥3/5) и при этом поднимает перекрытие
+#: других пар — то есть могло бы ДОБАВИТЬ склейки, чего правило делать не должно.
+_INDICATOR_QUALIFIER_GROUPS: tuple[frozenset[str], ...] = (
+    # показания опроса об уже состоявшемся изменении цен
+    frozenset({"наблюдаем", "воспринимаем"}),
+    # показания опроса о предстоящем изменении цен (имя показателя «ожидания»)
+    frozenset({"ожидани", "ожидаем", "ожидающ"}),
+)
+
 #: ключи scope, которые хост читает как метку показателя. Реальное употребление:
 #: `metric` (tests/scenario/test_commit_boundary.py — единственный свободный scope
 #: с явным метрическим ключом), `объект` (`curator` пишет его в предложениях:
@@ -234,6 +269,29 @@ def _territory_group_ids(words: frozenset[str]) -> set[int]:
     return groups
 
 
+def _indicator_qualifier_words(statement: str) -> frozenset[str]:
+    """Слова-уточнители показателя формулировки (закрытый словарь
+    `_INDICATOR_QUALIFIER_GROUPS`, T7.96)."""
+    found: set[str] = set()
+    for word in _indicator_tokens(statement):
+        if any(
+            word.startswith(prefix) for group in _INDICATOR_QUALIFIER_GROUPS for prefix in group
+        ):
+            found.add(word)
+    return frozenset(found)
+
+
+def _indicator_qualifier_group_ids(words: frozenset[str]) -> set[int]:
+    """Номера групп уточнителей, названных формулировкой («наблюдаемая» и «ожидания» —
+    разные группы; «наблюдаемая» и «ожидаемая населением инфляция» в одной формулировке —
+    обе группы, то есть конфликта нет)."""
+    groups: set[int] = set()
+    for index, group in enumerate(_INDICATOR_QUALIFIER_GROUPS):
+        if any(word.startswith(prefix) for prefix in group for word in words):
+            groups.add(index)
+    return groups
+
+
 def declared_scope_metric(scope: JsonDict | None) -> str | None:
     """Нормализованная метка показателя из свободного scope (T7.17: свободный scope
     модели живёт в staging-предложении и в assessed_scope legacy-строк).
@@ -271,7 +329,13 @@ def indicator_check(
         нормализации (это самый сильный сигнал: он не зависит от формулировки);
     (б) хотя бы у одной метки нет — словари значимых слов обязаны пересечься не
         слабее `INDICATOR_OVERLAP_MIN`, и формулировки не должны называть разные
-        территории. Пустой словарь у одной из сторон = сравнить нечего → False."""
+        территории (T7.83a) либо взаимоисключающие уточнители одного показателя
+        (T7.96: «наблюдаемая инфляция» против «инфляционные ожидания / ожидаемая
+        инфляция»). Пустой словарь у одной из сторон = сравнить нечего → False.
+
+    Оба словаря-вето односторонние и только ОТМЕНЯЮТ склейку: они не участвуют в
+    подсчёте перекрытия и не могут сделать пару «тот же показатель», если порог или
+    другой словарь её не пустили бы."""
     if claim_metric is not None and candidate_metric is not None:
         return IndicatorCheck(
             matched=claim_metric == candidate_metric,
@@ -300,6 +364,23 @@ def indicator_check(
             detail=(
                 f"the statements name different territories "
                 f"{sorted(claim_territories)} vs {sorted(candidate_territories)}"
+            ),
+        )
+    claim_qualifiers = _indicator_qualifier_words(claim_statement)
+    candidate_qualifiers = _indicator_qualifier_words(candidate_statement)
+    if (
+        claim_qualifiers
+        and candidate_qualifiers
+        and not (
+            _indicator_qualifier_group_ids(claim_qualifiers)
+            & _indicator_qualifier_group_ids(candidate_qualifiers)
+        )
+    ):
+        return IndicatorCheck(
+            matched=False,
+            detail=(
+                f"the statements name different indicator qualifiers "
+                f"{sorted(claim_qualifiers)} vs {sorted(candidate_qualifiers)}"
             ),
         )
     union = claim_words | candidate_words

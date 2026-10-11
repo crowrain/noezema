@@ -75,6 +75,15 @@ FACT_BELOW_FORECAST_7CC2B578 = (
     "Фактическая годовая инфляция в России по итогам 2025 года (5,59%) оказалась ниже всех прогнозов "
     "аналитиков: прогноз Банка России — 6,5–7%, Минэкономразвития — 6,8%, консенсус-прогноз ЦБ — 6,6%"
 )
+# ─── T7.96: две карты вопроса 5a68172e (стенд .92, сессия bdd9ef8d) дословно из дампа ──
+OBSERVED_7C8C9AFE = (
+    "Наблюдаемая населением годовая инфляция в России в сентябре 2026 года увеличилась до 15,1% "
+    "(по данным опроса ООО «инФОМ»)."
+)
+EXPECTATIONS_CC75E97F = (
+    "Инфляционные ожидания населения России в сентябре 2026 года составили 14,2% "
+    "(по данным опроса ООО «инФОМ»)."
+)
 
 # ─── T7.88b: синтетические формулировки на то же правило (ADR-0035 §13) ───────
 SYNTH_FORECAST_SHORT = "Прогноз ЦБ на 2025 год — 4,5%"
@@ -421,6 +430,39 @@ def test_stand_pair_observed_inflation_is_adjacent_not_same_indicator() -> None:
     rows = _rows(_source(), _candidate("c-391", OBSERVED_391C4388, as_of_year=AS_OF_OBSERVED))
     assert rows == [
         ("adjacent_metric", ROW_LINKED_OBSERVED),
+        ("no_independent", NO_INDEPENDENT),
+    ]
+
+
+def test_stand_pair_observed_inflation_and_expectations_are_not_shown_as_one_indicator() -> None:
+    """Дефект T7.96 (стенд .92, карты `7c8c9afe` и `cc75e97f`): наблюдаемая населением инфляция
+    15,1% и инфляционные ожидания 14,2% — разные показатели одного опроса. Пересечение словаря
+    3/4 выше порога гейта, поэтому раньше витрина утверждала «другая запись того же показателя …
+    расходится на 0,9 п.п.» на обеих карточках. Теперь строки нет: различие доказанное (закрытый
+    словарь уточнителей), а при доказанном различии подборщик молчит — ровно как в
+    `test_different_territory_is_not_shown_even_with_equal_metrics`; остаётся честная строка."""
+    rows = _rows(_source(OBSERVED_7C8C9AFE), _candidate("c-cc75", EXPECTATIONS_CC75E97F))
+    assert rows == [("no_independent", NO_INDEPENDENT)]
+    kinds = {kind for kind, _ in rows}
+    assert kinds.isdisjoint({"independent", "other_record", "likely_same_indicator"})
+    assert not any("расходится" in text for _, text in rows)
+
+    mirror = _rows(_source(EXPECTATIONS_CC75E97F), _candidate("c-7c8c", OBSERVED_7C8C9AFE))
+    assert mirror == [("no_independent", NO_INDEPENDENT)]
+
+
+def test_stand_pair_observed_expectations_with_lower_overlap_stays_a_related_record() -> None:
+    """`391c4388` (наблюдаемая инфляция декабря 2025) и `cc75e97f` (ожидания сентября 2026):
+    отказ по уточнителям не прячет запись — пересечение 5/9 попадает в диапазон смежных, и строка
+    остаётся нейтральной (T7.88a: о сходстве или различии она ничего не утверждает)."""
+    rows = _rows(_source(OBSERVED_391C4388), _candidate("c-cc75", EXPECTATIONS_CC75E97F))
+    assert rows == [
+        (
+            "adjacent_metric",
+            "Связанная запись: Инфляционные ожидания населения России в сентябре 2026 года "
+            "составили 14,2% (по… — показатель автоматически не сопоставлен; независимым измерением "
+            "не считается.",
+        ),
         ("no_independent", NO_INDEPENDENT),
     ]
 
