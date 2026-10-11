@@ -23,6 +23,7 @@ decision) and the one-shot container (which enforces isolation). It owns:
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -52,6 +53,39 @@ RETRY_POLICY: dict[IdempotencyClass, int] = {
 }
 
 MAX_OUTPUT = 10_000
+
+# T7.91: the engine flips the container state ASYNCHRONOUSLY. Measured on `.87`
+# (docker 29.8, probe script outside the repo): after `docker kill -s KILL` the
+# `docker exec` client returns with 137 BEFORE dockerd answers State.Running=false.
+# The gap from the exec return to the first "not running" answer: median 33 ms /
+# max 60 ms idle, median 70 ms / max 101 ms with six concurrent kills (the `-n auto`
+# profile). A fast unix-socket API client caught a stale `Running=true` right after
+# the exec return in 5/20 idle and 5/18 concurrent runs. The `docker inspect` CLI
+# costs 29–102 ms on this host, so locally the window usually hides behind the CLI's
+# own latency — which is exactly why only a CI runner tripped over it (run 38112342827).
+# A failed exec whose exit code is CONSISTENT with the container having been killed
+# therefore gets one bounded second look before it may be called a plain failure.
+CONTAINER_DEATH_RECHECK_SECONDS = 1.0
+CONTAINER_DEATH_RECHECK_INTERVAL = 0.1
+
+# 125 = `docker exec` could not run/attach the command at all: that is a CLI-level
+# refusal, not an answer from the command — the container may have been killed while
+# the exec was starting.
+DOCKER_CLI_EXEC_FAILURE_EXIT = 125
+# exit > 128 means "killed by signal N-128": 137 = 128+SIGKILL, 143 = 128+SIGTERM —
+# precisely how a container kill reaches the exec'd process.
+FATAL_SIGNAL_EXIT_FLOOR = 128
+
+
+def exit_is_consistent_with_container_death(exit_code: int) -> bool:
+    """Could this failed exec have been caused by the container dying?
+
+    A container kill reaches the exec'd process as a fatal signal (137/143) or, if
+    the kill wins before the exec process starts, as a docker CLI refusal (125).
+    Any other nonzero code is the command's OWN answer: the command ran and reported,
+    so the outcome is known even if the container died a moment later.
+    """
+    return exit_code > FATAL_SIGNAL_EXIT_FLOOR or exit_code == DOCKER_CLI_EXEC_FAILURE_EXIT
 
 
 class StagingWriter(Protocol):
@@ -245,14 +279,41 @@ class SandboxToolBroker:
         # a failed exec where the CONTAINER IS GONE is not a result — the
         # command may have executed partially (T2.22 failpoint)
         if not await self.runtime.is_running(self.handle):
-            return Observation(
-                tool=tool,
-                ok=False,
-                data=data,
-                error="container gone mid-execution",
-                result_unknown=True,
-            )
+            return self._container_gone(tool, data)
+        # T7.91: "still running" straight after a signal death is NOT conclusive —
+        # the engine has not flipped State.Running yet (CONTAINER_DEATH_RECHECK_*).
+        # Only an exit code that a container kill can produce gets the bounded
+        # second look; a command killed from INSIDE a live container stays a plain
+        # failure carrying its real exit code.
+        if exit_is_consistent_with_container_death(result.exit_code) and await self._await_container_death():
+            return self._container_gone(tool, data)
         return Observation(tool=tool, ok=False, data=data, error=f"exit code {result.exit_code}")
+
+    def _container_gone(self, tool: str, data: JsonDict) -> Observation:
+        """Outcome unknown: the command may have run partially (T2.22)."""
+        return Observation(
+            tool=tool,
+            ok=False,
+            data=data,
+            error="container gone mid-execution",
+            result_unknown=True,
+        )
+
+    async def _await_container_death(self) -> bool:
+        """Re-check the container state for a bounded window (T7.91).
+
+        True as soon as the engine reports the container gone. This is a STATE
+        re-check, not a retry of the action: the command was executed exactly once
+        either way, and an unknown outcome is still never retried (RETRY_POLICY /
+        §5.7 untouched). The budget is a constant, so the wait cannot become a stall.
+        """
+        waited = 0.0
+        while waited < CONTAINER_DEATH_RECHECK_SECONDS:
+            await asyncio.sleep(CONTAINER_DEATH_RECHECK_INTERVAL)
+            waited += CONTAINER_DEATH_RECHECK_INTERVAL
+            if not await self.runtime.is_running(self.handle):
+                return True
+        return False
 
     def _workspace(self, tool: str, arguments: JsonDict) -> Observation:
         root = self.handle.workspace_dir.resolve()

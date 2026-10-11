@@ -65,6 +65,38 @@ async def test_broker_sandbox_tools(sandbox_image: str, tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_broker_command_killed_from_inside_is_not_unknown(
+    sandbox_image: str, tmp_path: Path
+) -> None:
+    """T7.91 honesty on the real engine: a command that SIGKILLs ITSELF in a LIVE
+    container yields exit 137 — the very code a container kill produces. The bounded
+    second look must end with the plain failure (the container is alive and answers),
+    never with a false unknown, and the container stays usable afterwards."""
+    rt = _runtime(tmp_path, sandbox_image)
+    profile = _sealed()
+    base = tmp_path / "base"
+    base.mkdir()
+
+    handle = await rt.start(str(uuid.uuid4()), base, profile)
+    try:
+        broker = SandboxToolBroker(handle, profile, rt)
+
+        obs = await broker.execute("shell.execute", {"command": "kill -9 $$"})
+        assert not obs.ok
+        assert obs.data["exit_code"] == 137
+        assert obs.error == "exit code 137"
+        assert not obs.result_unknown, obs.error
+        assert not obs.transient
+
+        # the container survived and still executes commands
+        obs = await broker.execute("shell.execute", {"command": "echo alive"})
+        assert obs.ok, obs.error
+        assert obs.data["stdout"].strip() == "alive"
+    finally:
+        await rt.destroy(handle)
+
+
+@pytest.mark.asyncio
 async def test_reconcile_stuck_actions(migrated_db) -> None:
     """T2.9: a crash between action start and result → outcome_unknown,
     audited; never a guessed success."""

@@ -204,3 +204,151 @@ async def test_staging_deferred(tmp_path: Path) -> None:
     assert obs.ok
     assert obs.data["deferred"] is True
     assert writer.operations == [("question.create", {"text": "Почему 42?"})]
+
+
+# ── T7.91: the engine still reports a killed container as running for a moment ─
+
+
+class _FakeRuntime:
+    """exec always fails with one exit code; is_running answers from a scripted
+    list (the last answer repeats forever) and counts its calls."""
+
+    def __init__(self, exit_code: int, running: list[bool]) -> None:
+        self.exit_code = exit_code
+        self.running = running
+        self.exec_calls = 0
+        self.running_calls = 0
+
+    async def exec(self, handle: object, command: list[str], timeout: float | None = None):
+        from packages.sandbox.runtime import ExecResult
+
+        self.exec_calls += 1
+        return ExecResult(exit_code=self.exit_code, stdout="", stderr="")
+
+    async def is_running(self, handle: object) -> bool:
+        answer = self.running[min(self.running_calls, len(self.running) - 1)]
+        self.running_calls += 1
+        return answer
+
+
+def _broker_with(tmp_path: Path, runtime: _FakeRuntime) -> SandboxToolBroker:
+    handle = _handle(tmp_path)
+    return SandboxToolBroker(handle, handle.profile, runtime)  # type: ignore[arg-type]
+
+
+@pytest.mark.unit
+def test_only_kill_consistent_exit_codes_get_the_second_look() -> None:
+    """T7.91: a container kill reaches the exec'd process as a fatal signal
+    (137 = 128+SIGKILL, 143 = 128+SIGTERM) or as a docker CLI refusal (125). A
+    command's own nonzero exit is NOT kill-consistent — it is an answer."""
+    from packages.broker.broker import exit_is_consistent_with_container_death
+
+    assert exit_is_consistent_with_container_death(137)
+    assert exit_is_consistent_with_container_death(143)
+    assert exit_is_consistent_with_container_death(125)
+    assert not exit_is_consistent_with_container_death(1)
+    assert not exit_is_consistent_with_container_death(7)
+    assert not exit_is_consistent_with_container_death(126)
+    assert not exit_is_consistent_with_container_death(127)
+
+
+@pytest.mark.unit
+def test_container_death_recheck_window_is_bounded() -> None:
+    """The second look is a fixed, small wall-clock budget — never a stall and
+    never a retry of the action."""
+    from packages.broker import broker as bb
+
+    assert 0 < bb.CONTAINER_DEATH_RECHECK_INTERVAL <= bb.CONTAINER_DEATH_RECHECK_SECONDS
+    assert bb.CONTAINER_DEATH_RECHECK_SECONDS <= 2.0
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_signal_death_while_engine_still_says_running_is_unknown(tmp_path: Path) -> None:
+    """T7.91 (the CI flake): `docker exec` returned 137 while `docker inspect` has
+    not flipped State.Running yet. The outcome is UNKNOWN — the command may have
+    executed partially — not a clean "exit code 137" failure."""
+    rt = _FakeRuntime(137, [True, True, False])
+    broker = _broker_with(tmp_path, rt)
+
+    obs = await broker.execute("shell.execute", {"command": "sleep 30"})
+
+    assert not obs.ok
+    assert obs.result_unknown, obs.error
+    assert obs.error == "container gone mid-execution"
+    assert not obs.transient  # unknown outcomes are never retried
+    assert obs.idempotency_class is IdempotencyClass.NON_IDEMPOTENT
+    assert rt.exec_calls == 1  # the command was executed exactly once
+    assert rt.running_calls == 3  # the stale answer, then the flip inside the window
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_docker_cli_failure_while_engine_still_says_running_is_unknown(tmp_path: Path) -> None:
+    """125 = the docker CLI could not run the exec at all: the container may have
+    been killed while the exec was starting, so this is kill-consistent too."""
+    rt = _FakeRuntime(125, [True, False])
+    broker = _broker_with(tmp_path, rt)
+
+    obs = await broker.execute("shell.execute", {"command": "true"})
+
+    assert not obs.ok
+    assert obs.result_unknown
+    assert obs.error == "container gone mid-execution"
+    assert rt.exec_calls == 1
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_plain_failure_with_live_container_is_not_unknown(tmp_path: Path) -> None:
+    """A command's own nonzero exit with a live container stays a result — and pays
+    nothing for the T7.91 second look (one state check only)."""
+    rt = _FakeRuntime(1, [True])
+    broker = _broker_with(tmp_path, rt)
+
+    obs = await broker.execute("shell.execute", {"command": "false"})
+
+    assert not obs.ok
+    assert not obs.result_unknown
+    assert obs.error == "exit code 1"
+    assert not obs.transient
+    assert rt.running_calls == 1  # no bounded wait for a kill-inconsistent code
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_container_gone_at_once_is_unknown_without_waiting(tmp_path: Path) -> None:
+    """The T2.22 fast path is unchanged: the engine already says "gone" — unknown
+    immediately, no extra polls."""
+    rt = _FakeRuntime(137, [False])
+    broker = _broker_with(tmp_path, rt)
+
+    obs = await broker.execute("shell.execute", {"command": "sleep 30"})
+
+    assert obs.result_unknown
+    assert rt.running_calls == 1
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_signal_death_in_a_live_container_stays_a_plain_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`kill -9 $$` inside the command: the container is ALIVE and docker reports
+    the real exit code. After the bounded window the broker must call it a plain
+    failure — a false unknown would fail the whole session at the safe boundary over
+    an answer the command actually gave."""
+    from packages.broker import broker as bb
+
+    monkeypatch.setattr(bb, "CONTAINER_DEATH_RECHECK_SECONDS", 0.15)
+    monkeypatch.setattr(bb, "CONTAINER_DEATH_RECHECK_INTERVAL", 0.05)
+    rt = _FakeRuntime(137, [True])
+    broker = _broker_with(tmp_path, rt)
+
+    obs = await broker.execute("shell.execute", {"command": "kill -9 $$"})
+
+    assert not obs.ok
+    assert not obs.result_unknown, obs.error
+    assert obs.error == "exit code 137"
+    assert not obs.transient
+    assert rt.exec_calls == 1
