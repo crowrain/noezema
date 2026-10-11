@@ -24,14 +24,14 @@
 | 1 | пробуждение по расписанию, pause/backoff | MVP | ✅ | T3.29 (задача добавлена ретроспективно — пропуск плана): `apps/orchestrator/scheduler.py` + миграция 0005 (`wake_schedule` в snapshot, `wake_scheduler_state`), `noezemactl wake-tick` + `noezema-wake.timer`. Тесты: test_wake_schedule.py (unit: fail-closed-валидация `wake_schedule`, timing: первый tick/интервал/мин. gap/backoff-окно, экспоненциальный backoff + cap) + test_wake_scheduler.py (scenario: каждый admission gate — paused/nonterminal/unresolved commit/activation slot/disk quota/GPU fail-closed → skip с точной причиной + audit `wake_skipped`; backoff после failed; авто-pause после 3 неудач (sticky); success/cancel/partial сбрасывают; operator pause не сбивается; битый `wake_schedule` → fail-closed) + test_web_api.py (wake_now обходит timing но не admission — REJECTED с reason; resume сбрасывает failure-бухгалтерию; /status.wake) |
 | 2 | локальная LLM с fingerprint | MVP | ✅ | test_llm_gateway.py (OpenAI-compatible gateway для локальных бэкендов llama.cpp/Ollama/vLLM, retries только транзиентные, token/latency/finish_reason, test_fingerprint_is_deterministic_and_versioned) + test_compat_and_roles.py (compat suite T1.11, versioned prompts, tool schema hash). Fingerprint (профиль модели + prompt version + tool schema hash + policy version → canonical sha256) пишется в `model_runs.model_fingerprint` (NOT NULL) на каждом explorer/curator-вызове (T1.7–T1.8). Оговорка MVP: artifact/tokenizer-хэши опциональны (None до пиннинга артефакта); ModelProfile собирается в коде из gateway-settings — секция `model` снапшота не подключена (T1.7 «через config snapshot» — частично) |
 | 3 | causal/idempotency ID в trusted host | MVP | ✅ | test_orchestrator.py (turn_id/action_id/idempotency_key генерирует хост) |
-| 4 | typed actions в sandbox | MVP | ✅ | test_sandbox_runtime.py + test_tool_broker_sandbox.py (одноразовый контейнер, cap-drop/network/ro-rootfs, shell/python в sandbox, overlay) + test_sandbox_security.py + test_orchestrator_sandbox_executor.py (T7.58: продуктивный путь `NOEZEMA_TOOL_EXECUTOR=sandbox`, контейнер на сессию в `run_session`) |
+| 4 | typed actions в sandbox | MVP | ✅ | test_sandbox_runtime.py + test_tool_broker_sandbox.py (одноразовый контейнер, cap-drop/network/ro-rootfs, shell/python в sandbox, overlay) + test_sandbox_security.py + test_orchestrator_sandbox_executor.py (T7.58: продуктивный путь `NOEZEMA_TOOL_EXECUTOR=sandbox`, контейнер на сессию в `run_session`) + test_tool_broker_sandbox.py::test_broker_command_killed_from_inside_is_not_unknown (T7.91: команда, убившая себя сигналом в ЖИВОМ контейнере, — обычная ошибка с настоящим кодом, не unknown; контейнер после неё продолжает работать) |
 | 5 | claim только с согласованным lifecycle | MVP | ✅ | test_memory_service.py (head current ⇔ assessment+epistemic_status NOT NULL, CHECK §14.1; dedup claim+evidence; supersede) + test_orchestrator.py (apply в fenced tx: claim→evidence→assessment→head одной транзакцией) |
 | 6 | один fenced commit attempt | MVP | ✅ | test_orchestrator.py (prepared-строка до финального tx; fencing predicate: lease+revision+attempt=prepared; partial unique §14.2) + test_reconciler.py |
 | 7 | lost COMMIT → reconciliation | MVP | ✅ | test_reconciler.py (kill before COMMIT→aborted; after commit→accepted; open final tx→finalizer_in_progress; stale finalizer→fenced) + reconcile_with_retries (backoff+jitter, fresh conn) |
-| 8 | failpoints → старый/полный checkpoint | MVP | ✅ | test_failpoints.py (kill mid-action → outcome_unknown → session failed, staging не применён, ревизия не поднимается = полный старый checkpoint) + test_reconciler.py |
+| 8 | failpoints → старый/полный checkpoint | MVP | ✅ | test_failpoints.py (kill mid-action → outcome_unknown → session failed, staging не применён, ревизия не поднимается = полный старый checkpoint) + test_reconciler.py + T7.91: окно `docker inspect` сразу после kill закрыто — test_tool_broker.py::test_signal_death_while_engine_still_says_running_is_unknown (137 при ещё «Running=true» → outcome_unknown, а не «exit code 137») и ::test_container_gone_at_once_is_unknown_without_waiting (прежний быстрый путь T2.22) |
 | 9 | status/timeline/attempts/assessments + auth messages/controls | MVP (dependencies — v1) | ✅ | test_web_api.py + test_web_mvp.py (status+host/timeline+SSE/messages/commands; admin-token auth на Command, queries open; assessment view — M3 memory) + dependencies (v1-часть): test_web_knowledge.py (T7.1: claims/heads по effective snapshot, зависимости в обе стороны §8.6, provenance-навигация source→parent/artifact/группы) |
 | 10 | раздельные messages/stop/abort/controls | MVP | ✅ | test_web_api.py (раздельные endpoints; closed enum; idempotency key; stop/abort флаги сессии) |
-| 11 | нет вслепую-ретраев | MVP | ✅ | test_tool_broker.py (§5.7 retry-классы: pure=2, idempotent=1, non_idempotent/observation=0 без вслепую-ретраев; idempotency key + different hash=incident/alert) + test_llm_gateway.py + test_search_tool_contract.py (T7.71: новый `web.search` объявлен в реестре классом OBSERVATION → 0 ретраев, повтор идентичного вызова отсекает guard T7.12) |
+| 11 | нет вслепую-ретраев | MVP | ✅ | test_tool_broker.py (§5.7 retry-классы: pure=2, idempotent=1, non_idempotent/observation=0 без вслепую-ретраев; idempotency key + different hash=incident/alert) + test_llm_gateway.py + test_search_tool_contract.py (T7.71: новый `web.search` объявлен в реестре классом OBSERVATION → 0 ретраев, повтор идентичного вызова отсекает guard T7.12) + T7.91 (ограниченная перепроверка состояния контейнера после неуспешного exec — это вопрос о СОСТОЯНИИ, а не вторая попытка команды: `exec_calls == 1` закреплено тестами, unknown по-прежнему не ретраится; страж от ложного unknown — ::test_plain_failure_with_live_container_is_not_unknown, ::test_signal_death_in_a_live_container_stays_a_plain_failure) |
 | 12 | random backup point + root set | v1 | ✅ T7.2 + T7.3 | backup/PITR-сторона: test_backup_pitr.py (22 кейса / 10 уникальных, T7.46b: create_backup — recovery point `pg_current_wal_lsn()` + content-addressed artifact inventory + host-contour state с явным `host_ops_absent`-evidence, DB CHECK shape/consistency, audit `backup_created` той же tx; restore drill — случайная точка retention window (expired не выбирается; T7.46b/ADR-0021: drill — на инъекционном часе операции (выбор точки + `verified_at` + аудит, `now=None` → host-час), drill-тесты параметризованы сдвигом now +0/+1/+5 лет — не-зависимость от даты запуска + страж injected-vs-wall-clock), re-hash inventory + всех referenced objects + registry drift check, policy files, boot reconciliation + admission ДО старта runtime (записанный в манифест active head = ожидаемое degraded состояние, сюрприз-хед → failed), `verified_at` только при pass + audit `backup_restore_drill` (outcome/problems), corruption → failed без штампа; CLI `noezemactl backup`/`restore-drill`; diagnostics `backups`-блок). Root set (GC-сторона §15.3): test_gc.py (4: полный root set §15.3 — все классы корней выживают при apply-sweep, expired orphan + unpinned удаляются, checkpointed manifest живёт, expired backup REPORTED (не удаляется), terminal committed attempt + его manifest удаляются; запрет GC при reconciling_commit (rows сессии skipped, terminal attempt сессии не кандидат); dry-run ничего не удаляет + audit `gc_sweep` apply=false; expired backup + terminal config attempt в отчёте). CLI `noezemactl gc [--apply]` |
 | 13 | partial success на safe boundary | MVP | ✅ | test_orchestrator.py::test_budget_exhausted_partial (succeeded_partial) + T7.49/ADR-0022 (нормализация complete_reason: succeeded ТОЛЬКО из явного токена `goal_reached` в начале reason — `normalize_complete_reason`; test_complete_reason_normalization.py unit-таблица (20 позитивных: токен + разделитель + суффикс / кавычки / регистр; 13 негативных: суффикс без границы слова, токен не в начале, free-form, не-строки; приоритет первого токена) + test_complete_reason_normalization.py scenario (postgres+fake LLM: «goal_reached — <текст>» → succeeded + VERIFIED + `termination_reason="goal_reached"` + audit `complete_reason` (сырой) + `normalized_reason` (токен); free-form → succeeded_partial + сырая `termination_reason` + `normalized_reason=null` (прежнее поведение); unknown_actions + «goal_reached — …» → failed/`unknown_action_outcome` (T2.21)) + T7.50 (класс D — у источника: explorer-v5 пинится к enum `CompleteReason` и нормализатору — test_explorer_prompt_completion.py: токены промпта = enum минус `operator_stop` (токен хоста), оба JSON-примера валидны, правильный → `GOAL_REACHED`, неправильный (free-text) → `None`; test_freeze_payloads.py::test_config_v12_pins_explorer_v5_and_differs_from_v11_only_there; страж примеров — test_prompt_example_no_real_data.py, распространён на explorer) |
 | 14 | каскадная инвалидация | v1 | ✅ T4.1+T4.2+T4.3+T4.4+T4.5+T4.6+T4.7+T4.8+T4.9 | T4.1 (граф + цикл): test_claim_dependencies.py (unit: cycle check — чистая функция и через apply_claim_staging: циклическое evidential-ребро отклоняется с audit `dependency_edge_rejected`, claim всё же коммитится; research-ребро не в цикле и не двигает graph revision; evidential на non-current цель — отклонено §8.6; bad kind/self/missing/unparseable — отклонены) + test_orchestrator.py (scenario: полный цикл — curator-зависимость коммитится с bump `domain_revisions(dependency_graph)` 0→1 и audit-полями; цикл — ребро отклонено, graph revision не меняется) + test_staging_schema.py (ClaimDependencyProposal: closed kind, UUID, budget ≤10, дубликаты). T4.2 (barrier/closure/manifest): test_cascade.py (8: closure-ходы; inline cascade; idempotent replay; barrier lifecycle + crash-resume; graph-change → new generation; tamper → blocked; retrieval ancestor check; moved graph при старте). T4.3 (worker reassessment_jobs): test_reassessment.py (13: runnable-предикат — activating slot/чужой snapshot/backoff-отсрочка; head promotion через rules engine с audit и knowledge bump; insufficient data → invalid + UUIDv5 question; transient → retry с backoff; permanent → blocked + alert; expired-lease recovery; admission metrics; bounded batch + priority; mid-batch loss admission). T4.4 (writer admission): test_writer_admission.py (14: gate CAS §14.1 — acquire/release/expired-takeover/NOWAIT-конфликт + CHECK holder-полей; session intent — live lease, idempotent, clear, stale-очистка reconciler'ом после fencing; worker — deferral с jitter при gate-конфликте, уступка intent на входе и mid-batch (попытка не сгорает), release после батча; activation берёт gate до pointer; scheduler — T_escalate/T_worker_admission skip `reassessment_backlog`, свежая/blocked очереди не блокируют, fail-closed секция, SLO-метрики). T4.5 (online activation §8.7.2): test_online_activation.py (12: fenced lease — acquire/resume/takeover fence+1; quiesce — gate wait timeout, active session; shadow heads — fast path carry старой оценки / pending + activation jobs; deterministic UUIDv5 вопросы post-publish; atomic flip — pointer + bootstrap immutable; crash resume без смены fence; transient backoff + slot held; exhaustion → post_publish_blocked + alert + repair runner (repair CAS, phase=repair); superseded-закрытие без reactivation; T_repair_admission — skip repair_backlog; sealed-интервал триггер 45000). T4.6 (environment independence §8.7.3): test_env_independence.py unit (17: ключ группы — только (protocol, implementation, dataset lineage), GPU/seed/data order группу не создают; untracked fail-closed; 6 исходов классификации; shared dataset lineage убивает independence; strongest-pair с variation; engine — E3 только через independent_replication ≥2 группы, repeatability/reproducibility/variation не проходят, причины insufficient_independence / independence_*_not_met; unknown relation → ValueError) + scenario (6: полный манифест §14 + manifest_hash + снапшот на оценке; 2 сессии = 1 манифест, нет ложной independence; repeatability — одна группа, E2; другой GPU — reproducibility, гипотеза; независимые implementation'ы — E3; shared lineage — variation + independence_independent_replication_not_met). T4.7 (source graph §11.3): test_source_independence.py unit (10 новых: v2 — content_hash/parent/edge/correction базы; split отменяет прямую edge, но не domain; split бьёт merge (fail-closed); invalid correction игнорируется; unknown lineage; порядок-инвариантность) + scenario test_source_graph.py (6: E3 через два независимых источника + снапшот independence-v2; зеркала одного domain — одна группа; merge correction → head pending + job + ревизия 0→1 → recompute гипотеза (свежий снапшот, audit source_graph_changed); split correction → группы расходятся → E3; unknown lineage — одна группа; staging-commit — снапшот на оценке). T4.8 (counterevidence §8.7.4): test_counter_resolutions.py unit (9: claim_depends_on — транзитивность, циклы, направление) + test_rules_engine.py (+3: resolved counter не cap'ит, только-resolved — не refuted, один unresolved — disputed) + scenario test_counter_resolutions.py (5: disputed E1 с counter'ом; evidence-basis → каскад → E3 + audit; инварианты XOR/counter/scope/транзитивная зависимость/уникальность/DB CHECK; correction-basis → E3, отзыв correction → invalid + disputed; прямая invalidation + idempotent no-op). T4.9 (failpoints): test_failpoints_m4.py (7: crash после flip — pointer tuple + один publish + idempotent resume; crash между батчами — durable cursor, без дублей UUIDv5; stale activator после takeover — fence-отказ без writes; следующий flip закрывает blocked backlog (find_repair_backlog → None); barrier crash после каждого батча — 3 batch audits + 1 resolved; group merge + expired worker lease → recovery + hypothesis на свежем снапшоте; worker завершает после смерти intent-lease). GATE M4: retrieval ancestor check (T4.2) + worker starvation оба направления (T4.4+T4.9) + group merge recompute (T4.7+T4.9) |
@@ -8889,3 +8889,175 @@ mig/tpl-контейнеров 0. После всех прогонов: конт
 fake_openai_server/pytest и слушателей на repro-портах нет; временные скрипты repro — вне репо
 (`/tmp/t790/`). Стенд `.92` не опрашивался, LLM-движки не вызывались, интернет не использовался,
 eval-runs/смоуки не запускались. Push не выполнялся.
+
+## T7.91 — убийство контейнера не может быть отчитано как «чистая» ошибка: закрыто окно `docker inspect` после kill
+
+### 1. Симптом
+
+CI GitHub, run 38112342827, попытка 1: `tests/scenario/test_failpoints.py::test_container_kill_mid_execution_is_outcome_unknown`
+упала с
+
+```
+Observation(ok=False, data={'exit_code': 137, ...}, error='exit code 137', result_unknown=False)
+```
+
+повторный прогон — зелёный. Тест убивает контейнер (`docker kill -s KILL`) через 1,5 с от начала
+`sleep 30` и требует `outcome_unknown`; брокер же увидел ненулевой выход как ОТВЕТ команды. Для продукта
+это не тестовая мелочь: OOM-killer или внешний kill дают ложную «чистую» ошибку вместо «исход неизвестен»,
+то есть сессия отчитывается отказом там, где часть команды могла успеть исполниться (§3 invariant
+reconciliation, §5.7).
+
+### 2. Замеры (скрипты вне репо, `/home/denis/dsh1/t791-probe/`, образ `noezema-sandbox:test`, docker 29.8)
+
+Отсчёт — от момента ВОЗВРАТА exec-клиента: именно с него брокер спрашивает состояние контейнера
+(`packages/sandbox/runtime.py::is_running` → `docker inspect -f {{.State.Running}}`).
+
+Замер 1, окно переключения состояния. Профили: 20 прогонов в покое и 18 прогонов при шести
+одновременных убийствах (профиль `-n auto`); каждый профиль повторялся дважды, логи сохранены
+(`t791-probe/run_idle20.log`, `t791-probe/run_par6_18.log`) — это распределение, а не одна константа:
+
+| профиль | код exec | от возврата exec до первого ответа «не запущен» | CLI `docker inspect` | подтверждения, что API ещё отвечал `Running=true` уже после возврата exec |
+|---|---|---|---|---|
+| покой, 20 прогонов (первый промер) | 137 во всех | медиана 33,5 мс (min 27,3 / max 60,2) | медиана 35,3 мс (max 61,6) | 5/20, лежали до +5,3 мс (до 20 опросов подряд) |
+| покой, 20 прогонов (повтор, лог) | 137 во всех | медиана 35,4 мс (min 26,1 / max 58,3) | медиана 37,2 мс (max 60,5) | 4/20, лежали до +3,4 мс |
+| 6 одновременных убийств, 18 прогонов (первый промер) | 137 во всех | медиана 70,2 мс (min 29,6 / max 100,6) | медиана 73,7 мс (max 102,3) | 5/18, лежали до +7,6 мс |
+| 6 одновременных убийств, 18 прогонов (повтор, лог) | 137 во всех | медиана 50,3 мс (min 29,7 / max 82,9) | медиана 57,3 мс (max 94,7) | 1/18, лежали до +1,7 мс |
+
+Худшее измеренное окно — 101 мс; быстрый unix-socket-клиент (проба ~0,2 мс) видел `Running=true` уже
+после возврата exec в 15 из 76 прогонов.
+
+- `docker kill` как API-вызов возвращается почти одновременно с переключением состояния (+27…+99 мс):
+  окно живёт внутри обработки убийства в dockerd, а не в нашем коде;
+- методическая поправка (первая версия промера была неверной): непрерывный быстрый поллинг API во время
+  всего окна сам грузил dockerd и завышал измеренное окно (30–54 мс при 1 ложном ответе из 5) — поллинг
+  включается только ПОСЛЕ возврата exec-клиента;
+- почему flake только на CI: на `.87` CLI `docker inspect` стоит 27–102 мс и обычно завершается уже ПОСЛЕ
+  переключения — в промерах с сохранёнными логами он ни разу не ответил «запущен» после возврата exec
+  (0 из 38), то есть окно прячется за собственной задержкой CLI. На runner'е latency CLI оказалась короче
+  окна — inspect попал внутрь окна и вернул `true` → брокер отчитал `exit code 137`.
+
+Замер 2, воспроизведение условия CI на продуктовом пути (настоящий `SandboxToolBroker` +
+`ContainerSandboxRuntime`, у которого `is_running` — быстрый клиент docker API через unix-socket; скрипт вне репо):
+
+| версия брокера | итог прогонов команды `sleep 30` с убийством через 1,5 с |
+|---|---|
+| прежняя (3b3a7d6), 20 прогонов | unknown 14, **ошибочно классифицирован как `exit code 137` — 6 из 20** (ровно подпись CI-падения) |
+| исправленная, 15 прогонов | unknown 15/15 (`container gone mid-execution`) |
+
+### 3. Причина и решение
+
+Прежняя классификация (`packages/broker/broker.py::_sandbox_exec`) опиралась на ОДНУ пробу состояния:
+«контейнер ещё работает ⇒ ненулевой выход — это ответ команды». Сразу после убийства это неверно: ответ
+движка в первые десятки миллисекунд ничего не доказывает.
+
+Решение — второй, ограниченный взгляд на состояние ТОЛЬКО для кодов, которые убийство контейнера вообще
+может породить (`exit_is_consistent_with_container_death` в `packages/broker/broker.py`):
+
+- `exit_code > 128` — процесс убит смертельным сигналом (137 = 128+SIGKILL, 143 = 128+SIGTERM): так
+  убийство контейнера (`docker kill -s <sig>`, OOM-killer) доходит до exec-процесса. Взят весь диапазон
+  `> 128`, а не список {137, 143}, чтобы покрытие не зависело от того, каким именно сигналом убили;
+- `exit_code == 125` — отказ самого docker CLI выполнить/прикрепить exec: ответа команды нет вообще,
+  контейнер мог быть убит ровно в момент старта команды.
+
+Бюджет перепроверки — константы с запасом над измеренным максимумом (101 мс): `CONTAINER_DEATH_RECHECK_SECONDS = 1.0`,
+`CONTAINER_DEATH_RECHECK_INTERVAL = 0.1` (≈10× над худшим измеренным случаем и 14–28× над медианами; окна,
+которые не успели закрыться за 1 с, в промерах не встречались). Любой другой ненулевой код (1, 2, 7 …) —
+собственный ответ команды: исход известен независимо от того, умер контейнер мгновением позже, поэтому второй
+взгляд ему не положен (одна проба состояния и `exit code N`, как раньше; закреплено тестом
+`test_plain_failure_with_live_container_is_not_unknown`, там же проверяется, что за второй взгляд не платят
+лишними опросами). Оговорка честности: в сообщении коммита `bdac2ad` запас по ошибке назван «более чем в 16
+раз» — правильное число ≈10× над худшим случаем; код и константы от этого не меняются.
+
+### 4. Честный случай: команда убивает СЕБЯ в живом контейнере
+
+`kill -9 $$` (или `os.kill(os.getpid(), SIGKILL)`, segfault ребёнка) даёт ровно тот же код 137, но контейнер
+ЖИВ и всё окно отвечает `Running=true`. Такой случай обязан остаться обычной ошибкой с настоящим кодом:
+иначе ложный unknown ронял бы всю сессию на безопасной границе из-за ответа, который команда действительно
+дала. Так и сделано: после истечения окна брокер возвращает `exit code 137`, контейнер продолжает работать —
+проверено тестом на реальном движке `tests/scenario/test_tool_broker_sandbox.py::test_broker_command_killed_from_inside_is_not_unknown`
+(`kill -9 $$` → 137, не unknown; затем `echo alive` в том же контейнере). Цена честности — до 1 с на такую
+команду (и до 10 опросов состояния); это осознанная плата за то, чтобы не придумывать исход.
+
+Ложных unknown правка создать не может: unknown помечается ТОЛЬКО если движок сам ответил «контейнер не
+запущен» (прежний быстрый путь T2.22 — немедленно; новый — внутри окна). Ни один сценарий, где контейнер жив
+до конца окна и после него, unknown не даёт. Команда при этом исполняется ровно один раз: перепроверка
+спрашивает о СОСТОЯНИИ, а не повторяет команду (`exec_calls == 1` закреплено тестами). `RETRY_POLICY` (§5.7)
+и классы идемпотентности не изменены: unknown по-прежнему `transient=False` и никогда не ретраится,
+обычный ненулевой выход по-прежнему не транзиентен.
+
+Сознательно НЕ закрыто (чтобы не менять больше, чем требуется): ветка `SandboxError` в `_run_once`
+(таймаут движка, недоступный движок) по-прежнему делает одну пробу состояния. Попадание в окно там даёт
+`transient=True`, а не unknown; для `shell.execute`/`python.execute` класс NON_IDEMPOTENT ⇒ ретрая всё равно
+ноль, ложного успеха или слепого повтора не возникает. Расширять перепроверку туда — отдельная задача: это
+меняло бы классификацию движковых отказов сверх темы T7.91.
+
+### 5. Тесты
+
+`tests/unit/test_tool_broker.py` (+7, фейковый runtime `exec → один код`, `is_running` по скриптованному
+списку, счётчики опросов):
+
+- `test_signal_death_while_engine_still_says_running_is_unknown` — ровно условие CI: exec вернул 137,
+  движок ещё два раза отвечает `Running=true`, потом False → `result_unknown=True`, ошибка
+  `container gone mid-execution`, `transient=False`, класс NON_IDEMPOTENT, ровно одна команда;
+- `test_docker_cli_failure_while_engine_still_says_running_is_unknown` — 125 при живом контейнере → unknown;
+- `test_plain_failure_with_live_container_is_not_unknown` — exit 1 при живом контейнере → `exit code 1` и
+  ровно ОДНА проба состояния;
+- `test_container_gone_at_once_is_unknown_without_waiting` — прежний быстрый путь T2.22, без ожидания;
+- `test_signal_death_in_a_live_container_stays_a_plain_failure` — живой контейнер + сигнал → обычная ошибка
+  (окно подменено на 0,15/0,05 с, чтобы тест не зависел от wall-clock);
+- `test_only_kill_consistent_exit_codes_get_the_second_look` — предикат кодов (137/143/125 истинны,
+  1/7/126/127 ложны);
+- `test_container_death_recheck_window_is_bounded` — страж ограниченности окна.
+
+`tests/scenario/test_tool_broker_sandbox.py` (+1) — см. п. 4. `test_failpoints.py` НЕ ослаблен: ни один assert
+не изменён. Итого тестов в полном наборе: было 2154 + 12 skipped, стало 2162 + 12 skipped (+8).
+
+Краснота новых тестов на 3b3a7d6 проверена безопасно (в прошлой попытке незакоммиченный фикс был уничтожен
+`git checkout --`): текущая версия сохранялась копией (`cp … /home/denis/dsh1/t791-keep/broker.py.new`), файл
+подменялся из коммита (`git show 3b3a7d6:packages/broker/broker.py > packages/broker/broker.py`), прогон,
+возврат ИЗ КОПИИ, `diff` копия↔файл — пусто. Результат подмены: 5 отказов из 8 новых тестов, у ключевого —
+ровно подпись CI-падения (`AssertionError: exit code 137 … result_unknown=False`). Страховые новые тесты
+(«exit code 1», «gone сразу», «kill -9 $$») зелёные и на старом коде — они защищают неизменность прежнего
+поведения, а не фиксируют новое.
+
+### 6. Прогоны стабильности и проверки §6
+
+- `tests/scenario/test_failpoints.py` подряд **32 прогона**: все зелёные (по 2 теста в прогоне = 64 исполнения
+  kill-кейса), длительность прогона 3,65–10,11 с; падений нет. Под подменой старого broker.py тот же кейс
+  краснеет воспроизводимо (см. замер 2: 6 из 20 на реальном движке).
+- Baseline до правок (§6 целиком): ruff — All checks passed; mypy strict — Success, 153 файла;
+  `pytest -n auto -q -m "not timing"` — 2154 passed, 12 skipped (188,13 с); `pytest -q -m timing` — 4 passed,
+  2166 deselected (53,25 с).
+- Перед коммитом исправления (`bdac2ad`): ruff — All checks passed; mypy strict — Success, 153 файла;
+  `pytest -n auto -q -m "not timing"` — 2162 passed, 12 skipped (189,37 с); `pytest -q -m timing` — 4 passed,
+  2174 deselected (47,85 с).
+- Перед документационным коммитом этой же задачи: ruff — All checks passed; mypy strict — Success, 153 файла;
+  `pytest -n auto -q -m "not timing"` — 2162 passed, 12 skipped (230,47 с); `pytest -q -m timing` — 4 passed,
+  2174 deselected (47,67 с). Число тестов прежнее (2162 + 12): документы набор не меняют.
+
+### 7. Честно про остановленную попытку этой же задачи
+
+Первая попытка T7.91 шла в отдельном worktree (`/home/denis/dsh1/noezema-wt-halogen`) и была остановлена
+менеджером 2026-10-11 (эксперимент с halogen отключён). Её фикс `packages/broker/broker.py` был
+незакоммиченным и погиб при проверке красноты: файл подменили на старый, а вернули через `git checkout --`,
+который возвращает версию ИЗ ИНДЕКСА, то есть стёр сам фикс (тестовые заготовки уцелели и восстановлены из
+`/home/denis/dsh1/t791-salvage/`; их диффы против репо проверены — это только добавления). В текущей задаче
+краснота проверялась методом «копия → подмена → возврат из копии», а в §7 ловушек добавлены оба урока. Та
+попытка оставила после прерванных прогонов 47 `noezema_mig_*` и 7 `noezema_tpl_*` баз; в этой задаче они не
+трогались (см. п. 8).
+
+### 8. Остатки среды
+
+До задачи: контейнеры `docker ps -a` — 41 (запущенных 32), `noezema_mig_*` — 47, `noezema_tpl_*` — 7.
+После всех прогонов этой задачи — те же 41/32, 47 и 7. Список имён баз, снятый в конце, побайтово совпал со
+списком, оставленным прерванными прогонами предыдущей попытки (`/home/denis/dsh1/t791_dbs_after_kill.txt`), а
+в логах моих прогонов (`t791-baseline.log`, `t791-precommit1.log`, `t791-precommit2.log`,
+`t791-failpoints32.log`) имён scratch-БД нет ни одного (ни одного форс-дропа с warning) — то есть **ничего созданного мной не утекло и мною не удалено
+ничего**; чужие/прежние остатки не тронуты. Экспериментальные контейнеры промеров (`t791-probe-*`) удалялись
+тем же скриптом в `finally`; после удаления количество снова 41; сиротских контейнеров `noezema-sb-*`,
+процессов прогонов и слушателей временных портов нет. Eval/smoke-базы не опрашивались и не менялись (учёт
+только по `pg_database` контейнера `noezema-test-db`). Промежуточные скрипты и логи — вне репо
+(`/home/denis/dsh1/t791-probe/`, `/home/denis/dsh1/t791-keep/`, `t791-*.log`); репо их не содержит. Стенд `.92`
+не опрашивался, LLM-движки (.42/.141/.48) не вызывались, интернет из кода и тестов не использовался,
+eval-runs/смоуки не запускались; `ARCHITECTURE.md`, миграции, `apps/`, `prompts/`, `docs/eval/`, `deploy/`,
+`hostctl/` и новые AuditEventType не менялись; политика ретраев/идемпотентности не менялась. Push не выполнялся.
