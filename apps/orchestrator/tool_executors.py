@@ -34,6 +34,8 @@ Fail-closed rules (§3 invariants, AGENTS.md §4):
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 import os
 import shutil
@@ -197,7 +199,11 @@ class SandboxSessionExecutor:
     opened by the orchestrator hook once the session row and its effective
     capability profile exist. `close_session` is called from a `finally`: it
     never raises (a cleanup problem must not replace the durable session
-    outcome) but names every problem it could not fix.
+    outcome) but names every problem it could not fix. The one exception, by
+    design since T7.95: a cancellation stays a cancellation — `close_session`
+    re-raises asyncio.CancelledError after finishing what it can (the container removal
+    under its own ceiling and the overlay directory), because swallowing it here
+    would keep a cancelled session task of a stopping node alive.
     """
 
     def __init__(self, runtime: ContainerSandboxRuntime) -> None:
@@ -292,12 +298,21 @@ class SandboxSessionExecutor:
 
         Returns nothing; problems are logged with their names (a leaked
         container must be findable in the journal, not silently swallowed).
+
+        T7.95(в): a CANCELLATION is not such a problem — it is re-raised. `close_session` runs in
+        the `finally` around phase 1 of `run_session`, and swallowing a cancel here would keep the
+        session task of a stopping node alive past its shutdown drain. What the cancellation used to
+        abandon is done regardless: the removal is finished under the runtime's cleanup ceiling
+        (`_CLEANUP_CEILING_SECONDS`, which names a leak it could not fix), and the overlay directory
+        is removed on EVERY path — before T7.95 a cancelled `destroy` skipped `rmtree` and left
+        `<NOEZEMA_SANDBOX_WORK_ROOT>/<session_id>` behind (probe on 6ee80c5: dir still present).
         """
         handle = self._handle
         self._handle = None
         self._broker = None
         if handle is None:
             return
+        cancelled: asyncio.CancelledError | None = None
         try:
             await self._runtime.destroy(handle)
         except (SandboxError, OSError) as exc:
@@ -307,6 +322,18 @@ class SandboxSessionExecutor:
                 handle.session_id,
                 exc,
             )
+        except asyncio.CancelledError as exc:
+            # До T7.95 отмена во время `destroy` (потолок 30 с > 20 с дренажа веба) не давала ни
+            # строки LEAKED, ни уборки каталога: контейнер `noezema-sb-<…>` оставался жив в dockerd.
+            # Теперь removal доводится отдельным ограниченным вызовом движка; сам хэлпер называет
+            # утечку, если довести не удалось.
+            cancelled = exc
+            with contextlib.suppress(asyncio.CancelledError):
+                # повторную отмену (ее досылает дренаж на своём потолке) подавляем НЕ ради подавления:
+                # хэлпер уже назвал контейнер, а каталог ниже убирается в любом случае
+                await self._runtime.remove_container_best_effort(
+                    handle.container_name, "destroy was cancelled mid-call"
+                )
         # The overlay is disposable by design (§11, packages/sandbox/runtime.py):
         # the frozen workspace manifest in the DB is the only survivor.
         session_dir = handle.workspace_dir.parent
@@ -316,6 +343,8 @@ class SandboxSessionExecutor:
             logger.warning(
                 "tool executor=sandbox session dir %s not removed: %s", session_dir, exc
             )
+        if cancelled is not None:
+            raise cancelled  # отмена остаётся отменой: её нельзя превращать в отказ исполнителя
         logger.info(
             "tool executor=sandbox closed session=%s container=%s",
             handle.session_id,

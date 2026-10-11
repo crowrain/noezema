@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import os
 import shutil
 import uuid
@@ -147,6 +148,40 @@ class SandboxSettings(BaseSettings):
     work_root: Path = Path("/var/lib/noezema/sandbox")
 
 
+logger = logging.getLogger(__name__)
+
+# ── T7.95: потолки уборки, которая идёт ПОСЛЕ внешней отмены ─────────────────────────
+# `asyncio.wait_for` возвращается на ПЕРВОЙ отмене (замер: 0,000 с), поэтому работа ниже начинается
+# ровно в момент отмены сессии — внутри дренажа остановки веба (`apps/web/api.py`,
+# `_SHUTDOWN_DRAIN_CEILING_SECONDS` = 20,0 с, затем повторная отмена). Значения обычных движковых
+# вызовов (15 / 30 / 60 / +15 с) здесь НЕ меняются: это потолки ТОЛЬКО уборочных вызовов, и они
+# обязаны быть меньше дренажа — иначе сам дренаж обрывает уборку (именно так и терялся контейнер:
+# потолок `destroy` 30 с > 20 с дренажа).
+#   reap    2,0 с — пожатие уже убитого (SIGKILL) CLI-клиента: зависший child-watcher не должен
+#                   подвешивать остановку узла.
+#   cleanup 8,0 с — `rm -f` осиротевшего контейнера; здоровый dockerd делает это за доли секунды
+#                   (окно замера T7.91), 8 с — запас на нагруженный демон.
+# Худший случай одной отменённой уборки: 2,0 + 8,0 = 10,0 с < 20,0 с дренажа (≥10 с остаётся учёту
+# исхода сессии); весь остановочный путь ≤ 10 + 20 = 30 с < TimeoutStopSec 90 с юнита.
+# Разбор чисел и альтернативы: docs/STATUS.md T7.95.
+_REAP_CEILING_SECONDS = 2.0
+_CLEANUP_CEILING_SECONDS = 8.0
+
+# Потолки двух движковых глаголов запуска сессии. ЗНАЧЕНИЯ НЕ ИЗМЕНЯНЫ (60 с — они такие с T2.3 и
+# так же разобраны в T7.93); они только названы, чтобы тест мог опустить их как fixture knob и
+# проверить уборку после истечения потолка за секунды, а не за минуту (так же, как тесты T7.92/T7.93
+# опускают окна брокера). Продуктовые вызовы используют эти константы как есть.
+_CREATE_CEILING_SECONDS = 60.0
+_START_VERB_CEILING_SECONDS = 60.0
+
+
+def _consume_detached_task(task: asyncio.Task[Any]) -> None:
+    """A reap/cleanup task may deliberately outlive its cancelled caller (it is shielded): consume
+    its result so asyncio does not report an unretrieved exception when the loop closes."""
+    if not task.cancelled():
+        task.exception()
+
+
 @dataclass(frozen=True)
 class ExecResult:
     exit_code: int
@@ -265,6 +300,16 @@ class ContainerSandboxRuntime:
         except TimeoutError as exc:
             await self._kill_and_reap(proc)
             raise SandboxError(f"engine command timed out: {' '.join(args[:2])}") from exc
+        except asyncio.CancelledError:
+            # T7.95(а): внешняя отмена НЕ убивает запущенный CLI и НЕ идёт веткой TimeoutError.
+            # `wait_for` отменяет внутреннюю корутину (её `proc.communicate()` прерывается), возврат
+            # происходит сразу, а docker/podman-клиент продолжает жить: замер на 6ee80c5 — PID клиента
+            # через 1 с после отмены в состоянии S (спит), то есть сирота в таблице процессов.
+            # Клиента убиваем и пожираем тем же `_kill_and_reap` (ограниченно), после чего отмена
+            # идёт ДАЛЬШЕ без изменений: отмена — не отказ движка, превращать её в SandboxError
+            # нельзя (классификация брокера T7.91/T7.92 к ней неприменима).
+            await self._kill_and_reap(proc)
+            raise
         except FileNotFoundError as exc:
             raise SandboxHealthError(f"container engine not found: {self.engine}") from exc
         return (
@@ -275,18 +320,74 @@ class ContainerSandboxRuntime:
 
     @staticmethod
     async def _kill_and_reap(proc: asyncio.subprocess.Process | None) -> None:
-        """A ceiling-expired engine CLI must not survive the call.
+        """A ceiling-expired or cancelled engine CLI must not survive the call.
 
         kill() stops a client that hangs in the daemon; awaiting wait() reaps it, so no
         zombie is left in our process table either. A client that exited at the very same
         moment raises ProcessLookupError — then only the reap matters.
+
+        T7.95: the reap runs as its OWN task under `_REAP_CEILING_SECONDS` and is shielded from
+        our caller's cancellation. Cancellation is exactly the case where somebody is already
+        waiting for us to finish (the shutdown drain of `apps/web/api.py`), so a wedged child
+        watcher must not turn a bounded drain into an unbounded wait. SIGKILL is delivered
+        synchronously, BEFORE any await: giving up on the reap costs only the reap — asyncio's
+        child watcher still reaps the killed child — and a repeated cancellation of our caller
+        cannot abort the kill either. A *fresh* cancellation is not swallowed here: it travels on.
         """
         if proc is None or proc.returncode is not None:
             return
         with contextlib.suppress(ProcessLookupError):
             # the client exited at the very same moment — only the reap matters
             proc.kill()
-        await proc.wait()
+        reap = asyncio.create_task(proc.wait())
+        reap.add_done_callback(_consume_detached_task)
+        try:
+            await asyncio.wait_for(asyncio.shield(reap), timeout=_REAP_CEILING_SECONDS)
+        except TimeoutError:
+            logger.warning(
+                "engine CLI pid %s was killed but not reaped within %.1f s",
+                proc.pid,
+                _REAP_CEILING_SECONDS,
+            )
+
+    async def remove_container_best_effort(self, name: str, where: str) -> bool:
+        """One bounded `rm -f` for a container whose name is already with the engine (T7.95(б/в)).
+
+        Returns True only when the engine confirmed the removal; a cleanup that did not succeed is
+        named here in the log (`LEAKED container …`, the same rule as in `close_session`, T7.58), so
+        the caller's own exception/cancellation stays intact. The ONLY thing that leaves this method
+        as an exception is a fresh asyncio.CancelledError — a cleanup must never swallow a cancellation.
+
+        Defence against a repeated cancellation: the removal runs as its OWN task under
+        `_CLEANUP_CEILING_SECONDS`, and our `await` is shielded — a cancel aimed at our caller stops
+        OUR await but does not abort the engine call, which still finishes (or hits its own ceiling)
+        on its own. The ceiling is what makes this safe to use at all: T7.63 deliberately lets a
+        shutdown abandon a wedged engine rather than hang on it, so an unshielded-and-unbounded
+        cleanup would re-open exactly the hole it closes.
+        """
+        attempt = asyncio.create_task(self._run(self.destroy_command(name), timeout=_CLEANUP_CEILING_SECONDS))
+        attempt.add_done_callback(_consume_detached_task)
+        try:
+            rc, _out, err = await asyncio.shield(attempt)
+        except asyncio.CancelledError:
+            logger.warning(
+                "LEAKED container %s: the cleanup call started during %s was cancelled again and continues on its own",
+                name,
+                where,
+            )
+            raise
+        except SandboxError as exc:  # our own cleanup ceiling (T7.93) or the engine refused `rm -f`
+            logger.warning("LEAKED container %s: cleanup during %s failed: %s", name, where, exc)
+            return False
+        if rc != 0:
+            logger.warning(
+                "LEAKED container %s: cleanup during %s was refused by the engine: %s",
+                name,
+                where,
+                err.strip()[:200] or "no reason given",
+            )
+            return False
+        return True
 
     async def health_check(self) -> None:
         """Engine reachable, image present, a one-shot container runs."""
@@ -329,12 +430,43 @@ class ContainerSandboxRuntime:
 
         name = f"noezema-sb-{session_id.replace('-', '')[:12]}"
         cmd = self.create_command(name, self.image, profile, base_dir, workspace_dir)
-        rc, _out, err = await self._run(cmd, timeout=60)
+        # T7.95(б/г): с этой строки имя контейнера УЖЕ выдано движку, а `SandboxHandle` ещё не выдан.
+        # Именно хэндл делает контейнер доступным для `destroy`, а `close_session()` исполнителя при
+        # `handle is None` просто ничего не убирает — значит любой выход отсюда до успешного `start`
+        # (внешняя отмена сессии, истечение потолка вызова по T7.93) обязан закончиться ограниченной
+        # по времени попыткой `rm -f <имя>`; исходное исключение и отмена при этом пробрасываются
+        # без изменений. Оговорка: отказ самого движка (`rc != 0`) уборки НЕ вызывает — там движок
+        # ОТВЕТИЛ, что контейнера нет, а слепо удалять не подтверждённое нам имя было бы единственным
+        # путём, способным зацепить чужой контейнер с тем же префиксом. Разбор: docs/STATUS.md T7.95.
+        try:
+            rc, _out, err = await self._run(cmd, timeout=_CREATE_CEILING_SECONDS)
+        except SandboxHealthError:
+            raise  # движок не был запущен вовсе (нет бинаря): к движку не попало ничего
+        except asyncio.CancelledError:
+            await self.remove_container_best_effort(name, "the create call was cancelled")
+            raise
+        except SandboxError as exc:  # потолок вызова (T7.93): CLI убит, что успел dockerd — неизвестно
+            await self.remove_container_best_effort(name, f"the create call ended early: {exc}")
+            raise
         if rc != 0:
             raise SandboxError(f"failed to create sandbox container: {err[:300]}")
-        rc, _out, err = await self._run(["start", name], timeout=60)
+        try:
+            rc, _out, err = await self._run(["start", name], timeout=_START_VERB_CEILING_SECONDS)
+        except SandboxHealthError:
+            raise  # движок уже ответил на `create`; ветка — та же симметрия, что и выше
+        except asyncio.CancelledError:
+            await self.remove_container_best_effort(name, "the start call was cancelled")
+            raise
+        except SandboxError as exc:
+            await self.remove_container_best_effort(name, f"the start call ended early: {exc}")
+            raise
         if rc != 0:
-            await self._run(self.destroy_command(name), timeout=30.0)
+            # поведение прежнее (T2.3): контейнер, который движок отказывается запустить, убирается
+            # здесь. С T7.95 — тем же ограниченным хэлпером: прежде этот `rm -f` имел собственный
+            # вызов на 30 с, и его собственный SandboxError заменял собой «failed to start sandbox
+            # container: …»; теперь уборка ограничена `_CLEANUP_CEILING_SECONDS` и исходную ошибку
+            # заменить уже не может.
+            await self.remove_container_best_effort(name, "the engine refused to start the container")
             raise SandboxError(f"failed to start sandbox container: {err[:300]}")
         return SandboxHandle(
             session_id=session_id,
