@@ -18,6 +18,7 @@ verbs used here are identical for both.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import shutil
 import uuid
@@ -234,26 +235,58 @@ class ContainerSandboxRuntime:
     # ── engine ────────────────────────────────────────────────────────────
 
     async def _run(self, args: list[str], timeout: float = 120.0) -> tuple[int, str, str]:
-        try:
-            proc = await asyncio.wait_for(
-                asyncio.create_subprocess_exec(
-                    self.engine,
-                    *args,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                ),
-                timeout=timeout,
+        # T7.93: the ceiling covers the WHOLE engine call — spawning the CLI client and
+        # waiting for it to finish. Before this, wait_for guarded only create_subprocess_exec
+        # and communicate() was unbounded: a wedged daemon/network left the session hanging
+        # forever (neither unknown nor transient). On expiry the CLI process is killed and
+        # reaped (no orphan, no zombie) and callers get the SAME SandboxError
+        # "engine command timed out: ..." as before — the broker classification built in
+        # T7.91/T7.92 applies to it unchanged. Per-call timeout values are not touched here;
+        # their per-call analysis is in docs/STATUS.md (T7.93).
+        proc: asyncio.subprocess.Process | None = None
+
+        async def _spawn_and_complete() -> tuple[int, bytes, bytes]:
+            nonlocal proc
+            proc = await asyncio.create_subprocess_exec(
+                self.engine,
+                *args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
             stdout, stderr = await proc.communicate()
+            return (
+                proc.returncode if proc.returncode is not None else -1,
+                stdout,
+                stderr,
+            )
+
+        try:
+            rc, out, err = await asyncio.wait_for(_spawn_and_complete(), timeout=timeout)
         except TimeoutError as exc:
+            await self._kill_and_reap(proc)
             raise SandboxError(f"engine command timed out: {' '.join(args[:2])}") from exc
         except FileNotFoundError as exc:
             raise SandboxHealthError(f"container engine not found: {self.engine}") from exc
         return (
-            proc.returncode if proc.returncode is not None else -1,
-            stdout.decode("utf-8", "replace")[: self.MAX_OUTPUT],
-            stderr.decode("utf-8", "replace")[: self.MAX_OUTPUT],
+            rc,
+            out.decode("utf-8", "replace")[: self.MAX_OUTPUT],
+            err.decode("utf-8", "replace")[: self.MAX_OUTPUT],
         )
+
+    @staticmethod
+    async def _kill_and_reap(proc: asyncio.subprocess.Process | None) -> None:
+        """A ceiling-expired engine CLI must not survive the call.
+
+        kill() stops a client that hangs in the daemon; awaiting wait() reaps it, so no
+        zombie is left in our process table either. A client that exited at the very same
+        moment raises ProcessLookupError — then only the reap matters.
+        """
+        if proc is None or proc.returncode is not None:
+            return
+        with contextlib.suppress(ProcessLookupError):
+            # the client exited at the very same moment — only the reap matters
+            proc.kill()
+        await proc.wait()
 
     async def health_check(self) -> None:
         """Engine reachable, image present, a one-shot container runs."""
