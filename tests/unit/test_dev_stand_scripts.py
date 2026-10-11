@@ -628,6 +628,7 @@ class TestDevStandConfigVersion:
     #: canonical-хеші payload'ов: именно они попадают в `config_snapshots.payload_sha256` (AGENTS §8),
     #  в скриптах и README они названы короткими префиксами — оператор сверяет head по ним
     V20_CANONICAL = "2b065470"
+    V21_CANONICAL = "7af30850"
     V19_CANONICAL = "4d76c000"
     V18_CANONICAL = "b5605e4e"
     V17_CANONICAL = "5c402f4d"
@@ -732,6 +733,40 @@ class TestDevStandConfigVersion:
             assert v20["prompts"][role.name.lower()] == v19["prompts"][role.name.lower()], role
         # v19 остаётся ровно прежним canonical (прежние payload'ы не переписываются)
         assert canonical_sha256(v19).startswith(self.V19_CANONICAL)
+
+    def test_config_v21_is_config_v20_with_two_prompt_pins(self) -> None:
+        """T7.97: новый payload config-v21 = config-v20 ровно с двумя правками — пины
+        `prompts.explorer` → explorer-v10 (правило 13: итог обязан нести прочитанные
+        собственные оценки не-официальных акторов) и `prompts.curator` → curator-v11
+        (правило 11: такая оценка — отдельный claim с названием актора; публикация
+        ведомства остаётся публикацией ведомства). Пороги, `claim_type_rules`, бюджеты,
+        окна и `model.*` — байт в байт v20; canonical v21 закреплён и проверен на живом
+        файле; v20 не переписан и остаётся откатом (дефолт bootstrap'а — v20 до решения
+        менеджера, см. STATUS T7.97)."""
+        import json
+
+        from packages.domain.canonical import canonical_sha256
+        from packages.llm_gateway.roles import Role, resolve_prompts
+
+        v20 = json.loads((REPO_ROOT / "docs" / "eval" / self.V20).read_text(encoding="utf-8"))
+        v21_path = REPO_ROOT / "docs" / "eval" / "config-v21-payload.json"
+        assert v21_path.is_file()
+        v21 = json.loads(v21_path.read_text(encoding="utf-8"))
+        assert {k for k in v21 if v21[k] != v20[k]} == {"prompts"}
+        assert {r for r in v21["prompts"] if v21["prompts"][r] != v20["prompts"][r]} == {
+            "curator",
+            "explorer",
+        }
+        assert canonical_sha256(v21).startswith(self.V21_CANONICAL)
+        resolved = resolve_prompts(v21["prompts"], REPO_ROOT)
+        assert resolved[Role.CURATOR].version == "curator-v11"
+        assert resolved[Role.CURATOR].sha256 == v21["prompts"]["curator"]["sha256"]
+        assert resolved[Role.EXPLORER].version == "explorer-v10"
+        assert resolved[Role.EXPLORER].sha256 == v21["prompts"]["explorer"]["sha256"]
+        for role in (Role.PLANNER, Role.VERIFIER, Role.EXTRACTOR):
+            assert v21["prompts"][role.name.lower()] == v20["prompts"][role.name.lower()], role
+        # v20 остаётся ровно прежним canonical (прежние payload'ы не переписываются)
+        assert canonical_sha256(v20).startswith(self.V20_CANONICAL)
 
 
 class TestDevStandReasoningProfile:

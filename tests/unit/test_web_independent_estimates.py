@@ -1439,3 +1439,110 @@ def test_future_publication_of_a_report_still_marks_the_value_as_forecast() -> N
     roles = estimates.value_roles(EXPECT_PUBLICATION_FUTURE_FORM)
     assert roles.forecast == frozenset({"5.59"}), roles
     assert not roles.realized and roles.is_forecast_only, roles
+
+
+# ─── T7.97 (ADR-0035 §11.1): «Смежный прогноз» только сопоставимого периода ──
+# Карточка 5a68172e (стенд .92, фикстура fixtures-t797/claims_live.tsv): вопрос о 2026
+# годе, а в «Независимые оценки» карточек 2026 попала запись «Прогноз аналитиков … на
+# конец 2025 года … 6,3%» (`2d010d53`, as_of 2025-12-24). Прогноз — значение целевого
+# периода (T7.88b/T7.94), и правило периода §11 обязано действовать и в полосе
+# смежности: в matched-ветке проверка стоит с T7.88, полоса смежности её пропускала.
+
+FORECAST_2026_C6729D4C = (
+    "Прогноз Банка России по годовой инфляции в России на 2026 год составляет 6,0–7,0%."
+)
+CONSENSUS_2026_2F456E85 = (
+    "Консенсус-прогноз аналитиков по годовой инфляции в России на 2026 год составляет 6,6% "
+    "(по данным макроэкономического опроса Банка России за сентябрь 2026 года)."
+)
+EXPECTATIONS_2026_CC75E97F = (
+    "Инфляционные ожидания населения России в сентябре 2026 года составили 14,2% "
+    "(по данным опроса ООО «инФОМ»)."
+)
+OBSERVED_2026_7C8C9AFE = (
+    "Наблюдаемая населением годовая инфляция в России в сентябре 2026 года увеличилась "
+    "до 15,1% (по данным опроса ООО «инФОМ»)."
+)
+AS_OF_2026 = 2026  # staging bdd9ef8d: as_of 2026-08-17 / 2026-09-01 / 2026-09-29
+
+#: карточки вопроса 5a68172e: (id, statement, as_of) — дословно из фикстуры
+CARD_5A68172E: list[tuple[str, str, int]] = [
+    ("c-c6729d4c", FORECAST_2026_C6729D4C, AS_OF_2026),
+    ("c-2f456e85", CONSENSUS_2026_2F456E85, AS_OF_2026),
+    ("c-cc75e97f", EXPECTATIONS_2026_CC75E97F, AS_OF_2026),
+    ("c-7c8c9afe", OBSERVED_2026_7C8C9AFE, AS_OF_2026),
+]
+
+
+def _t797_candidates() -> list[estimates.EstimateCandidate]:
+    """Кандидаты карточек 5a68172e — прежние записи стенда (те же формулировки, что в
+    фикстуре claims_live.tsv) плюс записи самого вопроса; порядок — по id, как на стенде."""
+    return [
+        _candidate("c-2d010d53", FORECAST_2D010D53, as_of_year=AS_OF_FORECAST),
+        _candidate("c-391c4388", OBSERVED_391C4388, as_of_year=AS_OF_OBSERVED),
+        _candidate("c-6d9a12ff", MEDIAN_6D9A12FF, as_of_year=AS_OF_OBSERVED),
+        _candidate("c-73d52835", PRESS_73D52835),
+        _candidate("c-7cc2b578", FACT_BELOW_FORECAST_7CC2B578),
+        _candidate("c-c970bc08", SBER_C970BC08),
+        _candidate("c-e189c80d", OFFICIAL_E189C80D, as_of_year=AS_OF_OBSERVED),
+        _candidate("c-e2c52955", COMMENT_E2C52955),
+        _candidate("c-c6729d4c", FORECAST_2026_C6729D4C, as_of_year=AS_OF_2026),
+        _candidate("c-2f456e85", CONSENSUS_2026_2F456E85, as_of_year=AS_OF_2026),
+        _candidate("c-cc75e97f", EXPECTATIONS_2026_CC75E97F, as_of_year=AS_OF_2026),
+        _candidate("c-7c8c9afe", OBSERVED_2026_7C8C9AFE, as_of_year=AS_OF_2026),
+    ]
+
+
+def _rows_for_card(claim_id: str, statement: str, as_of: int) -> list[estimates.EstimateRow]:
+    """Карточка не показывает самое себя кандидатом — это делает вызывающий тест."""
+    source = _source(statement, claim_id=claim_id, as_of_year=as_of)
+    candidates = [c for c in _t797_candidates() if c.claim_id != claim_id]
+    return estimates.estimate_rows_for_source(source, candidates)
+
+
+def test_2026_cards_do_not_show_forecast_of_2025() -> None:
+    """Дефект (Б) закрыт: прогноз на конец 2025 года (`2d010d53`) не показывается строкой
+    «Смежный прогноз» ни на одной карточке 2026 года вопроса 5a68172e."""
+    for claim_id, statement, as_of in CARD_5A68172E:
+        rows = _rows_for_card(claim_id, statement, as_of)
+        forecast_ids = {row.candidate_id for row in rows if row.kind == "forecast_adjacent"}
+        assert "c-2d010d53" not in forecast_ids, (claim_id, [r.kind for r in rows])
+
+
+def test_2026_cards_keep_forecasts_of_2026() -> None:
+    """Сопоставимый период остаётся: консенсус-прогноз на 2026 год (`2f456e85`) виден на
+    остальных карточках того же вопроса — правка не превращает «Смежный прогноз» в пустую
+    категорию."""
+    for claim_id, statement, as_of in CARD_5A68172E:
+        if claim_id == "c-2f456e85":
+            continue  # карточка самого утверждения не показывает его как кандидата
+        rows = _rows_for_card(claim_id, statement, as_of)
+        forecast_ids = {row.candidate_id for row in rows if row.kind == "forecast_adjacent"}
+        assert "c-2f456e85" in forecast_ids, (claim_id, [r.kind for r in rows])
+
+
+def test_2026_cards_keep_measurement_and_t788_rows_unchanged() -> None:
+    """Измерения и прежние строки T7.88–T7.96a не тронуты: на карточках 2026 года
+    по-прежнему есть «Связанная запись» декабрьских измерений 2025 года, а карточка
+    консенсуса (`2f456e85`) остаётся без прогнозных строк (её период уже молчал в
+    matched-ветке с T7.88 — правка полосы смежности этого не меняет)."""
+    for claim_id, statement, as_of in CARD_5A68172E:
+        rows = _rows_for_card(claim_id, statement, as_of)
+        kinds = [row.kind for row in rows]
+        if claim_id == "c-2f456e85":
+            assert "forecast_adjacent" not in kinds, kinds
+        adjacent_ids = {row.candidate_id for row in rows if row.kind == "adjacent_metric"}
+        assert {"c-391c4388", "c-6d9a12ff"} & adjacent_ids, (claim_id, kinds)
+
+
+def test_2025_cards_keep_forecast_of_2025_period() -> None:
+    """Правило периода симметрично, но не молчит там, где период сопоставим: карточка
+    декабрьского измерения 2025 года (`391c4388`) и карточка прогноза на 2025 год
+    (`58e2d5d4`) показывают `2d010d53` строкой «Смежный прогноз» — как до правки."""
+    for claim_id, statement, as_of in (
+        ("c-391c4388", OBSERVED_391C4388, AS_OF_OBSERVED),
+        ("c-58e2d5d4", FORECAST_2D010D53, AS_OF_FORECAST),
+    ):
+        rows = _rows_for_card(claim_id, statement, as_of)
+        forecast_ids = {row.candidate_id for row in rows if row.kind == "forecast_adjacent"}
+        assert "c-2d010d53" in forecast_ids, (claim_id, [r.kind for r in rows])
