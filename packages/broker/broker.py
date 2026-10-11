@@ -42,6 +42,7 @@ from packages.sandbox.runtime import (
     ContainerSandboxRuntime,
     SandboxError,
     SandboxHandle,
+    SandboxHealthError,
 )
 
 # §5.7 retry policy: how many ADDITIONAL attempts after the first.
@@ -65,6 +66,8 @@ MAX_OUTPUT = 10_000
 # own latency — which is exactly why only a CI runner tripped over it (run 38112342827).
 # A failed exec whose exit code is CONSISTENT with the container having been killed
 # therefore gets one bounded second look before it may be called a plain failure.
+# T7.92: the same window is reused for an ENGINE-level failure (SandboxError) of
+# shell.execute/python.execute — there too, "still running" is not conclusive.
 CONTAINER_DEATH_RECHECK_SECONDS = 1.0
 CONTAINER_DEATH_RECHECK_INTERVAL = 0.1
 
@@ -216,8 +219,22 @@ class SandboxToolBroker:
             container_gone = False
             if tool in ("shell.execute", "python.execute"):
                 try:
-                    container_gone = not await self.runtime.is_running(self.handle)
+                    if not await self.runtime.is_running(self.handle):
+                        # the T2.22 fast path: the engine already answers "gone" — no waiting
+                        container_gone = True
+                    elif not isinstance(exc, SandboxHealthError):
+                        # T7.92: an engine-level failure (engine command timeout) while docker
+                        # still answers "running" is NOT conclusive — the engine flips the
+                        # container state asynchronously (T7.91 window), and a wedged/half-dead
+                        # dockerd is exactly when that window widens. So the same bounded second
+                        # look applies, with the same rule: unknown only when the engine ITSELF
+                        # answers "not running". A health error is exempt from the wait: there the
+                        # engine cannot be asked anything at all, so a recheck could only repeat
+                        # the same failing command — the classification stays as before.
+                        container_gone = await self._await_container_death()
                 except Exception:
+                    # a state probe that itself failed proves nothing (unchanged behavior):
+                    # unknown is declared only on an actual "not running" answer
                     container_gone = False
             obs = Observation(
                 tool=tool,
@@ -306,6 +323,10 @@ class SandboxToolBroker:
         re-check, not a retry of the action: the command was executed exactly once
         either way, and an unknown outcome is still never retried (RETRY_POLICY /
         §5.7 untouched). The budget is a constant, so the wait cannot become a stall.
+
+        Two call sites share it: a kill-consistent failed exec (T7.91) and an
+        engine-level failure of shell.execute/python.execute (T7.92). A probe that
+        raises is NOT swallowed here — each caller decides what a failing probe means.
         """
         waited = 0.0
         while waited < CONTAINER_DEATH_RECHECK_SECONDS:
