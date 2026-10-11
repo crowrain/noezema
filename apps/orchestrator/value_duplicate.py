@@ -46,6 +46,14 @@ than a foreign piece of evidence under a claim):
   are two statements that name mutually exclusive indicator QUALIFIERS of one topic —
   «наблюдаемая инфляция» (what people already feel) vs «инфляционные ожидания / ожидаемая
   инфляция» (what they expect for the next 12 months), T7.96, `_INDICATOR_QUALIFIER_GROUPS`.
+  T7.96a adds two dictionaries of the same shape, because ONE survey publishes SEVERAL
+  indicators whose formulations differ by exactly one word: WHOSE readings are named
+  («инфляционные ожидания населения» 14,2% vs «ценовые ожидания предприятий» 7,0%,
+  `_INDICATOR_RESPONDENT_GROUPS`) and which HORIZON the formulation names in words
+  («на годовом горизонте» 14,2% vs «на 5 лет вперёд» 10,7%, `_INDICATOR_HORIZON_MARKERS`
+  + `_INDICATOR_HORIZON_SCALES`). All three dictionaries stay veto-only: a conflict is a
+  refusal only when BOTH statements name the differentiator and their group sets do not
+  intersect, and none of them takes part in the overlap count.
 
 Decision policy (variant (i)/(ii) of T7.83): exactly ONE candidate matches strictly and
 the op's evidence links are all `supports` → the host converts the op into a reverify of
@@ -199,12 +207,62 @@ _TERRITORY_GROUPS: tuple[frozenset[str], ...] = (
 #: замер всех 15 формулировок дампа claims_live.tsv (STATUS T7.96) показывает, что их
 #: исключение не чинит этот дефект (пара остаётся ≥3/5) и при этом поднимает перекрытие
 #: других пар — то есть могло бы ДОБАВИТЬ склейки, чего правило делать не должно.
+#: Дополнение T7.96a: та же группа получила глагольные формы того же семейства
+#: («наблюдает/наблюдал/наблюдение», «ощущает») и слово «оценка*» в значении «оценка уже
+#: состоявшегося изменения»: пробы менеджера на c221369 склеивали «Население России НАБЛЮДАЕТ
+#: годовую инфляцию … 15,1%» с ожиданиями 14,2% (перекрытие 2/3) и «Годовая инфляция ПО ОЦЕНКЕ
+#: населения России … 15,1%» с теми же ожиданиями (6/7). «оценка*» при этом остаётся служебным
+#: словом словаря показателя (`_STOP_STEMS`) — его читает только словарь-вето, и читает по всем
+#: буквенным словам формулировки (`_differentiator_words`), а не по словарю показателя.
+#: Опасный класс «медианная оценка ожиданий» этим не расщепляется: такая формулировка называет
+#: обе группы сразу. Замер всех пар корпуса (все буквенные формулировки тестов + 15 формулировок
+#: дампа claims_live.tsv, 194 376 пар, 1 235 склеек на c221369; STATUS T7.96a): ни одна прежняя
+#: законная склейка не сломана, новых склеек 0.
 _INDICATOR_QUALIFIER_GROUPS: tuple[frozenset[str], ...] = (
-    # показания опроса об уже состоявшемся изменении цен
-    frozenset({"наблюдаем", "воспринимаем"}),
+    # показания опроса об уже состоявшемся изменении цен (T7.96 + формы T7.96a)
+    frozenset({"наблюдаем", "воспринимаем", "наблюда", "ощуща", "оцен"}),
     # показания опроса о предстоящем изменении цен (имя показателя «ожидания»)
     frozenset({"ожидани", "ожидаем", "ожидающ"}),
 )
+
+#: ЗАКРЫТЫЙ словарь групп РЕСПОНДЕНТА — «чьи именно показания опроса названы» (T7.96a, та же
+#: форма правила, что у `_TERRITORY_GROUPS`). Стендовые тексты ЦБ держат рядом два показателя
+#: одного периода и одной формы имени: «инфляционные ожидания НАСЕЛЕНИЯ России … 14,2%» и
+#: «ценовые ожидания ПРЕДПРИЯТИЙ России … 7,0%». Лексика имени у них общая (инфляционн-,
+#: ожидания, России, месяц), поэтому словарь показателя даёт ровно порог — 3/5 — и склеивает;
+#: различает пары только это слово. Правило двустороннее: отказ лишь когда обе стороны назвали
+#: респондента и группы не пересекаются (формулировка «ожидания населения и предприятий» называет
+#: обе группы — конфликта нет).
+_INDICATOR_RESPONDENT_GROUPS: tuple[frozenset[str], ...] = (
+    frozenset({"насел", "гражд", "домохозяй"}),
+    frozenset({"предпр", "бизнес", "компани"}),
+)
+
+#: ЗАКРЫТЫЙ словарь ГОРИЗОНТА формулировки (T7.96a). Живые тексты ЦБ называют горизонт
+#: ожидания словом: «на годовом ГОРИЗОНТЕ» 14,2% против «на 5 ЛЕТ ВПЕРЁД» 10,7% — имена
+#: показателя при этом идентичны («инфляционные ожидания населения России»), и словарь
+#: даёт 2/3 выше порога. Числа в сравнение НЕ берутся (цифра — не слово): сопоставляются
+#: группы словесных форм, где горизонт назван МАРКЕРОМ направления («вперёд», «горизонт»)
+#: и ШКАЛОЙ в том же словосочетании (годовая / многолетняя). Период сам по себе («год»,
+#: «месяц», «по итогам года») горизонтом не считается: его отсекает правило периода гейта,
+#: и в словарь показателя эти слова возвращать нельзя (ADR-0033 §10.5).
+_INDICATOR_HORIZON_MARKERS: tuple[str, ...] = ("вперед", "горизонт")
+#: основа «год» снимает и название города — оно не шкала горизонта
+_HORIZON_SCALE_EXCLUSIONS: tuple[str, ...] = ("город",)
+_INDICATOR_HORIZON_SCALES: tuple[frozenset[str], ...] = (
+    # «на годовом горизонте», «на год вперёд»
+    frozenset({"год"}),
+    # «на 5 лет вперёд», «на десять лет вперёд» (шкала стоит рядом с маркером)
+    frozenset({"лет", "пятилет", "десятилет"}),
+)
+
+#: сколько слов может стоять между маркером и шкалой, чтобы это оставалось одним
+#: словосочетанием: 0, то есть шкала обязана стоять рядом с маркером («на годовом ГОРИЗОНТЕ»,
+#: «на год ВПЕРЁД», «на 5 ЛЕТ ВПЕРЁД»). Расширить окно — значит начать читать шкалой слово из
+#: соседней конструкции: в фразе «на 5 лет вперёд в сентябре 2026 года» при окне в одно слово
+#: годовой шкалой стало бы «года» из даты, и формулировка получила бы второй горизонт, которого
+#: она не называет (замер на корпусе это подтверждает: склейка (4) перестала бы отказывать).
+_HORIZON_MAX_GAP_WORDS = 0
 
 #: ключи scope, которые хост читает как метку показателя. Реальное употребление:
 #: `metric` (tests/scenario/test_commit_boundary.py — единственный свободный scope
@@ -269,11 +327,20 @@ def _territory_group_ids(words: frozenset[str]) -> set[int]:
     return groups
 
 
+def _differentiator_words(statement: str) -> list[str]:
+    """Буквенные слова формулировки для словарей-вето (T7.96a). Словарь показателя здесь НЕ
+    используется сознательно: «год», «месяц», «оценка» — служебные слова `_STOP_STEMS`, и
+    возвращать их в словарь показателя нельзя (ADR-0033 §10.5: период решает правило периода
+    гейта), но как средство различия одного и того же имени показателя их прочитать надо.
+    Этот список никогда не участвует в подсчёте перекрытия: он может только ОТМЕНИТЬ склейку."""
+    return [word.lower() for word in _WORD_RE.findall(_normalize_text(statement)) if len(word) >= 3]
+
+
 def _indicator_qualifier_words(statement: str) -> frozenset[str]:
     """Слова-уточнители показателя формулировки (закрытый словарь
     `_INDICATOR_QUALIFIER_GROUPS`, T7.96)."""
     found: set[str] = set()
-    for word in _indicator_tokens(statement):
+    for word in _differentiator_words(statement):
         if any(
             word.startswith(prefix) for group in _INDICATOR_QUALIFIER_GROUPS for prefix in group
         ):
@@ -290,6 +357,68 @@ def _indicator_qualifier_group_ids(words: frozenset[str]) -> set[int]:
         if any(word.startswith(prefix) for prefix in group for word in words):
             groups.add(index)
     return groups
+
+
+def _respondent_words(statement: str) -> frozenset[str]:
+    """Слова, которыми формулировка назвала респондента (закрытый словарь
+    `_INDICATOR_RESPONDENT_GROUPS`, T7.96a)."""
+    found: set[str] = set()
+    for word in _differentiator_words(statement):
+        if any(
+            word.startswith(prefix) for group in _INDICATOR_RESPONDENT_GROUPS for prefix in group
+        ):
+            found.add(word)
+    return frozenset(found)
+
+
+def _respondent_group_ids(words: frozenset[str]) -> set[int]:
+    """Номера групп респондента («населения» и «предприятий» — разные группы; «населения и
+    предприятий» в одной формулировке — обе группы, конфликта нет)."""
+    groups: set[int] = set()
+    for index, group in enumerate(_INDICATOR_RESPONDENT_GROUPS):
+        if any(word.startswith(prefix) for prefix in group for word in words):
+            groups.add(index)
+    return groups
+
+
+def _indicator_horizon_words(statement: str) -> frozenset[str]:
+    """Слова словосочетания, которым формулировка назвала горизонт ожидания (T7.96a):
+    маркер направления и шкала рядом с ним (`_HORIZON_MAX_GAP_WORDS`). Пустое множество —
+    горизонт не назван (маркер без шкалы рядом, «годовая инфляция», «за следующие 12 месяцев»,
+    «на горизонте в один год»): тогда вето молчит и решение остаётся за словарём показателя."""
+    words = _differentiator_words(statement)
+    found: set[str] = set()
+    for index, word in enumerate(words):
+        if not word.startswith(_INDICATOR_HORIZON_MARKERS):
+            continue
+        low = max(0, index - _HORIZON_MAX_GAP_WORDS - 1)
+        high = min(len(words), index + _HORIZON_MAX_GAP_WORDS + 2)
+        for other_index in range(low, high):
+            if other_index == index:
+                continue
+            other = words[other_index]
+            if other.startswith(_INDICATOR_HORIZON_MARKERS):
+                continue
+            if _horizon_scale_group(other) is not None:
+                found.update((word, other))
+    return frozenset(found)
+
+
+def _horizon_scale_group(word: str) -> int | None:
+    """Группа шкалы одного слова («годовом» → годовая, «лет»/«пятилетние» → многолетняя).
+    Название города («город», «городе») годовой шкалой не считается: `_STOP_STEMS` снимает его
+    из словаря показателя по той же основе «год», и здесь путаница так же исключена."""
+    if word.startswith(_HORIZON_SCALE_EXCLUSIONS):
+        return None
+    for index, group in enumerate(_INDICATOR_HORIZON_SCALES):
+        if any(word.startswith(prefix) for prefix in group):
+            return index
+    return None
+
+
+def _indicator_horizon_group_ids(words: frozenset[str]) -> set[int]:
+    """Номера групп шкалы («годовой горизонт» и «5 лет вперёд» — разные группы)."""
+    return {group for word in words if (group := _horizon_scale_group(word)) is not None}
 
 
 def declared_scope_metric(scope: JsonDict | None) -> str | None:
@@ -328,12 +457,15 @@ def indicator_check(
     (а) обе стороны назвали метку показателя — метки обязаны совпасть после
         нормализации (это самый сильный сигнал: он не зависит от формулировки);
     (б) хотя бы у одной метки нет — словари значимых слов обязаны пересечься не
-        слабее `INDICATOR_OVERLAP_MIN`, и формулировки не должны называть разные
-        территории (T7.83a) либо взаимоисключающие уточнители одного показателя
-        (T7.96: «наблюдаемая инфляция» против «инфляционные ожидания / ожидаемая
-        инфляция»). Пустой словарь у одной из сторон = сравнить нечего → False.
+        слабее `INDICATOR_OVERLAP_MIN`, и формулировки не должны называть разные территории
+        (T7.83a), взаимоисключающие уточнители одного показателя (T7.96: «наблюдаемая
+        инфляция» против «инфляционные ожидания / ожидаемая инфляция»; T7.96a расширил ту же
+        группу глагольными формами «наблюдает/ощущает»), разных респондентов одного опроса
+        (T7.96a: «ожидания населения» и «ценовые ожидания предприятий») либо несовместимый
+        названный горизонт (T7.96a: «на годовом горизонте» против «на 5 лет вперёд»). Пустой
+        словарь у одной из сторон = сравнить нечего → False.
 
-    Оба словаря-вето односторонние и только ОТМЕНЯЮТ склейку: они не участвуют в
+    Все четыре словаря-вето двусторонние и только ОТМЕНЯЮТ склейку: они не участвуют в
     подсчёте перекрытия и не могут сделать пару «тот же показатель», если порог или
     другой словарь её не пустили бы."""
     if claim_metric is not None and candidate_metric is not None:
@@ -381,6 +513,36 @@ def indicator_check(
             detail=(
                 f"the statements name different indicator qualifiers "
                 f"{sorted(claim_qualifiers)} vs {sorted(candidate_qualifiers)}"
+            ),
+        )
+    claim_respondents = _respondent_words(claim_statement)
+    candidate_respondents = _respondent_words(candidate_statement)
+    if (
+        claim_respondents
+        and candidate_respondents
+        and not (_respondent_group_ids(claim_respondents) & _respondent_group_ids(candidate_respondents))
+    ):
+        return IndicatorCheck(
+            matched=False,
+            detail=(
+                f"the statements name different survey respondents "
+                f"{sorted(claim_respondents)} vs {sorted(candidate_respondents)}"
+            ),
+        )
+    claim_horizon = _indicator_horizon_words(claim_statement)
+    candidate_horizon = _indicator_horizon_words(candidate_statement)
+    if (
+        claim_horizon
+        and candidate_horizon
+        and not (
+            _indicator_horizon_group_ids(claim_horizon) & _indicator_horizon_group_ids(candidate_horizon)
+        )
+    ):
+        return IndicatorCheck(
+            matched=False,
+            detail=(
+                f"the statements name different indicator horizons "
+                f"{sorted(claim_horizon)} vs {sorted(candidate_horizon)}"
             ),
         )
     union = claim_words | candidate_words
