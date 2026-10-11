@@ -89,6 +89,48 @@ SYNTH_FORECAST_RANGE_SAME_METRIC = (
 )
 SYNTH_FORECAST_INTEGERS_ONLY = "По прогнозу Минэкономразвития, инфляция в России составит 4% и усилится до 5%."
 SYNTH_EXPECTATION_SURVEY = "Инфляционные ожидания населения России — 13,7%"
+# ─── T7.94 (дополнение ADR-0035 §13.7): ожидание и будущее время как признаки прогноза ──
+EXPECT_ANALYSTS_2026 = "Аналитики ожидают, что инфляция в 2026 году составит 4,5%"
+EXPECT_FUTURE_ONLY_2026 = "Инфляция в 2026 году составит 4,5%"
+EXPECT_PAST_REALIZED = "По итогам года инфляция составила 5,59%"
+EXPECT_INTEGERS_ONLY = (
+    "Ожидается, что инфляция замедлится до 4% и сохранится на этом уровне в течение года"
+)
+EXPECT_PARTICIPLE_FORECAST = "Ожидаемая инфляция на 2026 год — 4,5%"
+MEASURED_EXPECTATION_POPULATION = "Ожидаемая населением инфляция на 2026 год — 12,4%"
+MEASURED_EXPECTATION_FULL = (
+    "Наблюдаемая и ожидаемая населением инфляция (медианная оценка) в декабре 2026 года "
+    "составила 12,4%"
+)
+MEASURED_EXPECTATION_VERB = "Согласно опросу инФОМ, население ожидает инфляцию 13,7%"
+EXPECT_ANALYSTS_METRIC = (
+    "Аналитики ожидают, что годовая инфляция в России по итогам 2026 года "
+    "(декабрь 2026 к декабрю 2025) составит 4,5%."
+)
+MEASURED_POPULATION_METRIC = (
+    "Ожидаемая населением инфляция в России по итогам 2026 года (декабрь 2026 к декабрю 2025) "
+    "составила 12,4%."
+)
+EXPECT_SURVEY_INDICATOR_FUTURE = "Ожидаемая населением инфляция в России вырастет до 12,4% в 2026 году"
+EXPECT_SUPPOSITION_SAME_METRIC = (
+    "Экономисты предполагают, что годовая инфляция в России по итогам 2026 года "
+    "(декабрь 2026 к декабрю 2025) — 4,7%."
+)
+EXPECT_BASIS_OVER_SURVEY_INDICATOR = (
+    "Прогноз аналитиков по инфляционным ожиданиям населения на 2026 год — 13,7%"
+)
+EXPECT_BEHIND_FACT_MARKER = "Сначала аналитики ожидали иного, и фактическая инфляция в России — 5,59%"
+EXPECT_ADMIT_WITH_FUTURE = "Экономисты допускают, что инфляция в 2026 году окажется 4,8%"
+MIXED_REALIZED_AND_FUTURE = "Инфляция составила 5,59%, а в 2026 году составит 4,5%"
+EXPECT_PHRASE_WITH_PREDICATE = (
+    "По ожиданиям аналитиков, годовая инфляция в России превысит 5,8% по итогам 2026 года"
+)
+CONSENSUS_WITH_FUTURE_FORM = "Консенсус аналитиков: инфляция в России в 2026 году достигнет 5,2%"
+CONSENSUS_NOUN_ONLY = "Консенсус аналитиков по инфляции на 2026 год — 5,2%"
+PHRASE_WITHOUT_PREDICATE = "По ожиданиям участников рынка годовая инфляция в России — 5,8%"
+EXPECT_PUBLICATION_FUTURE_FORM = (
+    "Окончательная оценка инфляции за 2025 год будет опубликована 16 января: она составила 5,59%"
+)
 SYNTH_FORECAST_IN_OTHER_CLAUSE = (
     "В начале года аналитики опубликовали прогноз по инфляции. Годовая инфляция в России по итогам "
     "2025 года (декабрь 2025 к декабрю 2024) составила 5,59%."
@@ -1119,3 +1161,239 @@ def test_two_ambiguous_records_are_still_other_record_but_without_values() -> No
     assert [kind for kind, _text in rows] == ["other_record", "no_independent"]
     assert rows[0][1].endswith("единицы значений неясны"), rows[0][1]
     assert "совпадает" not in rows[0][1]
+
+
+# ─── T7.94 (дополнение ADR-0035 §13.7): ожидание и будущее время как признаки прогноза ──
+
+
+def test_expectation_clause_marks_the_value_as_forecast() -> None:
+    """Репродуктор дефекта витрины: «Аналитики ожидают, что инфляция в 2026 году составит 4,5%» —
+    прогноз, хотя слово «прогноз» в формулировке не названо ни разу. До правки ближайшее перед
+    значением слово было нейтральным, роль — «фактическое», и запись могла попасть в
+    «Независимую оценку того же показателя». Сказуемое ожидания про само значение — тот же признак
+    прогноза, что и основа «прогн*» (окно и голова отрезка не меняются)."""
+    roles = estimates.value_roles(EXPECT_ANALYSTS_2026)
+    assert roles.forecast == frozenset({"4.5"}), roles
+    assert not roles.realized and not roles.ambiguous, roles
+    assert roles.is_forecast_only
+
+
+def test_future_tense_of_the_value_itself_marks_the_forecast() -> None:
+    """Прогноз высказывают и без слова «прогноз»: будущее время глагола-сказуемого самого значения
+    («инфляция в 2026 году составит 4,5%»). Прошедшее и настоящее время того же глагола — то же
+    слово, но уже не признак: «по итогам года составила 5,59%» остаётся измерением. Поэтому списки
+    `estimates._FUTURE_FORMS` закрытые и состоят из точных форм, а не стемов: стем схлопнул бы
+    «составит» и «составила» и вернул дефект T7.88b."""
+    future = estimates.value_roles(EXPECT_FUTURE_ONLY_2026)
+    assert future.forecast == frozenset({"4.5"}) and not future.realized, future
+    assert future.is_forecast_only
+    past = estimates.value_roles(EXPECT_PAST_REALIZED)
+    assert past.realized == frozenset({"5.59"}) and not past.forecast, past
+
+
+def test_expectation_verb_without_future_tense_marks_the_value_as_forecast() -> None:
+    """Глагол ожидания сам по себе — прогноз, даже когда сказуемое свёрнуто в тире («предполагают,
+    что годовая инфляция … — 4,7%») и когда само ожидание высказано раньше прошедшим временем
+    («экономисты допускают … окажется 4,8%»: здесь признак и глагол, и будущая форма)."""
+    supposition = estimates.value_roles(EXPECT_SUPPOSITION_SAME_METRIC)
+    assert supposition.forecast == frozenset({"4.7"}) and not supposition.realized, supposition
+    admission = estimates.value_roles(EXPECT_ADMIT_WITH_FUTURE)
+    assert admission.forecast == frozenset({"4.8"}) and not admission.realized, admission
+
+
+def test_expectation_participle_over_the_value_is_a_forecast() -> None:
+    """«Ожидаемая инфляция на 2026 год — 4,5%» — prediction, свёрнутая в определение числа: это та
+    же предикация ожидания. Знаменательное существительное («инфляционные ожидания населения …»,
+    «ожидания респондентов») признаком НЕ является: на живых страницах так называют измеряемый
+    показатель опроса (см. следующий тест), а не предсказание значения."""
+    participle = estimates.value_roles(EXPECT_PARTICIPLE_FORECAST)
+    assert participle.forecast == frozenset({"4.5"}) and not participle.realized, participle
+    noun = estimates.value_roles("Инфляционные ожидания по итогам 2026 года — 13,7%")
+    assert noun.realized == frozenset({"13.7"}) and not noun.forecast, noun
+
+
+def test_measured_population_expectations_are_not_a_forecast() -> None:
+    """Измерение чужих ожиданий — показания опроса, а не прогноз реализованного значения:
+    «Инфляционные ожидания населения России — 13,7%» (закреплено с T7.88b), «Наблюдаемая и
+    ожидаемая населением инфляция (медианная оценка) … составила 12,4%», «Ожидаемая населением
+    инфляция на 2026 год — 12,4%» (период назван будущим годом, но число — медианная оценка ответа
+    респондентов) и «согласно опросу инФОМ, население ожидает инфляцию 13,7%»: здесь сказуемое
+    ожидания есть, но оно относится к населению, а не к показателю, и это уже состоявшийся факт
+    опроса. Различает их соседство слова ожидания с «население/домохозяйства/респонденты»
+    (`estimates._MEASURED_EXPECTATION_RE`); оно снимает атрибуцию ожидания и только её."""
+    for statement in (
+        MEASURED_EXPECTATION_POPULATION,
+        MEASURED_EXPECTATION_FULL,
+        MEASURED_EXPECTATION_VERB,
+    ):
+        roles = estimates.value_roles(statement)
+        assert not roles.forecast and not roles.ambiguous, (statement, roles)
+    existing = estimates.value_roles(SYNTH_EXPECTATION_SURVEY)
+    assert existing.realized == frozenset({"13.7"}), existing
+    rows = _rows(_source(), _candidate("c-measured-pop", MEASURED_EXPECTATION_POPULATION))
+    assert [kind for kind, _text in rows] == ["adjacent_metric", "no_independent"], rows
+    assert rows[0][1] == (
+        "Связанная запись: Ожидаемая населением инфляция на 2026 год — 12,4% — показатель "
+        "автоматически не сопоставлен; независимым измерением не считается."
+    ), rows[0][1]
+
+
+def test_survey_reading_with_declared_metric_stays_an_independent_estimate() -> None:
+    """Охрана от перекоса в другую сторону (и проверка, что прежний тест не ослаблен): запись
+    показаний опроса с объявленной той же метрикой и другой записанной группой — независимое
+    ИЗМЕРЕНИЕ того же показателя, а не прогноз. Explorer-v9 (правило 12) перечисляет наблюдаемую и
+    воспринимаемую инфляцию по опросам домохозяйств именно как независимое измерение."""
+    source = _source(
+        metric=METRIC, as_of_year=AS_OF_SOURCE, snapshot_id="snap-1", groups=frozenset({"g0"})
+    )
+    rows = _rows(
+        source,
+        _candidate(
+            "c-survey-metric",
+            MEASURED_POPULATION_METRIC,
+            metric=METRIC,
+            snapshot_id="snap-1",
+            groups=frozenset({"g1"}),
+        ),
+    )
+    assert [kind for kind, _text in rows] == ["independent"], rows
+    assert "расходится на 6,81 п.п." in rows[0][1], rows[0][1]
+
+
+def test_forecast_basis_survives_the_survey_reading_guard() -> None:
+    """Охрана ожидания снимает только атрибуцию ожидания: явная основа прогноза остаётся признаком
+    и внутри оборота про показания опроса — прогноз о значении самого показателя опроса."""
+    roles = estimates.value_roles(EXPECT_BASIS_OVER_SURVEY_INDICATOR)
+    assert roles.forecast == frozenset({"13.7"}) and not roles.realized, roles
+
+
+def test_future_tense_wins_over_the_survey_reading_guard() -> None:
+    """«Ожидаемая населением инфляция в России вырастет до 12,4% в 2026 году» — предсказание того,
+    каким станет показатель опроса: будущая форма глагола здесь не принадлежит обороту измерения и
+    остаётся признаком прогноза."""
+    roles = estimates.value_roles(EXPECT_SURVEY_INDICATOR_FUTURE)
+    assert roles.forecast == frozenset({"12.4"}) and not roles.realized, roles
+    rows = _rows(_source(), _candidate("c-survey-future", EXPECT_SURVEY_INDICATOR_FUTURE))
+    assert [kind for kind, _text in rows] == ["forecast_adjacent", "no_independent"], rows
+
+
+def test_realized_marker_still_beats_the_expectation_basis() -> None:
+    """Порядок ближайшего маркера не изменился: сказуемое ожидания в начале отрезка проигрывает
+    маркеру факта перед значением («сначала аналитики ожидали иного, и фактическая инфляция … —
+    5,59%») — ровно как проигрывал основе «прогн*» (T7.88b)."""
+    roles = estimates.value_roles(EXPECT_BEHIND_FACT_MARKER)
+    assert roles.realized == frozenset({"5.59"}), roles
+    assert not roles.forecast and not roles.ambiguous, roles
+
+
+def test_expectation_over_whole_numbers_keeps_the_silence() -> None:
+    """Признак прогноза не создаёт значения: «ожидается … замедлится до 4% и сохранится» называет
+    только целые числа, а существенное значение — только десятичное (то же правило, что у гейта
+    дублей). Прогнозной строки нет, честная строка обязана остаться молчанием, а не «0 прогнозов»."""
+    roles = estimates.value_roles(EXPECT_INTEGERS_ONLY)
+    assert roles == estimates.ValueRoles(frozenset(), frozenset(), frozenset()), roles
+    rows = _rows(_source(), _candidate("c-integers", EXPECT_INTEGERS_ONLY))
+    assert [(kind, text) for kind, text in rows] == [("no_independent", NO_INDEPENDENT)], rows
+
+
+def test_mixed_record_splits_realized_and_future_values_by_nearest_marker() -> None:
+    """«Инфляция составила 5,59%, а в 2026 году составит 4,5%»: ближайшее перед числом сказуемое
+    решает роль каждого значения отдельно. Измерением записи остаётся 5,59 %, и именно по нему
+    запись сопоставляется с карточкой; прогнозное 4,5 % в сравнении игнорируется."""
+    roles = estimates.value_roles(MIXED_REALIZED_AND_FUTURE)
+    assert roles.realized == frozenset({"5.59"}), roles
+    assert roles.forecast == frozenset({"4.5"}), roles
+    assert not roles.ambiguous and not roles.is_forecast_only, roles
+    rows = _rows(_source(), _candidate("c-mixed-future", MIXED_REALIZED_AND_FUTURE))
+    assert [kind for kind, _text in rows] == ["likely_same_indicator", "no_independent"], rows
+    assert "значение 5,59% совпадает с 5,59%" in rows[0][1], rows[0][1]
+    assert "расходится" not in rows[0][1] and "4,5% совпадает" not in rows[0][1], rows[0][1]
+
+
+def test_expectation_forecast_is_shown_as_a_forecast_row() -> None:
+    """Уровень витрины карточки: та же запись с объявленной той же метрикой и другой записанной
+    группой не может стать «Независимой оценкой того же показателя» — прогнозная строка обязывает
+    назвать её прогнозом и отказать ей в статусе измерения."""
+    source = _source(
+        metric=METRIC, as_of_year=AS_OF_SOURCE, snapshot_id="snap-1", groups=frozenset({"g0"})
+    )
+    rows = _rows(
+        source,
+        _candidate(
+            "c-expect-metric",
+            EXPECT_ANALYSTS_METRIC,
+            metric=METRIC,
+            snapshot_id="snap-1",
+            groups=frozenset({"g1"}),
+        ),
+    )
+    assert [kind for kind, _text in rows] == ["forecast_adjacent", "no_independent"], rows
+    assert rows[0][1].endswith(
+        "— прогноз реализованного значения; независимым измерением этого показателя он не является."
+    ), rows[0][1]
+
+
+def test_expectation_forecast_next_to_the_card_claim_is_a_forecast_adjacent_row() -> None:
+    """Связь с формулировкой карточки выводит различитель T7.83a, а роль — слова самой записи:
+    прогнозная связка остаётся смежным рядом «Смежный прогноз, не измерение» (T7.88b) и не получает
+    ни независимости, ни значения карточки."""
+    rows = _rows(_source(), _candidate("c-expect-analysts", EXPECT_ANALYSTS_2026))
+    assert [kind for kind, _text in rows] == ["forecast_adjacent", "no_independent"], rows
+    assert rows[0][1] == (
+        "Смежный прогноз, не измерение: Аналитики ожидают, что инфляция в 2026 году составит 4,5% — "
+        "прогноз реализованного значения; независимым измерением этого показателя он не является."
+    ), rows[0][1]
+
+
+def test_stand_claims_from_the_live_tsv_keep_their_roles() -> None:
+    """Таблица ролей десяти подлинных формулировок карты 7ceb8047 (fixtures-t788a/claims_live.tsv):
+    ни в одной из них нет ни сказуемого ожидания, ни будущего времени глагола-сказуемого значения
+    («составила», «приведена как», «указана как», «оказалась» — прошедшее и настоящее), поэтому
+    роли T7.88b сохраняются без изменения. Десятое утверждение `58e2d5d4…` — побайтовый дубль
+    `2d010d53…` (T7.85), его роль проверяется той же константой."""
+    claims_live: list[tuple[str, str, frozenset[str], frozenset[str]]] = [
+        ("9266248e", CPI_9266248E, frozenset({"5.59"}), frozenset()),
+        ("c970bc08", SBER_C970BC08, frozenset({"5.6"}), frozenset()),
+        ("7cc2b578", FACT_BELOW_FORECAST_7CC2B578, frozenset({"5.59"}), frozenset({"6.5", "6.6", "6.8"})),
+        ("e2c52955", COMMENT_E2C52955, frozenset({"5.6"}), frozenset()),
+        ("73d52835", PRESS_73D52835, frozenset({"5.6"}), frozenset()),
+        ("6d9a12ff", MEDIAN_6D9A12FF, frozenset({"13.1", "15.6"}), frozenset()),
+        ("2d010d53", FORECAST_2D010D53, frozenset(), frozenset({"6.3"})),
+        ("391c4388", OBSERVED_391C4388, frozenset({"14.5"}), frozenset()),
+        ("e189c80d", OFFICIAL_E189C80D, frozenset({"5.59"}), frozenset()),
+        ("58e2d5d4", FORECAST_2D010D53, frozenset(), frozenset({"6.3"})),
+    ]
+    for claim_uuid, statement, realized, forecast in claims_live:
+        roles = estimates.value_roles(statement)
+        assert roles.realized == realized, (claim_uuid, roles)
+        assert roles.forecast == forecast, (claim_uuid, roles)
+        assert not roles.ambiguous, (claim_uuid, roles)
+
+
+def test_consensus_and_phrase_get_their_role_from_their_own_predicate() -> None:
+    """Знак берётся из предиката, а не из модного оборота: «по ожиданиям аналитиков … превысит 5,8%»
+    и «консенсус аналитиков: … достигнет 5,2%» — прогнозы, потому что рядом со значением стоит сказуемое
+    ожидания или будущая форма. Те же обороты без предиката («консенсус аналитиков по инфляции … — 5,2%»,
+    «по ожиданиям участников рынка годовая инфляция … — 5,8%») признаком не стали: на живых страницах так
+    пересказывают уже опубликованные оценки, а выдумывать признак на слово «консенсус» означало бы прятать
+    измерения под прогнозом. «Консенсус-прогноз» ловится основой «прогн*»: дефис разбивает слово
+    `_MARKER_WORD_RE` на «консенсус» и «прогноз»."""
+    with_predicate = estimates.value_roles(EXPECT_PHRASE_WITH_PREDICATE)
+    assert with_predicate.forecast == frozenset({"5.8"}) and not with_predicate.realized, with_predicate
+    consensus_future = estimates.value_roles(CONSENSUS_WITH_FUTURE_FORM)
+    assert consensus_future.forecast == frozenset({"5.2"}) and not consensus_future.realized, consensus_future
+    noun_only = estimates.value_roles(CONSENSUS_NOUN_ONLY)
+    assert noun_only.realized == frozenset({"5.2"}) and not noun_only.forecast, noun_only
+    phrase_only = estimates.value_roles(PHRASE_WITHOUT_PREDICATE)
+    assert phrase_only.realized == frozenset({"5.8"}) and not phrase_only.forecast, phrase_only
+
+
+def test_future_publication_of_a_report_still_marks_the_value_as_forecast() -> None:
+    """Сознательно принятая граница (задокументирована в ADR-0035 §13.7): «окончательная оценка … будет
+    опубликована 16 января: она составила 5,59%» получает роль прогноза — будущее время относится к
+    публикации, а не к значению, и различить их правилами окна нельзя без морфологии. Направление ошибки
+    прежнее (§13.6): измерение прячется под прогнозом, витрина показывает меньше, чем знает; сравнения по
+    такой записи витрина не утверждает. Тест нужен, чтобы граница была видимой, а не случайной."""
+    roles = estimates.value_roles(EXPECT_PUBLICATION_FUTURE_FORM)
+    assert roles.forecast == frozenset({"5.59"}), roles
+    assert not roles.realized and roles.is_forecast_only, roles
