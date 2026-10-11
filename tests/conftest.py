@@ -1,8 +1,10 @@
 """Shared pytest fixtures (T0.6).
 
 ``fake_llm`` spawns a deterministic OpenAI-compatible server (T0.5) on an
-ephemeral port and yields a handle to script its responses. ``db`` provides an
-async SQLAlchemy session bound to the CI PostgreSQL service when
+ephemeral port and yields a handle to script its responses. The server is
+identified by a unique token (T7.90) so a port collision between xdist
+workers can never make a test talk to another worker's server. ``db``
+provides an async SQLAlchemy session bound to the CI PostgreSQL service when
 ``NOEZEMA_TEST_DATABASE_URL`` is set, and skips otherwise so unit tests run
 anywhere.
 """
@@ -69,40 +71,95 @@ class FakeLLM:
         self._client.close()
 
 
-@pytest.fixture()
-def fake_llm() -> Iterator[FakeLLM]:
-    port = _free_port()
-    root = f"http://127.0.0.1:{port}"
-    proc = subprocess.Popen(
-        [sys.executable, "-m", "tests.fakes.fake_openai_server", "--port", str(port)],
+# T7.90. `_free_port()` releases the port between bind(0) and the subprocess's
+# own bind — a ~0.3 s window (interpreter start + uvicorn import, measured).
+# Under xdist another worker can be handed the same number in that window:
+# the loser's health check then sees the WINNER's HTTP 200 while its own
+# process is still importing, and the test silently talks to another worker's
+# fake server — i.e. another test's scripted queue (the historical flake
+# `test_relied_claims...: relied ids not resolved host-side: []`, T7.84/T7.88a,
+# and `fake LLM server exited during startup`). The fixture therefore
+# (a) hands every spawned server a unique token and accepts only a
+# /_noezema/whoami answer carrying that token — a stranger on the port is
+# never used — and (b) retries with a fresh port when the spawned process
+# died (bind failure) or a stranger answers.
+_FAKE_LLM_ATTEMPTS = 5
+_FAKE_LLM_READY_TIMEOUT = 20.0
+
+
+def _spawn_fake_llm(port: int, token: str) -> subprocess.Popen[bytes]:
+    return subprocess.Popen(
+        [sys.executable, "-m", "tests.fakes.fake_openai_server", "--port", str(port), "--token", token],
         cwd=REPO_ROOT,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+
+
+def _terminate_proc(proc: subprocess.Popen[bytes]) -> None:
+    proc.terminate()
     try:
-        deadline = time.monotonic() + 20
-        up = False
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+
+
+def _probe_fake_llm(proc: subprocess.Popen[bytes], root: str, token: str) -> str:
+    """'ready' — OUR server answers; 'dead' — our process exited (bind failed);
+    'stranger' — a server answers on this port but it is NOT ours; 'pending'."""
+    if proc.poll() is not None:
+        return "dead"
+    try:
+        r = httpx.get(f"{root}/_noezema/whoami", timeout=1.0)
+    except httpx.HTTPError:
+        return "pending"
+    if r.status_code != 200:
+        return "pending"
+    try:
+        served = r.json().get("token")
+    except ValueError:
+        served = None
+    return "ready" if served == token else "stranger"
+
+
+def _start_fake_llm() -> tuple[FakeLLM, subprocess.Popen[bytes]]:
+    """Spawn OUR fake server and wait until it answers under OUR token.
+
+    Returns the handle and its process (the caller owns the process). A port
+    collision is detected — never attached to — and retried on a fresh port,
+    so a test can never end up scripting someone else's fake server.
+    """
+    last = "unknown"
+    for _attempt in range(_FAKE_LLM_ATTEMPTS):
+        port = _free_port()
+        token = secrets.token_hex(16)
+        root = f"http://127.0.0.1:{port}"
+        proc = _spawn_fake_llm(port, token)
+        deadline = time.monotonic() + _FAKE_LLM_READY_TIMEOUT
         while time.monotonic() < deadline:
-            if proc.poll() is not None:
-                raise RuntimeError("fake LLM server exited during startup")
-            try:
-                if httpx.get(f"{root}/v1/models", timeout=1.0).status_code == 200:
-                    up = True
-                    break
-            except httpx.HTTPError:
-                pass
+            status = _probe_fake_llm(proc, root, token)
+            if status == "ready":
+                return FakeLLM(root), proc
+            if status in ("dead", "stranger"):
+                last = status
+                break
             time.sleep(0.05)
-        if not up:
-            raise RuntimeError("fake LLM server did not become ready")
-        handle = FakeLLM(root)
+        else:
+            last = "timeout"
+        _terminate_proc(proc)
+    raise RuntimeError(
+        f"fake LLM server did not start as ours after {_FAKE_LLM_ATTEMPTS} attempts (last: {last})"
+    )
+
+
+@pytest.fixture()
+def fake_llm() -> Iterator[FakeLLM]:
+    handle, proc = _start_fake_llm()
+    try:
         yield handle
-        handle.close()
     finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+        handle.close()
+        _terminate_proc(proc)
 
 
 @pytest.fixture()
@@ -433,8 +490,12 @@ def _sealed() -> SandboxProfile:
 
 __all__ = [
     "FakeLLM",
+    "_probe_fake_llm",
     "_runtime",
     "_sealed",
+    "_spawn_fake_llm",
+    "_start_fake_llm",
+    "_terminate_proc",
     "db_url_factory",
     "docker_engine",
     "fake_llm",

@@ -4,8 +4,14 @@ Purpose: run the entire CI without a GPU. Scenarios are scripted from tests:
 
     POST /_noezema/scenario  {"responses": [...]}   — set the response queue
     GET  /_noezema/state                              — queue length + request log
+    GET  /_noezema/whoami                             — the --token identity (T7.90)
     GET  /v1/models
     POST /v1/chat/completions                         — pops the next scripted reply
+
+`--token` (T7.90): the fixture passes a unique token to the server it spawns
+and checks it via /_noezema/whoami before using the server — so a port
+collision between two xdist workers can never make a test talk to ANOTHER
+worker's server (the historical fake_llm flake, see tests/conftest.py).
 
 A scripted response entry is a JSON object:
     {"message": "..."}                      plain text reply
@@ -70,12 +76,23 @@ _state: dict[str, Any] = {
     "queue": [],
     "requests": [],
     "seq": itertools.count(1),
+    # T7.90: unique identity handed to this process via --token; None when the
+    # server was started manually without one.
+    "token": None,
 }
 
 
 @app.get("/v1/models")
 def models() -> dict[str, Any]:
     return {"object": "list", "data": [{"id": "fake-thinker", "object": "model"}]}
+
+
+@app.get("/_noezema/whoami")
+def whoami() -> dict[str, Any]:
+    """Identity probe (T7.90): the fixture only trusts a server that echoes the
+    exact token it passed to that process — a stranger on a colliding port is
+    detected instead of being silently used."""
+    return {"token": _state["token"]}
 
 
 @app.post("/_noezema/scenario")
@@ -189,7 +206,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Fake OpenAI-compatible LLM server")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8089)
+    parser.add_argument(
+        "--token",
+        default=None,
+        help="unique identity echoed by GET /_noezema/whoami (T7.90: the fixture "
+        "refuses a server that does not answer with its own token)",
+    )
     args = parser.parse_args()
+    _state["token"] = args.token
     import uvicorn
 
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
