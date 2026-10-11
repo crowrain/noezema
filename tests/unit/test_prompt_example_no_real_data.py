@@ -30,12 +30,19 @@ General protection (any future prompt version is covered):
    ``decision.reason`` of the negative example) and the example topic
    itself must not occur in any question-set corpus (v1–v4 in the
    repo, the smoke set when present).
+
+4. T7.97a: свободный ТЕКСТ ПРАВИЛ промпта нынешнего payload не имеет права
+   воспроизводить реальный случай (имя актора или связку «значение +
+   период»), которым этот промпт будут проверять: пример-копия делает
+   исполнение правила неотличимым от переписывания примера. Критерий,
+   его обоснование и область действия — в разделе «T7.97a» ниже.
 """
 
 from __future__ import annotations
 
 import json
 import re
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -246,3 +253,328 @@ def test_rule7_example_ids_do_not_intersect_docs(prompt_file: Path) -> None:
         f"{prompt_file.name}: rule-7 example UUIDs present in docs "
         f"(leaked real run ids): {sorted(leaked - expected)}"
     )
+
+
+# ─── T7.97a: свободный текст ПРАВИЛ нынешнего payload не должен совпадать со случаем,
+#     которым этот промпт будут проверять ────────────────────────────────────────────
+#
+# Проверки 1–3 видят UUID и блоки ```json```, но пример, записанный строкой внутри текста
+# правила, от них вне поля зрения. Дефект curator-v11: правило 11 приводило формулировку
+# «Аналитики SberCIB: прогноз инфляции в России на 2026 год — 6,5% …», то есть ДОСЛОВНО
+# ожидаемый ответ контрольного вопроса витрины 5a68172e (та же сущность, показатель, период и
+# значение прочитанной страницы SberCIB), а explorer-v10 и curator-v11 называли реальный
+# источник того же случая. После активации config-v21 менеджер повторит ровно этот вопрос, и
+# «куратор прочитал улику» было бы неотличимо от «куратор переписал пример». Тот же класс
+# дефекта, от которого защищают T7.39 (реальный id в примере) и T7.50 (свободный текст
+# примеров explorer), — поэтому проверка живёт в этом же файле.
+#
+# Критерий и почему именно такой.
+#
+# (а) Имена акторов. Вынуть «названия организаций» из произвольного русского текста надёжно
+#     нельзя, поэтому список имён закреплён в тесте ЯВНО (`REAL_ACTOR_PATTERNS`), а его
+#     полнота над структурированными реальными данными — проверкой
+#     `test_real_actor_patterns_cover_the_claims_fixture`: каждая строка `claims_live.tsv`
+#     обязана дать хотя бы одно имя из списка, иначе тест краснеет и список придётся менять
+#     осознанно. Имена взяты из реальных данных: утверждения витрины (`claims_live.tsv`),
+#     контрольный вопрос (`control_question.txt`) и отчёты `docs/eval` (Росстат,
+#     Минэкономразвития, ЦБ, «Коммерсантъ»); регулярки накрывают падежи (нормализация
+#     регистра и «ё»), иначе «Банка России» проскакивает мимо «Банк России».
+# (б) Связка «значение + период». Вычисляется ИЗ ДАННЫХ без словаря: из строк claims и из
+#     нормализованной страницы того же стендового случая (закреплена T7.97) берутся
+#     десятичные значения при знаке % и годы 20xx той же строки источника; правило нового
+#     промпта не может содержать такую пару. Это ловит и подмену имени с сохранением случая:
+#     актор переименован, а «6,5% … 2026» осталось. Пары считаются только по НОВЫМ строкам —
+#     иначе унаследованная цифра замороженного текста давала бы фантомные связки с новым.
+#
+# Область действия. Промпты, закреплённые ПОСЛЕДНИМ payload (ныне config-v21), и новее: новый
+# текст этого выпуска написать «на живом примере» ещё можно — именно это запрещается. Строки,
+# байт в байт взятые из прежней закреплённой версии того же промпта (ADR-0019: прежнее
+# содержимое не переписывается), из критерия вынесены, но их попадания закреплены явно
+# (`INHERITED_REAL_DATA`): новая строка с реальными данными краснит тест, и молча разрастающийся
+# унаследованный зазор — тоже. Прежние промпты (пины прежних payload) проверяются как раньше:
+# проверки 1–3.
+
+FIXTURES_DIR = REPO_ROOT / "tests" / "fixtures"
+CLAIMS_LIVE_FIXTURE = FIXTURES_DIR / "t797a" / "claims_live.tsv"
+CONTROL_QUESTION_FIXTURE = FIXTURES_DIR / "t797a" / "control_question.txt"
+#: нормализованная страница стендового случая закреплена в репозиторий раньше (T7.97)
+STAND_PAGE_FIXTURES = [FIXTURES_DIR / "t797" / "sbercib_2026_34ecbe51.normalized.txt"]
+
+#: Имена реальных акторов (T7.97a). Источник каждого имени — реальные данные, а не выдумка теста.
+REAL_ACTOR_PATTERNS: dict[str, str] = {
+    # claims_live.tsv c970bc08 «Независимые оценки Сбера/СберCIB…» и страница случая T7.97
+    "sbercib": r"sbercib|сберcib",
+    # латинское написание того же актора (именно так он написан на странице случая): промпт
+    # мог бы привести его транслитом — это та же утечка
+    "сбер": r"\bсбер\b|\bсбера\b|\bсберу\b|\bсбером\b|\bсбербан\w*|\bsber\b|\bsbera\b",
+    # claims_live.tsv (Банк России — автор прогнозов и опроса) и контрольный вопрос 5a68172e
+    "банк_россии": r"\bбанк\w*\s+росси\w*|\bбанков\w*\s+росси\w*",
+    # claims_live.tsv 7cc2b578 «консенсус-прогноз ЦБ»
+    "цб": r"\bцб\b",
+    # claims_live.tsv e189c80d, 9266248e; отчёты docs/eval
+    "росстат": r"\bросстат\w*",
+    # claims_live.tsv 7cc2b578 «Минэкономразвития»
+    "минэкономразвития": r"минэкономразвити\w*",
+    # контрольный вопрос 5a68172e и claims_live.tsv cc75e97f/7c8c9afe (ООО «инФОМ»)
+    "инфом": r"\bинф[оо]м\w*",
+    # claims_live.tsv d8155167 (ООН) — актор реального утверждения витрины
+    "онн": r"\bоон\b",
+    # отчёты docs/eval и корпус question-set-v4 (kommersant.ru как источник того же показателя)
+    "коммерсант": r"коммерсант\w*|kommersant\w*",
+    # реальный актор наблюдений, зафиксированных в замерах (tests/fixtures/t785, STATUS T7.85)
+    "левада": r"\bлевада\w*|\blevada\w*",
+}
+
+_YEAR_RE = re.compile(r"\b20\d{2}\b")
+#: десятичное значение при % (в том числе в диапазоне «6,5–7%»). Голые числа — порог 0.75 или
+#: номер задачи T7.97 — в отпечаток не входят: без привязки к % они дали бы ложные связки.
+_VALUE_RE = re.compile(r"(?<![\d.,])(\d{1,3}[.,]\d+)(?=\s*(?:%|п\. п\.)|[–-]\s*\d)")
+
+#: Унаследованные попадания: строки нынешнего промпта, байт в байт взятые из прежней
+#: закреплённой версии. Прежнее содержимое не переписывается (ADR-0019), поэтому новый критерий
+#: к ним не применяется — но они закреплены здесь явно: любая новая строка с реальными данными
+#: краснит тест вместо тихого разрастания зазора. Это остаточный дефект класса T7.39 в
+#: замороженном тексте: пример перефразы-дубля правила 7 curator-v10 (и curator-v11 как его
+#: наследник) называет Росстат и 5,59 % за 2025 год — реальный случай витрины.
+INHERITED_REAL_DATA: dict[str, set[tuple[str, str]]] = {
+    "curator-v11.md": {("актор", "росстат"), ("пара", "5,59+2025")},
+}
+
+
+def _norm(text: str) -> str:
+    return text.lower().replace("ё", "е")
+
+
+def _actor_hits(text: str) -> set[tuple[str, str]]:
+    """(имя паттерна, найденный фрагмент) по каждому реальному актору."""
+    normalized = _norm(text)
+    hits: set[tuple[str, str]] = set()
+    for name, pattern in REAL_ACTOR_PATTERNS.items():
+        for match in re.finditer(pattern, normalized):
+            hits.add((name, normalized[match.start() : match.end()]))
+    return hits
+
+
+def _fixture_lines(path: Path) -> list[str]:
+    """Строки реальных данных: у TSV — колонка statement без шапки, у текстовых фикстур — строки
+    без комментариев."""
+    lines = path.read_text(encoding="utf-8").splitlines()
+    if path.suffix == ".tsv":
+        return [row.split("\t")[-1] for row in lines[1:] if row.strip()]
+    return [line for line in lines if not line.lstrip().startswith("#")]
+
+
+def _real_value_year_pairs() -> set[tuple[str, str]]:
+    """Отпечатки «значение + период» реального случая: пара берётся из ОДНОЙ строки источника —
+    иначе любая связка года и числа считалась бы копией случая."""
+    pairs: set[tuple[str, str]] = set()
+    for path in [CLAIMS_LIVE_FIXTURE, *STAND_PAGE_FIXTURES]:
+        for line in _fixture_lines(path):
+            if "%" not in line:
+                continue
+            values = set(_VALUE_RE.findall(_norm(line)))
+            years = set(_YEAR_RE.findall(_norm(line)))
+            pairs |= {(value, year) for value in values for year in years}
+    return pairs
+
+
+def _payload_files() -> list[Path]:
+    files = sorted((DOCS_DIR / "eval").glob("config-v*-payload.json"))
+    assert len(files) >= 2, "нужны минимум два payload, чтобы отличить новый текст от унаследованного"
+
+    def version(path: Path) -> int:
+        match = re.search(r"config-v(\d+)-payload\.json", path.name)
+        assert match, f"не опознан номер payload: {path.name}"
+        return int(match.group(1))
+
+    return sorted(files, key=version)
+
+
+def _current_prompt_targets() -> list[tuple[Path, Path]]:
+    """(нынешний закреплённый промпт, прежняя закреплённая версия того же промпта) по последнему
+    payload. Роль без смены пина получает базой самое себя: нового текста у неё нет — проверка это
+    подтверждает и ждёт следующей редакции этого промпта."""
+    latest = json.loads(_payload_files()[-1].read_text(encoding="utf-8"))
+    previous = json.loads(_payload_files()[-2].read_text(encoding="utf-8"))
+    targets: list[tuple[Path, Path]] = []
+    for role in sorted(latest["prompts"]):
+        path = REPO_ROOT / latest["prompts"][role]["path"]
+        assert path.is_file(), f"{path} закреплён последним payload, но отсутствует на диске"
+        prev_pin = previous["prompts"].get(role)
+        base = REPO_ROOT / prev_pin["path"] if prev_pin else path
+        assert base.is_file(), f"{base}: прежний пин роли {role} отсутствует на диске"
+        targets.append((path, base))
+    return targets
+
+
+def _new_lines(current: Path, base: Path) -> list[str]:
+    """Строки, написанные этой версией: построчное сравнение с прежней закреплённой версией с
+    сохранением кратности (повтор уже существовавшей строки не считается новым текстом)."""
+    lines = current.read_text(encoding="utf-8").splitlines()
+    remaining = Counter(lines)
+    for line in base.read_text(encoding="utf-8").splitlines():
+        if remaining[line]:
+            remaining[line] -= 1
+    new: list[str] = []
+    for line in lines:
+        if remaining[line]:
+            remaining[line] -= 1
+            new.append(line)
+    return new
+
+
+def _inherited_lines(current: Path, base: Path) -> list[str]:
+    pending = Counter(_new_lines(current, base))
+    inherited: list[str] = []
+    for line in current.read_text(encoding="utf-8").splitlines():
+        if pending[line]:
+            pending[line] -= 1
+        else:
+            inherited.append(line)
+    return inherited
+
+
+def _pair_hits(text: str, pairs: set[tuple[str, str]]) -> set[tuple[str, str]]:
+    values = set(_VALUE_RE.findall(_norm(text)))
+    years = set(_YEAR_RE.findall(_norm(text)))
+    return {pair for pair in pairs if pair[0] in values and pair[1] in years}
+
+
+@pytest.mark.unit
+def test_real_data_fixtures_of_the_guard_are_present() -> None:
+    """Страж не должен «озеленеть» из-за тихого исчезновения реальных данных, на которых он
+    построен: их минимальный объём закреплён."""
+    assert CLAIMS_LIVE_FIXTURE.is_file(), f"{CLAIMS_LIVE_FIXTURE} отсутствует"
+    rows = _fixture_lines(CLAIMS_LIVE_FIXTURE)
+    assert len(rows) >= 15, f"в {CLAIMS_LIVE_FIXTURE.name} ожидалось не меньше 15 строк claims"
+    assert CONTROL_QUESTION_FIXTURE.is_file(), f"{CONTROL_QUESTION_FIXTURE} отсутствует"
+    question = "\n".join(_fixture_lines(CONTROL_QUESTION_FIXTURE))
+    assert "инФОМ" in question and "2026" in question, question
+    for path in STAND_PAGE_FIXTURES:
+        assert path.is_file(), path
+        assert len(path.read_text(encoding="utf-8")) > 1_000, path
+
+
+@pytest.mark.unit
+def test_real_actor_patterns_cover_the_claims_fixture() -> None:
+    """Список имён акторов обязан покрывать структурированные реальные данные: каждая строка
+    claims витрины даёт хотя бы одно имя из `REAL_ACTOR_PATTERNS`. Новая строка фикстуры без
+    разбора списка — красный тест; молча сузить список тоже нельзя (см. обоснование критерия (а))."""
+    uncovered = [row[:60] for row in _fixture_lines(CLAIMS_LIVE_FIXTURE) if not _actor_hits(row)]
+    assert not uncovered, f"claims без опознанного актора: {uncovered}"
+
+
+@pytest.mark.unit
+def test_real_value_year_pairs_exist_for_the_t797_case() -> None:
+    """Отпечаток «значение + период» существует ровно для реального случая (6,5 % на 2026 год со
+    страницы SberCIB), а не получается из воздуха; и вымышленное значение примера ни с чьим
+    реальным случаем не пересекается. Без этого проверка 4 была бы пустой."""
+    pairs = _real_value_year_pairs()
+    assert ("6,5", "2026") in pairs, sorted(pairs)[:10]
+    assert not any(value == "3,4" for value, _year in pairs), sorted(pairs)
+
+
+@pytest.mark.unit
+def test_the_guard_catches_the_defect_it_was_written_for() -> None:
+    """Самопроверка сканера (тот же приём, что в T7.65): синтетический текст прежнего правила 11
+    curator-v11 обязан дать и акторное попадание, и связку «значение + период». Зелёный тест на
+    пустом сканере ничего не значит."""
+    old_rule_11 = (
+        "11. Когда вопрос просит независимые оценки или прогнозы: собственная оценка "
+        "не-официального актора записывается отдельным claim'ом — «Аналитики SberCIB: прогноз "
+        "инфляции в России на 2026 год — 6,5% (базовый прогноз на конец 2026 года)», а медиана "
+        "макроэкономического опроса аналитиков Банка России остаётся публикацией ведомства."
+    )
+    actor_hits = _actor_hits(old_rule_11)
+    pair_hits = _pair_hits(old_rule_11, _real_value_year_pairs())
+    assert {"sbercib", "банк_россии"} <= {name for name, _ in actor_hits}, sorted(actor_hits)
+    assert ("6,5", "2026") in pair_hits, sorted(pair_hits)
+
+    # падежи и кириллические написания: тот же сканер обязан опознать актора в косой форме
+    cyrillic_case = (
+        "Независимые оценки Сбера совпали с официальной цифрой Росстата; консенсус-прогноз ЦБ — "
+        "6,6%, Минэкономразвития — 6,8%; опрос инФОМ дал 14,2%; ООН и «Коммерсантъ» тут ни при чём."
+    )
+    assert {
+        "сбер",
+        "росстат",
+        "цб",
+        "минэкономразвития",
+        "инфом",
+        "онн",
+        "коммерсант",
+    } <= {name for name, _ in _actor_hits(cyrillic_case)}, sorted(_actor_hits(cyrillic_case))
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "prompt_file,base_file",
+    _current_prompt_targets(),
+    ids=lambda value: value.name,
+)
+def test_current_prompt_rules_carry_no_real_case_data(prompt_file: Path, base_file: Path) -> None:
+    """Правила промпта нынешнего payload не называют реальных акторов витрины и не воспроизводят
+    связку «значение + период» реального случая — пример-копия делает исполнение правила
+    неотличимым от переписывания примера ровно на том вопросе, которым его проверяют (T7.97a).
+    Попадания унаследованного текста закреплены в `INHERITED_REAL_DATA` побайтно: их рост и
+    исчезновение краснят тест."""
+    new_text = "\n".join(_new_lines(prompt_file, base_file))
+    actor_hits = _actor_hits(new_text)
+    pair_hits = _pair_hits(new_text, _real_value_year_pairs())
+    assert not actor_hits, (
+        f"{prompt_file.name}: новый текст правил называет реальных акторов {sorted(actor_hits)} "
+        "— пример должен быть вымышленным (T7.97a)"
+    )
+    assert not pair_hits, (
+        f"{prompt_file.name}: новый текст правил воспроизводит «значение + период» реального "
+        f"случая {sorted(pair_hits)} — возьмите другое значение и другой год (T7.97a)"
+    )
+
+    inherited = _inherited_lines(prompt_file, base_file)
+    found: set[tuple[str, str]] = set()
+    for line in inherited:
+        found |= {("актор", name) for name, _snippet in _actor_hits(line)}
+        found |= {("пара", f"{value}+{year}") for value, year in _pair_hits(line, _real_value_year_pairs())}
+    declared = INHERITED_REAL_DATA.get(prompt_file.name, set())
+    assert found == declared, (
+        f"{prompt_file.name}: унаследованные реальные данные не совпадают с закреплённым "
+        f"исключением: найдено {sorted(found)}, закреплено {sorted(declared)}"
+    )
+
+
+@pytest.mark.unit
+def test_curator_example_is_fictional_and_matches_no_real_case() -> None:
+    """Пример формулировки оценки в нынешнем curator-промпте помечен как вымышленный случай, его
+    собственные имена не встречаются ни в claims витрины, ни в странице стендового случая, ни в
+    контрольном вопросе, ни в корпусах вопросов, и его «значение + период» не является отпечатком
+    реального случая (T7.97a)."""
+    cur_path, base_path = next((pair for pair in _current_prompt_targets() if "curator" in pair[0].name), (None, None))
+    assert cur_path is not None and base_path is not None, "curator не закреплён последним payload"
+    new_lines = _new_lines(cur_path, base_path)
+    new_text = "\n".join(new_lines)
+    examples = [example for example in re.findall(r"«([^»]+)»", new_text) if "%" in example]
+    assert examples, f"{cur_path.name}: в новом тексте правила нет примера формулировки оценки"
+    assert any("вымышлен" in _norm(line) for line in new_lines), (
+        f"{cur_path.name}: пример правила не помечен как вымышленный случай (T7.97a)"
+    )
+    sources = [
+        (path.name, "\n".join(_fixture_lines(path)))
+        for path in [CLAIMS_LIVE_FIXTURE, CONTROL_QUESTION_FIXTURE, *STAND_PAGE_FIXTURES]
+    ]
+    sources += [(corpus.name, corpus.read_text(encoding="utf-8")) for corpus in _corpora()]
+    for example in examples:
+        # собственные имена примера (первое слово фразы — не имя актора): они не имеют права
+        # встречаться в реальных данных, иначе пример опознаётся как живой случай
+        names = list(re.findall(r"[А-ЯЁ][а-яё]{3,}", example))[1:]
+        names += re.findall(r"„([^”]+)“", example)
+        assert names, f"пример {example!r}: нет собственного имени актора"
+        for source_name, content in sources:
+            normalized = _norm(content)
+            for name in names:
+                assert _norm(name) not in normalized, (
+                    f"пример {example!r}: имя {name!r} встречается в реальных данных {source_name}"
+                )
+        assert not _pair_hits(example, _real_value_year_pairs()), (
+            f"пример {example!r}: совпадает со связкой «значение + период» реального случая"
+        )
+

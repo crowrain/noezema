@@ -628,7 +628,12 @@ class TestDevStandConfigVersion:
     #: canonical-хеші payload'ов: именно они попадают в `config_snapshots.payload_sha256` (AGENTS §8),
     #  в скриптах и README они названы короткими префиксами — оператор сверяет head по ним
     V20_CANONICAL = "2b065470"
-    V21_CANONICAL = "7af30850"
+    #: T7.97a: canonical config-v21 пересчитан — файл не менял форму (ровно два пина prompt'ов),
+    #: но сами промпты curator-v11 и explorer-v10 правятся на месте (выпущенными ещё не были):
+    #: пример правила 11 заменён вымышленным случаем, ведомство в правилах названо ролью.
+    #: config-v20 при этом байт в байт прежний (`2b065470`), активация v21 — по-прежнему решение
+    #: менеджера, откат v20 не тронут.
+    V21_CANONICAL = "baf6e34c"
     V19_CANONICAL = "4d76c000"
     V18_CANONICAL = "b5605e4e"
     V17_CANONICAL = "5c402f4d"

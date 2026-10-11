@@ -190,12 +190,12 @@
   "prompts": {
     "curator": {
       "path": "prompts/curator/curator-v11.md",
-      "sha256": "3702b7f5cb4b007ca186401251d3a6c453ac509b41a13118aa045c3a8bb71c07",
+      "sha256": "1064b15e03ef924bbf393fa08188cfd141f308a22fea9ed72028006998f64935",
       "version": "curator-v11"
     },
     "explorer": {
       "path": "prompts/explorer/explorer-v10.md",
-      "sha256": "8af31bbfe9ac790c55768eb46dc5a2a9def6531894cd31b617a02ea963d4f4f0",
+      "sha256": "2351e76cdd4988c0730edf066582b9850d5ef10af84171fd2eb1dbd67f074203",
       "version": "explorer-v10"
     },
     "extractor": {

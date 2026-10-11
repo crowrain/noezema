@@ -138,9 +138,17 @@ def render_repeat_fetch_note(step: int, first_step: int) -> str:
     """Honesty about a second read of the same address in one session (the stand burned two steps this
     way on `rosstat.gov.ru` and one on the already-read `cbr.ru`). The call is still executed — a repeat
     fetch legitimately checks freshness — but the model is told that the group independence does not grow
-    from it (T7.75) and that a second side of a check needs a DIFFERENT address."""
+    from it (T7.75) and that a second side of a check needs a DIFFERENT address.
+
+    T7.97a (текстовая правка, логика и лимиты не тронуты): прежняя формулировка противоречила правилу
+    13 explorer-v10, которое требует перечитать адрес, если страница с прочитанной оценкой уже выпала из
+    контекста шага (бюджет T7.10). Отметка обязана называть законную цель повторного захода — вернуть
+    страницу в контекст до подведения итога, — иначе модель получает два взаимоисключающих указания в
+    одном контексте. Независимость от повтора по-прежнему не растёт (T7.75), и `TOOL_REPEAT_DENY_LIMIT`
+    остаётся прежним: правка касается только текста отметки."""
     return (
         f"[{step}] повтор того же адреса: первая попытка была на шаге {first_step}. Новых знаний этот "
-        "заход не обещает, второй группы независимости от него нет. Для второй стороны проверки нужен "
-        "другой адрес."
+        "заход не обещает, второй группы независимости от него нет; он законен только чтобы вернуть в "
+        "контекст страницу, которую снял бюджет контекста, — без перечитывания оценку честно не "
+        "назвать. Для второй стороны проверки нужен другой адрес."
     )
