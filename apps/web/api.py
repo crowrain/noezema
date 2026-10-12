@@ -204,7 +204,7 @@ _ENGINEER_HTML = """<!doctype html>
 <p><a href="/knowledge">Знание (граф)</a> · <a href="/diagnostics">Диагностика</a></p>
 <p><a href="/metrics">Метрики (§16)</a> · <a href="/evaluation">Evaluation (§22.2)</a></p>
 <div id="banner" class="none">загрузка…</div>
-<div class="card"><b>Узел:</b> <span id="node">—</span> · <b>Фазa:</b> <span id="phase">—</span></div>
+<div class="card"><b>Узел:</b> <span id="node">—</span> · <b>Фаза:</b> <span id="phase">—</span></div>
 <div class="card"><b>Конфиг:</b> <code id="cfg">—</code></div>
 <div class="card"><b>Сессия:</b> <span id="sess">—</span></div>
 <div class="card"><b>Ресурсы:</b> <span id="counts">—</span></div>
@@ -781,7 +781,7 @@ async function tick(){
     if(!r.ok){document.getElementById('detail').textContent='не найдена';return;}
     const s = await r.json();
     document.getElementById('detail').innerHTML =
-      `<b>Фазa:</b> ${s.state} · <b>Вопрос:</b> ${s.question_id||'—'}`;
+      `<b>Фаза:</b> ${s.state} · <b>Вопрос:</b> ${s.question_id||'—'}`;
     const ul = document.getElementById('events'); ul.innerHTML='';
     for(const e of s.events){ const li=document.createElement('div'); li.className='ev';
       li.innerHTML = `<span class="t">${e.sequence} ${e.type}</span> `+
