@@ -36,6 +36,10 @@ General protection (any future prompt version is covered):
    период»), которым этот промпт будут проверять: пример-копия делает
    исполнение правила неотличимым от переписывания примера. Критерий,
    его обоснование и область действия — в разделе «T7.97a» ниже.
+   T7.102: у нынешнего curator-промпта (ныне curator-v12, пин config-v22)
+   унаследованных исключений нет — пример перефразы правила 7 заменён
+   вымышленным случаем той же формы; запись для curator-v11 остаётся как
+   история выпущенного пина config-v21.
 """
 
 from __future__ import annotations
@@ -286,13 +290,15 @@ def test_rule7_example_ids_do_not_intersect_docs(prompt_file: Path) -> None:
 #     актор переименован, а «6,5% … 2026» осталось. Пары считаются только по НОВЫМ строкам —
 #     иначе унаследованная цифра замороженного текста давала бы фантомные связки с новым.
 #
-# Область действия. Промпты, закреплённые ПОСЛЕДНИМ payload (ныне config-v21), и новее: новый
+# Область действия. Промпты, закреплённые ПОСЛЕДНИМ payload (ныне config-v22: curator-v12), и новее: новый
 # текст этого выпуска написать «на живом примере» ещё можно — именно это запрещается. Строки,
 # байт в байт взятые из прежней закреплённой версии того же промпта (ADR-0019: прежнее
 # содержимое не переписывается), из критерия вынесены, но их попадания закреплены явно
 # (`INHERITED_REAL_DATA`): новая строка с реальными данными краснит тест, и молча разрастающийся
 # унаследованный зазор — тоже. Прежние промпты (пины прежних payload) проверяются как раньше:
-# проверки 1–3.
+# проверки 1–3. С T7.102 закреплён дополнительный инвариант нынешнего curator-промпта: у него
+# унаследованных исключений быть не может (`INHERITED_REAL_DATA` для него пуст) — остаточная
+# протечка правила 7 закрыта заменой примера перефразы на вымышленный случай.
 
 FIXTURES_DIR = REPO_ROOT / "tests" / "fixtures"
 CLAIMS_LIVE_FIXTURE = FIXTURES_DIR / "t797a" / "claims_live.tsv"
@@ -336,8 +342,14 @@ _VALUE_RE = re.compile(r"(?<![\d.,])(\d{1,3}[.,]\d+)(?=\s*(?:%|п\. п\.)|[–-]
 #: краснит тест вместо тихого разрастания зазора. Это остаточный дефект класса T7.39 в
 #: замороженном тексте: пример перефразы-дубля правила 7 curator-v10 (и curator-v11 как его
 #: наследник) называет Росстат и 5,59 % за 2025 год — реальный случай витрины.
+#: С T7.102 дефект закрыт в curator-v12: абзац перефразы правила 7 заменён вымышленным
+#: случаем той же формы, поэтому у нынешнего промпта унаследованных исключений нет (пустая
+#: запись ниже — проверка обязана быть чистой, см. test_current_curator_prompt_has_no_inherited_exceptions).
+#: Запись curator-v11 остаётся как история: v11 закреплён config-v21 и не переписывается;
+#: его попадание проверяет test_released_curator_v11_record_stays_pinned.
 INHERITED_REAL_DATA: dict[str, set[tuple[str, str]]] = {
     "curator-v11.md": {("актор", "росстат"), ("пара", "5,59+2025")},
+    "curator-v12.md": set(),
 }
 
 
@@ -539,6 +551,47 @@ def test_current_prompt_rules_carry_no_real_case_data(prompt_file: Path, base_fi
     assert found == declared, (
         f"{prompt_file.name}: унаследованные реальные данные не совпадают с закреплённым "
         f"исключением: найдено {sorted(found)}, закреплено {sorted(declared)}"
+    )
+
+
+@pytest.mark.unit
+def test_current_curator_prompt_has_no_inherited_exceptions() -> None:
+    """T7.102: у нынешнего curator-промпта (пин последнего payload) унаследованных исключений
+    быть не может: остаточная протечка правила 7 (Росстат и 5,59 % за 2025 год) закрыта заменой
+    примера перефразы на вымышленный случай той же формы. Непустая запись `INHERITED_REAL_DATA`
+    для нынешнего промпта означает, что протечка вернулась (или в новую версию заморожен новый
+    реальный текст) — тест краснеет."""
+    cur_path, _base = next((pair for pair in _current_prompt_targets() if "curator" in pair[0].name), (None, None))
+    assert cur_path is not None, "curator не закреплён последним payload"
+    declared = INHERITED_REAL_DATA.get(cur_path.name, set())
+    assert declared == set(), (
+        f"{cur_path.name}: нынешний curator-промпт опирается на унаследованные реальные данные "
+        f"{sorted(declared)} — с T7.102 нынешний curator-промпт обязан быть чистым"
+    )
+
+
+@pytest.mark.unit
+def test_released_curator_v11_record_stays_pinned() -> None:
+    """История закреплена, а не ослаблена: curator-v11 (пин config-v21) не переписывается — его
+    новый текст (правило 11) чист, а унаследованные попадания замороженного правила 7 совпадают
+    с закреписью `INHERITED_REAL_DATA` побайтно. Переписать v11 «под сканер» или разрастить
+    зазор — красный тест."""
+    v21 = json.loads((DOCS_DIR / "eval" / "config-v21-payload.json").read_text(encoding="utf-8"))
+    v20 = json.loads((DOCS_DIR / "eval" / "config-v20-payload.json").read_text(encoding="utf-8"))
+    cur = REPO_ROOT / v21["prompts"]["curator"]["path"]
+    base = REPO_ROOT / v20["prompts"]["curator"]["path"]
+    assert cur.name == "curator-v11.md" and base.name == "curator-v10.md", (cur.name, base.name)
+    new_text = "\n".join(_new_lines(cur, base))
+    assert not _actor_hits(new_text), sorted(_actor_hits(new_text))
+    assert not _pair_hits(new_text, _real_value_year_pairs()), sorted(_pair_hits(new_text, _real_value_year_pairs()))
+    found: set[tuple[str, str]] = set()
+    for line in _inherited_lines(cur, base):
+        found |= {("актор", name) for name, _snippet in _actor_hits(line)}
+        found |= {("пара", f"{value}+{year}") for value, year in _pair_hits(line, _real_value_year_pairs())}
+    declared = INHERITED_REAL_DATA.get(cur.name, set())
+    assert found == declared, (
+        f"{cur.name}: унаследованные реальные данные выпущенного промпта не совпадают с "
+        f"закреплённой историей: найдено {sorted(found)}, закреплено {sorted(declared)}"
     )
 
 

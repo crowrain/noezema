@@ -634,6 +634,12 @@ class TestDevStandConfigVersion:
     #: config-v20 при этом байт в байт прежний (`2b065470`), активация v21 — по-прежнему решение
     #: менеджера, откат v20 не тронут.
     V21_CANONICAL = "baf6e34c"
+    #: T7.102: canonical config-v22 = config-v21 ровно с одной правкой — пин `prompts.curator` →
+    #: curator-v12 (реальный пример абзаца перефразы правила 7 — 5,59 % / Росстат / 2025 год —
+    #: заменён вымышленным случаем той же формы, смысл правила не изменён). config-v21 байт в байт
+    #: прежний (`baf6e34c`), дефолт bootstrap'а прежний (config-v20): активация v22 — по-прежнему
+    #: решение менеджера (STATUS T7.102).
+    V22_CANONICAL = "05ada8a4"
     V19_CANONICAL = "4d76c000"
     V18_CANONICAL = "b5605e4e"
     V17_CANONICAL = "5c402f4d"
@@ -772,6 +778,40 @@ class TestDevStandConfigVersion:
             assert v21["prompts"][role.name.lower()] == v20["prompts"][role.name.lower()], role
         # v20 остаётся ровно прежним canonical (прежние payload'ы не переписываются)
         assert canonical_sha256(v20).startswith(self.V20_CANONICAL)
+
+    def test_config_v22_is_config_v21_with_one_curator_pin(self) -> None:
+        """T7.102: новый payload config-v22 = config-v21 ровно с одной правкой — пин
+        `prompts.curator` → curator-v12 (реальный пример абзаца перефразы правила 7 заменён
+        вымышленным случаем той же формы; смысл правила не изменён). Пороги, `claim_type_rules`,
+        бюджеты, окна, `model.*` и пин explorer-v10 — байт в байт v21; canonical v22 закреплён и
+        проверен на живом файле; config-v21 не переписан и остаётся историей (его canonical
+        `baf6e34c`); дефолт bootstrap'а прежний — config-v20 (активация v22 — решение менеджера,
+        STATUS T7.102)."""
+        import json
+
+        from packages.domain.canonical import canonical_sha256
+        from packages.llm_gateway.roles import Role, resolve_prompts
+
+        v21 = json.loads((REPO_ROOT / "docs" / "eval" / "config-v21-payload.json").read_text(encoding="utf-8"))
+        v22_path = REPO_ROOT / "docs" / "eval" / "config-v22-payload.json"
+        assert v22_path.is_file()
+        v22 = json.loads(v22_path.read_text(encoding="utf-8"))
+        assert {k for k in v22 if v22[k] != v21[k]} == {"prompts"}
+        assert {r for r in v22["prompts"] if v22["prompts"][r] != v21["prompts"][r]} == {"curator"}
+        assert canonical_sha256(v22).startswith(self.V22_CANONICAL)
+        resolved = resolve_prompts(v22["prompts"], REPO_ROOT)
+        assert resolved[Role.CURATOR].version == "curator-v12"
+        assert resolved[Role.CURATOR].sha256 == v22["prompts"]["curator"]["sha256"]
+        assert resolved[Role.EXPLORER].version == "explorer-v10"
+        assert resolved[Role.EXPLORER].sha256 == v21["prompts"]["explorer"]["sha256"]
+        for role in (Role.PLANNER, Role.VERIFIER, Role.EXTRACTOR):
+            assert v22["prompts"][role.name.lower()] == v21["prompts"][role.name.lower()], role
+        # config-v21 остаётся ровно прежним canonical (прежние payload'ы не переписываются)
+        assert canonical_sha256(v21).startswith(self.V21_CANONICAL)
+        # дефолт bootstrap'а не тронут: config-v20, config-v22 в скриптах не упоминается
+        bootstrap = BOOTSTRAP.read_text(encoding="utf-8")
+        assert f'CONFIG_PAYLOAD="${{NOEZEMA_DEV_CONFIG_PAYLOAD:-$REPO_ROOT/{self.V20_REF}}}"' in bootstrap
+        assert "config-v22" not in bootstrap
 
 
 class TestDevStandReasoningProfile:
