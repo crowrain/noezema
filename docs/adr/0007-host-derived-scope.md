@@ -53,7 +53,7 @@ independence) и §11.2/AGENTS.md §3 (ID и другие grade-входы ге�
    - `source_domains`: registrable domain источников, названных
      вопросом (та же гранулярность, что у independence-групп §11.3).
      Вопрос без источников → пустой список = нет ограничения.
-2. **Evidence scope** — из PROVENANCE строки evidence (дurable
+2. **Evidence scope** — из PROVENANCE строки evidence (durable
    `sources` row): registrable domain `canonical_uri` и
    `retrieved_at`; для не-source evidence — время наблюдения
    (commit time). При переиспользовании claim все строки evidence

@@ -94,7 +94,7 @@ overall failed по `significant_claim_reuse`) → **EVAL-3d** (2026-09-19,
 | eligible sessions с результатом | ≥60% | mechanism: ADR-0004 + test_evaluation.py (eligible/completed sessions); расчёт: gates.py + test_evaluation_gates.py; actual run — T7.7 (EVAL-1/2); EVAL-3d (2026-09-19, mid-run v2→v3) — ADR-0008 |
 | near-duplicate вопросы | ≤15% | mechanism: ADR-0004 + test_evaluation.py (thresholds jsonb); расчёт: gates.py + test_evaluation_gates.py; actual run — T7.7 (EVAL-1/2); EVAL-3d (2026-09-19, mid-run v2→v3) — ADR-0008 |
 | переиспользование значимых claims | ≥25% / 20 сессий | mechanism: ADR-0004 + test_evaluation.py (thresholds jsonb); расчёт: gates.py + test_evaluation_gates.py; actual run — T7.7 (EVAL-1/2); EVAL-3d (2026-09-19, mid-run v2→v3) — ADR-0008; EVAL-4d — **0/29 failed**: разбор (три пути гейта — evidence/revisions/dependencies, 0 срабатываний; 11 паков; 14 memory.search, replay 8/14; связывающее ограничение — «follow-up'ы не коммитят знание» (22/33 паковых сессий) + шов побайтового statement+type; у claim'а нет identity (только точный statement+type), у evidence — есть (§14.3); варианты) — **T7.33**, `docs/eval/EVAL-4d-reuse-analysis.md`; **T7.34/ADR-0018 (2026-09-23, решение пользователя — направление (vii), включая минимальную правку ARCHITECTURE.md §14.1)**: перепроверка существующего claim'а теперь записывается — `claim`-операция staging с `existing_claim_id` (host-issued id, модель только ссылается; префикс — только однозначный среди видимых, fail-closed; T7.9-условие на обеих границах), запись = сессионная строка `claim_assessments` (независимо от evidence — ловушка identity: 12/20 identities якорей схлопываются, ЕС — полное), гейт 5 — пятый путь `claim_assessments.created_in_session` (порог 0.25/`at_least` не тронуты), relative-срок сдвигается к моменту перепроверки (ADR-0017, единое правило), curator-v4 + config-v6-payload (diff 1 строка); форма EVAL-4d в фикстуре: полная 8/29 = 0.276 → **passed**, строгая (5 по id) 5/29 = 0.172 → failed (сохранённый 0/29 не тронут) — тесты test_claim_reference.py (12), test_staging_schema.py (+5), test_memory_service.py (+8), test_reverify_curator.py (2), test_evaluation_gates.py (+3), раздел T7.34; **T7.38** (2026-09-24, решение пользователя: предложения (1)/(2)/(5) разбора SMOKE-V8-K2): curator-v5 + config-v9 — матрица type↔evidence в промпте (единый источник истины с `claim_type_rules` — test_curator_prompt_matrix.py), правило 7 «Перепроверка» с конкретным примером, `dependencies: []` без заглушек (корень гибели обоих паков смоука: 0/7 `existing_claim_id`, пары `computed_result←local_observation`/`local_observation←source_assertion` отбивали ВСЁ предложение) — только текст промпта + bootstrap-пин, схема/rules_hash/payload'ы v2…v8 не тронуты; проверка — повторный смоук (отдельная задача), раздел T7.38; **T7.39** (2026-09-24, решение пользователя): curator-v6 + config-v10 — пример перепроверки заменён на свободный от данных (тема вне корпусов + свежий UUID; приёмка T7.38: в v5 был настоящий id claim'а SMOKE-V8-K2), тест-страж «в примерах промптов нет реальных данных» — test_prompt_example_no_real_data.py, раздел T7.39 |
-| due/stale time-sensitive | <20% | mechanism: ADR-0004 + test_evaluation.py (thresholds jsonb); расчёт: gates.py + test_evaluation_gates.py + test_freshness.py (T7.27/ADR-0014: правило §8.6/T3.7 по reverify_after на момент расчёта гейта, не по сохранённому полю — без зависимости от переоценки/флипа; retrieval — то же правило при чтении); T7.28/ADR-0015: строгое направление `below` (`ratio < threshold`) по спеке «<20%» — на границе 6/30 = 0.200 → failed, 6/31 → passed (до T7.28 — `at_most`, расхождение на границе); граничные тесты всех долевых гейтов — test_evaluation_gates.py (+18); actual run — T7.7 (EVAL-1/2); EVAL-3d (2026-09-19, mid-run v2→v3) — ADR-0008; EVAL-4d — passed 0/28 по сохранённому полю (артефакт), по правилу failed 22/28 — ADR-0014; сохранённых результатов g6 ровно на пороге 0.20 в прошлых прогонах нет (SELECT по noezema-eval*); T7.30/ADR-0016: опорная дата as_of строки claim — хост-деривация (явная дата вопроса > относительная форма → дата сессии по часам хоста > модельный as_of при бездатовом вопросе; модельная дата — только аудит: staging + claim_created `as_of`/`assessed_as_of`), формула reverify_after не изменена — test_scope.py (+6), test_as_of_commit.py (7: коммит relative/явная/бездат/полночь-UTC, переоценка без возврата модельной даты, re-деривация as_of при переиспользовании, форма EVAL-4d 19 relative + 6 явных старых + 3 бездатных = 28 → g6 8/28 = 0.2857 → failed — пересчёт T7.29); T7.31 (2026-09-23): заморозка EVAL-5 — корпус v4 (55 вопросов: 34 v2 + 13 v3 дословно + 8 новых; бездатных URL-вопросов 0 — все с явной датой/относительной формой; K = 2 заложенных due: ООН @ 2026-04-15, ЕС @ 2026-01-01; sha256 `b08009ff…`); предрегистрация g6 — **passed** (2/22.3 = 0.090; маржа 2: проходит при ≤ 4 due, падает при 5; N < 20 → insufficient_sample — гейт не оценён, не failed); предрегистрация g5 — failed при наблюдаемом R = 0 (EVAL-4d), но арифметически проходим в отличие от v3 (пул 28–34 ≤ 4R = 40: 10/28 = 0.357 … 10/34 = 0.294 ≥ 0.25; незакрытый в v3 конфликт g5/g6 — 11/47 = 0.234 — снят); EVAL-5-freeze.md, раздел T7.31; T7.32/ADR-0017 (2026-09-23): срок перепроверки существует ТОЛЬКО у утверждения о настоящем (якорь `relative` → now + окно volatility; якоря `explicit`/`none` — срока нет, NULL) — класс «просрочен навсегда» (улика `de9855eb`, Спутник 1957) исчезает по построению; статус `evergreen` (NULL = «срока нет по построению»; retrieval-вес 1.0 = fresh — неизменный факт не опускается как unknown); знаменатель гейта 6 = только `temporal_fact` с `reverify_after IS NOT NULL` (способные просрочиться; фиксированные моменты не проходят гейт композицией); порог 0.20 и направление `below` не тронуты; миграция 0024; предрегистрация PЕРЕСЧИСЛЕНА: K = 0, знаменатель relative-only 20.3–22.6, ожидаемо **passed** 0/20.3 … 0/22.6 (проходит при ≤ 4 due — 4/20.3 = 0.197 < 0.20, падает при 5 — 0.246/0.221; N < 20 → insufficient_sample); тесты: test_scope.py (+3), test_freshness.py (+1), test_rules_engine.py (+1), test_as_of_commit.py (+1), test_evaluation_gates.py (+1), test_retrieval.py/test_memory_service.py/test_reassessment.py (ожидания по правилу ADR-0017) — ADR-0017, пометка в ADR-0014, EVAL-5-freeze.md §3.1, раздел T7.32 |
+| due/stale time-sensitive | <20% | mechanism: ADR-0004 + test_evaluation.py (thresholds jsonb); расчёт: gates.py + test_evaluation_gates.py + test_freshness.py (T7.27/ADR-0014: правило §8.6/T3.7 по reverify_after на момент расчёта гейта, не по сохранённому полю — без зависимости от переоценки/флипа; retrieval — то же правило при чтении); T7.28/ADR-0015: строгое направление `below` (`ratio < threshold`) по спеке «<20%» — на границе 6/30 = 0.200 → failed, 6/31 → passed (до T7.28 — `at_most`, расхождение на границе); граничные тесты всех долевых гейтов — test_evaluation_gates.py (+18); actual run — T7.7 (EVAL-1/2); EVAL-3d (2026-09-19, mid-run v2→v3) — ADR-0008; EVAL-4d — passed 0/28 по сохранённому полю (артефакт), по правилу failed 22/28 — ADR-0014; сохранённых результатов g6 ровно на пороге 0.20 в прошлых прогонах нет (SELECT по noezema-eval*); T7.30/ADR-0016: опорная дата as_of строки claim — хост-деривация (явная дата вопроса > относительная форма → дата сессии по часам хоста > модельный as_of при бездатовом вопросе; модельная дата — только аудит: staging + claim_created `as_of`/`assessed_as_of`), формула reverify_after не изменена — test_scope.py (+6), test_as_of_commit.py (7: коммит relative/явная/бездат/полночь-UTC, переоценка без возврата модельной даты, re-деривация as_of при переиспользовании, форма EVAL-4d 19 relative + 6 явных старых + 3 бездатных = 28 → g6 8/28 = 0.2857 → failed — пересчёт T7.29); T7.31 (2026-09-23): заморозка EVAL-5 — корпус v4 (55 вопросов: 34 v2 + 13 v3 дословно + 8 новых; бездатных URL-вопросов 0 — все с явной датой/относительной формой; K = 2 заложенных due: ООН @ 2026-04-15, ЕС @ 2026-01-01; sha256 `b08009ff…`); предрегистрация g6 — **passed** (2/22.3 = 0.090; маржа 2: проходит при ≤ 4 due, падает при 5; N < 20 → insufficient_sample — гейт не оценён, не failed); предрегистрация g5 — failed при наблюдаемом R = 0 (EVAL-4d), но арифметически проходим в отличие от v3 (пул 28–34 ≤ 4R = 40: 10/28 = 0.357 … 10/34 = 0.294 ≥ 0.25; незакрытый в v3 конфликт g5/g6 — 11/47 = 0.234 — снят); EVAL-5-freeze.md, раздел T7.31; T7.32/ADR-0017 (2026-09-23): срок перепроверки существует ТОЛЬКО у утверждения о настоящем (якорь `relative` → now + окно volatility; якоря `explicit`/`none` — срока нет, NULL) — класс «просрочен навсегда» (улика `de9855eb`, Спутник 1957) исчезает по построению; статус `evergreen` (NULL = «срока нет по построению»; retrieval-вес 1.0 = fresh — неизменный факт не опускается как unknown); знаменатель гейта 6 = только `temporal_fact` с `reverify_after IS NOT NULL` (способные просрочиться; фиксированные моменты не проходят гейт композицией); порог 0.20 и направление `below` не тронуты; миграция 0024; предрегистрация ПЕРЕСЧИСЛЕНА: K = 0, знаменатель relative-only 20.3–22.6, ожидаемо **passed** 0/20.3 … 0/22.6 (проходит при ≤ 4 due — 4/20.3 = 0.197 < 0.20, падает при 5 — 0.246/0.221; N < 20 → insufficient_sample); тесты: test_scope.py (+3), test_freshness.py (+1), test_rules_engine.py (+1), test_as_of_commit.py (+1), test_evaluation_gates.py (+1), test_retrieval.py/test_memory_service.py/test_reassessment.py (ожидания по правилу ADR-0017) — ADR-0017, пометка в ADR-0014, EVAL-5-freeze.md §3.1, раздел T7.32 |
 | reassessment SLO | зафиксировано до run | mechanism: ADR-0004 + test_evaluation.py (reassessment_slo_seconds в thresholds, фиксация до run); расчёт: gates.py + test_evaluation_gates.py; actual run — T7.7 (SLO 3600 с, зафиксировано); EVAL-3d — ADR-0008 |
 | current assessments с pending/invalid ancestor | 0 | mechanism: ADR-0004 + test_evaluation.py (thresholds jsonb); расчёт: gates.py + test_evaluation_gates.py; actual run — T7.7 (EVAL-1/2); EVAL-3d (2026-09-19, mid-run v2→v3) — ADR-0008 |
 | high-severity incidents | 0 | mechanism: ADR-0004 + test_evaluation.py (thresholds jsonb); расчёт: gates.py + test_evaluation_gates.py; actual run — T7.7 (EVAL-1/2); EVAL-3d (2026-09-19, mid-run v2→v3) — ADR-0008 |
@@ -445,7 +445,7 @@ overall failed по `significant_claim_reuse`) → **EVAL-3d** (2026-09-19,
  **Правило** (корень провалов гейта 6 — класс «просрочен
  навсегда»: «Спутник-1 запущен 4 октября 1957» → срок отсчитан от
  as_of 1957 → due всегда; улики: claim `de9855eb` EVAL-4d, 16
- модельных as_of-артефактов T7.29/T7.30, 6 zаложенных due v2/v3):
+ модельных as_of-артефактов T7.29/T7.30, 6 заложенных due v2/v3):
  срок `reverify_after` существует ТОЛЬКО у утверждения о
  настоящем — вопрос с относительной формой. Якорь (закрытый
  набор) уже определяет `derive_claim_as_of` (ADR-0016):
@@ -512,7 +512,7 @@ overall failed по `significant_claim_reuse`) → **EVAL-3d** (2026-09-19,
  NULL → `evergreen`, а не переиспользование `unknown` (иначе
  retrieval 0.7 опускал бы «Спутник» ниже свежих); (в) знаменатель
  g6 — только со сроком (старая предрегистрация 2/22.3
- построена на zаложенных due, которых под ADR-0017 нет); (г)
+ построена на заложенных due, которых под ADR-0017 нет); (г)
  legacy (без `date_anchor`) → `relative`, fail-closed в сторону
  перепроверки.
 
@@ -1130,7 +1130,7 @@ ruff + mypy strict + pytest (NOEZEMA_TEST_DATABASE_URL) — 944 passed.
 
 Не меняется: код поведения (кроме bootstrap-пина), схема CuratorProposal, rules_hash, claim_type_rules, пороги, payload'ы v2…v8, корпуса, ARCHITECTURE.md, данные прогонов (SELECT only). Прогон НЕ запускался, к LLM на 192.168.1.48 обращений не было, фоновых процессов нет — проверка нового промпта будет повторным смоуком отдельной задачей (на config-v9).
 
-Тесты было/стало: 944 → 946 (+2: матрица единого источника, pин v9; ассерт сценария обновлён, не ослаблен).
+Тесты было/стало: 944 → 946 (+2: матрица единого источника, пин v9; ассерт сценария обновлён, не ослаблен).
 
 **Пометка (2026-09-24, T7.39):** пример перепроверки из п.1(б) (настоящий id claim'а SMOKE-V8-K2 `35d5b7ae-…` + реальный факт и `as_of` смоука) заменён в curator-v6 на свободный от данных пример — раздел T7.39. Исторический текст не переписан; curator-v5 заморожен (на него пинится config-v9).
 
@@ -1219,7 +1219,7 @@ ruff + mypy strict + pytest (NOEZEMA_TEST_DATABASE_URL) — 944 passed.
 
 Не меняется: код поведения (кроме bootstrap-пина), схема CuratorProposal/EvidenceLink/ClaimDependencyProposal, rules_hash, claim_type_rules, пороги, payload'ы v2…v10, корпуса, ARCHITECTURE.md, curator-v6 (заморожен, пин config-v10), данные прогонов (SELECT only). Прогон НЕ запускался, к LLM на 192.168.1.48 обращений не было, фоновых процессов нет — проверка нового промпта будет повторным смоуком отдельной задачей (на config-v11; разрешение на обращение к .48 — за пользователем).
 
-Тесты было/стало: 956 → **964** passed, 4 → **8** skipped (+8 passed: pин v11, floor-сверка min_support_evidence, матрица v7, страж ×3 на v7 (uuid-пересечение, statements обоих примеров, id обоих примеров) + страж id на v5/v6; +4 skipped: новый id-страж на v1–v4, у которых правило 7 без id).
+Тесты было/стало: 956 → **964** passed, 4 → **8** skipped (+8 passed: пин v11, floor-сверка min_support_evidence, матрица v7, страж ×3 на v7 (uuid-пересечение, statements обоих примеров, id обоих примеров) + страж id на v5/v6; +4 skipped: новый id-страж на v1–v4, у которых правило 7 без id).
 
 Проверка: ruff + mypy strict + pytest -n auto (NOEZEMA_TEST_DATABASE_URL) — 964 passed, 8 skipped. Пометка: на 2-м из 3 подряд параллельных прогонов один раз упал timing-тест `test_orchestrator.py::test_slow_llm_does_not_lose_commit_lease` (PendingRollbackError); 1-й и 3-й прогоны — зелёные, одиночный прогон — зелёный; к изменениям (промпт/payload/docs) отношения не имеет — существующий флок под `-n auto`.
 
@@ -1282,7 +1282,7 @@ ruff + mypy strict + pytest (NOEZEMA_TEST_DATABASE_URL) — 944 passed.
 
 **T7.46b — time bomb в restore-drill: drill работает на инъекционном часе, не на `now()` БД** (ADR-0021; обнаружено T7.45b п.6).
 
-Вывод по шагу 1 (bug в коде vs в тесте): **bug в коде drill'а**. `run_restore_drill` принимает `now`, но использовал его только для `verified_at` (`restore.py:336`), а выбор точки сравнивал host-заштампованную `retention_until` с реальным `now()` БД (`restore.py:84`) — **одна операция, два часовых пояса**. Аргументы: (1) конвенция модуля — инъекционный host-час (`create_backup` принимает `now` и штампует `retention_until` из него, `service.py:164,230`; `run_restore_drill` принимает тот же `now` для `verified_at`) — drill-запрос с `now()` единственный расходчик, игнорирующий инъекцию; (2) `retention_until` — host-заштампованное значение, истекает должно от того же host-часа (сравнивать host-значение с часом хранилища = drift на desync-хосте); (3) production-семантика сохранена — CLI `restore-drill` не передаёт `now` → после фикса `datetime.now(UTC)` (host-час), как и до; (4) `now()` БД оправдана там, где часы не инжектятся (GC-сweep `gc/service.py:338` — реальная операционная очистка, не тронут).
+Вывод по шагу 1 (bug в коде vs в тесте): **bug в коде drill'а**. `run_restore_drill` принимает `now`, но использовал его только для `verified_at` (`restore.py:336`), а выбор точки сравнивал host-заштампованную `retention_until` с реальным `now()` БД (`restore.py:84`) — **одна операция, два часовых пояса**. Аргументы: (1) конвенция модуля — инъекционный host-час (`create_backup` принимает `now` и штампует `retention_until` из него, `service.py:164,230`; `run_restore_drill` принимает тот же `now` для `verified_at`) — drill-запрос с `now()` единственный расходчик, игнорирующий инъекцию; (2) `retention_until` — host-заштампованное значение, истекает должно от того же host-часа (сравнивать host-значение с часом хранилища = drift на desync-хосте); (3) production-семантика сохранена — CLI `restore-drill` не передаёт `now` → после фикса `datetime.now(UTC)` (host-час), как и до; (4) `now()` БД оправдана там, где часы не инжектятся (GC-sweep `gc/service.py:338` — реальная операционная очистка, не тронут).
 
 Изменения: `restore.py` — `_pick_retained_backup(db, rng, now)` → `retention_until > :drill_now` (бинд, non-nullable datetime — ловушка §7 о nullable-биндах не затронута); `run_restore_drill` — `moment = now or datetime.now(UTC)` на всю операцию (выбор + `verified_at` + аудит). Тесты `test_backup_pitr.py`: фиксированный `NOW = 2026-09-15T12:00Z` — опорная дата (НЕ реальное время); drill-тесты — фикстура `drill_now` с параметрами **+0/+1/+5 лет** (сдвиг через параметр, не wall-clock) — доказательство не-зависимости от даты запуска (retention-окна, прибитые к сдвинутому now, открыты на ЛЮБОЙ дате запуска); expired-window семантика тестируема (`test_restore_drill_no_retained_backup` — бэкап вне окна ЧАСА DRILL'а → `RestoreDrillError`); новый страж `test_restore_drill_selects_on_injected_clock_not_wall_clock` — бэкап, чьё окно ЗАКРЫТО на wall-clock'е (2026-09-25 12:00Z) но ОТКРЫТО на `now=NOW`, обязан выбираться (при возврате к `now()` БД — падение на каждой дате после 2026-09-25).
 
@@ -1292,7 +1292,7 @@ ruff + mypy strict + pytest (NOEZEMA_TEST_DATABASE_URL) — 944 passed.
 - **T7.46a** (`39cf85c`): ruff + mypy strict — зелёные; pytest -n auto (NOEZEMA_TEST_DATABASE_URL) — **970 passed, 8 skipped, 5 failed** — 5 = ТОЛЬКО задокументированная time bomb T7.46b (каждый день с 2026-09-25 12:00Z, фикс — следующий коммит, заказанный порядок T7.46a→T7.46b), других падений нет, флок `test_slow_llm` не проявился.
 - **T7.46b** (этот коммит): ruff + mypy strict — зелёные; pytest -n auto — **987 passed, 8 skipped, 1 failed** — 1 = `test_slow_llm_does_not_lose_commit_lease` (задокументированный флок T7.43, PendingRollbackError на параллельном xdist; **одиночный повтор — 1 passed**, как и в T7.43). Все 5 time-bomb тестов — зелёные (дата запуска 2026-09-25, wall-clock уже перечёркнул 10d-окна фиксированного `NOW` — бомба реально взорвалась до фикса, после — зелёная).
 
-Не меняется: схемы (миграций нет), `rules_hash`, замороженные payload'ы config-v2…v11 и промпты (хэши не тронуты), пины, пороги, корпуса, `ARCHITECTURE.md`, curator-v7/config-v11, `create_backup`/GC-сweep/CLI `restore-drill` (интерфейс и production-час не тронуты), данные прошлых прогонов (SELECT only). Открытые вопросы (ADR-0020, отчёт): NUL в ТЕКСТЕ МОДЕЛИ (claim statement → `session_staging` JSONB) вне трёх границ T7.46a — кандидат на отдельное усиление → **закрыто T7.47a**; прочие C0-байты не маскируются → **закрыто фактом T7.47a**.
+Не меняется: схемы (миграций нет), `rules_hash`, замороженные payload'ы config-v2…v11 и промпты (хэши не тронуты), пины, пороги, корпуса, `ARCHITECTURE.md`, curator-v7/config-v11, `create_backup`/GC-sweep/CLI `restore-drill` (интерфейс и production-час не тронуты), данные прошлых прогонов (SELECT only). Открытые вопросы (ADR-0020, отчёт): NUL в ТЕКСТЕ МОДЕЛИ (claim statement → `session_staging` JSONB) вне трёх границ T7.46a — кандидат на отдельное усиление → **закрыто T7.47a**; прочие C0-байты не маскируются → **закрыто фактом T7.47a**.
 
 ### T7.47a — NUL в тексте МОДЕЛИ (четвёртый канал, вне трёх границ T7.46a): граница на входе ответа + защитная линия staging — ADR-0020 (дополнение T7.47a)
 
@@ -1449,12 +1449,12 @@ Partial всего 20 (класс B — 3; класс D — 15; 2 `budget_exhaus
 
 **(b) Разбор (T7.52b).** Остановка — после SELECT: 7/7 терминальных (6 succeeded + 1 succeeded_partial), commit_attempts 7/7 committed, потерь нет; юнит inactive; все smoke-*inactive. Отчёт: `docs/eval/SMOKE-V14-EXL3-report.md` (+ указатель в SMOKE-V13-K2-report.md). Ключевое:
 - **complete_reason**: 6/7 — класс A (`goal_reached` ровно токеном, пояснение explorer-v5 пишет в отдельное `public_rationale`; T7.49-нормализация не понадобилась ни разу; классов B/C/D ноль); Go-сессия — единственная partial, **честная**: host-терминал `budget_exhausted` после 10 шагов без принятого complete (в V13 5/7 partial были формальными).
-- **EXL3 структурно**: 36 model_runs (29+7; planner/verifier — 0, `verification.mode=off` в config-v12), finish stop 36/36, output_schema_valid 36/36 при профиле `none`, outputs max 4481 ≤ 8192 (length-трuncations нет), скорость aggregate ≈47/45 tok/s vs 24/20 у V13-K2 (~×2); fingerprint `context_window 32768/max_output_tokens 4096` — **инертные MVP-дефолты** `ModelProfile` (одинаковы во всех прогонах, включая V13); packing-бюджет берётся из model-секции config-v12: `input_budget = 262144−8192−2048 = 251904` оценочных токенов — **больше физического окна EXL3 (131072)**, риска в этом прогоне не было (max input 30617), наблюдение на будущие длинные сессии.
+- **EXL3 структурно**: 36 model_runs (29+7; planner/verifier — 0, `verification.mode=off` в config-v12), finish stop 36/36, output_schema_valid 36/36 при профиле `none`, outputs max 4481 ≤ 8192 (length-truncations нет), скорость aggregate ≈47/45 tok/s vs 24/20 у V13-K2 (~×2); fingerprint `context_window 32768/max_output_tokens 4096` — **инертные MVP-дефолты** `ModelProfile` (одинаковы во всех прогонах, включая V13); packing-бюджет берётся из model-секции config-v12: `input_budget = 262144−8192−2048 = 251904` оценочных токенов — **больше физического окна EXL3 (131072)**, риска в этом прогоне не было (max input 30617), наблюдение на будущие длинные сессии.
 - **C0/NUL/repeats**: нули по 14 JSON/text-колонкам БД и байтам 19 artifact-файлов; `python.execute` за прогон не вызывался → NUL-фиксы «в бою» по-прежнему не подтверждены (только отсутствие регрессии). Lease-ошибок 0. worker.log: единственный класс traceback'ов — 201 блок teardown `AsyncEngine.dispose … attached to a different loop` + `Event loop is closed` (`hostctl/cli.py`, тот же дефект с V13) при нулевой содержательной нагрузке тиков.
-- **Дeny/retry**: policy allow 20/deny 0; один отказ repetition-guard (`tool_call_repeated`, Go); unknown_actions 0; search/searxng во время прогона не использовались; новых вопросов модель не создавала (near_dup 0/7).
+- **Deny/retry**: policy allow 20/deny 0; один отказ repetition-guard (`tool_call_repeated`, Go); unknown_actions 0; search/searxng во время прогона не использовались; новых вопросов модель не создавала (near_dup 0/7).
 - **Гейт 5 = 2/4** (хранёное = пересчёт кодом репозитория, `~/dsh1/smoke-v14/analyze-gate5-v14.py`, MATCH): Python-пара — глубокая перепроверка (ветки [1]+[5], FU добавила новую evidence-строку свежего chocolatey); plan-пара — только ветка [5] (read побайтово идентичен → evidence дедуплицирована; случай ADR-0018 «запись перепроверки — оценка, не evidence»). **Правило 7 не использовалось**: `existing_claim_id=null` ×2, reuse через host-dedup точное statement+type с head-в-снапшоте (T7.9); `claim_reverified` — 0 (в V13 — 2). UN/Sputnik — только знаменатель.
 - **Go без claim'а (знаменатель 4 вместо 5)**: `extract_question_urls` обрезает URL по первой `)` → named-источник `…/wiki/Go_(язык_программирования` без закрывающей скобки не может быть покрыт каноническими скачиваниями (coverage-ключ матчит с ней); EXL3 скачивал правильные варианты (полный https/raw/http), 3× отклонение complete, отказ guard'а → бюджет исчерпан; V13-K2 закрыл тот же дефект случайно: literal-fetch битого URL → 404 → `errored` → Go-claim родился. Дефект экстрактора **не лечился** (задача — анализ); выделен в рекомендации отдельной кодовой правкой.
-- **Пиновки/схемы**: prompt_sha256 36/36 ненулевые: curator-v7 `19d6c6e8…` ×7 (identичен V11–V13), explorer-v5 `3b1fd49d…` ×29 (= хэш T7.50); tool_schema_hash exploring побайтово равен v13-шному (схемы не менялись); rules-v2 `f96eeffc…`; даты ADR-0016/0017 корректны (explicit UN 2026-04-15; relative Python — host-clock as_of 2026-10-04, единственный reverify_after 2026-11-03 (+30 сут от FU-оценки); none plan/Sputnik); blind structural provenance/scope 4/4 и 4/4 (n=4 < blind-size → insufficient_sample; ручная слепая проверка не проводилась, как в прошлых прогонах).
+- **Пиновки/схемы**: prompt_sha256 36/36 ненулевые: curator-v7 `19d6c6e8…` ×7 (идентичен V11–V13), explorer-v5 `3b1fd49d…` ×29 (= хэш T7.50); tool_schema_hash exploring побайтово равен v13-шному (схемы не менялись); rules-v2 `f96eeffc…`; даты ADR-0016/0017 корректны (explicit UN 2026-04-15; relative Python — host-clock as_of 2026-10-04, единственный reverify_after 2026-11-03 (+30 сут от FU-оценки); none plan/Sputnik); blind structural provenance/scope 4/4 и 4/4 (n=4 < blind-size → insufficient_sample; ручная слепая проверка не проводилась, как в прошлых прогонах).
 - **Окружение**: restart policy `no` у `noezema-searxng` и `noezema-test-db`; **предложено (не применено)**: `docker update --restart unless-stopped noezema-searxng noezema-test-db`.
 
 **Конфаунд и границы выводов.** Относительно V13 изменены ДВЕ переменные сразу (модель K2→EXL3 и explorer-v4/config-v11 → explorer-v5/config-v12): безусловны только утверждения о паре «explorer-v5 на EXL3» (чистые токены завершения, 36/36 schema-valid, ×2 скорость, честный partial, отсутствие NUL/C0/lease-аномалий, host-dedup reuse работает без правила 7); атрибуция вклада модели vs промпта по одному прогону невозможна; «гейт 5 изменился» не утверждается (знаменатели 4 vs 5 объясняются потерей Go через coverage-дефект + различием поведения). Рекомендации: контрольные прогоны по одному фактору (EXL3+config-v11 или K2+config-v12); отдельная правка парсера `extract_question_urls` (balanced-parenthesis tail); починка teardown-шума `hostctl/cli.py`; решение о restart-policy — за оператором.
@@ -1471,7 +1471,7 @@ Partial всего 20 (класс B — 3; класс D — 15; 2 `budget_exhaus
 - **Claims 6 vs 4**: +Go-claim и +дубль plan-claim: FU-curator написал statement с опечаткой («архитектор **иследователь**» против «и исследователь») → host-dedup (побайтовый statement+type) не слил → отдельный claim E2 (identity-hash наблюдения совпадает с анкерным `4126a0f7…` — дедуп evidence сработал, раздвоился claim). **Гейт 5 = 1/6** (хранёное = пересчёт `_gate_reuse`, MATCH; `~/dsh1/smoke-v14b/analyze-gate5-v14.py`): числитель только Python-пара `[1]+[5]` (FU добавила новую evidence-строку chocolatey `c35b33db…` + assessment чужой сессии); правило 7 не использовалось (`existing_claim_id` null ×7, reuse через host-dedup). Разница 2/4(V14) vs 1/6(V14B) — арифметика разных наборов claim'ов (опечатка + случайно появившийся Go), **не** улучшение/ухудшение механизма.
 - **EXL3 структурно**: 38 model_runs (explorer-v4 ×31 + curator-v7 ×7): stop 38/38, output_schema_valid 38/38 при профиле `none`, grammar/HTTP400 ноль; outputs explorer med/p95/max 679/3291/**4691**, curator 2032/3005/**3058** (≤8192); скорость aggregate exploring **45.9** / consolidating **58.3** tok/s (V14: 47.1/45.2; V13-K2: 20.7/24.4); latency max 180 с — один explorer-вызов; шаги 31 (= V13, состав иной). Пиновки 38/38 exact (explorer-v4 `5829a55c…` = пин config-v11); tool_schema_hash exploring побайтово равен v13-/v14-ному. Даты ADR-0016/0017 корректны (UN explicit 2026-04-15 evergreen; Python/Go as_of 2026-10-04 host-clock, reverify_after +30 сут; plan ×2/Спутник none). Blind structural 6/6 + 6/6 (n<blind-size; ручная — не проводилась). Fingerprint cw/mout 32768/4096 — инертны как всегда; packing input_budget 251904 > окна EXL3 131072 (max input 28780).
 - **Инструменты (впервые богаче)**: research.fetch ×13, **python.execute ×2** (первый вызов в серии: ISO-дата и дата+время UTC; exit 0, чистый stdout → маска T7.46a прошла «в бою», но маскирование под РЕАЛЬНЫМИ NUL по-прежнему не доказано), workspace list/read/write ×5, memory.search ×1 (пусто до коммитов), **shell.execute ×1 → FAILED `unreachable`**: eval-профиль оркестратора использует `StubToolExecutor` без ветки shell.execute (политика и схема инструмента разрешают — apps/orchestrator/main.py:45, executor.py:71) — разрыв конфига и исполнителя, выделен в открытые пункты. Deny 0, unknown_actions 0, repetition-guard отказов 0 (в V14 был 1), completion rejected ×2 (только Go).
-- **C0/NUL/загрязнение**: сплошной скан всех text/jsonb-колонок БД (**189 колонок × 3040 строк**): сырых управляющих байтов, литерального `\x00`-маркера маски, литерального `\u000b`, повторов в модельных полях — **ноль**; попадания регекспa повторов ×7 (audit+outbox) классифицированы: пробелы ×16–26 во внешнем контенте payload'ов. Байты 0x00/0x0B/0x0C в 18 artifact-файлах — ноль. Lease/T7.51 маркеров (LeaseLost/PendingRollbackError/UntranslatableCharacter) — **ноль во всех логах**. Traceback'и: ровно два класса одной teardown-цепи (`Event loop is closed` + asyncio Future-loop, `hostctl/cli.py`, дефект с V13) ×2294 каждый — число раздуто простоем воркера ~4 ч 45 мин после конца eval-run.
+- **C0/NUL/загрязнение**: сплошной скан всех text/jsonb-колонок БД (**189 колонок × 3040 строк**): сырых управляющих байтов, литерального `\x00`-маркера маски, литерального `\u000b`, повторов в модельных полях — **ноль**; попадания регекспа повторов ×7 (audit+outbox) классифицированы: пробелы ×16–26 во внешнем контенте payload'ов. Байты 0x00/0x0B/0x0C в 18 artifact-файлах — ноль. Lease/T7.51 маркеров (LeaseLost/PendingRollbackError/UntranslatableCharacter) — **ноль во всех логах**. Traceback'и: ровно два класса одной teardown-цепи (`Event loop is closed` + asyncio Future-loop, `hostctl/cli.py`, дефект с V13) ×2294 каждый — число раздуто простоем воркера ~4 ч 45 мин после конца eval-run.
 - **Выводы (раздельно)**: **(а) эффект модели** K2→EXL3 (промпт/корпус побайтово равны): класс A 2/7→7/7, статусы 2+5→7+0, скорость ×~2–3 — направление надежно; гейт-арифметика (2/5→1/6) — нет. **(б) эффект explorer-v5** на EXL3 **данными не подтверждается**: v4 даёт тот же результат (A 7/7); hypothesis полезности v5 (лечение класса D) остаётся непроверенной ровно там, где D жил (K2-класс). **(в)** при N=7×1 нельзя утверждать значимость различий гейтов (1/6 vs 2/4 vs 2/5), воспроизводимость Go-закрытия и бесполезность v5 на других моделях. **(г) рекомендация**: **оставить explorer-v5 в пине** BOOTSTRAP/config (откатывать нечем — выигрыша v4 в данных нет; D-проблема живёт в K2-классе), серию T7.38…T7.53 закрыть, дополнительный смоук для этого решения не нужен; приоритет открытых пунктов: кодовая правка `extract_question_urls` (balanced-parenthesis tail) → разрыв shell.execute в eval-профиле → увязка packing-бюджета с окном модели → restart-policy контейнеров (предложение T7.52 не применено: searxng Up с 02:04Z запуском V14, в прогоне не использовался; политика `no` у searxng и test-db) → teardown-шум `hostctl/cli.py` → NUL «в бою» (случай появится — фиксировать, спец-смоук не делать) → fingerprint ≠ физическое окно.
 
 **Не тронуто:** код, тесты (проверка §6 на этом же дереве: ruff/mypy strict 129 файлов/pytest `-n auto` — 1048 passed, 12 skipped), payload'ы v2…v12, промпты/пины и хэши, корпуса, `ARCHITECTURE.md`, схемы БД (миграций нет), пороги; БД `noezema-smoke-v14b-exl3` и все прошлые смоук/eval — SELECT only (пересчёт гейта — кодом репозитория); прогоны не запускались; к LLM на 192.168.1.42/.48 обращений не было; llama-swap не тронут; docker-политики не менялись (команда лишь предложена); фоновых процессов нет (smoke-v14b-exl3-worker остановлен, transient unloaded, все smoke-* inactive).
@@ -1616,7 +1616,7 @@ deadlock невозможен (лок держится только ~1–2 се�
 
 ### T7.56 — flake lease-семейства под `-n auto`: лечение абсолютных времён unit-guard тестов (TTL 0,6→3,0 с) + последовательный stage `timing` в полной проверке и CI; код продукта не тронут
 
-**Основание.** Два известных падających теста: `tests/scenario/test_orchestrator.py::test_slow_llm_does_not_lose_commit_lease`
+**Основание.** Два известных падающих теста: `tests/scenario/test_orchestrator.py::test_slow_llm_does_not_lose_commit_lease`
 (история: T7.50 приёмка, T7.51 before TTL 1 с — 3/20 под DDL-штормом; после масштабирования T7.51 до TTL 3 с красным ещё
 4 из 12 полных §6-прогонов в «медленных» окнах T7.55) и `tests/unit/test_lease.py::test_guard_keeps_lease_alive_across_long_operation`
 (TTL 0,6 с — не масштабировался в T7.51; падал у менеджера на WSL2 `-n 12`; упоминался в красных прогонах T7.55). Механика одна:
@@ -2627,7 +2627,7 @@ workspace и не пишутся в production-путь. Отдельно
 Тесты (`tests/unit/test_dev_stand_scripts.py`, +6): по умолчанию в dry-run `systemctl enable` НЕ содержит
 `noezema-dev-tick.timer` (но содержит unit-state/maint/web); флаг добавляет его; уже включённый таймер
 репортится и в плане нет ни одного `disable`; флаг описан в `--help`; `status.sh` (реальный скрипт со
-stub'ным `systemctl`) печатает нужный вердикт в обе стороны; README-пин. Хarness дополнен `_run_status()` и
+stub'ным `systemctl`) печатает нужный вердикт в обе стороны; README-пин. Harness дополнен `_run_status()` и
 stub'ом `systemctl`, отвечающим на `is-enabled` (`STUB_TICK_TIMER_STATE`). `bash -n bootstrap.sh status.sh
 reset-db.sh` — чисто; `shellcheck -S warning` (0.11.0, временно в `.shellcheck-venv`, `pyproject.toml` не
 тронут; каталог удалён после проверки) — 0 замечаний. Реальный `bootstrap.sh` на .87 и тем более на .92 не
@@ -3721,7 +3721,7 @@ Offered-список строится из возможностей снапшо
 снапшоты `web.search` не запрашивают → их `tool_schema_hash` и лента шагов не меняются; новый инструмент
 виден только там, где его явно granted.
 
-- config-v13: caps 10 инструментов; pин offered-списка (inbox пуст, `message.reply` снят по T7.13) =
+- config-v13: caps 10 инструментов; пин offered-списка (inbox пуст, `message.reply` снят по T7.13) =
   `f76284735e255086…` (замер MODELSEL), полный список 10 → `c64d98d40e631755…`.
 - config-v14 = v13 ровно с двумя изменениями: `policy.capabilities.tools` — **+web.search, −artifact.create**
   (список из 10 имён остаётся списком из 10), и пин `prompts.explorer` → `explorer-v6`.
@@ -6775,7 +6775,7 @@ created/reverified/reused/relied, но touched_claims_cte блок `relied` не
 
 Конфигурация: `docs/eval/config-v19-payload.json` = config-v18 ровно с одной правкой (пин `prompts.curator` →
 curator-v9); canonical payload **`4d76c000a87395b0887eedfcee4a25f58c3c3dde2f390b7dbe2140c189a8ce3d`**, sha256
-файла `0845315721…` (дuality canonical/файл — AGENTS §6); payload'ы v1…v18 не переписаны, config-v18
+файла `0845315721…` (duality canonical/файл — AGENTS §6); payload'ы v1…v18 не переписаны, config-v18
 (canonical `b5605e4eb04d…`) — documented-откат. Bootstrap/reset-db dev-стенда по умолчанию активируют v19.
 
 ### 3. Наблюдение (не правка): collapse шагов работы в карточке
@@ -7559,7 +7559,7 @@ forbes). Признаком чужой оценки служат только г
 | (11) «По мнению аналитиков, точная оценка — 14,5%» после отчёта Росстата | `derivative → Росстат`, окно | отказ `no_value_attribution` |
 
 Дополнительно закреплено, что вето НЕ является ложным: «ожидания выросли до 13,7%» внутри самой фразы
-атрибуции — не другой источник (вeto начинается после её конца; тест
+атрибуции — не другой источник (veto начинается после её конца; тест
 `test_expectations_inside_the_attribution_sentence_are_not_a_veto` остаётся `derivative → Банк России`), и
 «Банк России сохранил оценку…» после фразы атрибуции — первоисточник, а не банк-актор
 (`test_bank_of_russia_alias_is_not_an_actor_bank`).
@@ -8301,7 +8301,7 @@ hypothesis; роли улик — все прочитанные источник
 
 Уточнение: подписи смежных строк этой таблицы («Смежный показатель … другой показатель») и отсутствие
 честной строки там, где была только «другая запись того же показателя», исправлены T7.88a — действующие
-tексты приведены в разделе T7.88a ниже; правила подбора (различитель, пороги, бюджет) не изменились.
+тексты приведены в разделе T7.88a ниже; правила подбора (различитель, пороги, бюджет) не изменились.
 
 ### 3. Цена витрин (замер SELECT'ов на карточке ответа)
 
@@ -9795,7 +9795,7 @@ issues found in 153 source files», `-n auto -m "not timing"` — **2200 passed,
 
 Не изменено сознательно: классификация брокера, тексты `SandboxError`, значения потолков
 (15/30/60/+15, reap 2, cleanup 8), drain-арифметика (2+8=10<20), контракты исполнителя, домен, миграции,
-`AuditEventType`, labels вебa, `ARCHITECTURE.md`.
+`AuditEventType`, labels веба, `ARCHITECTURE.md`.
 
 ### 5. Тесты: 7 новых, красны на `d0e27c1`; прежние 11 — без ослабления
 
@@ -9856,7 +9856,7 @@ collation), `noezema-sb-*` — **ни одного** ни до, ни после.
 каталоги проб `/tmp/t795a-w-close*`, `/tmp/t795a-w-create*` удалены по завершении; скрипты и логи — вне репо
 (`t795a_probe_*.py`, `t795a-keep/`). Стенд `.92` не опрашивался, движки `.42/.141/.48` не вызывались,
 eval-runs и смоуки не запускались, интернет из кода и тестов не использовался; `ARCHITECTURE.md`, миграции,
-`AuditEventType`, labels вебa не изменены. Push не выполнялся.
+`AuditEventType`, labels веба не изменены. Push не выполнялся.
 
 ## T7.96 — «наблюдаемая населением инфляция» и «инфляционные ожидания» перестали быть одним показателем: третий замкнутый словарь различителя (замечание с витрины стенда `.92` от 2026-10-11; код — коммит `6a7e313`)
 
@@ -11226,3 +11226,123 @@ ruff — «All checks passed!»; mypy strict на `packages apps hostctl` — «
 in 153 source files»; `-n auto -m "not timing"` — **2376 passed, 12 skipped, 0 failed** (221.14 с);
 `-m timing` — **4 passed, 2388 deselected** (47.67 с). Контейнеров 41 до и после, `noezema_mig_*`
 и `noezema_tpl_*` в админ-БД 0.
+
+## T7.102 (2026-10-12): вымышленный пример перефразы правила 7 (curator-v12), config-v22; охота на гомоглифы
+
+Решение пользователя 2026-10-12 («да, готовь») по итогам T7.101: закрыть остаточную протечку,
+явно записанную в T7.97a, — пример перефразы-дубля в правиле 7 curator-v10/v11 содержит реальный
+случай витрины. curator-v11 не переписан (ADR-0019: выпущенный пин config-v21, правила 1–10
+обязаны быть байт в байт v10); закрытие — новой версией промпта, как и требовала запись T7.97a.
+
+### Что заменено в правиле 7
+
+`prompts/curator/curator-v12.md` — байт в байт curator-v11, кроме строки `version:` и абзаца
+перефразы (строки 170–175 → 170–177). Было (реальные данные витрины — утверждения `9266248e`
+и `e189c80d`):
+
+>    Та же ошибка в форме перефразы (наблюдена на стенде): в разделе «Знание»
+>    строка `[c:…]` с годовой инфляцией 5,59% по итогам 2025 года уже записана
+>    (supported, E4), а предложение приносит «Официальная годовая инфляция в
+>    России по итогам 2025 года … составила 5,59% (по данным Росстата)» — то же
+>    число того же показателя за тот же период, только переформулированное со
+>    ссылкой на первоисточник, и `existing_claim_id: null`. Это тоже новый
+
+Стало (вымышленный случай той же формы):
+
+>    Та же ошибка в форме перефразы (наблюдена на стенде; пример — вымышленный
+>    случай той же формы): в разделе «Знание» строка `[c:…]` с уровнем
+>    безработицы в Тармении 6,1% по итогам 2029 года уже записана (supported,
+>    E4), а предложение приносит «Официальный уровень безработицы в Тармении
+>    по итогам 2029 года … составил 6,1% (по данным Тарменской службы
+>    статистики)» — то же число того же показателя за тот же период, только
+>    переформулированное со ссылкой на первоисточник, и `existing_claim_id: null`.
+>    Это тоже новый
+
+Смысл правила не изменён: тот же показатель, значение и период, уже записанные как `[c:…]`,
+получают перефразу со ссылкой на первоисточник и `existing_claim_id: null` — это дубль claim'а;
+перепроверку оформляет куратор сам, на гейт хоста полагаться нельзя. Правила 1–6 и 8–11 —
+байт в байт v11 (закреплено тестом побайтного diff). Вымышленные имена (Тармения, «Тарменская
+служба статистики»), значение 6,1 % и год 2029 не встречаются ни в фикстурах витрины
+(`claims_live.tsv`, контрольный вопрос, нормализованная страница случая T7.97, страницы T7.101,
+корпуса вопросов), связка «6,1 % + 2029» не встречается ни в одной строке реальных данных, и
+пример не пересекается с примерами других правил (Франция 4,7 %/2024, Испания 3,1 %/2024,
+условная группа «Веер»/Кварлении 3,4 %/2031, 3,94 %/2026).
+
+### Хеши и пины
+
+- `prompts/curator/curator-v12.md` sha256 `06d5fe1d080fc75696ed700d7acdb9cbcdfa2283bc13bc5203e99600353321ca`;
+- `docs/eval/config-v22-payload.json` = config-v21 ровно с одной правкой (пин `prompts.curator` →
+  curator-v12), canonical `05ada8a415fa376dc4b443b1f073057cbf7d35627035eea551a5f2a2c34513fa`
+  (хеш файла `0edf88e3d39c880e0a63a21ec5515d37e88fb94806b19aaec103a10574660ac7` — другое число, AGENTS §8);
+- неизменны: config-v21 (canonical `baf6e34c…`), config-v20 (`2b065470…`), curator-v11
+  (`1064b15e…`), curator-v10 (`8b940bf5…`), explorer-v10 и прочие пины; дефолт bootstrap'а —
+  config-v20; config-v22 не активирован (активация — решение менеджера, AGENTS §6).
+
+### Тесты и краснота
+
+- Страж `tests/unit/test_prompt_example_no_real_data.py`: `INHERITED_REAL_DATA` получила пустую
+  запись для curator-v12 (нынешний промпт обязан быть чистым), запись curator-v11 осталась как
+  история выпущенного пина. Новые тесты: `test_current_curator_prompt_has_no_inherited_exceptions`
+  (нынешний curator-промпт не имеет права опираться на унаследованные реальные данные) и
+  `test_released_curator_v11_record_stays_pinned` (попадания v11 совпадают с закреплённой историей
+  побайтно; зелёный и на старой, и на новой ветке — закрепление, не ослабление).
+- `tests/unit/test_curator_prompt_paraphrase_fictional_t7102.py` (7 тестов): побайтный diff
+  v11→v12 (ровно версия + абзац), сохранение смысла правила 7 и неизменность правил 1–6/8–11,
+  вымышленность примера, пины v22/v21, `PromptPinError` при подменённом пине.
+- `tests/unit/test_dev_stand_scripts.py`: `test_config_v22_is_config_v21_with_one_curator_pin`
+  (canonical `05ada8a4…`; explorer-v10, пороги, бюджеты и `model.*` — байт в байт v21; дефолт
+  bootstrap'а не тронут).
+- Краснота на `cfd384f` (detached worktree `/tmp/wt7102`, копии новых и изменённых тестов):
+  **9 failed / 98 passed** — 7 тестов нового файла (нет v12/v22), тест чистоты стража (нынешний
+  curator-v11 опирается на протечку `[('актор', 'росстат'), ('пара', '5,59+2025')]`), тест
+  config-v22 (нет файла).
+- Краснота стража при возврате реального абзаца: побайтно восстановленный абзац v11 в
+  curator-v12 (временная копия файла, diff после восстановления пуст) —
+  `test_current_prompt_rules_carry_no_real_case_data[curator-v12.md-curator-v11.md]` (найдено
+  `{росстат, 5,59+2025}` против пустой записи) и `test_curator_example_is_fictional_and_matches_no_real_case`
+  (в новом тексте нет примера формулировки оценки) — **2 failed**.
+
+### Гомоглифы: скан и правки
+
+Скан `grep -rnoP "\S*(\p{Cyrillic}[A-Za-z]|[A-Za-z]\p{Cyrillic})\S*" docs prompts AGENTS.md apps |
+grep -v '\\' | grep -viE "сберcib"` дал на `cfd384f` **102 попадания**. Исправлено заменой буквы
+(смысл не изменён) **27** — только `docs/adr/*.md` и `docs/STATUS.md`:
+
+| Где | Было | Стало |
+|---|---|---|
+| ADR-0035:1503 | группa | группа |
+| ADR-0003:25 | fоновая | фоновая |
+| ADR-0007:56 | дurable | durable |
+| ADR-0008:136 | реvisions | revisions |
+| ADR-0021:66,110 | GC-сweep ×2 | GC-sweep |
+| ADR-0024:79 | пишетcя | пишется |
+| ADR-0032:66 | дuality | duality |
+| STATUS:97 | PЕРЕСЧИСЛЕНА | ПЕРЕСЧИСЛЕНА |
+| STATUS:448,515 | zаложенных ×2 | заложенных |
+| STATUS:1133,1222,3724 | pин ×3 | пин |
+| STATUS:1285,1295 | GC-сweep ×2 | GC-sweep |
+| STATUS:1452 | трuncations | truncations |
+| STATUS:1454 | Дeny | Deny |
+| STATUS:1457 | identичен | идентичен |
+| STATUS:1474 | регекспa | регекспа |
+| STATUS:1619 | падających | падающих |
+| STATUS:2630 | Хarness | Harness |
+| STATUS:6778 | дuality | duality |
+| STATUS:7562 | вeto | veto |
+| STATUS:8304 | tексты | тексты |
+| STATUS:9798,9859 | вебa ×2 | веба |
+
+Оставшиеся **75** не правятся (данные или законное смешение; группировка): `docs/eval/**` — 23
+(записи поведения модели: `yкраїнська` в слепой выборке, `сode`, `HyperТекст`, `неcallable`,
+`Трuncation`, `Bimodальность`/`bimodальность`, `внесource`, `peresчёт`, `zаложенных`, `(upала`,
+`неAuthoritative` — цитаты прогонов, менять нельзя); `docs/STATUS-archive.md` — 10 (заморожен
+байт в байт, T7.42); `apps/` — 8 (5 регексп-классов `[a-zа-яё]`/`[А-ЯЁA-Za-zа-яё]`, комментарий
+`датless` в оркестраторе, `Фазa` ×2 в `apps/web/api.py` — подлинные гомоглифы в коде, вне
+разрешённой области правки; отмечено для отдельного решения); `docs/PLAN_FROM_SCRATCH.md` — 4
+(`fоновые`, `Bюджеты`, `Conservативные`, `atomарна`) и `docs/web-access-design.md` — 1 (`отказa`)
+— вне списка разрешённых правок; гибридные термины (`датless` ×10 в ADR/STATUS/AGENTS, `датеless`,
+`propagateция`, `re-deriviруется`, `fetchом`); маркдаун-якоря STATUS:159,162 (обязаны совпадать с
+заголовками замороженного архива); литерал (`сберc` в таблице T7.96a); слова через слэш
+(`engine/logика`); пропуски пробелов (`артефактfail-closed`, `неAuthoritative`, `внесource`,
+`естьObservation`, `ПроверкаHostname'а`, `ТестTLS`, `жеClaim`) — это не гомоглифы, замена буквы
+к ним неприменима. `prompts/` — ноль попаданий (включая новый curator-v12).

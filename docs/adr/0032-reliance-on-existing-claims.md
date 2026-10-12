@@ -63,7 +63,7 @@ RELATION_KEYS дополнен значением `relied`, но `touched_claims
 curator-v9 (`8897e6c5d7fb…`) — факультативность подчёркнута: «поле можно не приводить вовсе», пустое — `[]`;
 перепроверка по-прежнему идёт через `existing_claim_id`, и куратору сказано различать эти два случая.
 config-v19 = config-v18 ровно с одной правкой (пин curator-v9), canonical `4d76c000a873…` (файл — другое
-число, дuality AGENTS §6); payload'ы v1…v18 не переписаны, v18 (`b5605e4eb04d…`) — documented-откат;
+число, duality AGENTS §6); payload'ы v1…v18 не переписаны, v18 (`b5605e4eb04d…`) — documented-откат;
 bootstrap/reset-db dev-стенда по умолчанию активируют v19.
 
 ## 6. Что НЕ тронуто
