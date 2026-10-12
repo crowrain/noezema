@@ -68,9 +68,12 @@ from apps.research_proxy.source_attribution import (
     normalize_scan_text,
     primary_source,
 )
+from packages.domain.models.base import JsonDict
 from packages.memory.scope import (
+    EVIDENCE_SELF_PUBLICATION_KEY,
     VALUE_ATTRIBUTION_PAIRING_PUBLICATION,
     VALUE_ATTRIBUTION_PAIRING_STRICT,
+    build_self_publication,
 )
 
 #: версия метода поуровневой атрибуции: попадает в запись улики и в аудит, чтобы решение можно было
@@ -902,3 +905,35 @@ def self_publication_candidate(
         basis_fragment=_basis(matched[spec.key]),
         actor_veto=veto,
     )
+
+
+def self_publication_scope_for_fragment(
+    *,
+    canonical_uri: str | None,
+    text: str | None,
+    claim_statement: str | None = None,
+) -> JsonDict | None:
+    """T7.104 (ADR-0035 §19 дополнение): запись о собственной публикации для НОВОЙ улики.
+
+    Общий помощник двух путей: та же `self_publication_candidate` (те же гейты — статус
+    `self_primary`, ровно один производитель, домашний хост прочитанной страницы, вето третьего
+    актора) и тот же `build_self_publication` с тем же `method`, что пишет `research-reattribute
+    --evidence-level` (ADR-0035 §19.2: записанное при создании фиксируется методом текущей эпохи,
+    перечитывание окна её не перезаписывает — идемпотентность держится на этом же признаке).
+    None — когда кандидат не пройден (ловушка Росстата T7.87, вето третьего актора, пересказ):
+    запись не пишется, витрина молчит, как молчала."""
+    candidate = self_publication_candidate(
+        canonical_uri=canonical_uri, text=text, claim_statement=claim_statement
+    )
+    if candidate is None or candidate.actor_veto:
+        return None
+    record = build_self_publication(
+        primary_key=candidate.primary_key,
+        primary_name=candidate.primary_name,
+        primary_uri=str(canonical_uri),
+        method=VALUE_ATTRIBUTION_METHOD_VERSION,
+        basis_fragment=candidate.basis_fragment,
+    )
+    if record is None:
+        return None
+    return {EVIDENCE_SELF_PUBLICATION_KEY: record.as_scope()}

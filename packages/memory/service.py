@@ -74,12 +74,14 @@ from packages.memory.rules_engine import (
     reverify_after,
 )
 from packages.memory.scope import (
+    EVIDENCE_SELF_PUBLICATION_KEY,
     EVIDENCE_VALUE_ATTRIBUTION_KEY,
     anchor_from_scope,
     carry_value_attribution,
     derive_claim_as_of,
     derive_claim_scope,
     derive_evidence_scope,
+    parse_self_publication,
     parse_value_attribution,
 )
 from packages.memory.source_graph import build_source_independence_snapshot
@@ -922,6 +924,15 @@ class MemoryService:
                         merged = dict(ev.scope or {})
                         merged[EVIDENCE_VALUE_ATTRIBUTION_KEY] = decision.as_scope()
                         ev.scope = merged
+                    elif parse_self_publication(ev.scope) is None:
+                        # T7.104 (ADR-0035 §19 дополнение): то же дописывание для ключа
+                        # собственной публикации — существующая запись не перезаписывается,
+                        # два ключа на одной улике не соседствуют (решение детектора одно)
+                        publication = parse_self_publication(payload)
+                        if publication is not None:
+                            merged = dict(ev.scope or {})
+                            merged[EVIDENCE_SELF_PUBLICATION_KEY] = publication.as_scope()
+                            ev.scope = merged
             else:
                 if kind in ("source_assertion", "quote_integrity") and rec_source_id is None:
                     problems.append(
@@ -942,6 +953,14 @@ class MemoryService:
                     and decision.parent_source_id != str(rec_source_id)
                 ):
                     ev_scope[EVIDENCE_VALUE_ATTRIBUTION_KEY] = decision.as_scope()
+                elif rec_source_id is not None:
+                    # T7.104 (ADR-0035 §19 дополнение): хостовое решение о собственной
+                    # публикации производителя переносится из staging-payload в скоуп улики
+                    # тем же способом, что value_attribution; строку источника не трогаем —
+                    # запись не склейка, группировка и оценки её не читают
+                    publication = parse_self_publication(payload)
+                    if publication is not None:
+                        ev_scope[EVIDENCE_SELF_PUBLICATION_KEY] = publication.as_scope()
                 ev = ORMEvidence(
                     id=uuid.uuid4(),
                     claim_id=linked_claim.id,

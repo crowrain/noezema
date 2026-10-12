@@ -55,10 +55,11 @@ from apps.orchestrator.value_duplicate import (
 )
 from apps.research_proxy.derivative_pointer import resolve_primary_source
 from apps.research_proxy.normalization import PARSER_FINGERPRINT
-from apps.research_proxy.source_attribution import primary_source
+from apps.research_proxy.source_attribution import STATUS_SELF_PRIMARY, primary_source
 from apps.research_proxy.value_attribution import (
     VALUE_ATTRIBUTION_METHOD_VERSION,
     attribute_value_in_fragment,
+    self_publication_scope_for_fragment,
 )
 from packages.artifacts import freeze_workspace
 from packages.broker import ToolExecutor, check_idempotency
@@ -2474,6 +2475,16 @@ class Orchestrator:
             text=fragment,
             claim_statement=claim_statement,
         )
+        if decision.status == STATUS_SELF_PRIMARY:
+            # T7.104 (ADR-0035 §19 дополнение): собственная публикация производителя на его
+            # домашнем хосте — та же запись и те же гейты, что пишет `research-reattribute
+            # --evidence-level` для той же улики (общий помощник self_publication_scope_for_fragment).
+            # Строку источника не трогаем: запись не склейка, группировка и оценки её не читают.
+            return self_publication_scope_for_fragment(
+                canonical_uri=str(record.payload.get("url") or "") or None,
+                text=fragment,
+                claim_statement=claim_statement,
+            )
         if not decision.is_derivative or decision.primary_key is None:
             return None
         spec = primary_source(decision.primary_key)
