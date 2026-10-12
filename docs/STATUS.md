@@ -10974,3 +10974,137 @@ ruff — «All checks passed!»; mypy strict на `packages apps hostctl` — «
 in 153 source files»; `-n auto -m "not timing"` — **2333 passed, 12 skipped, 0 failed** (208.99 с);
 `-m timing` — **4 passed, 2345 deselected** (47.69 с). Контейнеров 41, `noezema_mig_*` 40,
 `noezema_tpl_*` 0 (замер до правок и после — одинаков).
+
+## T7.100 — метка «Опубликовано производителем» при единственной улике (решение пользователя 2026-10-12; ADR-0035 §18; код и тесты — коммит `928cc50`)
+
+### Постановка
+
+Решение пользователя («да, давай по плану»): дать ОДИН честный ярлык одному факту. Метка
+случая производителя ставится всегда, когда записанные факты действующей оценки показывают:
+значение опубликовал его производитель и все подтверждения сворачиваются к этому единственному
+производителю — независимо от того, одна подтверждающая улика или несколько, и независимо от
+того, какой из двух кодов нехватки подтверждений записали правила
+(`insufficient_independence` или `insufficient_evidence`). Уровень (`weak`/жёлтый), метка
+уровня, grade, пороги, rules engine, словарь знаний — без изменений; правка только в переводе
+уже вычисленной оценки (ADR-0026). Fail-closed сохранён: если из записанных фактов производитель
+не выводится, прежняя подпись «Подтверждено слабо» остаётся.
+
+### Правило (где лежит)
+
+`apps/web/producer_view.py`: гейт условия (а) — `PRODUCER_CASE_REASONS` (:67) =
+`INDEPENDENCE_SHORTFALL_REASONS` (:57, `insufficient_independence`, rules_engine.py:237) ∪
+`EVIDENCE_SHORTFALL_REASONS` (:64, `insufficient_evidence`, rules_engine.py:235); `no_evidence`
+(:192) и семейство `independence_<relation>_not_met` (:242) вне гейта. Тело правила —
+`producer_publication_case` (:134): роли улик, ровно одна записанная группа, записанные
+указатели (атрибуция значения или якорь-родитель на домашнем хосте производителя из словаря),
+нет контр-улик; возвращает имя и число подтверждающих улик. `producer_publication_name` (:189)
+— прежний контракт T7.87 поверх того же тела. Подсказка единственной улики —
+`apps/web/reliability.py::_producer_hint` (:141, `_PRODUCER_HINT_SINGLE` :131): «одна публикация,
+независимых измерений нет»; уровень/цвет/метка — прежние (`_producer_badge` :166). Вызовы
+витрины передают число улик из того же одного вызова правила: `apps/web/knowledge.py`
+(`_assessment_explanations` :200, `assessment_view` :337), `apps/web/answer.py`
+(`_estimate_row_json` :885, `publication_by_claim` :1264), `apps/web/questions_view.py`
+(:308, :173). Никаких пересчётов на отображении, новых типов событий, миграций и порогов.
+
+### Таблица: 20 действующих записей стенда `.92` (фикстура `fixtures-t7100/`, срез 2026-10-12)
+
+| id (первые 8) | тип | причина оценки | улики/группы/указатели (записано) | было → стало | обоснование |
+|---|---|---|---|---|---|
+| 9266248e | temporal_fact | insufficient_independence | 8 support, 1 группа (parent:якорь Росстат ×1, VA→Росстат ×5: v6×4 + v1×1) | Опубликовано производителем (Росстат) → то же | случай T7.87, старое условие (а) выполнено |
+| 391c4388 | temporal_fact | insufficient_independence | 3 support, 1 группа (VA→ЦБ ×2 v6 publication_window, якорь cbr forecast_260724.pdf) | Опубликовано производителем (Банк России) → то же | случай T7.87 |
+| 136a0ca0 | external_fact | insufficient_independence | 2 support, 1 группа parent:88fb9e2f (VA→ЦБ ×2 v6 строгое pairing) | Опубликовано производителем (Банк России) → то же | случай T7.87 (после переатрибуции T7.98) |
+| 6d9a12ff | external_fact | insufficient_evidence | 1 support (forbes.ru), 1 группа parent:88fb9e2f, якорь-родитель → cbr.ru forecast_260724.pdf | **Подтверждено слабо → Опубликовано производителем (Банк России)** | единственная улика — пересказ документа производителя; указатель записан (якорь) |
+| 7cc2b578 | external_fact | insufficient_evidence | 1 support (sbercib.ru), 1 группа parent:33912509, VA→Росстат (v1) | **Подтверждено слабо → Опубликовано производителем (Росстат)** | единственная улика с записанной атрибуцией значения |
+| 07126d06 | external_fact | insufficient_evidence | 1 support (internationalinvestment.biz), 1 группа single, указателей нет | Подтверждено слабо → то же | собственная оценка Альфа-Банка: называть производителя нечем |
+| 44bd1460 | external_fact | insufficient_evidence | 1 support (sbercib.ru), 1 группа single, указателей нет | → то же | собственная оценка SberCIB |
+| 7d810f8c | external_fact | insufficient_evidence | 1 support (t-j.ru), 1 группа single, указателей нет | → то же | собственная оценка Т-Инвестиций |
+| e61b4a58 | external_fact | insufficient_evidence | 1 support (t-j.ru), 1 группа single, указателей нет | → то же | собственная оценка ACI Russia |
+| 2f456e85 | external_fact | insufficient_evidence | 1 support (cbr.ru/statistics/ddkp/mo_br/), 1 группа single, VA/якоря нет | → то же | консенсус-прогноз ЦБ (медиана опроса ЦБ; §15 — публикация ведомства), но указатель не записан → fail-closed |
+| 7c8c9afe | external_fact | insufficient_evidence | 1 support (cbr.ru inflationary_expectations/I), 1 группа single, VA/якоря нет | → то же | страница ЦБ: self_primary на уровне значения не записан (см. ниже) |
+| c6729d4c | external_fact | insufficient_independence | 2 support (cbr.ru ×2), 1 группа domain:cbr.ru, VA/якоря нет | → то же | хост прочитанной страницы указателем не считается (запрет T7.87) |
+| cc75e97f | external_fact | insufficient_independence | 2 support (cbr.ru ×2), 1 группа domain:cbr.ru, VA/якоря нет | → то же | то же |
+| 58e2d5d4 | temporal_fact | insufficient_evidence | 1 support (cbr.ru Infl_25-12), 1 группа single, VA/якоря нет | → то же | прогноз аналитиков на странице ЦБ: значение создано не ЦБ (§15) |
+| 2d010d53 | external_fact | insufficient_evidence | 1 support (cbr.ru Infl_25-12), 1 группа single, VA/якоря нет | → то же | то же |
+| e189c80d | temporal_fact | insufficient_evidence | 1 support (garant.ru, 2026-10-09), 1 группа single, VA нет, parent None | → то же | указатель не записан; нужна переатрибуция улики текущим методом (задача на данные) |
+| 73d52835 | external_fact | insufficient_evidence | 1 support (cbr.ru press event 28251), 1 группа single, VA/якоря нет | → то же | страница ЦБ без записанного указателя |
+| e2c52955 | external_fact | insufficient_evidence | 1 support (cbr.ru CPD_2025-12), 1 группа single, VA/якоря нет | → то же | то же |
+| c970bc08 | external_fact | insufficient_independence | 2 support (sbercib, nbj), 1 группа correction:merge, VA/якоря нет | → то же | указателей нет |
+| d8155167 | external_fact | insufficient_evidence | 1 support (un.org), 1 группа single, VA/якоря нет | → то же | указателей нет |
+
+Итог: метку меняют ровно две записи — `6d9a12ff` и `7cc2b578`; остальные 18 остаются как
+было. Закреплено тестом `tests/unit/test_web_producer_view_t7100.py::test_labels_after_the_change`
+(ожидания по всем 20 строкам + явная проверка `changed == ["6d9a12ff", "7cc2b578"]`).
+
+### (б) Допустимость `insufficient_evidence` и риск ложной метки
+
+`insufficient_evidence` (rules_engine.py:235) записывается, когда поддерживающих улик меньше
+`min_support_evidence` (external_fact/temporal_fact: порог 2 → ровно одна улика), и никогда не
+соседствует с `insufficient_independence` (:237) — ветка elif. Оба кода описывают одно
+витринное состояние; метка не должна зависеть от выбора кода (ADR-0035 §18.2). Риск подписать
+не-производителя закрыт прежними условиями: указатель обязан быть записан (VA значения или
+якорь-родитель на домашнем хосте производителя из словаря), группа ровно одна, контр-улик нет;
+VA пишется только для производных пересказов (собственная оценка актора VA не имеет —
+curator-v11 правило 11), якорь-родитель означает производность. Число улик не вводит новой
+оценки: оно читается из тех же строк и нужно только чтобы подсказка не преувеличивала.
+
+### (в) Где записан `self_primary` и чего не хватает
+
+Страничное решение «страница принадлежит производителю значения» записано только на уровне
+страницы — в payload события `research_fetch_completed` (`attribution_status`,
+`apps/research_proxy/service.py` ~:291–345). На уровне значения оркестратор пишет
+`evidence.scope.value_attribution` только при `decision.is_derivative`
+(`apps/orchestrator/orchestrator.py::_value_attribution` ~:2454–2500), то есть для собственной
+страницы производителя записи в scope улики НЕТ и витрина её не читает. Вычислять это на
+отображении запрещено (ADR-0026). Предложение на отдельную задачу: запись решения о
+происхождении значения при fetch / переатрибуции (запись при fetch), после чего страницы ЦБ с
+подтверждённой собственной публикацией получат метку случая по тому же правилу. Запрет
+«cbr.ru host сам производителем не называет» (T7.87) сохранён и тестами, и правилом.
+
+### (г) Публикации ведомства и прогнозы аналитиков
+
+`2f456e85` (консенсус-прогноз 6,6% — медиана опроса ЦБ, опубликованная ЦБ): по §15 это
+публикация ведомства и заслуживала бы метки случая, но указатель не записан → метка не
+ставится (задача на запись данных, не на витрину). `2d010d53`/`58e2d5d4` (прогнозы аналитиков,
+опубликованные ЦБ): значение создано не ЦБ — ЦБ только издатель; «Подтверждено слабо» честно
+(§15, curator-v11 правило 11) и не должно смениться даже при записи self_primary — правило
+требует указатель на производителя ЗНАЧЕНИЯ, а не издателя.
+
+### (д) Свёрнутые пары T7.99 после правки
+
+Пары `9266248e ↔ e189c80d` и `c6729d4c ↔ 136a0ca0` расходятся по-прежнему — правка не меняет
+записанные факты. `e189c80d`: улика garant.ru (2026-10-09) без `value_attribution` и без
+якоря-родителя — для метки случая нужна переатрибуция этой улики текущим методом (задача на
+данные). `c6729d4c`: страница ЦБ без записанного указателя (см. (в)). ADR-0035 §17.3 остаётся
+в силе: расхождение показано, не выровнено.
+
+### Тесты и краснота на `f74e5c4`
+
+Изменён `tests/unit/test_web_producer_view.py`: условие (а) закрепляет обе причины случая
+(`insufficient_evidence` убран из списка «прежних причин» с обоснованием в докстринге),
+добавлены гейт-тесты (fail-closed без указателя, при двух группах, `no_evidence` вне),
+`test_case_carries_the_support_count`, три теста подсказок (единственная улика, потолки,
+сомнительное имя) и расширение теста «новый текст не утверждает проверку». Новые файлы:
+`tests/unit/test_web_producer_view_t7100.py` (4 теста: таблица 20 записей, ровно две смены
+метки, единичные подсказки, уровень/цвет без изменений у всех 20) и
+`tests/scenario/test_web_producer_badge_t7100.py` (5 тестов: карточка ответа для репродюсера
+`6d9a12ff` (якорь ЦБ) и `7cc2b578` (VA→Росстат) с единичной подсказкой и прежней строкой
+причины «доказательств меньше нужного»; fail-closed: собственная оценка Альфа-Банка и страницы
+ЦБ без указателя; единый бейдж в списке знаний, карточке утверждения и списке вопросов).
+Прежние тесты T7.87/T7.88/T7.99 (`test_web_producer_badge.py`, `test_web_independent_estimates.py`,
+`test_web_duplicate_fold_t799.py`, `test_web_knowledge.py`, `test_web_answer_api.py`,
+`test_web_questions.py`) — зелёные БЕЗ ослабления ожиданий (константа
+`INDEPENDENCE_SHORTFALL_REASONS` не изменена; seed'ы fold-теста с `insufficient_evidence` не
+имеют улик — случай не признан и там).
+
+Красность (detached worktree `/tmp/wt7100` на `f74e5c4`, удалён): unit-файлы — ImportError
+collection (нет `producer_publication_case`/`EVIDENCE_SHORTFALL_REASONS`); scenario —
+**3 failed, 2 passed** (обе карточки и витринный тест красные: старый код даёт «Подтверждено
+слабо»; два fail-closed guard-теста зелёны и там — они закрепляют отсутствие поведения).
+
+### Полная проверка (§6) перед коммитом кода `928cc50`
+
+ruff — «All checks passed!»; mypy strict на `packages apps hostctl` — «Success: no issues found
+in 153 source files»; `-n auto -m "not timing"` — **2349 passed, 12 skipped, 0 failed** (211.80 с);
+`-m timing` — **4 passed, 2361 deselected** (47.55 с). Всего тестов 2333 → 2349 (+16, уменьшения
+нет). Контейнеров 41, `noezema_mig_*` в БД 40, `noezema_tpl_*` 0 (замер до правок и после —
+одинаков).
