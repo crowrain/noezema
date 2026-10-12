@@ -31,14 +31,18 @@
     ни то ни другое под это условие не подставляется;
 (б) среди подтверждающих улик этой оценки ровно одна группа независимости;
 (в) в ней есть хотя бы один указатель на производителя — запись происхождения значения улики
-    (`value_attribution.primary_key` из словаря первоисточников) либо якорь-родитель строки
+    (`value_attribution.primary_key` из словаря первоисточников), запись о собственной публикации
+    производителя (`value_self_publication`, T7.101, ADR-0029 дополнение) либо якорь-родитель строки
     источника, чей хост является домашним хостом производителя из того же словаря, — и все
     такие указатели называют одного и того же производителя;
 (г) контр-улик у этой оценки нет.
 
 Сам прочитанный адрес вида `cbr.ru` производителем не называет: страница ЦБ может сообщать цифру
 Росстата (стендовый случай 9266248e), поэтому хост строки источника в указатели не входит —
-указателем считается только записанное решение о происхождении значения или якорь-родитель.
+указателем считается только записанное решение о происхождении значения, запись о собственной
+публикации или якорь-родитель. Запись о собственной публикации — ровно тот случай, когда хостовое
+решение (`self_primary`) уже проверило домашний хост при атрибуции; витрина проверяет запись
+заново (имя из словаря, адрес на домашнем хосте) и не верит ей на слово.
 """
 
 from __future__ import annotations
@@ -49,7 +53,7 @@ from typing import Any, Final
 
 from apps.research_proxy.source_attribution import PRIMARY_SOURCES, is_home_host, primary_source
 from packages.domain.models.enums import AssessmentEvidenceRole
-from packages.memory.scope import parse_value_attribution
+from packages.memory.scope import parse_self_publication, parse_value_attribution
 
 #: Причина rules engine, которая означает «независимых групп меньше нужного».
 #: Семейство `independence_<relation>_not_met` говорит о связи между источниками (повторяемость
@@ -99,6 +103,31 @@ def _attribution_pointer(row: Mapping[str, Any]) -> Any:
     return str(spec.name)
 
 
+def _self_publication_pointer(row: Mapping[str, Any]) -> Any:
+    """Указатель из записи о собственной публикации производителя (T7.101, ADR-0029 дополнение).
+
+    Запись называет производителя, но витрина обязана её проверить, а не поверить на слово:
+    имя обязано совпадать со словарём по `primary_key`, а адрес записанной страницы —
+    принадлежать домашнему хосту этого производителя (тот же host-контроль, что у
+    `_attribution_pointer`: сравнивать надо метку хоста, registrable domain у `.gov.ru`
+    один на всех, T7.75). Битая запись, запись с именем не из словаря или с адресом вне
+    домашнего хоста — маркер (условие (в) не выполнен)."""
+    publication = parse_self_publication(row.get("scope"))
+    if publication is None:
+        return None
+    spec = primary_source(publication.primary_key)
+    if spec is None or not spec.home_hosts:
+        return _UNNAMED_POINTER
+    if str(publication.primary_name) != spec.name:
+        # запись противоречит словарю: называть производителя по такой улике нельзя
+        return _UNNAMED_POINTER
+    if not publication.primary_uri or not is_home_host(publication.primary_uri, spec.home_hosts):
+        # страница записана на хосте, который не является домашним для названного производителя:
+        # «собственная публикация» по такой записи не читается
+        return _UNNAMED_POINTER
+    return str(spec.name)
+
+
 def _parent_pointer(row: Mapping[str, Any]) -> Any:
     """Указатель из якоря-родителя строки источника: хост якоря — производитель из словаря.
 
@@ -141,8 +170,8 @@ def producer_publication_case(
     `evidence_rows` — улики утверждения с колонками действующей оценки:
     `assessment_role` (роль улики в этой оценке; None — оценка эту улику не использовала),
     `group_id` (записанная группа независимости из снимка этой оценки), `scope` (payload улики,
-    включая `value_attribution`) и `parent_uri`/`parent_source_id` (якорь-родитель источника).
-    `reasons` — записанные причины этой же оценки.
+    включая `value_attribution` и `value_self_publication`) и `parent_uri`/`parent_source_id`
+    (якорь-родитель источника). `reasons` — записанные причины этой же оценки.
 
     None означает «случай не признан»: витрина показывает прежнюю подпись без изменений.
     """
@@ -175,7 +204,11 @@ def producer_publication_case(
 
     names: set[str] = set()
     for row in supports:
-        for pointer in (_attribution_pointer(row), _parent_pointer(row)):
+        for pointer in (
+            _attribution_pointer(row),
+            _parent_pointer(row),
+            _self_publication_pointer(row),
+        ):
             if pointer is _UNNAMED_POINTER:
                 return None  # условие (в): указатель есть, но производитель по нему не читается
             if isinstance(pointer, str) and pointer:
@@ -206,6 +239,10 @@ def evidence_producer_names(evidence_rows: Iterable[Mapping[str, Any]]) -> froze
     имена из словаря первоисточников; битые и безымянные записи просто ничего не дают.
     Это НЕ признание случая производителя (полное правило — у `producer_publication_name`):
     функция отвечает только на вопрос «какие производители в записях названы».
+
+    С T7.101 записью о собственной публикации здесь НЕ читается: полоса связанных оценок
+    (ADR-0035 §11) закреплена прежними тестами, а запись обязана влиять только на метку
+    витрины (STATUS T7.101).
     """
     names: set[str] = set()
     for row in evidence_rows:

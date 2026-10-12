@@ -26,6 +26,16 @@ T7.98 (ADR-0029, узкая реализация «варианта C» из AGE
 положительное противоречие (прочие свежие отказы прежний указатель сохраняют), источники под
 операторскими коррекциями (ADR-0031) не трогаются никогда. Идемпотентность: после снятия
 строка источника уже не размечена, повторный прогон даёт «изменений нет».
+
+T7.101 (ADR-0029 дополнение, ADR-0035 §19): у решения `self_primary` появился долговременный
+выход — запись о собственной публикации производителя (`packages/memory/scope.py::
+value_self_publication`). Переатрибуция — единственный механизм записи: новая улика рождается
+без неё (оркестратор пишет только производность), а перечитать окно умеет именно эта команда.
+Запись не склеивает источники — для неё нет каскада переоценок (`changed_sources` не пополняется):
+группировка, оценки и движок правил эту запись не читают, её читает только витрина. Вето
+третьего актора (`SelfPublicationCandidate.actor_veto`, ADR-0035 §15) — честный отказ: значение
+на странице названо оценкой не производителя, и запись не пишется. Идемпотентность та же:
+запись текущего метода не перезаписывается, повторный прогон даёт «изменений нет».
 """
 
 from __future__ import annotations
@@ -42,6 +52,7 @@ from apps.research_proxy.derivative_pointer import resolve_primary_source, write
 from apps.research_proxy.source_attribution import (
     ATTRIBUTION_METHOD_VERSION,
     STATUS_AMBIGUOUS,
+    STATUS_SELF_PRIMARY,
     AttributionDecision,
     PrimarySource,
     detect_source_attribution,
@@ -49,15 +60,22 @@ from apps.research_proxy.source_attribution import (
 )
 from apps.research_proxy.value_attribution import (
     VALUE_ATTRIBUTION_METHOD_VERSION,
+    SelfPublicationCandidate,
     ValueAttributionDecision,
     attribute_value_in_fragment,
+    self_publication_candidate,
 )
 from packages.artifacts.store import ArtifactStore, ArtifactStoreError
 from packages.domain.canonical import canonical_json_bytes
 from packages.domain.db.uow import transaction
 from packages.domain.services.audit import AuditService
 from packages.memory.reassessment import WorkerOutcome, run_reassessment_batch
-from packages.memory.scope import EVIDENCE_VALUE_ATTRIBUTION_KEY, build_value_attribution
+from packages.memory.scope import (
+    EVIDENCE_SELF_PUBLICATION_KEY,
+    EVIDENCE_VALUE_ATTRIBUTION_KEY,
+    build_self_publication,
+    build_value_attribution,
+)
 from packages.memory.source_graph import apply_source_graph_change
 
 #: версия страничного детектора, которая решает сейчас: переатрибуция пересматривает решения,
@@ -66,6 +84,11 @@ from packages.memory.source_graph import apply_source_graph_change
 #: валидной записью, его перечитывает заново запущенный детектор (ADR-0029 дополнение).
 CURRENT_PAGE_METHOD_VERSION: Final = ATTRIBUTION_METHOD_VERSION
 CURRENT_VALUE_METHOD_VERSION: Final = VALUE_ATTRIBUTION_METHOD_VERSION
+#: запись о собственной публикации (T7.101) ввёл текущий метод значений: прежние эпохи v1…v5
+#: такой записи не писали, поэтому прогон, помеченный прежней меткой (тестовый приём эпохи —
+#: подмена `CURRENT_VALUE_METHOD_VERSION`/`VALUE_ATTRIBUTION_METHOD_VERSION`), обязан писать
+#: ровно то, что писала та версия метода, и не дописывать ей то, чего она не знала
+_SELF_PUBLICATION_METHOD: Final = VALUE_ATTRIBUTION_METHOD_VERSION
 #: автор записей журнала, порождённых каскадом переатрибуции (тип события существующий)
 REATTRIBUTE_ACTOR: Final = "hostctl research-reattribute"
 #: метка в metadata.derivative_of: решение принято отложенным прогоном, не чтением
@@ -546,6 +569,13 @@ class _EvidencePlan:
     #: прежнее решение улики (T7.85): пусто, если записи не было
     recorded_key: str = ""
     recorded_parent: str = ""
+    #: T7.101: запись о собственной публикации производителя вместо производной атрибуции
+    #: (не склеивает: без родителя, без каскада). `source_uri` — адрес прочитанной страницы,
+    #: он попадает в запись, чтобы витрина проверила домашний хост, а не поверила на слово.
+    self_publication: SelfPublicationCandidate | None = None
+    source_uri: str = ""
+    #: метод прежней записи о собственной публикации (пусто — записи не было)
+    recorded_self_method: str = ""
 
 
 async def _read_pages(db: AsyncSession, since: datetime) -> dict[uuid.UUID, str]:
@@ -603,7 +633,11 @@ async def _evidence_to_reevaluate(db: AsyncSession, source_id: uuid.UUID) -> lis
 
     Прежнее решение — не пропуск: это ровно то, что обязан пересмотреть исправленный детектор.
     Запись прежнего метода печатается в план отдельной строкой «было → станет», включая случай,
-    когда свежий метод отказался решать (тогда прежняя запись остаётся — знание не удаляется)."""
+    когда свежий метод отказался решать (тогда прежняя запись остаётся — знание не удаляется).
+
+    С T7.101 сюда же попадают улики с записью о собственной публикации: записи о происхождении
+    значения у них нет по построению (пересказа нет), поэтому перечитывание идёт по предикату
+    собственной записи — её метод тоже сверяется (`recorded_self_method`)."""
     return [
         dict(row)
         for row in (
@@ -614,7 +648,9 @@ async def _evidence_to_reevaluate(db: AsyncSession, source_id: uuid.UUID) -> lis
                         "  e.scope -> 'value_attribution' ->> 'primary_name' AS recorded_name, "
                         "  e.scope -> 'value_attribution' ->> 'primary_key' AS recorded_key, "
                         "  e.scope -> 'value_attribution' ->> 'method' AS recorded_method, "
-                        "  e.scope -> 'value_attribution' ->> 'parent_source_id' AS recorded_parent "
+                        "  e.scope -> 'value_attribution' ->> 'parent_source_id' AS recorded_parent, "
+                        "  e.scope -> 'value_self_publication' ->> 'method' AS recorded_self_method, "
+                        "  e.scope -> 'value_self_publication' ->> 'primary_name' AS recorded_self_name "
                         "FROM evidence e "
                         "JOIN claims c ON c.id = e.claim_id "
                         "JOIN sources s ON s.id = e.source_id "
@@ -709,11 +745,15 @@ async def _plan_evidence_window(
             canonical_uri = str(item["canonical_uri"] or "")
             recorded_method = str(item["recorded_method"] or "")
             recorded_name = str(item["recorded_name"] or "") or None
+            recorded_self_method = str(item["recorded_self_method"] or "")
+            recorded_self_name = str(item["recorded_self_name"] or "") or None
             # «было» для улики, решённой прежним методом: прежнее решение печатается целиком,
             # иначе оператор не увидит, ЧТО именно пересматривается
             was_status = (
                 f"derivative → {recorded_name} ({recorded_method})"
                 if recorded_method
+                else f"собственная публикация → {recorded_self_name} ({recorded_self_method})"
+                if recorded_self_method
                 else NO_DECISION_YET
             )
             if source_id in corrected:
@@ -736,6 +776,82 @@ async def _plan_evidence_window(
                 claim_statement=statement,
             )
             if not decision.is_derivative:
+                # T7.101: `self_primary` — значение на прочитанной странице принадлежит её же
+                # хозяину. Запись о собственной публикации пишется только там, где записи о
+                # происхождении значения нет (она и не нужна: пересказа нет); улика с прежней
+                # записью `value_attribution` остаётся на прежнем решении — тот же принцип,
+                # что и для честных отказов: знание не удаляется.
+                candidate: SelfPublicationCandidate | None = None
+                if (
+                    decision.status == STATUS_SELF_PRIMARY
+                    and not recorded_method
+                    and CURRENT_VALUE_METHOD_VERSION == _SELF_PUBLICATION_METHOD
+                ):
+                    candidate = self_publication_candidate(
+                        canonical_uri=canonical_uri or None,
+                        text=page_text,
+                        claim_statement=statement,
+                    )
+                if candidate is not None and candidate.actor_veto:
+                    rows.append(
+                        EvidenceAttributionRow(
+                            claim_id=claim_id,
+                            claim_statement=statement,
+                            canonical_uri=canonical_uri,
+                            was_status=was_status,
+                            now_status=decision.status,
+                            primary_name=None,
+                            action=(
+                                "изменений нет: собственная публикация не записана — "
+                                "значение названо оценкой третьего актора (ADR-0035 §15)"
+                            ),
+                            was_method=recorded_method,
+                        )
+                    )
+                    continue
+                if candidate is not None:
+                    if recorded_self_method == CURRENT_VALUE_METHOD_VERSION:
+                        rows.append(
+                            EvidenceAttributionRow(
+                                claim_id=claim_id,
+                                claim_statement=statement,
+                                canonical_uri=canonical_uri,
+                                was_status=was_status,
+                                now_status=decision.status,
+                                primary_name=candidate.primary_name,
+                                action="изменений нет: собственная публикация уже записана",
+                                was_method=recorded_method,
+                            )
+                        )
+                        continue
+                    rows.append(
+                        EvidenceAttributionRow(
+                            claim_id=claim_id,
+                            claim_statement=statement,
+                            canonical_uri=canonical_uri,
+                            was_status=was_status,
+                            now_status=decision.status,
+                            primary_name=candidate.primary_name,
+                            action=(
+                                f"будет записано: собственная публикация производителя "
+                                f"{candidate.primary_name}"
+                            ),
+                            was_method=recorded_method,
+                        )
+                    )
+                    plan.append(
+                        _EvidencePlan(
+                            evidence_id=uuid.UUID(str(item["evidence_id"])),
+                            source_id=source_id,
+                            claim_id=uuid.UUID(str(item["claim_id"])),
+                            decision=decision,
+                            row_index=len(rows) - 1,
+                            self_publication=candidate,
+                            source_uri=canonical_uri,
+                            recorded_self_method=recorded_self_method,
+                        )
+                    )
+                    continue
                 rows.append(
                     EvidenceAttributionRow(
                         claim_id=claim_id,
@@ -800,7 +916,15 @@ async def _plan_evidence_window(
 def _written_action(item: _EvidencePlan) -> str:
     """Что строка отчёта говорит после успешной записи (T7.85). Различение важное: запись прежнего
     метода с тем же первоисточником — это обновление формы, а не перемена независимости; с другим
-    первоисточником — настоящая смена группы, её пересчитывает каскад."""
+    первоисточником — настоящая смена группы, её пересчитывает каскад. Запись о собственной
+    публикации (T7.101) каскада не имеет вовсе: она не склеивает источники."""
+    if item.self_publication is not None:
+        if item.recorded_self_method:
+            return (
+                "собственная публикация производителя: запись прежнего метода "
+                "обновлена до текущего"
+            )
+        return "собственная публикация производителя записана"
     if not item.recorded_key:
         return "происхождение значения улики записано"
     if item.recorded_key == (item.decision.primary_key or ""):
@@ -852,7 +976,10 @@ async def reattribute_evidence_window(
     async with factory() as db:
         rows, plan = await _plan_evidence_window(db, store, since)
         preview_claims = await _claim_count_for(
-            db, frozenset({item.source_id for item in plan})
+            db,
+            # каскад предсказывается только для производных записей: собственная публикация
+            # (T7.101) источники не склеивает и переоценок не вызывает
+            frozenset({item.source_id for item in plan if item.self_publication is None}),
         )
 
     if dry_run or not plan:
@@ -873,6 +1000,63 @@ async def reattribute_evidence_window(
     # записи и каскад — одной транзакцией (инвариант audit+outbox §3)
     async with factory() as db, transaction(db):
         for item in plan:
+            if item.self_publication is not None:
+                # T7.101: запись о собственной публикации производителя. Предзащита та же по
+                # смыслу: строка берётся на блокировку только если решение по значению в ней
+                # отсутствует либо принято ПРЕЖНЕЙ версией метода, и только если источник не под
+                # коррекцией оператора (ADR-0031). Запись не склеивает источники: `changed_sources`
+                # не пополняется — каскада переоценок для неё нет по построению (ADR-0029 дополнение).
+                candidate = item.self_publication
+                guarded = (
+                    (
+                        await db.execute(
+                            text(
+                                "SELECT id FROM evidence WHERE id = :id AND source_id = :sid "
+                                "  AND jsonb_typeof(scope -> 'value_attribution') IS NULL "
+                                "  AND COALESCE(scope -> 'value_self_publication' ->> 'method', '') <> :method "
+                                "  AND NOT EXISTS (SELECT 1 FROM source_graph_corrections c "
+                                "      WHERE c.valid AND c.actor LIKE :prefix "
+                                "        AND (c.from_source_id = :sid OR c.to_source_id = :sid)) "
+                                "FOR UPDATE"
+                            ),
+                            {
+                                "id": item.evidence_id,
+                                "sid": item.source_id,
+                                "method": CURRENT_VALUE_METHOD_VERSION,
+                                "prefix": f"{OPERATOR_ACTOR_PREFIX}%",
+                            },
+                        )
+                    )
+                    .scalars()
+                    .first()
+                )
+                if guarded is None:
+                    continue  # решение свежее, параллельное или под коррекцией оператора — не трогаем
+                self_record = build_self_publication(
+                    primary_key=candidate.primary_key,
+                    primary_name=candidate.primary_name,
+                    primary_uri=item.source_uri,
+                    method=VALUE_ATTRIBUTION_METHOD_VERSION,
+                    basis_fragment=candidate.basis_fragment,
+                )
+                if self_record is None:
+                    continue
+                await db.execute(
+                    text(
+                        "UPDATE evidence SET scope = COALESCE(scope, '{}'::jsonb) || CAST(:m AS jsonb) "
+                        "WHERE id = :id AND jsonb_typeof(scope -> 'value_attribution') IS NULL "
+                        "  AND COALESCE(scope -> 'value_self_publication' ->> 'method', '') <> :method"
+                    ),
+                    {
+                        "m": canonical_json_bytes(
+                            {EVIDENCE_SELF_PUBLICATION_KEY: self_record.as_scope()}
+                        ).decode("utf-8"),
+                        "id": item.evidence_id,
+                        "method": CURRENT_VALUE_METHOD_VERSION,
+                    },
+                )
+                changed_evidence += 1
+                continue
             spec = primary_source(item.decision.primary_key or "")
             if spec is None:
                 continue

@@ -29,6 +29,12 @@
 Решение принимает только хост: модель к производности не допускается, оценки назначает rules engine.
 Разворачивается решение в записях БД в `apps/orchestrator/orchestrator.py` (новая улика) и
 `apps/research_proxy/reattribution.py` (уже существующие улики).
+
+С T7.101 (ADR-0029 дополнение, ADR-0035 §19) у решения `self_primary` появился второй выход:
+`self_publication_candidate` называет производителя и его вето третьего актора, чтобы
+переатрибуция записала «собственную публикацию производителя» отдельным ключом evidence scope
+(`packages/memory/scope.py::value_self_publication`) — без родительского указателя и без влияния
+на группировку: читает её только витрина (`apps/web/producer_view.py`).
 """
 
 from __future__ import annotations
@@ -700,29 +706,11 @@ def _publication_decision(
     )
 
 
-def attribute_value_in_fragment(
-    *,
-    canonical_uri: str | None,
-    text: str | None,
-    claim_statement: str | None = None,
-) -> ValueAttributionDecision:
-    """Кому принадлежит значение, на котором стоит утверждение.
-
-    `text` — основание улики: фрагмент прочитанной страницы (для новой улики это `assertion_text`,
-    для уже существующей — весь сохранённый нормализованный текст страницы: долговременного фрагмента
-    у строки улики нет, ограничение описано в STATUS T7.78). `canonical_uri` — адрес прочитанной
-    страницы, `claim_statement` — формулировка утверждения (может отсутствовать).
-    """
-    if not text:
-        return ValueAttributionDecision(status=STATUS_NO_VALUE_ATTRIBUTION)
-
-    scanned = normalize_scan_text(text)[:MAX_SCAN_CHARS]
-    values = claim_value_numbers(claim_statement)
-
-    if any(pattern.search(scanned) for pattern in _OWN_ASSESSMENT):
-        # своя оценка/альтернативный расчёт в основании улики: склеивать нельзя
-        return ValueAttributionDecision(status=STATUS_OWN_ASSESSMENT, claim_values=values)
-
+def _pairing_maps(scanned: str, values: tuple[str, ...]) -> tuple[dict[str, str], dict[str, str]]:
+    """Пары фрагментов: `attributed` — фрагменты, где названа атрибуция (независимо от значения),
+    `matched` — пары «первоисточник → фрагмент» про значение утверждения. Вынесено из
+    `attribute_value_in_fragment` дословно (T7.101): решение о собственной публикации обязано
+    строиться на ровно том же pairing, что и решение об атрибуции, — второй копии логики нет."""
     attributed: dict[str, str] = {}
     matched: dict[str, str] = {}
     for fragment in _fragments(scanned):
@@ -747,6 +735,33 @@ def attribute_value_in_fragment(
             else relay
         )
         matched.update(dict.fromkeys({**relay_value, **keys}, fragment))
+    return attributed, matched
+
+
+def attribute_value_in_fragment(
+    *,
+    canonical_uri: str | None,
+    text: str | None,
+    claim_statement: str | None = None,
+) -> ValueAttributionDecision:
+    """Кому принадлежит значение, на котором стоит утверждение.
+
+    `text` — основание улики: фрагмент прочитанной страницы (для новой улики это `assertion_text`,
+    для уже существующей — весь сохранённый нормализованный текст страницы: долговременного фрагмента
+    у строки улики нет, ограничение описано в STATUS T7.78). `canonical_uri` — адрес прочитанной
+    страницы, `claim_statement` — формулировка утверждения (может отсутствовать).
+    """
+    if not text:
+        return ValueAttributionDecision(status=STATUS_NO_VALUE_ATTRIBUTION)
+
+    scanned = normalize_scan_text(text)[:MAX_SCAN_CHARS]
+    values = claim_value_numbers(claim_statement)
+
+    if any(pattern.search(scanned) for pattern in _OWN_ASSESSMENT):
+        # своя оценка/альтернативный расчёт в основании улики: склеивать нельзя
+        return ValueAttributionDecision(status=STATUS_OWN_ASSESSMENT, claim_values=values)
+
+    attributed, matched = _pairing_maps(scanned, values)
 
     def fallback(refusal: ValueAttributionDecision) -> ValueAttributionDecision:
         """Честный отказ строгого режима ещё не значит «пересказа нет»: страница могла объявить
@@ -814,3 +829,76 @@ def attribute_value_in_fragment(
 def _home_hosts(key: str) -> tuple[str, ...]:
     spec = primary_source(key)
     return () if spec is None else spec.home_hosts
+
+
+# ─── T7.101 (ADR-0029 дополнение, ADR-0035 §19): решение о собственной публикации ──────────────
+#
+# `self_primary` существовал как честный отказ от пересказа, но ничего не сообщал витрине:
+# страница Банка России с собственным прогнозом молчала «Подтверждено слабо». Решение о записи
+# принимает НЕ новая детекция, а та же `attribute_value_in_fragment`: эта функция отвечает на
+# второй вопрос — как зовут производителя и не чужое ли значение стоит на странице.
+
+
+@dataclass(frozen=True)
+class SelfPublicationCandidate:
+    """Решение записать: значение утверждения на прочитанной странице — собственная публикация
+    производителя на его домашнем хосте (T7.101).
+
+    `actor_veto` — честность к ADR-0035 §15: фрагмент, давший решение, называет ТРЕТЬЕГО актора
+    создателем значения («Аналитики, опрошенные…, ожидают инфляцию 6,0–7,0%» на странице ЦБ) —
+    хост здесь только издатель, и запись не пишется (fail-closed: витрина молчит, как молчала)."""
+
+    primary_key: str
+    primary_name: str
+    basis_fragment: str
+    actor_veto: bool
+
+
+def _third_actor_present(fragment: str) -> bool:
+    """Есть ли во фрагменте действующее лицо — третий актор (тот же словарь, что у вето окна
+    публикации и у гварда (б) relay-кандидата, T7.98): поиск по фону ЗАМАЗАННЫХ алиасов
+    словаря — порядок критичен: «Банк России» в действующее лицо-банк не превращается,
+    «Альфа-Банк» — превращается."""
+    masked = _mask_primary_aliases(fragment)
+    return any(re.search(pattern, masked, re.IGNORECASE) for pattern in OTHER_SOURCE_ACTOR_MARKERS)
+
+
+def self_publication_candidate(
+    *,
+    canonical_uri: str | None,
+    text: str | None,
+    claim_statement: str | None = None,
+) -> SelfPublicationCandidate | None:
+    """Собственная ли публикация стоит на прочитанной странице и стоит ли её записать.
+
+    Решение принимает `attribute_value_in_fragment` — здесь ничего не решается заново: функция
+    только называет производителя по словарю и проверяет вето третьего актора. None — когда
+    решение не `self_primary` (запись пишется только для этого статуса) или когда защита не
+    пропускает запись: без адреса страницы, без pairing, с двумя производителями или с
+    домашним хостом, не совпадающим с прочитанной страницей."""
+    decision = attribute_value_in_fragment(
+        canonical_uri=canonical_uri, text=text, claim_statement=claim_statement
+    )
+    if decision.status != STATUS_SELF_PRIMARY:
+        return None
+    if not canonical_uri or not text:
+        return None  # защита: без адреса прочитанной страницы домашний хост не проверить
+    scanned = normalize_scan_text(text)[:MAX_SCAN_CHARS]
+    _, matched = _pairing_maps(scanned, decision.claim_values)
+    if not matched:
+        return None  # защита: `self_primary` без pairing не бывает, но и проверка не на слепке
+    specs = [
+        spec
+        for spec in (primary_source(key) for key in matched)
+        if spec is not None and is_home_host(canonical_uri, spec.home_hosts)
+    ]
+    if len(specs) != 1 or {spec.key for spec in specs} != set(matched):
+        return None  # запись — ровно об одном производителе, чей домашний хост мы читаем
+    spec = specs[0]
+    veto = any(_third_actor_present(fragment) for fragment in matched.values())
+    return SelfPublicationCandidate(
+        primary_key=spec.key,
+        primary_name=spec.name,
+        basis_fragment=_basis(matched[spec.key]),
+        actor_veto=veto,
+    )

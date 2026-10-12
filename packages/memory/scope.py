@@ -554,16 +554,121 @@ def parse_value_attribution(scope: JsonDict | None) -> ValueAttribution | None:
     )
 
 
+# ─── T7.101 (ADR-0029 дополнение, ADR-0035 §19): собственная публикация производителя ──────────
+#
+# `attribute_value_in_fragment` умеет решить, что значение утверждения на прочитанной странице —
+# собственная публикация производителя на ЕГО домашнем хосте (`self_primary`), но это решение
+# нигде не записывалось: витрина молчала «Подтверждено слабо» там, где подтверждение есть —
+# публикация производителя (замер стенда .92: `c6729d4c`, страницы ЦБ CPD_2026-7 и Infl_exp_26-09).
+# Запись живёт отдельным ключом evidence scope рядом с `value_attribution` и НЕ является
+# родительским указателем: первоисточник не может быть родителем самого себя, склейки источников
+# эта запись не создаёт — группировка, оценки и движок правил её не читают (тот же список
+# потребителей, что у `value_attribution` выше, минус загрузчик снимка независимости).
+# Канал один: витрина (`apps/web/producer_view.py`) читает её как указатель на производителя.
+
+#: дополнительный ключ evidence scope (хостовый, модель его не пишет)
+EVIDENCE_SELF_PUBLICATION_KEY = "value_self_publication"
+#: маркер формы записи внутри ключа; версии метода различаются полем `method` — та же схема,
+#: что у `VALUE_ATTRIBUTION_SCHEMA`: поднятие маркера формы отклоняло бы прежние записи, а
+#: переатрибуция пересматривает решения по метке МЕТОДА, не по маркеру формы.
+SELF_PUBLICATION_SCHEMA = "host-value-self-publication-v1"
+
+
+@dataclass(frozen=True)
+class SelfPublication:
+    """Запись об улике: значение утверждения на прочитанной странице — собственная публикация
+    производителя на его домашнем хосте (T7.101). Родителя нет по построению: это не склейка."""
+
+    primary_key: str
+    primary_name: str
+    #: адрес ПРОЧИТАННОЙ страницы (не домашний URI словаря): витрина обязана проверить, что
+    #  хост источника — домашний хост названного производителя, а не поверить записи на слово
+    primary_uri: str
+    method: str
+    basis_fragment: str
+
+    def as_scope(self) -> JsonDict:
+        return {
+            "schema": SELF_PUBLICATION_SCHEMA,
+            "primary_key": self.primary_key,
+            "primary_name": self.primary_name,
+            "primary_uri": self.primary_uri,
+            "method": self.method,
+            "basis_fragment": self.basis_fragment,
+        }
+
+
+def build_self_publication(
+    *,
+    primary_key: str,
+    primary_name: str,
+    primary_uri: str,
+    method: str,
+    basis_fragment: str = "",
+) -> SelfPublication | None:
+    """Собрать запись о собственной публикации. Строго, как у `build_value_attribution`:
+    нестроковые/пустые поля и слишком длинные значения — отказ (None). UUID-родителя нет:
+    запись не склеивает."""
+    fields: dict[str, object] = {
+        "primary_key": primary_key,
+        "primary_name": primary_name,
+        "primary_uri": primary_uri,
+        "method": method,
+    }
+    cleaned: dict[str, str] = {}
+    for name, value in fields.items():
+        if not isinstance(value, str):
+            return None
+        text = mask_nul(value).strip()
+        limit = 500 if name == "primary_uri" else 200
+        if not text or len(text) > limit:
+            return None
+        cleaned[name] = text
+    basis = mask_nul(basis_fragment).strip()
+    if len(basis) > 1_000:
+        basis = basis[:1_000]
+    return SelfPublication(
+        primary_key=cleaned["primary_key"],
+        primary_name=cleaned["primary_name"],
+        primary_uri=cleaned["primary_uri"],
+        method=cleaned["method"],
+        basis_fragment=basis,
+    )
+
+
+def parse_self_publication(scope: JsonDict | None) -> SelfPublication | None:
+    """Прочитать запись из evidence scope. Нет ключа / не та форма — None (fail-closed:
+    отсутствие решения означает «витрина молчит»)."""
+    if not isinstance(scope, dict):
+        return None
+    raw = scope.get(EVIDENCE_SELF_PUBLICATION_KEY)
+    if not isinstance(raw, dict) or raw.get("schema") != SELF_PUBLICATION_SCHEMA:
+        return None
+    return build_self_publication(
+        primary_key=str(raw.get("primary_key", "")),
+        primary_name=str(raw.get("primary_name", "")),
+        primary_uri=str(raw.get("primary_uri", "")),
+        method=str(raw.get("method", "")),
+        basis_fragment=str(raw.get("basis_fragment", "")),
+    )
+
+
 def carry_value_attribution(current_scope: JsonDict | None, derived_scope: JsonDict) -> JsonDict:
-    """Перенести решение об улике в ПЕРЕСЧИТАННЫЙ скоуп (T7.17 пересчитывает скоуп каждой
+    """Перенести решения об улике в ПЕРЕСЧИТАННЫЙ скоуп (T7.17 пересчитывает скоуп каждой
     улики утверждения из его провенанса и перезаписывает строку — без переноса решение
-    исчезало бы при следующем коммите). Ничего кроме хостового решения не переносится:
-    канонические измерения всегда берутся из свежего провенанса."""
+    исчезало бы при следующем коммите). Ничего кроме хостовых решений не переносится:
+    канонические измерения всегда берутся из свежего провенанса. С T7.101 переносятся оба
+    хостовых ключа (`value_attribution` и `value_self_publication`) — иначе переатрибуция
+    записала бы собственную публикацию, а следующий коммит того же утверждения молча её стёр."""
     attribution = parse_value_attribution(current_scope)
-    if attribution is None:
+    publication = parse_self_publication(current_scope)
+    if attribution is None and publication is None:
         return derived_scope
     carried = dict(derived_scope)
-    carried[EVIDENCE_VALUE_ATTRIBUTION_KEY] = attribution.as_scope()
+    if attribution is not None:
+        carried[EVIDENCE_VALUE_ATTRIBUTION_KEY] = attribution.as_scope()
+    if publication is not None:
+        carried[EVIDENCE_SELF_PUBLICATION_KEY] = publication.as_scope()
     return carried
 
 

@@ -427,7 +427,12 @@ async def test_primary_plus_two_retellings_is_not_graded_above_one_group(
     assert poll_row.action == "будет записано происхождение значения улики", poll_row
     own_plan_row = by_url[URL_CBR_HOME]
     assert own_plan_row.now_status == STATUS_SELF_PRIMARY, own_plan_row
-    assert own_plan_row.action == "изменений нет: атрибуция значения не собрана", own_plan_row
+    # T7.101: собственная страница первоисточника со своим значением — не «не собрано»:
+    # переатрибуция пишет запись о собственной публикации (без родителя и без каскада)
+    assert own_plan_row.action == (
+        "будет записано: собственная публикация производителя Банк России"
+    ), own_plan_row
+    assert own_plan_row.primary_name == "Банк России", own_plan_row
 
     report = await _run_backfill(scratch_url, store)
     origins = await _records_of(scratch_url, STATEMENT_145)
@@ -443,8 +448,17 @@ async def test_primary_plus_two_retellings_is_not_graded_above_one_group(
     assert own["origin"] is None, "собственная страница ЦБ стала пересказом сама себя"
     own_row = next(row for row in report.rows if row.canonical_uri == URL_CBR_HOME)
     assert own_row.now_status == STATUS_SELF_PRIMARY, own_row
+    # запись о собственной публикации живёт рядом с value_attribution, отдельным ключом
+    self_rec = await _scalar(
+        scratch_url,
+        "SELECT e.scope -> 'value_self_publication' ->> 'primary_name' AS n FROM evidence e "
+        "JOIN sources s ON s.id = e.source_id WHERE s.canonical_uri = " + _quoted(URL_CBR_HOME),
+    )
+    assert self_rec is not None and self_rec[0] == "Банк России", self_rec
 
-    assert report.changed_evidence == 2 and report.jobs_created >= 1, report.rows
+    # T7.101: третья запись — собственная публикация на самой странице ЦБ (value_attribution
+    # у неё по-прежнему нет: пересказа нет, родителя нет — см. assert выше)
+    assert report.changed_evidence == 3 and report.jobs_created >= 1, report.rows
     assert len(await _group_ids(scratch_url, STATEMENT_145)) == 1
     # ровно то же, что даёт одна независимая группа: ложное «подтверждено независимо» снято
     assert await _current_assessment(scratch_url, STATEMENT_145) == ("E1", "hypothesis")
@@ -608,7 +622,9 @@ async def test_records_tagged_v2_method_are_reconsidered_by_current_version(
     assert all(row.action == "будет записано прежнее происхождение значения улики" for row in stale), stale
 
     report = await _run_backfill(scratch_url, store)
-    assert report.changed_evidence == 2, report.rows
+    # T7.101: две прежние записи пересмотрены + собственная страница ЦБ получает запись о
+    # собственной публикации (эпохи v2…v4 такой записи не писали — gated-прогон эпохи её не пишет)
+    assert report.changed_evidence == 3, report.rows
     written_after = {
         str(r["canonical_uri"]): dict(r["origin"])
         for r in await _records_of(scratch_url, STATEMENT_145)
@@ -703,7 +719,9 @@ async def test_records_tagged_v3_and_v4_methods_are_reconsidered_by_current_vers
     assert plan.dry_run and plan.changed_evidence == 0 and not plan.changed_source_ids, plan.rows
 
     report = await _run_backfill(scratch_url, store)
-    assert report.changed_evidence == 2, report.rows
+    # T7.101: v3 и v4 пересмотрены + собственная страница ЦБ получает запись о собственной
+    # публикации (её прежние эпохи не писали)
+    assert report.changed_evidence == 3, report.rows
     written_after = {
         str(r["canonical_uri"]): dict(r["origin"])
         for r in await _records_of(scratch_url, STATEMENT_145)
