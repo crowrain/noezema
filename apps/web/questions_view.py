@@ -51,7 +51,7 @@ from apps.web.knowledge import (
     current_assessment_evidence_joins,
     effective_claim_rules,
 )
-from apps.web.producer_view import producer_publication_name
+from apps.web.producer_view import producer_publication_case
 from packages.domain.models.base import JsonDict
 from packages.domain.models.enums import QuestionOrigin, QuestionState
 from packages.domain.sanitization import mask_nul
@@ -171,6 +171,7 @@ def build_answer_summary(
             freshness_status=first.get("freshness_status"),
             rules=rules,
             single_producer=first.get("single_producer"),
+            producer_supports=first.get("producer_supports"),
         )["reliability"]
         # T7.74: та же связь, что показывает карточка (подпись — из словаря).
         summary["relation"] = first.get("relation")
@@ -305,9 +306,9 @@ async def list_question_rows(
         # карточка ответа, поэтому имя производителя считается здесь той же чистой функцией
         # (`apps.web.producer_view`) из записанных фактов этой же оценки. Ничего не пересчитывается.
         item = dict(row)
-        item["single_producer"] = producer_publication_name(
-            _assessment_facts(item), reasons=_grade_reasons(item)
-        )
+        case = producer_publication_case(_assessment_facts(item), reasons=_grade_reasons(item))
+        item["single_producer"] = case.name if case is not None else None
+        item["producer_supports"] = case.supports if case is not None else None
         per_question_claims.setdefault(str(row["question_id"]), []).append(item)
 
     rules = await effective_claim_rules(db)

@@ -1,4 +1,4 @@
-"""Случай «кластер вокруг производителя» (ADR-0035 вариант A, T7.87).
+"""Случай «кластер вокруг производителя» (ADR-0035 вариант A, T7.87; T7.100 — дополнение §18).
 
 Чистая презентационная функция: ни базы, ни rules engine, ни модели. Ей передают ровно то,
 что витрина уже прочитала — улики действующей оценки утверждения и записанные факты графа
@@ -20,10 +20,15 @@
 
 Условия признания случая:
 
-(а) действующая оценка объяснена нехваткой независимости — в её записанных причинах есть
-    `insufficient_independence` (единственный код правил, означающий «групп меньше нужного»:
-    `packages/memory/rules_engine.py:237`; семейство `independence_<relation>_not_met` — про
-    связь между источниками, а не про число групп, :242);
+(а) действующая оценка объяснена нехваткой подтверждений — в её записанных причинах есть
+    `insufficient_independence` (код правил «групп меньше нужного»:
+    `packages/memory/rules_engine.py:237`) или `insufficient_evidence` (код «поддерживающих
+    улик меньше `min_support_evidence`»: :235; для external_fact/temporal_fact это ровно одна
+    улика). T7.100 (ADR-0035 §18): оба кода описывают один витринный случай — все подтверждения
+    сворачиваются к одному производителю, — и метка не должна зависеть от того, какой из двух
+    кодов записали правила. Семейство `independence_<relation>_not_met` — про связь между
+    источниками, а не про число групп (:242), и `no_evidence` — про отсутствие улик вовсе:
+    ни то ни другое под это условие не подставляется;
 (б) среди подтверждающих улик этой оценки ровно одна группа независимости;
 (в) в ней есть хотя бы один указатель на производителя — запись происхождения значения улики
     (`value_attribution.primary_key` из словаря первоисточников) либо якорь-родитель строки
@@ -39,16 +44,27 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from typing import Any, Final
 
 from apps.research_proxy.source_attribution import PRIMARY_SOURCES, is_home_host, primary_source
 from packages.domain.models.enums import AssessmentEvidenceRole
 from packages.memory.scope import parse_value_attribution
 
-#: Единственная причина rules engine, которая означает «независимых групп меньше нужного».
+#: Причина rules engine, которая означает «независимых групп меньше нужного».
 #: Семейство `independence_<relation>_not_met` говорит о связи между источниками (повторяемость
 #: одним методом), а не о числе групп: подставлять под него подпись про производителя нельзя.
 INDEPENDENCE_SHORTFALL_REASONS: Final[frozenset[str]] = frozenset({"insufficient_independence"})
+
+#: Причина rules engine, которая означает «поддерживающих улик меньше `min_support_evidence`»
+#: (`packages/memory/rules_engine.py:235`; для external_fact/temporal_fact — ровно одна улика).
+#: T7.100 (ADR-0035 §18): это тот же витринный случай, что и нехватка групп, — подтверждение
+#: есть, но оно сворачивается к одному производителю; метка не должна зависеть от того, какой
+#: из двух кодов записали правила. `no_evidence` (улик нет вовсе) сюда не входит.
+EVIDENCE_SHORTFALL_REASONS: Final[frozenset[str]] = frozenset({"insufficient_evidence"})
+
+#: Гейт причины для случая производителя (условие (а)): ровно эти два кода правил.
+PRODUCER_CASE_REASONS: Final[frozenset[str]] = INDEPENDENCE_SHORTFALL_REASONS | EVIDENCE_SHORTFALL_REASONS
 
 _SUPPORT_ROLE: Final = AssessmentEvidenceRole.SUPPORT.value
 _COUNTER_ROLE: Final = AssessmentEvidenceRole.COUNTER.value
@@ -102,12 +118,25 @@ def _parent_pointer(row: Mapping[str, Any]) -> Any:
     return None
 
 
-def producer_publication_name(
+@dataclass(frozen=True)
+class ProducerPublication:
+    """Признанный случай: имя производителя и число подтверждающих улик этой оценки.
+
+    `supports` нужен честной подсказке (T7.100): при единственной улике витрина говорит
+    «одна публикация», а не «все подтверждения — один кластер»; число взято из тех же
+    записанных строк, что и имя, — ничего не пересчитывается.
+    """
+
+    name: str
+    supports: int
+
+
+def producer_publication_case(
     evidence_rows: Iterable[Mapping[str, Any]],
     *,
     reasons: Iterable[str],
-) -> str | None:
-    """Имя производителя, вокруг которого свернулась действующая оценка, либо None.
+) -> ProducerPublication | None:
+    """Признанный случай «значение опубликовал его производитель» либо None.
 
     `evidence_rows` — улики утверждения с колонками действующей оценки:
     `assessment_role` (роль улики в этой оценке; None — оценка эту улику не использовала),
@@ -117,7 +146,7 @@ def producer_publication_name(
 
     None означает «случай не признан»: витрина показывает прежнюю подпись без изменений.
     """
-    if not any(str(reason) in INDEPENDENCE_SHORTFALL_REASONS for reason in reasons):
+    if not any(str(reason) in PRODUCER_CASE_REASONS for reason in reasons):
         return None
 
     supports: list[Mapping[str, Any]] = []
@@ -154,7 +183,20 @@ def producer_publication_name(
     if not names or len(names) > 1:
         return None
 
-    return next(iter(names))
+    return ProducerPublication(name=next(iter(names)), supports=len(supports))
+
+
+def producer_publication_name(
+    evidence_rows: Iterable[Mapping[str, Any]],
+    *,
+    reasons: Iterable[str],
+) -> str | None:
+    """Имя производителя, вокруг которого свернулась действующая оценка, либо None.
+
+    Прежний контракт (T7.87): то же правило, что у `producer_publication_case`, только имя.
+    """
+    case = producer_publication_case(evidence_rows, reasons=reasons)
+    return case.name if case is not None else None
 
 
 def evidence_producer_names(evidence_rows: Iterable[Mapping[str, Any]]) -> frozenset[str]:

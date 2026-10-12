@@ -100,9 +100,10 @@ TYPE_REQUIREMENT: Final[dict[str, str]] = {
 #: Уровни, при которых предположение показывается жёлтым («частично подтверждено»).
 _WEAK_GRADES: Final[frozenset[str]] = frozenset({"E1", "E2"})
 
-# ─── случай «кластер вокруг производителя» (ADR-0035 вариант A, T7.87) ───────
+# ─── случай «кластер вокруг производителя» (ADR-0035 вариант A, T7.87; T7.100 — §18) ───
 #
-# Когда действующая оценка объяснена нехваткой независимости, а факты графа этой же
+# Когда действующая оценка объяснена нехваткой подтверждений (записанная причина —
+# `insufficient_independence` или, с T7.100, `insufficient_evidence`), а факты графа этой же
 # оценки сводят все подтверждения к одному производителю (`apps.web.producer_view`),
 # витрина называет это публикацией производителя, а не «предположением» в том же
 # смысле, что непроверенная городская легенда (ADR-0035 §5 п.2). Уровень оценки,
@@ -124,15 +125,31 @@ _PRODUCER_HINT_NO_NAME: Final = (
     "Независимых измерений нет — истинность не проверена."
 )
 
+#: Подсказка единственной улики (T7.100, ADR-0035 §18): подтверждение ровно одно —
+#: публикация производителя. «Один кластер» здесь было бы преувеличением: кластер
+# предполагает несколько подтверждений, а их ровно одно (записано правилом).
+_PRODUCER_HINT_SINGLE: Final = (
+    "Производитель ({name}) опубликовал это значение: одна публикация, "
+    "независимых измерений нет — истинность не проверена."
+)
+_PRODUCER_HINT_NO_NAME_SINGLE: Final = (
+    "Производитель опубликовал это значение: одна публикация, "
+    "независимых измерений нет — истинность не проверена."
+)
 
-def _producer_hint(name: str) -> str:
-    """Подсказка случая «кластер вокруг производителя» (ADR-0035 §6.1/§6.2).
+
+def _producer_hint(name: str, supports: int | None) -> str:
+    """Подсказка случая «кластер вокруг производителя» (ADR-0035 §6.1/§6.2, §18).
 
     Дословно повторяется только то, что действительно следует из данных: имя
     производителя — из записанной атрибуции, «один кластер» — из ровно одной
-    записанной группы независимости этой оценки. Никаких «сообщений ЦБ» и прочих
+    записанной группы независимости этой оценки, «одна публикация» — из ровно одной
+    подтверждающей улики этой оценки (T7.100). Никаких «сообщений ЦБ» и прочих
     деталей, которых в строках оценки нет (запрет выдумки, ADR-0035 §6).
     """
+    if supports == 1:
+        single = _PRODUCER_HINT_SINGLE.format(name=name)
+        return single if len(single) <= MAX_HINT_CHARS else _PRODUCER_HINT_NO_NAME_SINGLE
     named = (
         f"Производитель ({name}) опубликовал это значение: все подтверждения этой оценки "
         "— один кластер. Независимых измерений нет — истинность не проверена."
@@ -146,13 +163,19 @@ def _producer_hint(name: str) -> str:
     return short if len(short) <= MAX_HINT_CHARS else _PRODUCER_HINT_NO_NAME
 
 
-def _producer_badge(name: object) -> dict[str, str]:
+def _producer_badge(name: object, supports: int | None) -> dict[str, str]:
     """Бейдж «опубликовано производителем»: уровень `weak` и цвет сохранены, подписи другие."""
     label = str(name).strip() if isinstance(name, str) else ""
+    if _PRODUCER_NAME.match(label):
+        hint = _producer_hint(label, supports)
+    elif supports == 1:
+        hint = _PRODUCER_HINT_NO_NAME_SINGLE
+    else:
+        hint = _PRODUCER_HINT_NO_NAME
     return {
         "level": LEVEL_WEAK,
         "label": PRODUCER_LABEL,
-        "hint": _producer_hint(label) if _PRODUCER_NAME.match(label) else _PRODUCER_HINT_NO_NAME,
+        "hint": hint,
         "color": _LEVEL_COLOR[LEVEL_WEAK],
     }
 
@@ -174,6 +197,7 @@ def reliability(
     head_state: str | None = None,
     min_grade_for_supported: str | None = None,
     single_producer: str | None = None,
+    producer_supports: int | None = None,
 ) -> dict[str, str]:
     """{"level","label","hint","color"} по уже вычисленной оценке.
 
@@ -189,6 +213,10 @@ def reliability(
     подписи случая «hypothesis + слабый уровень»: уровень остаётся `weak`, grade и пороги
     никто не пересматривает. Для `supported` (`Проверено`) и для спорно/опровергнуто/
     отложено имя не участвует: там бейдж уже назван другим исходом оценки.
+
+    `producer_supports` (T7.100, ADR-0035 §18) — число подтверждающих улик этой же оценки
+    (считает `producer_view` из тех же записанных строк): 1 — единственная улика, подсказка
+    говорит «одна публикация»; None — число не передано, подсказка прежняя общая форма.
     """
     grade = effective_grade if isinstance(effective_grade, str) and effective_grade else None
     status = epistemic_status if isinstance(epistemic_status, str) and epistemic_status else None
@@ -215,7 +243,7 @@ def reliability(
             )
         if grade in _WEAK_GRADES:
             if single_producer:
-                return _producer_badge(single_producer)
+                return _producer_badge(single_producer, producer_supports)
             key = str(claim_type or "")
             threshold = min_grade_for_supported or TYPE_MIN_GRADE.get(key, "")
             requirement = TYPE_REQUIREMENT.get(key) or (

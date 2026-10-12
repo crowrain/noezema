@@ -51,7 +51,7 @@ from apps.web.knowledge import (
     effective_claim_rules,
     grade_reason_view,
 )
-from apps.web.producer_view import evidence_producer_names, producer_publication_name
+from apps.web.producer_view import ProducerPublication, evidence_producer_names, producer_publication_case
 from apps.web.reliability import LEVEL_VERIFIED, describe_verification
 from packages.domain.models.base import JsonDict
 from packages.domain.models.enums import AuditEventType, ClaimType, QuestionState, SessionState
@@ -884,6 +884,7 @@ def _estimate_row_json(
         return out
     out["claim_id"] = row.candidate_id
     reasons = [str(reason) for reason in (claim_row.get("grade_reasons") or [])]
+    case = producer_publication_case(_estimate_facts(claim_row), reasons=reasons)
     out.update(
         assessment_view(
             claim_type=claim_row["claim_type"],
@@ -892,7 +893,8 @@ def _estimate_row_json(
             effective_grade=claim_row["effective_grade"],
             freshness_status=claim_row["freshness_status"],
             rules=rules,
-            single_producer=producer_publication_name(_estimate_facts(claim_row), reasons=reasons),
+            single_producer=case.name if case is not None else None,
+            producer_supports=case.supports if case is not None else None,
         )
     )
     return out
@@ -1259,13 +1261,14 @@ async def question_answer(db: AsyncSession, question_id: uuid.UUID) -> JsonDict 
             str(row["id"]): ("" if row["assessment_id"] is None else str(row["assessment_id"]))
             for row in [*claim_rows, *relied_rows]
         }
-        producer_by_claim = {
-            claim_id: producer_publication_name(
+        publication_by_claim: dict[str, ProducerPublication] = {}
+        for claim_id, rows in by_claim.items():
+            case = producer_publication_case(
                 rows,
                 reasons=reason_by_assessment.get(assessment_id_by_claim.get(claim_id, ""), ()),
             )
-            for claim_id, rows in by_claim.items()
-        }
+            if case is not None:
+                publication_by_claim[claim_id] = case
 
         for row in claim_rows:
             claim_id = str(row["id"])
@@ -1294,6 +1297,7 @@ async def question_answer(db: AsyncSession, question_id: uuid.UUID) -> JsonDict 
             }
             assessment_id = str(row["assessment_id"]) if row["assessment_id"] is not None else ""
             reasons = reason_by_assessment.get(assessment_id, [])
+            publication = publication_by_claim.get(claim_id)
             item.update(
                 assessment_view(
                     claim_type=row["claim_type"],
@@ -1302,7 +1306,8 @@ async def question_answer(db: AsyncSession, question_id: uuid.UUID) -> JsonDict 
                     effective_grade=row["effective_grade"],
                     freshness_status=row["freshness_status"],
                     rules=rules,
-                    single_producer=producer_by_claim.get(claim_id),
+                    single_producer=publication.name if publication is not None else None,
+                    producer_supports=publication.supports if publication is not None else None,
                 )
             )
             item["verification"] = describe_verification(by_claim.get(claim_id, []))
@@ -1347,6 +1352,7 @@ async def question_answer(db: AsyncSession, question_id: uuid.UUID) -> JsonDict 
             }
             assessment_id = str(row["assessment_id"]) if row["assessment_id"] is not None else ""
             reasons = reason_by_assessment.get(assessment_id, [])
+            publication = publication_by_claim.get(claim_id)
             item.update(
                 assessment_view(
                     claim_type=row["claim_type"],
@@ -1355,7 +1361,8 @@ async def question_answer(db: AsyncSession, question_id: uuid.UUID) -> JsonDict 
                     effective_grade=row["effective_grade"],
                     freshness_status=row["freshness_status"],
                     rules=rules,
-                    single_producer=producer_by_claim.get(claim_id),
+                    single_producer=publication.name if publication is not None else None,
+                    producer_supports=publication.supports if publication is not None else None,
                 )
             )
             item["verification"] = describe_verification(by_claim.get(claim_id, []))

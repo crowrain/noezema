@@ -20,7 +20,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.web.labels import LABELS, describe
-from apps.web.producer_view import producer_publication_name
+from apps.web.producer_view import producer_publication_case
 from apps.web.reliability import describe_verification, reliability
 from packages.domain.models.base import JsonDict
 from packages.domain.models.enums import AuditEventType
@@ -201,7 +201,7 @@ def _assessment_explanations(
     fact_rows: Iterable[Any],
     reasons_by_assessment: Mapping[str, Sequence[str]],
 ) -> dict[str, JsonDict]:
-    """{claim_id: {"single_producer", "reasons"}} по правилу ADR-0035 вариант A.
+    """{claim_id: {"single_producer", "producer_supports", "reasons"}} по правилу ADR-0035 вариант A.
 
     `fact_rows` — улики с колонками действующей оценки (`claim_id`, `assessment_id`, колонки из
     `CURRENT_ASSESSMENT_FACT_COLUMNS` плюс `scope`, `parent_source_id`, `parent_uri`). Никакого
@@ -217,15 +217,17 @@ def _assessment_explanations(
         grouped.setdefault(claim_id, []).append(row)
         if row.get("assessment_id") is not None:
             assessment_of[claim_id] = str(row["assessment_id"])
-    return {
-        claim_id: {
-            "single_producer": producer_publication_name(
-                rows, reasons=reasons_by_assessment.get(assessment_of.get(claim_id, ""), ())
-            ),
+    out: dict[str, JsonDict] = {}
+    for claim_id, rows in grouped.items():
+        case = producer_publication_case(
+            rows, reasons=reasons_by_assessment.get(assessment_of.get(claim_id, ""), ())
+        )
+        out[claim_id] = {
+            "single_producer": case.name if case is not None else None,
+            "producer_supports": case.supports if case is not None else None,
             "reasons": list(reasons_by_assessment.get(assessment_of.get(claim_id, ""), [])),
         }
-        for claim_id, rows in grouped.items()
-    }
+    return out
 
 
 async def current_assessment_explanation(
@@ -237,7 +239,8 @@ async def current_assessment_explanation(
     показывала страница (N+1 запрещён и проверяется тестом списка). `floor` — самая ранняя из
     этих claim-строк: та же нижняя граница ленты, что у карточки ответа (`assessment_reason_rows`).
 
-    Возврат — {claim_id: {"single_producer": str | None, "reasons": [коды]}}. Утверждения, у
+    Возврат — {claim_id: {"single_producer": str | None, "producer_supports": int | None,
+    "reasons": [коды]}}. Утверждения, у
     которых нет ни одной улики действующей оценки, в результат не попадают: витрина показывает
     для них прежнюю подпись (fail-closed), а не выдуманное объяснение.
     """
@@ -331,13 +334,16 @@ def assessment_view(
     freshness_status: Any,
     rules: Mapping[str, Any],
     single_producer: str | None = None,
+    producer_supports: int | None = None,
 ) -> dict[str, Any]:
     """Аддитивные человеческие подписи к уже вычисленной оценке утверждения.
 
     `single_producer` (T7.87, ADR-0035 вариант A) — имя производителя, которое
     `apps.web.producer_view` вывел из записанных фактов этой же оценки. Оно передаётся в
     `reliability` и может поменять только подписи случая «hypothesis + слабый уровень»;
-    уровень, grade и пороги правила не пересматривают. Одна функция подписи на карточке
+    уровень, grade и пороги правила не пересматривают. `producer_supports` (T7.100,
+    ADR-0035 §18) — число подтверждающих улик той же оценки из того же правила: ровно одна
+    улика меняет только формулировку подсказки. Одна функция подписи на карточке
     ответа, в списке знаний и на карточке утверждения — иначе витрины разошлись бы в
     бейджах (риск ADR-0035 §4 п.3).
     """
@@ -355,6 +361,7 @@ def assessment_view(
             head_state=head,
             min_grade_for_supported=_min_grade_for(rules, claim_type),
             single_producer=single_producer,
+            producer_supports=producer_supports,
         ),
     }
 
@@ -435,6 +442,7 @@ async def list_claims(
                 freshness_status=r["freshness_status"],
                 rules=rules,
                 single_producer=explanation["single_producer"] if explanation is not None else None,
+                producer_supports=explanation["producer_supports"] if explanation is not None else None,
             )
         )
         # T7.73 (ADR-0018) + T7.87: список подписывает причины действующей оценки теми же
@@ -648,6 +656,7 @@ async def claim_detail(db: AsyncSession, claim_id: uuid.UUID) -> JsonDict:
             freshness_status=claim["freshness_status"],
             rules=rules,
             single_producer=explanation["single_producer"] if explanation is not None else None,
+            producer_supports=explanation["producer_supports"] if explanation is not None else None,
         )
     )
     detail["grade_reasons"] = grade_reason_view(reasons)

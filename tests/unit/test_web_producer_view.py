@@ -17,7 +17,10 @@ import pytest
 
 from apps.web.labels import MAX_HINT_CHARS, MAX_LABEL_CHARS
 from apps.web.producer_view import (
+    EVIDENCE_SHORTFALL_REASONS,
     INDEPENDENCE_SHORTFALL_REASONS,
+    PRODUCER_CASE_REASONS,
+    producer_publication_case,
     producer_publication_name,
 )
 from apps.web.reliability import LEVEL_WEAK, PRODUCER_LABEL, reliability
@@ -68,7 +71,7 @@ def _name(*rows: dict[str, Any], reasons: list[str] = SHORTFALL) -> str | None:
     return producer_publication_name(list(rows), reasons=reasons)
 
 
-# ─── условие (а): причину обязана давать нехватка независимости ────────────────
+# ─── условие (а): причину обязана давать нехватка подтверждений (T7.87 + T7.100) ────
 
 
 def test_the_rule_holds_on_too_few_independence_groups() -> None:
@@ -77,9 +80,62 @@ def test_the_rule_holds_on_too_few_independence_groups() -> None:
     assert frozenset({"insufficient_independence"}) == INDEPENDENCE_SHORTFALL_REASONS
 
 
+def test_single_evidence_is_the_same_case() -> None:
+    """T7.100 (ADR-0035 §18): `insufficient_evidence` — тот же витринный случай.
+
+    Правила записывают этот код, когда поддерживающих улик меньше `min_support_evidence`
+    (для external_fact/temporal_fact — ровно одна). Подтверждение при этом есть — это
+    публикация производителя; метка не должна зависеть от того, какой из двух кодов
+    записали правила. Решение пользователя 2026-10-12.
+    """
+    assert _name(_row(parent_uri=ROSSTAT), reasons=["insufficient_evidence"]) == "Росстат"
+    assert (
+        _name(_row(primary_key="rosstat", primary_name="Росстат"), reasons=["insufficient_evidence"])
+        == "Росстат"
+    )
+    assert frozenset({"insufficient_evidence"}) == EVIDENCE_SHORTFALL_REASONS
+    assert PRODUCER_CASE_REASONS == INDEPENDENCE_SHORTFALL_REASONS | EVIDENCE_SHORTFALL_REASONS
+
+
+def test_single_evidence_without_a_pointer_stays_weak() -> None:
+    """Fail-closed (T7.100): единственная улика без записанного указателя — называть
+    производителя нечем. Хост прочитанной страницы в указатели не входит (правило читает
+    только `value_attribution` и якорь-родителя), поэтому страница самого ЦБ без записанного
+    решения о происхождении значения остаётся на прежней подписи."""
+    assert _name(_row(), reasons=["insufficient_evidence"]) is None
+    assert _name(_row(group=None), reasons=["insufficient_evidence"]) is None
+
+
+def test_single_evidence_with_two_groups_stays_weak() -> None:
+    """Fail-closed (T7.100): указатель есть, но групп две — случай не признан."""
+    assert (
+        _name(
+            _row(group="g0", parent_uri=ROSSTAT),
+            _row(group="g1", parent_uri=ROSSTAT),
+            reasons=["insufficient_evidence"],
+        )
+        is None
+    )
+
+
+def test_case_carries_the_support_count() -> None:
+    """T7.100: правило отдаёт и число подтверждающих улик — из тех же записанных строк."""
+    single = producer_publication_case([_row(parent_uri=ROSSTAT)], reasons=["insufficient_evidence"])
+    assert single is not None and (single.name, single.supports) == ("Росстат", 1)
+    cluster = producer_publication_case(
+        [_row(parent_uri=ROSSTAT), _row(parent_uri="https://www.garant.ru/cpi")], reasons=SHORTFALL
+    )
+    assert cluster is not None and (cluster.name, cluster.supports) == ("Росстат", 2)
+
+
 def test_other_shortfalls_keep_the_previous_wording() -> None:
-    """Мало улик — не «кластер вокруг производителя»: карточка остаётся на прежнем тексте."""
-    for reasons in (["insufficient_evidence"], ["requirements_met"], ["as_of_missing"], []):
+    """Другие причины оценки — не витринный случай производителя.
+
+    `insufficient_evidence` убран из этого списка правкой T7.100 (ADR-0035 §18): теперь
+    это причина случая, если выполнены условия (б)–(г). `no_evidence` (улик нет вовсе)
+    случаем не становится.
+    """
+    for reasons in (["requirements_met"], ["as_of_missing"], ["no_evidence"], []):
         assert _name(_row(parent_uri=ROSSTAT), reasons=reasons) is None, reasons
 
 
@@ -88,13 +144,15 @@ def test_reason_gate_is_tied_to_the_rules_engine() -> None:
 
     Отдельно проверяется, что семейство `independence_<relation>_not_met` сюда НЕ входит:
     оно строится из `required_independence` (отношение сред, §8.7.3), а не из числа групп
-    независимости источников, и объясняет другой дефект оценки.
+    независимости источников, и объясняет другой дефект оценки. С T7.100 проверяются обе
+    причины случая и то, что `no_evidence` в гейт не входит.
     """
     source = (REPO_ROOT / "packages/memory/rules_engine.py").read_text(encoding="utf-8")
-    for reason in INDEPENDENCE_SHORTFALL_REASONS:
+    for reason in PRODUCER_CASE_REASONS:
         assert f'"{reason}"' in source, reason
     assert 'f"independence_{rule.required_independence}_not_met"' in source
-    assert not any(reason.startswith("independence_") for reason in INDEPENDENCE_SHORTFALL_REASONS)
+    assert not any(reason.startswith("independence_") for reason in PRODUCER_CASE_REASONS)
+    assert "no_evidence" not in PRODUCER_CASE_REASONS
 
 
 # ─── условие (в): указатель на производителя ──────────────────────────────────
@@ -190,6 +248,49 @@ def test_the_producer_hint_stays_within_the_label_limits() -> None:
         assert "истинность не проверена" in hint
 
 
+def test_single_evidence_hint_names_one_publication() -> None:
+    """T7.100: при единственной подтверждающей улике подсказка говорит «одна публикация»,
+    а не «все подтверждения — один кластер»: кластер предполагает несколько подтверждений.
+    При нескольких уликах и при непереданном числе (прежний контракт) — прежняя формулировка."""
+    single = reliability(
+        "external_fact", "hypothesis", "E1", head_state="current", single_producer="Росстат", producer_supports=1
+    )
+    assert single["label"] == PRODUCER_LABEL and single["level"] == LEVEL_WEAK
+    assert "одна публикация" in single["hint"] and "кластер" not in single["hint"]
+    assert "истинность не проверена" in single["hint"]
+    assert len(single["hint"]) <= MAX_HINT_CHARS
+    many = reliability(
+        "external_fact", "hypothesis", "E1", head_state="current", single_producer="Росстат", producer_supports=8
+    )
+    assert "один кластер" in many["hint"] and "одна публикация" not in many["hint"]
+    legacy = reliability("external_fact", "hypothesis", "E1", head_state="current", single_producer="Росстат")
+    assert legacy == many  # прежний контракт T7.87 не изменился
+
+
+def test_single_evidence_hint_stays_within_the_limit_and_keeps_the_level() -> None:
+    for name in ("Росстат", "Банк России", "Федеральная служба государственной статистики"):
+        badge = reliability(
+            "temporal_fact", "hypothesis", "E2", head_state="current", single_producer=name, producer_supports=1
+        )
+        assert len(badge["hint"]) <= MAX_HINT_CHARS, name
+        assert "истинность не проверена" in badge["hint"]
+        plain = reliability("temporal_fact", "hypothesis", "E2", head_state="current")
+        assert badge["level"] == plain["level"] == LEVEL_WEAK
+        assert badge["color"] == plain["color"]
+
+
+def test_suspicious_name_single_case_prints_no_name() -> None:
+    """Запасная подсказка единственной улики тоже не выдумывает имя."""
+    for name in ("Росстат 559", "claim_assessed", "https://rosstat.gov.ru/"):
+        badge = reliability(
+            "temporal_fact", "hypothesis", "E1", head_state="current", single_producer=name, producer_supports=1
+        )
+        assert badge["label"] == PRODUCER_LABEL
+        assert name not in badge["hint"]
+        assert "одна публикация" in badge["hint"]
+        assert len(badge["hint"]) <= MAX_HINT_CHARS
+
+
 def test_a_suspicious_producer_name_is_not_printed() -> None:
     """Имя с цифрами/кодами наружу не выводится: подпись остаётся, но без имени."""
     for name in ("Росстат 559", "claim_assessed", "https://rosstat.gov.ru/"):
@@ -204,8 +305,12 @@ def test_no_new_text_claims_verification() -> None:
     texts = [PRODUCER_LABEL]
     for grade in ("E1", "E2"):
         for name in ("Росстат", "Федеральная служба государственной статистики"):
-            badge = reliability("temporal_fact", "hypothesis", grade, head_state="current", single_producer=name)
-            texts += [badge["label"], badge["hint"]]
+            for supports in (None, 1, 8):
+                badge = reliability(
+                    "temporal_fact", "hypothesis", grade, head_state="current",
+                    single_producer=name, producer_supports=supports,
+                )
+                texts += [badge["label"], badge["hint"]]
     for text in texts:
         assert re.search(r"(?<!не )\bпроверен", text.lower(), flags=re.IGNORECASE) is None, text
 
