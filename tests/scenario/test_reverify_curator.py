@@ -301,3 +301,137 @@ async def test_reverify_by_id_end_to_end(
         await eng.dispose()
     assert state == "succeeded"
     assert await _unresolved_attempts(scratch_url) == 0
+
+
+@pytest.mark.asyncio
+async def test_unresolved_reverify_reference_bounces_only_that_operation(
+    migrated_db: Any, fake_llm: FakeLLM, tmp_path: Path
+) -> None:
+    """T7.105 (ADR-0034 вариант B): неразрешимая ссылка перепроверки — проверка ОДНОЙ
+    операции. Прежняя именованная причина снимает только эту операцию; законная claim-операция
+    того же предложения применяется, отказа предложения целиком нет, связь снятой операции
+    названа в записи отказа (`rejected_operations`), а не перенесена на выживший claim."""
+    scratch_url, _engine = migrated_db
+    await _anchor_claim_id(scratch_url, fake_llm, tmp_path / "ws1")
+
+    unknown = uuid.uuid4()
+    qid = await _seed_question(scratch_url, "Сколько будет 6*7? И сколько будет 6+6?")
+    fake_llm.script(
+        [
+            _tool("python.execute", {"code": "print(6*7)"}),
+            _tool("python.execute", {"code": "print(6+6)"}),
+            _complete(),
+            _curator(
+                [
+                    {
+                        "statement": "6*7 равно 42 (перепроверено)",
+                        "claim_type": "computed_result",
+                        "scope": {"expr": "6*7"},
+                        "existing_claim_id": str(unknown),
+                    },
+                    {
+                        "statement": "6+6 равно 12",
+                        "claim_type": "computed_result",
+                        "scope": {"expr": "6+6"},
+                    },
+                ],
+                [
+                    {"evidence_index": 0, "claim_index": 0, "relation": "supports"},
+                    {"evidence_index": 1, "claim_index": 1, "relation": "supports"},
+                ],
+            ),
+        ]
+    )
+    orch, gateway, engine = _make_orchestrator(scratch_url, fake_llm, tmp_path / "ws2")
+    try:
+        outcome = await orch.run_session(qid)
+    finally:
+        await gateway.close()
+        await engine.dispose()
+
+    assert outcome.final_state.value == "succeeded"
+    assert outcome.claims_proposed == 2
+
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    eng = create_async_engine(scratch_url)
+    factory = async_sessionmaker(eng, expire_on_commit=False)
+    try:
+        async with factory() as db:
+            # прежнего отказного события нет: снята не вся операция предложения
+            rejected = (
+                (
+                    await db.execute(
+                        text(
+                            "SELECT payload FROM audit_events WHERE session_id = :s "
+                            "AND payload ? 'curator_rejected'"
+                        ),
+                        {"s": str(outcome.session_id)},
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            assert rejected == []
+
+            rows = (
+                (
+                    await db.execute(
+                        text(
+                            "SELECT payload FROM audit_events WHERE session_id = :s "
+                            "AND type = 'claim_created' AND jsonb_typeof(payload -> 'claims') = 'array'"
+                        ),
+                        {"s": str(outcome.session_id)},
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            assert len(rows) == 1
+            payload = dict(rows[0])
+            assert payload["claims_proposed"] == 2
+            assert payload["claims_applied"] == 1
+            entries = payload["rejected_operations"]
+            assert len(entries) == 1
+            entry = entries[0]
+            assert entry["claim_index"] == 0
+            # прежняя строка причины перепроверки — та же, что роняла всё предложение
+            assert "reverify reference" in entry["reason"]
+            assert "is not visible to the session" in entry["reason"]
+            assert entry["operation"]["existing_claim_id"] == str(unknown)
+            # связь снятой операции названа снятой; выживший claim получил ровно свою улику
+            assert entry["evidence_links_rejected"] == [
+                {"claim_index": 0, "evidence_index": 0, "relation": "supports"}
+            ]
+
+            claims = (
+                (await db.execute(text("SELECT statement FROM claims ORDER BY statement"))).scalars().all()
+            )
+            assert sorted(claims) == sorted(["6*7 равно 42", "6+6 равно 12"])
+            # якорь не тронут перепроверкой, которой не было: ни второй оценки, ни claim_reverified
+            reverifies = (
+                (
+                    await db.execute(
+                        text("SELECT id FROM audit_events WHERE session_id = :s AND type = 'claim_reverified'"),
+                        {"s": str(outcome.session_id)},
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            assert reverifies == []
+            staging = (
+                (
+                    await db.execute(
+                        text("SELECT op, payload->>'evidence_index' FROM session_staging WHERE session_id = :s"),
+                        {"s": str(outcome.session_id)},
+                    )
+                )
+                .all()
+            )
+            assert sorted(row[0] for row in staging) == ["claim", "evidence"]
+        state, _reason = await _session_state(scratch_url, outcome.session_id)
+    finally:
+        await eng.dispose()
+    assert state == "succeeded"
+    assert await _unresolved_attempts(scratch_url) == 0

@@ -238,6 +238,40 @@ def test_failed_steps_note_names_the_number_only() -> None:
     assert f"{base}: 2" in notes
 
 
+# ─── снятые на границе знания операции (T7.105, ADR-0034 вариант B) ─────────
+
+
+def test_rejected_operations_count_reads_only_recorded_journal_entries() -> None:
+    events: list[dict[str, Any]] = [
+        {
+            "type": "claim_created",
+            "payload": {"rejected_operations": [{"claim_index": 0}, {"claim_index": 2}]},
+        },
+        {"type": "claim_created", "payload": {"claims": [{"statement": "s"}]}},
+        {"type": "session_committed", "payload": None},
+        {"type": "action_completed", "payload": {}},
+    ]
+    # карточка считает ровно то, что хост уже записал в журнал, и ничего не выдумывает
+    assert ans.rejected_operations_count(events) == 2
+    assert ans.rejected_operations_count([]) == 0
+
+
+def test_rejected_operations_note_names_the_number_and_otherwise_stays_quiet() -> None:
+    base_kwargs: dict[str, Any] = {
+        "saw_research_fetch": True,
+        "network_mode": "none",
+        "evidence_kinds": {"source_assertion": 2},
+        "answer_claim_count": 1,
+        "failed_actions": 0,
+    }
+    notes = ans.build_honesty_notes(**base_kwargs, rejected_operations=3)
+    label = ui_labels.describe("honesty_note", "curator_rejected_operations")["label"]
+    assert f"{label}: 3" in notes
+    # ноль снятых операций — замечания нет: замечание только про видимое в данных
+    plain = ans.build_honesty_notes(**base_kwargs)
+    assert label not in " ".join(plain)
+
+
 # ─── итог по вопросу ──────────────────────────────────────────────────────
 
 

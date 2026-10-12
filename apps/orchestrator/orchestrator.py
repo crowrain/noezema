@@ -33,6 +33,12 @@ from typing import Any
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from apps.orchestrator.curator_rejections import (
+    claim_index_from_line,
+    rejected_operation_entries,
+    rules_problems_by_operation,
+    split_structural_problems,
+)
 from apps.orchestrator.evidence import observation_to_evidence, reselect_assertion_fragment
 from apps.orchestrator.executor import arguments_hash
 from apps.orchestrator.rejected_proposal import rejected_proposal_digest
@@ -2688,16 +2694,26 @@ class Orchestrator:
         # dependencies). Проверка опорной `as_of` отсюда убрана: она зависит от вида операции и
         # обязана идти после его окончательного определения (та же ловушка, что у T7.73).
         problems = proposal.structural_problems(len(ctx.evidence), questions_max=max_questions)
-        if problems:
+        # T7.105 (ADR-0034 вариант B): проверки, называющие ОДНУ операцию claim, снимают
+        # только эту операцию с именованной причиной; проверки свойства предложения целиком
+        # (индексы уликовых связей вне списка, бюджеты новых вопросов, дубли dependencies)
+        # по-прежнему отказывают предложение полностью (ADR-0032 §4). `dropped` — снятые
+        # операции: индекс → первая именованная причина; порядок вставки = порядок этапов.
+        whole_problems, search_problems = split_structural_problems(problems)
+        dropped: dict[int, str] = {}
+        for claim_index in sorted(search_problems):
+            dropped[claim_index] = search_problems[claim_index][0]
+        if whole_problems or (dropped and len(dropped) == len(proposal.claims)):
+            # Отказ предложения ЦЕЛИКОМ — тот же event, прежние ключи (T7.84 часть A: отказ
+            # обязан называть ОТКЛОНЁННОЕ предложение, а не только причину; стенд ed36f4a0:
+            # чем именно были два temporal_fact без as_of, нельзя узнать ниоткуда).
+            # T7.105: здесь же — когда пооперационные снятия оставили БЕЗ операций всё
+            # предложение: поведение как раньше (ADR-0034 §7, решение 5).
             await audit.record(
                 AuditEventType.SESSION_STATE_CHANGED,
                 session_id=session.id,
                 payload={
                     "curator_rejected": problems[:10],
-                    # T7.84 (часть A): отказ обязан называть ОТКЛОНЁННОЕ предложение, а не
-                    # только причину (стенд ed36f4a0: два temporal_fact без as_of — чем именно
-                    # они были, нельзя узнать ниоткуда: claim_created не написан, сырой ответ
-                    # модели не сохраняется). Тот же event, прежние ключи, нового типа нет.
                     "rejected_proposal": rejected_proposal_digest(proposal),
                 },
                 public_summary="curator proposal rejected by host validation",
@@ -2717,30 +2733,29 @@ class Orchestrator:
 
         reverify_anchor_types: dict[int, str] = {}
         claims_for_validation = [c.model_dump(mode="json") for c in proposal.claims]
+        reverify_drops = 0
+        reverify_summary = ""
         if any(c.existing_claim_id is not None for c in proposal.claims):
             visible_pack_ids = _pack_claim_ids(knowledge)
             for i, c in enumerate(proposal.claims):
-                if c.existing_claim_id is None:
+                if c.existing_claim_id is None or i in dropped:
                     continue
                 ref_id, ref_problem = resolve_claim_reference(c.existing_claim_id, visible_pack_ids)
                 if ref_problem is not None:
-                    await audit.record(
-                        AuditEventType.SESSION_STATE_CHANGED,
-                        session_id=session.id,
-                        payload={
-                            "curator_rejected": [
-                                f"claim[{i}]: reverify reference {ref_problem}"
-                            ],
-                            "curator_reject_kind": "reverify_unresolved",
-                            # T7.84 (часть A): тот же снимок отклонённого предложения
-                            "rejected_proposal": rejected_proposal_digest(proposal),
-                        },
-                        public_summary=(
-                            "curator proposal rejected: reverify reference "
-                            f"{ref_problem} (unknown or ambiguous claim id)"
-                        ),
+                    # T7.105 (ADR-0034 вариант B, решение 1): неразрешимая ссылка снимает СВОЮ
+                    # операцию с прежней именованной причиной; законные операции остаются
+                    # (снятая — tests/scenario/test_reverify_curator.py::
+                    # test_unresolved_reverify_reference_bounces_only_that_operation; прежний
+                    # fail-closed отказа всего предложения — тот же файл,
+                    # test_reverify_unknown_reference_rejects_whole_proposal: когда сняты ВСЕ
+                    # операции, event и ключи прежние).
+                    dropped[i] = f"claim[{i}]: reverify reference {ref_problem}"
+                    reverify_drops += 1
+                    reverify_summary = (
+                        "curator proposal rejected: reverify reference "
+                        f"{ref_problem} (unknown or ambiguous claim id)"
                     )
-                    return 0, 0
+                    continue
                 # the same condition as the T7.9 dedup: the target must
                 # have a head in THIS session's snapshot
                 anchor_type = (
@@ -2759,25 +2774,34 @@ class Orchestrator:
                     .first()
                 )
                 if anchor_type is None:
-                    await audit.record(
-                        AuditEventType.SESSION_STATE_CHANGED,
-                        session_id=session.id,
-                        payload={
-                            "curator_rejected": [
-                                f"claim[{i}]: reverify target {ref_id} has no head in the session snapshot"
-                            ],
-                            "curator_reject_kind": "reverify_unresolved",
-                            # T7.84 (часть A): тот же снимок отклонённого предложения
-                            "rejected_proposal": rejected_proposal_digest(proposal),
-                        },
-                        public_summary=(
-                            "curator proposal rejected: reverify target has no "
-                            "head in the session snapshot"
-                        ),
+                    # T7.105: отсутствие головы у якоря снимает СВОЮ перепроверку с прежней
+                    # строкой причины (проверка зависит от операции, а не от предложения).
+                    dropped[i] = (
+                        f"claim[{i}]: reverify target {ref_id} has no head in the session snapshot"
                     )
-                    return 0, 0
+                    reverify_drops += 1
+                    reverify_summary = (
+                        "curator proposal rejected: reverify target has no "
+                        "head in the session snapshot"
+                    )
+                    continue
                 reverify_anchor_types[i] = str(anchor_type[0])
                 claims_for_validation[i]["claim_type"] = str(anchor_type[0])
+
+        if proposal.claims and reverify_drops and len(dropped) == len(proposal.claims):
+            # T7.105: сняты ВСЕ операции — поведение как раньше (отказ предложения целиком,
+            # тот же event, прежние ключи; строки причин — все снявшие операцию причины).
+            await audit.record(
+                AuditEventType.SESSION_STATE_CHANGED,
+                session_id=session.id,
+                payload={
+                    "curator_rejected": list(dropped.values())[:10],
+                    "curator_reject_kind": "reverify_unresolved",
+                    "rejected_proposal": rejected_proposal_digest(proposal),
+                },
+                public_summary=reverify_summary,
+            )
+            return 0, 0
 
         # T7.82 (B), ADR-0032: опора на существующее знание (факультативное поле
         # curator-v9). Хост принимает ТОЛЬКО id, видимые в контекст-паке этой сессии —
@@ -2888,7 +2912,9 @@ class Orchestrator:
                         metric=declared_scope_metric(c.scope),
                     )
                     for i, c in enumerate(proposal.claims)
-                    if c.existing_claim_id is None
+                    # T7.105: снятая операция не участвует в гейте дублей — у неё уже есть
+                    # именованный отказ.
+                    if c.existing_claim_id is None and i not in dropped
                 ]
                 # T7.85 (ADR-0033 дополнение): сначала побайтовая идентичность формулировки при
                 # другом claim_type — это более узкое и более надёжное основание, чем числовой
@@ -2935,13 +2961,29 @@ class Orchestrator:
         reverify_indices = frozenset(
             index for index, staged in enumerate(staged_claims) if staged.existing_claim_id is not None
         )
-        as_of_problems = proposal.temporal_as_of_problems(reverify_indices)
-        if as_of_problems:
+        as_of_problems = [
+            line
+            for line in proposal.temporal_as_of_problems(reverify_indices)
+            # T7.105: строка снятой операции не добавляется — у операции уже есть причина;
+            # для ещё активных операций причина прежняя, и снятие касается только её.
+            if claim_index_from_line(line) is not None and claim_index_from_line(line) not in dropped
+        ]
+        as_of_drops = 0
+        for line in as_of_problems:
+            line_claim_index = claim_index_from_line(line)
+            if line_claim_index is None or line_claim_index in dropped:
+                continue
+            dropped[line_claim_index] = line
+            as_of_drops += 1
+        if proposal.claims and as_of_drops and len(dropped) == len(proposal.claims):
+            # T7.105: «temporal_fact без даты» по-прежнему отказывает предложение ЦЕЛИКОМ,
+            # когда без даты осталась каждая его операция: тот же event, прежние ключи, тот
+            # же текст причины (fail-closed политика T7.84 не меняется).
             await audit.record(
                 AuditEventType.SESSION_STATE_CHANGED,
                 session_id=session.id,
                 payload={
-                    "curator_rejected": as_of_problems[:10],
+                    "curator_rejected": list(dropped.values())[:10],
                     "rejected_proposal": rejected_proposal_digest(proposal),
                     **({"value_duplicates": value_duplicates} if value_duplicates else {}),
                 },
@@ -2971,7 +3013,20 @@ class Orchestrator:
             ],
             list(ctx.evidence),
         )
-        if rule_problems:
+        grouped_rules = rules_problems_by_operation(rule_problems)
+        rules_drops = 0
+        for claim_index, lines in sorted(grouped_rules.items()):
+            # T7.105 (ADR-0034 вариант B, решение 1): предпроверка правил снимает ту операцию
+            # claim, которую называет её строка (`claim <i> (<тип>): …`), а не всё предложение:
+            # уликовый вид — свойство пары «утверждение ↔ улики» этой операции. Строки правил,
+            # относящиеся к уже снятой операции, новых снятий не добавляют.
+            if claim_index < len(proposal.claims) and claim_index not in dropped:
+                dropped[claim_index] = lines[0]
+                rules_drops += 1
+        if rule_problems and proposal.claims and len(dropped) == len(proposal.claims):
+            # Сняты ВСЕ операции — отказ предложения целиком, как раньше (тот же event,
+            # прежние ключи `curator_rejected_by_rules` / `rejected_proposal`, прежний текст
+            # причин — движок видел предложение целиком).
             await audit.record(
                 AuditEventType.SESSION_STATE_CHANGED,
                 session_id=session.id,
@@ -2988,25 +3043,38 @@ class Orchestrator:
                 ),
             )
             return 0, 0
+        # T7.105: если после снятий остались активные операции — предложение применяется
+        # частично: снятые операции называются в payload уже существующего CLAIM_CREATED
+        # (паттерн value_duplicates/relied_claims_rejected; нового типа события нет).
 
         # T2.13: proposals go to session_staging, applied at commit
         # (T7.83: staged_claims — копия списка; конвертированные дубли подменены
         #  операциями с existing_claim_id, остальные объекты — те же самые)
-        for claim in staged_claims:
+        # T7.105 (ADR-0034 вариант B): снятые операции в staging не пишутся. Индексы
+        # оставшихся claims перенумеровываются так, чтобы на границе коммита claim
+        # соответствовал связям по позиции — ровно как если бы снятых операций в предложении
+        # не было; чужим операциям связи НЕ переносятся (решение 3 ADR-0034 §7).
+        active_claims = [index for index in range(len(staged_claims)) if index not in dropped]
+        staged_index = {old: new for new, old in enumerate(active_claims)}
+        for claim_index in active_claims:
             await staging.record(
                 db,
                 audit,
                 session,
                 "claim",
-                claim.model_dump(mode="json"),
+                staged_claims[claim_index].model_dump(mode="json"),
                 proposed_claims=1,
             )
         # evidence links (M3): the only channel for evidence changes; the
         # trusted host recomputes every identity at the commit boundary
         for link in proposal.evidence_links:
+            if link.claim_index in dropped:
+                # T7.105: связь снятой операции снимается вместе с ней (с причиной в записи
+                # отказа); наблюдение и источник остаются в базе — знание не удаляется.
+                continue
             evidence_payload: JsonDict = {
                 "evidence_index": link.evidence_index,
-                "claim_index": link.claim_index,
+                "claim_index": staged_index[link.claim_index],
                 "relation": link.relation.value,
             }
             # T7.78 (ADR-0029): сюда же хост кладёт решение о происхождении ЗНАЧЕНИЯ этой улики
@@ -3057,11 +3125,28 @@ class Orchestrator:
         # прежние сессии и их аудит остаются байт-в-байт прежними
         if value_duplicates:
             claim_event_payload["value_duplicates"] = value_duplicates
+        # T7.105 (ADR-0034 §4, §7): снятые операции называются в payload УЖЕ СУЩЕСТВУЮЩЕГО
+        # события (паттерн value_duplicates / relied_claims_rejected: нового AuditEventType
+        # нет, миграции нет). Счётчики разделены и названы; ключи появляются только когда что-то
+        # действительно снято — сессии без отказов остаются байт в байт прежними. Массивы
+        # `claims` и `evidence_links` выше — ПРЕЖНЕЕ предложение целиком: журнал обязан
+        # показывать и снятое (с причиной), а не только применённое.
+        if dropped:
+            claim_event_payload["rejected_operations"] = rejected_operation_entries(proposal, dropped)
+            claim_event_payload["claims_proposed"] = len(proposal.claims)
+            claim_event_payload["claims_applied"] = len(active_claims)
+        public_summary = f"curator: {len(proposal.claims)} claims, {len(proposal.new_questions)} questions"
+        if dropped:
+            public_summary = (
+                f"curator: {len(active_claims)} of {len(proposal.claims)} claims applied, "
+                f"{len(proposal.new_questions)} questions, "
+                f"{len(dropped)} operations rejected by host validation"
+            )
         await audit.record(
             AuditEventType.CLAIM_CREATED,
             session_id=session.id,
             payload=claim_event_payload,
-            public_summary=f"curator: {len(proposal.claims)} claims, {len(proposal.new_questions)} questions",
+            public_summary=public_summary,
         )
         return len(proposal.claims), len(proposal.new_questions)
 

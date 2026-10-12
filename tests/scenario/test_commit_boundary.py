@@ -381,3 +381,198 @@ async def test_commit_boundary_error_ends_session_terminal(
 
     # the next session is admitted and runs to a terminal state
     assert await _run_next_session(scratch_url, fake_llm, tmp_path / "ws2") is SessionState.SUCCEEDED
+
+
+@pytest.mark.asyncio
+async def test_disallowed_evidence_kind_bounces_only_that_operation(
+    migrated_db: Any, fake_llm: FakeLLM, tmp_path: Path
+) -> None:
+    """T7.105 (ADR-0034 вариант B): предпроверка правил называет ОДНУ операцию —
+    только она и снимается. Запрещённая комбинация (computed_result + local_observation)
+    снята с прежней именованной причиной движка правил; законная computed_result
+    того же предложения применяется; отказа предложения целиком нет, связь снятой
+    операции названа в `rejected_operations`, а не перенесена на выживший claim."""
+    scratch_url, _engine = migrated_db
+    question_id = await _seed_question(scratch_url, "Сколько строк в notes/reading.md и сколько будет 3+3?")
+    fake_llm.script(
+        [
+            _tool("workspace.write", {"path": "notes/reading.md", "content": READING_MD}),
+            # прочитанный файл — local_observation evidence (индекс 0), как в прежнем тесте;
+            # python.execute — computation (индекс 1)
+            _tool("workspace.read", {"path": "notes/reading.md"}),
+            _tool("python.execute", {"code": "print(3+3)"}),
+            _complete(),
+            _curator(
+                [
+                    {
+                        "statement": "Количество непустых строк в файле notes/reading.md равно 3.",
+                        "claim_type": "computed_result",
+                        "scope": {"path": "notes/reading.md", "metric": "nonempty_lines", "value": 3},
+                    },
+                    {
+                        "statement": "3+3 равно 6",
+                        "claim_type": "computed_result",
+                        "scope": {"expr": "3+3"},
+                    },
+                ],
+                [
+                    {"evidence_index": 0, "claim_index": 0, "relation": "supports"},
+                    {"evidence_index": 1, "claim_index": 1, "relation": "supports"},
+                ],
+            ),
+        ]
+    )
+    orch, gateway, orch_engine = _make_orchestrator(scratch_url, fake_llm, tmp_path / "ws1")
+    try:
+        outcome = await orch.run_session(question_id)
+    finally:
+        await gateway.close()
+        await orch_engine.dispose()
+
+    assert outcome.final_state is SessionState.SUCCEEDED
+    assert outcome.claims_proposed == 2
+
+    engine = create_async_engine(scratch_url)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with factory() as db:
+            # прежнего отказного события нет: снята одна операция, не предложение целиком
+            rejected = (
+                await db.execute(
+                    text(
+                        "SELECT payload FROM audit_events WHERE session_id = :s "
+                        "AND payload ? 'curator_rejected_by_rules'"
+                    ),
+                    {"s": str(outcome.session_id)},
+                )
+            ).scalars().all()
+            assert rejected == []
+
+            rows = (
+                await db.execute(
+                    text(
+                        "SELECT payload FROM audit_events WHERE session_id = :s "
+                        "AND type = 'claim_created' AND jsonb_typeof(payload -> 'claims') = 'array'"
+                    ),
+                    {"s": str(outcome.session_id)},
+                )
+            ).scalars().all()
+            assert len(rows) == 1
+            payload = dict(rows[0])
+            assert payload["claims_proposed"] == 2
+            assert payload["claims_applied"] == 1
+            entries = payload["rejected_operations"]
+            assert len(entries) == 1
+            assert entries[0]["claim_index"] == 0
+            # та же строка причины движка правил, что раньше роняла всё предложение
+            assert "claim 0 (computed_result):" in entries[0]["reason"]
+            assert "support evidence kind 'local_observation' not allowed for computed_result" in (
+                entries[0]["reason"]
+            )
+            assert entries[0]["evidence_links_rejected"] == [
+                {"claim_index": 0, "evidence_index": 0, "relation": "supports"}
+            ]
+
+            statements = (await db.execute(text("SELECT statement FROM claims"))).scalars().all()
+            assert sorted(statements) == sorted(["3+3 равно 6"])
+            staging = (
+                await db.execute(
+                    text("SELECT op FROM session_staging WHERE session_id = :s"),
+                    {"s": str(outcome.session_id)},
+                )
+            ).scalars().all()
+            assert sorted(staging) == ["claim", "evidence"]
+            attempts = (await db.execute(text("SELECT status FROM commit_attempts"))).scalars().all()
+            assert attempts == ["committed"]
+    finally:
+        await engine.dispose()
+
+    assert await _unresolved_attempts(scratch_url) == 0
+
+
+@pytest.mark.asyncio
+async def test_all_claims_rejected_by_rules_still_rejects_whole_proposal(
+    migrated_db: Any, fake_llm: FakeLLM, tmp_path: Path
+) -> None:
+    """T7.105 (ADR-0034 §7): когда сняты ВСЕ операции, поведение не меняется вовсе —
+    прежний отказ предложения целиком, прежний event с прежними ключами
+    (`curator_rejected_by_rules` + `rejected_proposal`), нулевой staging."""
+    scratch_url, _engine = migrated_db
+    question_id = await _seed_question(scratch_url, "Сколько строк в двух заметках?")
+    fake_llm.script(
+        [
+            _tool("workspace.write", {"path": "notes/a.md", "content": READING_MD}),
+            # каждое чтение — local_observation evidence: обе связи запрещены для computed_result
+            _tool("workspace.read", {"path": "notes/a.md"}),
+            _tool("workspace.write", {"path": "notes/b.md", "content": "One\nTwo\n"}),
+            _tool("workspace.read", {"path": "notes/b.md"}),
+            _complete(),
+            _curator(
+                [
+                    {
+                        "statement": "Количество непустых строк в notes/a.md равно 3.",
+                        "claim_type": "computed_result",
+                        "scope": {"path": "notes/a.md", "metric": "nonempty_lines", "value": 3},
+                    },
+                    {
+                        "statement": "Количество непустых строк в notes/b.md равно 2.",
+                        "claim_type": "computed_result",
+                        "scope": {"path": "notes/b.md", "metric": "nonempty_lines", "value": 2},
+                    },
+                ],
+                [
+                    {"evidence_index": 0, "claim_index": 0, "relation": "supports"},
+                    {"evidence_index": 1, "claim_index": 1, "relation": "supports"},
+                ],
+            ),
+        ]
+    )
+    orch, gateway, orch_engine = _make_orchestrator(scratch_url, fake_llm, tmp_path / "ws1")
+    try:
+        outcome = await orch.run_session(question_id)
+    finally:
+        await gateway.close()
+        await orch_engine.dispose()
+
+    assert outcome.final_state is SessionState.SUCCEEDED
+    assert outcome.claims_proposed == 0
+
+    engine = create_async_engine(scratch_url)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with factory() as db:
+            rejected = (
+                await db.execute(
+                    text(
+                        "SELECT payload::text FROM audit_events WHERE session_id = :s "
+                        "AND payload ? 'curator_rejected_by_rules'"
+                    ),
+                    {"s": str(outcome.session_id)},
+                )
+            ).scalars().all()
+            assert len(rejected) == 1
+            assert "claim 0 (computed_result):" in rejected[0]
+            assert "claim 1 (computed_result):" in rejected[0]
+            digest = (
+                await db.execute(
+                    text(
+                        "SELECT payload->'rejected_proposal'->'claims' FROM audit_events "
+                        "WHERE session_id = :s AND payload ? 'curator_rejected_by_rules'"
+                    ),
+                    {"s": str(outcome.session_id)},
+                )
+            ).scalar_one()
+            assert len(digest) == 2
+            staging = (
+                await db.execute(
+                    text("SELECT count(*) FROM session_staging WHERE session_id = :s"),
+                    {"s": str(outcome.session_id)},
+                )
+            ).scalar_one()
+            assert staging == 0
+            claims = (await db.execute(text("SELECT count(*) FROM claims"))).scalar_one()
+            assert claims == 0
+    finally:
+        await engine.dispose()
+
+    assert await _unresolved_attempts(scratch_url) == 0

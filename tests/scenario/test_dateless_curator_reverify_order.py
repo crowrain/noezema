@@ -13,8 +13,9 @@ T7.73), но был недостижим.
 Проверяются оба варианта реального контекста стенда: в пакет этой сессии попали ОБА
 5,59%-claim'а (`9266248e…` и записанный ранее дубль `e189c80d…`). Если куратор объявил
 опорой оба — гейт видит двух строгих кандидатов, оставляет операцию как предложено, и
-отсутствие даты по-прежнему роняет всё предложение (политику отказа часть B не меняет),
-теперь с дайджестом. Если только один — склейка.
+отсутствие даты снимает ЭТУ операцию с прежней именованной причиной (T7.105, ADR-0034
+вариант B): законные операции предложения применяются, снятая названа в журнале. Если
+только один — склейка.
 
 Порядок после правки: структурные проверки (индексы связей, бюджеты, пустые search_statements)
 — первыми; проверка «temporal_fact требует as_of» — после разрешения перепроверок, relied-id
@@ -378,26 +379,40 @@ async def test_two_dateless_restatements_become_reverifies_of_their_anchors(
     assert {item["relation"] for item in card["claims"]} == {"reverified"}
 
 
-# ── реальный контекст стенда: два 5,59%-кандидата в опорном списке → отказ всего ──
+# ── реальный контекст стенда: два 5,59%-кандидата в опорном списке → отказ ОДНОЙ операции ──
 
 @pytest.mark.asyncio
-async def test_two_relied_candidates_for_one_value_refuse_the_proposal_with_a_digest(
+async def test_two_relied_candidates_for_one_value_refuse_only_that_operation(
     migrated_db: tuple[str, Any],
     fake_llm: FakeLLM,
     fake_fetch: None,
     tmp_path: Path,
 ) -> None:
-    """Замер поведения на реальной форме ed36f4a0: в контекст-паке ОБА 5,59%-claim'а
-    (`9266248e…` и дубль `e189c80d…`), куратор объявил опорой оба. Гейт T7.83a видит двух
-    строгих кандидатов и НЕ выбирает один (эвристики выбора нет) — операция остаётся новой,
-    даты у неё нет → отказ всего предложения, как и раньше. Отличие от прежнего кода только в
-    том, что журнал теперь показывает отклонённое содержимое."""
+    """Замер поведения на реальной форме ed36f4a0 в профиле ADR-0034 вариант B (T7.105).
+
+    В контекст-паке ОБА 5,59%-claim'а (`9266248e…` и дубль `e189c80d…`), куратор объявил
+    опорой оба. Гейт T7.83a видит двух строгих кандидатов и НЕ выбирает один (эвристики
+    выбора нет) — первая операция остаётся новой, даты у неё нет. Прежний код на этом
+    отклонял ВСЁ предложение (и вторая — законно склеенная — операция гибла вместе с
+    первой). По варианту B проверка `as_of` называет одну операцию: она снимается с прежней
+    именованной причиной, а законная перепроверка применяется; отказа предложения целиком
+    нет вовсе, снятая операция названа в payload уже существующего claim_created
+    (`rejected_operations`, счётчики `claims_proposed` / `claims_applied`).
+    """
     scratch_url, engine = migrated_db
     activation = await _run_online(engine, _payload())
     assert activation.state == "active"
 
     ids = await _seed_candidates(scratch_url, fake_llm, tmp_path)
     before = {name: await _assessment(scratch_url, claim_id) for name, claim_id in ids.items()}
+    evidence_before = {
+        name: await _scalar(
+            scratch_url,
+            "SELECT count(*) FROM evidence WHERE claim_id = :c",
+            {"c": str(claim_id)},
+        )
+        for name, claim_id in ids.items()
+    }
 
     outcome, question_id = await _run_compare_session(
         scratch_url,
@@ -409,19 +424,36 @@ async def test_two_relied_candidates_for_one_value_refuse_the_proposal_with_a_di
     )
     session_id = outcome.session_id
     assert outcome.final_state.value == "succeeded"
-    assert outcome.claims_proposed == 0
+    # предложено ≠ применено: предложение целиком остаётся видимым, но операция одна снята
+    assert outcome.claims_proposed == 2
 
-    events = await _rejection_events(scratch_url, session_id)
-    assert len(events) == 1
-    payload = events[0]
-    # прежняя причина и прежний ключ —policy не изменилась
-    assert payload["curator_rejected"] == ["claim[0]: temporal_fact requires as_of"]
+    # отказа предложения целиком нет: прежний event с прежними ключами не написан
+    assert await _rejection_events(scratch_url, session_id) == []
 
-    # неоднозначность названа: хост не выбирал один из двух кандидатов (эвристики выбора нет).
-    # Вторая операция тем временем была склеена законно (один объявленный опора-кандидат того
-    # же показателя) — решение гейта записано честно, но отказ всего предложения его отменяет:
-    # staging нет ни у той, ни у другой.
-    decisions = payload["value_duplicates"]
+    rows = await _all(
+        scratch_url,
+        "SELECT payload FROM audit_events WHERE session_id = :s AND type = 'claim_created' "
+        "AND jsonb_typeof(payload -> 'claims') = 'array'",
+        {"s": str(session_id)},
+    )
+    assert len(rows) == 1
+    curator_payload = dict(rows[0]["payload"])
+    assert set(curator_payload) == {
+        "claims",
+        "evidence_links",
+        "new_questions",
+        "summary",
+        "relied_claim_ids",
+        "value_duplicates",
+        "rejected_operations",
+        "claims_proposed",
+        "claims_applied",
+    }
+    assert curator_payload["claims_proposed"] == 2
+    assert curator_payload["claims_applied"] == 1
+
+    # неоднозначность названа по-прежнему: хост не выбирал один из двух кандидатов
+    decisions = curator_payload["value_duplicates"]
     assert sorted((entry["claim_index"], entry["action"]) for entry in decisions) == [
         (0, "kept"),
         (1, "reverified"),
@@ -432,38 +464,85 @@ async def test_two_relied_candidates_for_one_value_refuse_the_proposal_with_a_di
     merged = next(entry for entry in decisions if entry["claim_index"] == 1)
     assert merged["target"] == str(ids["observed"])
 
-    # содержимое отклонённого предложения записано: что именно модель предлагала
-    digest = payload["rejected_proposal"]
-    assert [entry["claim_index"] for entry in digest["claims"]] == [0, 1]
-    assert digest["claims"][0]["as_of"] is None
-    assert digest["claims"][0]["existing_claim_id"] is None
-    assert "5,59" in digest["claims"][0]["statement"]
-    assert "14,5" in digest["claims"][1]["statement"]
-    assert sorted(digest["relied_claim_ids"]) == sorted(
-        [str(ids["official"]), str(ids["dup"]), str(ids["observed"])]
-    )
+    # снятая операция названа: прежняя строка причины, digest операции, снятая связь с причиной
+    rejected = curator_payload["rejected_operations"]
+    assert len(rejected) == 1
+    entry = rejected[0]
+    assert entry["claim_index"] == 0
+    assert entry["reason"] == "claim[0]: temporal_fact requires as_of"
+    assert entry["operation"]["as_of"] is None
+    assert entry["operation"]["existing_claim_id"] is None
+    assert "5,59" in entry["operation"]["statement"]
+    assert entry["evidence_links_rejected"] == [
+        {"claim_index": 0, "evidence_index": 1, "relation": "supports"}
+    ]
+    # прежние списки предложения остаются целыми в журнале (снятое видно, а не вырезано)
+    assert [c["statement"] for c in curator_payload["claims"]] == [RESTATED_OFFICIAL, RESTATED_OBSERVED]
 
-    # ни staging, ни знания: fail-closed сохранён полностью
-    staging = await _scalar(
-        scratch_url, "SELECT count(*) FROM session_staging WHERE session_id = :s", {"s": str(session_id)}
+    # законная операция применена: staging ровно одна claim-операция (перепроверка якоря)
+    staging = await _all(
+        scratch_url,
+        "SELECT op, payload FROM session_staging WHERE session_id = :s ORDER BY op",
+        {"s": str(session_id)},
     )
-    assert staging is not None and staging[0] == 0
+    claim_ops = [row for row in staging if row["op"] == "claim"]
+    assert len(claim_ops) == 1
+    assert claim_ops[0]["payload"]["existing_claim_id"] == str(ids["observed"])
+    # снятая связь НЕ перенесена на другую операцию: уликовая связь ровно одна, и это
+    # связь якоря observed (evidence_index 0), а не чужая evidence_index 1
+    evidence_ops = [row for row in staging if row["op"] == "evidence"]
+    assert len(evidence_ops) == 1
+    assert evidence_ops[0]["payload"]["evidence_index"] == 0
+
     reverifies = await _all(
         scratch_url,
         "SELECT id FROM audit_events WHERE session_id = :s AND type = 'claim_reverified'",
         {"s": str(session_id)},
     )
-    assert reverifies == []
+    assert len(reverifies) == 1
+
+    # знание не удалено и не испорчено: снятая операция ничего не записала, якорь official
+    # и его дубль — ровно та же оценка, что до сессии; новой строки claims нет
     rows = await _all(scratch_url, "SELECT id::text, statement FROM claims")
     assert len(rows) == 3
     for name, claim_id in ids.items():
+        if name == "observed":
+            continue
         assert await _assessment(scratch_url, claim_id) == before[name]
+        count = await _scalar(
+            scratch_url, "SELECT count(*) FROM evidence WHERE claim_id = :c", {"c": str(claim_id)}
+        )
+        assert count is not None and count == evidence_before[name]
+    after_observed = await _scalar(
+        scratch_url, "SELECT count(*) FROM evidence WHERE claim_id = :c", {"c": str(ids["observed"])}
+    )
+    # union улик свёрнут по идентичности: comparison-сессия перечитала ровно ту же
+    # epsilon-страницу, что уже лежит у observed, — второй копии знания нет (T7.19 dedup),
+    # и фиксация называет это именно вычитанием дубля, а не добавлением
+    assert after_observed is not None and after_observed[0] == evidence_before["observed"][0]
+    finalize = await _scalar(
+        scratch_url,
+        "SELECT payload->'memory' FROM audit_events WHERE session_id = :s "
+        "AND type = 'commit_attempt_committed'",
+        {"s": str(session_id)},
+    )
+    assert finalize is not None
+    stats = dict(finalize[0])
+    assert stats["evidence_added"] == 0 and stats["evidence_deduped"] == 1
+    # перепроверка не «reuse» и не новая строка claims: она даёт свежую оценку (assessments)
+    assert stats["claims_created"] == 0 and stats["claims_reused"] == 0 and stats["assessments"] == 1
 
-    # что видит оператор: ответа нет, и это названо
-    state = await _scalar(scratch_url, "SELECT state FROM questions WHERE id=:q", {"q": str(question_id)})
-    assert state is not None and state[0] == "partially_answered"
+    # вопрос получает ответ (applied ≥ 1), а не «Ответ не записан»
+    state_rows = await _all(
+        scratch_url, "SELECT state FROM questions WHERE id = :q", {"q": str(question_id)}
+    )
+    assert state_rows[0]["state"] == "verified"
+
+    # что видит оператор: снятая операция не показана, перепроверенный якорь — да
     card = await _card(scratch_url, tmp_path, question_id)
-    assert card["claims"] == []
+    statements = [item["statement"] for item in card["claims"]]
+    assert statements == [CANDIDATE_OBSERVED]
+    assert {item["relation"] for item in card["claims"]} == {"reverified"}
 
 
 # ── вариант relied: только 9266248e — дубль в пакете не создаёт ложной неоднозначности ──

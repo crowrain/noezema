@@ -135,6 +135,7 @@ HONESTY_KEYS: Final[tuple[str, ...]] = (
     "computation_only",
     "no_evidence",
     "failed_steps",
+    "curator_rejected_operations",
 )
 
 #: Состояния вопроса, которые означают «работа по нему уже идёт».
@@ -465,6 +466,21 @@ def evidence_kind_counts(rows: Iterable[Mapping[str, Any]]) -> dict[str, int]:
     return counts
 
 
+def rejected_operations_count(events: Sequence[Mapping[str, Any]]) -> int:
+    """Сколько операций куратора снято на границе записи (T7.105, ADR-0034 вариант B).
+
+    Источник — уже существующие события: записи `rejected_operations` в payload событий
+    этой сессии (паттерн `value_duplicates`). Ничего нового не считаем и не выдумываем:
+    карточка показывает ровно то, что хост уже записал в журнал.
+    """
+    total = 0
+    for event in events:
+        entries = _payload_of(event).get("rejected_operations")
+        if isinstance(entries, list):
+            total += len(entries)
+    return total
+
+
 def build_honesty_notes(
     *,
     saw_research_fetch: bool,
@@ -472,6 +488,7 @@ def build_honesty_notes(
     evidence_kinds: Mapping[str, int],
     answer_claim_count: int,
     failed_actions: int,
+    rejected_operations: int = 0,
 ) -> list[str]:
     """Замечания только про то, что действительно видно в данных этой работы."""
     kinds = {kind: count for kind, count in evidence_kinds.items() if count}
@@ -492,6 +509,10 @@ def build_honesty_notes(
 
     if failed_actions > 0:
         notes.append(f"{_phrase('honesty_note', 'failed_steps')}: {failed_actions}")
+    # T7.105: часть предложенного отклонена правилами — карточка обязана сказать это
+    # честно, а не молчать о снятых операциях (иначе «2 из 3» выглядят полным ответом).
+    if rejected_operations > 0:
+        notes.append(f"{_phrase('honesty_note', 'curator_rejected_operations')}: {rejected_operations}")
     return [note for note in notes if note]
 
 
@@ -1466,6 +1487,7 @@ async def question_answer(db: AsyncSession, question_id: uuid.UUID) -> JsonDict 
         ),
         answer_claim_count=len(claims) + len(folded_claims),
         failed_actions=failed_actions,
+        rejected_operations=rejected_operations_count(events),
     )
 
     work_row = next((row for row in sessions if str(row["id"]) == (work_session_id or "")), None)
