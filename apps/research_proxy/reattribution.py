@@ -16,6 +16,16 @@
 Решения пишутся в той же транзакции, что и каскад (инвариант §3 «Audit + outbox»). Прямые
 UPDATE идут только в provenance-поля источников (`parent_source_id`, `metadata.derivative_of`)
 — это происхождение прочитанного, а не знание: оценки меняет исключительно rules engine.
+
+T7.98 (ADR-0029, узкая реализация «варианта C» из AGENTS §7 T7.75): с v4 страничного детектора
+переатрибуция не только проставляет указатели, но и снимает прежнюю ХОСТОВУЮ разметку там, где
+свежий метод увидел на странице два первоисточника (`ambiguous_primaries` при действующем
+`metadata.derivative_of`). Снятие — единственный способ разорвать ошибочную parent-склейку без
+редактирования оценок: коррекция `split` алгоритмические основания не отменяет. Ограничения
+снятия: только хостовая разметка (`derivative_of` пишет один `derivative_pointer.py`), только
+положительное противоречие (прочие свежие отказы прежний указатель сохраняют), источники под
+операторскими коррекциями (ADR-0031) не трогаются никогда. Идемпотентность: после снятия
+строка источника уже не размечена, повторный прогон даёт «изменений нет».
 """
 
 from __future__ import annotations
@@ -31,6 +41,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from apps.research_proxy.derivative_pointer import resolve_primary_source, write_derivative_pointer
 from apps.research_proxy.source_attribution import (
     ATTRIBUTION_METHOD_VERSION,
+    STATUS_AMBIGUOUS,
     AttributionDecision,
     PrimarySource,
     detect_source_attribution,
@@ -188,6 +199,9 @@ class _Plan:
     source_id: uuid.UUID
     decision: AttributionDecision
     row_index: int
+    #: T7.98: True — не проставить указатель, а снять прежний хостовый (свежий метод увидел
+    #: на странице два первоисточника; см. `_plan_window`)
+    clear: bool = False
 
 
 async def _plan_window(
@@ -269,6 +283,36 @@ async def _plan_window(
         decision = detect_source_attribution(
             canonical_uri=str(state["canonical_uri"]), text=page_text
         )
+        if state["marked"] and decision.status == STATUS_AMBIGUOUS:
+            # T7.98 (ADR-0029, узкая реализация «варианта C» из AGENTS §7 T7.75): хостовый
+            # указатель противоречит свежему страничному методу — страница называет ДВА
+            # первоисточника, а прежний указатель приписал всю страницу одному из них
+            # (стендовый замер ca2484b2: intl.ru с указателем на Росстат при прогнозе ЦБ).
+            # Снимается ТОЛЬКО хостовая разметка: `derivative_of` пишет один
+            # `derivative_pointer.py`, коррекции оператора (ADR-0031) отбракованы выше,
+            # а `has_parent` без разметки — не хостовое решение и не снимается.
+            # Снимает не «любой свежий отказ», а именно положительное противоречие
+            # `ambiguous_primaries`: прочие отказы прежний указатель сохраняют (та же
+            # логика, что «прежняя запись сохранена» в passes улик ниже).
+            rows.append(
+                ReattributeRow(
+                    canonical_uri=str(state["canonical_uri"]),
+                    was_status=str(candidate["was_status"]),
+                    was_method=str(candidate["was_method"]),
+                    now_status=decision.status,
+                    primary_name=decision.primary_name,
+                    action="указатель будет снят: свежий метод видит на странице два первоисточника",
+                )
+            )
+            plan.append(
+                _Plan(
+                    source_id=source_id,
+                    decision=decision,
+                    row_index=len(rows) - 1,
+                    clear=True,
+                )
+            )
+            continue
         if state["has_parent"] or state["marked"]:
             rows.append(
                 ReattributeRow(
@@ -348,6 +392,37 @@ async def reattribute_window(
     # указатели и каскад — одной транзакцией (инвариант audit+outbox §3)
     async with factory() as db, transaction(db):
         for item in plan:
+            if item.clear:
+                # T7.98: снятие прежней хостовой разметки. Guard перечитывает строку под
+                # FOR UPDATE и требует, чтобы `derivative_of` всё ещё была хостовой: если
+                # разметку параллельно снял или изменил кто-то другой — не трогаем.
+                guarded = (
+                    (
+                        await db.execute(
+                            text(
+                                "SELECT id FROM sources WHERE id = :id "
+                                "  AND metadata ? 'derivative_of' "
+                                "FOR UPDATE"
+                            ),
+                            {"id": item.source_id},
+                        )
+                    )
+                    .scalars()
+                    .first()
+                )
+                if guarded is None:
+                    continue  # разметка изменена параллельно — не трогаем
+                await db.execute(
+                    text(
+                        "UPDATE sources SET "
+                        "  parent_source_id = NULL, "
+                        "  metadata = COALESCE(metadata, '{}'::jsonb) - 'derivative_of' "
+                        "WHERE id = :id"
+                    ),
+                    {"id": item.source_id},
+                )
+                changed.add(item.source_id)
+                continue
             guarded = (
                 (
                     await db.execute(
@@ -381,9 +456,13 @@ async def reattribute_window(
 
     actions = {
         item.row_index: (
-            "указатель проставлен"
+            ("указатель снят" if item.clear else "указатель проставлен")
             if item.source_id in changed
-            else "разметка появилась параллельно — пропущено"
+            else (
+                "разметка изменена параллельно — пропущено"
+                if item.clear
+                else "разметка появилась параллельно — пропущено"
+            )
         )
         for item in plan
     }

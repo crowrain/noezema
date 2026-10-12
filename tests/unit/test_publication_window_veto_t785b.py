@@ -294,6 +294,7 @@ def test_method_version_is_v5_after_t785c() -> None:
     """Поведение метода изменилось снова (T7.85c: окно публикации только для русского текста и
     латинское имя собственного вне словаря) → номер поднят; переатрибуция пересматривает записи
     эпох v2, v3 и v4 по тому же предикату «метка записи ≠ текущий метод»
-    (tests/scenario/test_reattribute_stale_records.py)."""
+    (tests/scenario/test_reattribute_stale_records.py). T7.98 поднял номер дальше (v6, relay в
+    строгом режиме) — предикат тот же, окно публикации по-прежнему не тронуто."""
 
-    assert VALUE_ATTRIBUTION_METHOD_VERSION == "host-value-attribution-v5"
+    assert VALUE_ATTRIBUTION_METHOD_VERSION == "host-value-attribution-v6"

@@ -84,8 +84,9 @@ def test_retelling_of_a_release_is_derivative(uri: str, text: str) -> None:
     # основание решения записывается: оператор может проверить, чем хост руководствовался
     assert decision.basis_fragment
     # версия метода закреплена: T7.85 поднял её (алиасы/шаблоны по замерам живых страниц и
-    # схлопывание пробела при склейке фрагмента). Само это решение — из v1, оно не изменилось.
-    assert ATTRIBUTION_METHOD_VERSION == "host-source-attribution-v3"
+    # схлопывание пробела при склейке фрагмента), T7.98 — до v4 (relay-кандидат прогноза).
+    # Само это решение — из v1, оно не изменилось.
+    assert ATTRIBUTION_METHOD_VERSION == "host-source-attribution-v4"
 
 
 # ─── пересказ опознаётся и по-английски ──────────────────────────────────
@@ -396,4 +397,6 @@ def test_typography_fix_bumps_the_method_version() -> None:
     # T7.85 поднял версию до v3 тем же способом: словарь и склейка фрагмента исправлены по
     # замерам живых страниц подставки, прежние решения остаются валидными записями — их
     # пересматривает переатрибуция, а не отмена (STATUS T7.85, ADR-0029 дополнение).
-    assert ATTRIBUTION_METHOD_VERSION == "host-source-attribution-v3"
+    # T7.98 поднял версию до v4 тем же способом: relay-кандидат «первоисточник + глагол
+    # прогноза + значение» без шаблона (ADR-0029 дополнение, STATUS T7.98).
+    assert ATTRIBUTION_METHOD_VERSION == "host-source-attribution-v4"

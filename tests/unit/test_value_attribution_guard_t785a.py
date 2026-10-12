@@ -37,7 +37,9 @@ STRICT_TABLE: tuple[tuple[str, str, str, str | None], ...] = (
     ("interfax_1068021_b", STATEMENT_559, "derivative", "rosstat"),
     ("ria_2068393962", STATEMENT_559, "derivative", "rosstat"),
     ("sbercib_2025", STATEMENT_559, "derivative", "rosstat"),
-    ("cbr_CPD_2025-12", STATEMENT_559, "no_value_attribution", None),
+    # T7.98: на CPD назван собственный прогноз ЦБ (другое число) → первоисточник в основании
+    # есть, значение не то: value_not_attributed вместо «атрибуции нет вовсе»
+    ("cbr_CPD_2025-12", STATEMENT_559, "value_not_attributed", None),
     ("cbr_reginfl_64837", STATEMENT_559, "value_not_attributed", None),
     ("garant_1963171", STATEMENT_559, "no_value_attribution", None),
     ("nbj_71790", STATEMENT_559, "no_value_attribution", None),

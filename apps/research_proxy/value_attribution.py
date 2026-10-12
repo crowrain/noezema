@@ -44,6 +44,7 @@ from apps.research_proxy.source_attribution import (
     _TEMPLATES,
     ATTRIBUTION_WINDOW_CHARS,
     MAX_SCAN_CHARS,
+    OTHER_SOURCE_ACTOR_MARKERS,
     STATUS_AMBIGUOUS,
     STATUS_DERIVATIVE,
     STATUS_NO_VALUE_ATTRIBUTION,
@@ -52,7 +53,10 @@ from apps.research_proxy.source_attribution import (
     VALUE_NUMBER_PATTERN,
     _attributed_keys,
     _basis,
+    _canonical_number,
     _fragments,
+    _mask_primary_aliases,
+    _relay_forecast_keys,
     is_home_host,
     named_primary_keys,
     normalize_scan_text,
@@ -99,7 +103,19 @@ from packages.memory.scope import (
 #: и pairing `value_and_primary_in_fragment` — не тронут ни на пункт. Поведение метода изменилось →
 #: номер поднят, и переатрибуция пересматривает записи эпох v2, v3 И v4 тем же предикатом
 #: «метка записи ≠ текущий метод».
-VALUE_ATTRIBUTION_METHOD_VERSION: Final = "host-value-attribution-v5"
+#: v6 (T7.98, стендовый дефект ca2484b2): в СТРОГОМ режиме добавлен relay — пара «алиас
+#: первоисточника + его глагол прогноза + значение» без шаблона атрибуции
+#: (`apps/research_proxy/source_attribution.py::_relay_forecast_keys`, ADR-0029 дополнение):
+#: «24 июля Банк России повысил прогноз инфляции на 2026 год до 6–7%» приписывается Банку
+#: России, а не остаётся `no_value_attribution`. Pairing такой записи — прежний
+#: `value_and_primary_in_fragment`: значение и первоисточник по-прежнему названы в одном
+#: фрагменте, просто связь выражена не шаблоном, а субъектной позицией алиаса. Окно
+#: публикации не тронуто; вето собственной оценки, «другого числа», home-host правило и
+#: разночтение двух первоисточников действуют над relay ровно как над шаблонной парой
+#: (словарь действующих лиц `OTHER_SOURCE_ACTOR_MARKERS` переехал в детектор страниц без
+#: изменений и теперь один на оба режима). Поведение метода изменилось → номер поднят, и
+#: переатрибуция пересматривает записи эпох v2…v5 тем же предикатом.
+VALUE_ATTRIBUTION_METHOD_VERSION: Final = "host-value-attribution-v6"
 
 #: честный отказ этого детектора: первоисточник в основании назван, но значение там другое — не то,
 #: на котором стоит утверждение. Отличие от `no_value_attribution` (атрибуции нет вовсе) нужно,
@@ -190,23 +206,14 @@ _PUBLICATIONS: Final = tuple(re.compile(pattern, re.IGNORECASE) for pattern in P
 # Вето действует только в режиме окна публикации и только в сторону отказа (сомнение — не
 # приписывать: ADR-0029 «Риски», ложная склейка дороже ложного пропуска); строгий режим не тронут.
 
-#: действующие лица, которые могут быть другим источником числа. Поиск идёт по окну, где алиасы
-#: словаря первоисточников замазаны (см. `_mask_primary_aliases`): строгие формы «Банк России»,
-#: «Банка России», «Центробанк» в действующее лицо-банк не превращаются, а «Сбербанк(а)»,
-#: «Райффайзенбанк(а)», голое «банки/банка» — превращаются (граница слова у алиаса «банк»
-#: намеренно отсутствует: имя банка-актера может содержать его внутри себя).
-OTHER_SOURCE_ACTOR_MARKERS: Final[tuple[str, ...]] = (
-    r"\bаналит[а-яё]*",
-    r"\bэкономист[а-яё]*",
-    r"\bэксперт[а-яё]*",
-    r"\bспециалист[а-яё]*",
-    r"\bкомпани[а-яё]*",
-    r"\bагентств[а-яё]*",
-    r"\bинститут[а-яё]*",
-    r"\bцентр[а-яё]*",
-    # без `\b` в начале: «Сбербанка», «Райффайзенбанка» — действующее лицо; алиасы словаря замазаны
-    r"банк[а-яё]*",
-)
+#: действующие лица, которые могут быть другим источником числа: словарь переехал в
+#: `apps/research_proxy/source_attribution.py` (T7.98) без изменений — он один на два режима:
+#: окно публикации (здесь) и relay-кандидат строгого режима (`_relay_forecast_keys`).
+#: Поиск идёт по окну, где алиасы словаря первоисточников замазаны (см. `_mask_primary_aliases`
+#: там же): строгие формы «Банк России», «Банка России», «Центробанк» в действующее лицо-банк
+#: не превращаются, а «Сбербанк(а)», «Райффайзенбанк(а)», голое «банки/банка» — превращаются
+#: (граница слова у алиаса «банк» намеренно отсутствует: имя банка-актера может содержать его
+#: внутри себя). `OTHER_SOURCE_ACTOR_MARKERS` импортирован выше и остаётся доступен отсюда.
 
 #: глаголы и обороты оценки/прогноза. Ключевое различение (закреплено формой Коммерсанта из
 #: фикстур T7.85): «Оценка текущих темпов роста цен при этом осталась на уровне 14,5%» —
@@ -388,13 +395,6 @@ class ValueAttributionDecision:
         return self.status == STATUS_DERIVATIVE
 
 
-def _canonical_number(raw: str) -> str:
-    """Число для сравнения: типографика убрана, десятичная запятая становится точкой. `5,59`,
-    `5.59` и `5,\u00a059` — одно значение; `2025` к значениям не относится (нет единицы)."""
-    text = re.sub(r"[\s\u00a0]+", "", raw)
-    return text.replace(",", ".").strip(".")
-
-
 def _measured_numbers(text: str) -> set[str]:
     """Числа текста, которые являются значениями: число с единицей измерения рядом."""
     found: set[str] = set()
@@ -439,20 +439,6 @@ def _publication_window(text: str, start: int, end: int) -> tuple[str, int]:
     if 0 <= break_after < upper:
         upper = break_after
     return text[lower:upper], lower
-
-
-def _mask_primary_aliases(zone: str) -> str:
-    """Копия зоны вето, где алиасы словаря первоисточников замазаны пробелами (длина та же —
-    координаты не плывут). Нужно, чтобы строгое название первоисточника не читалось как
-    действующее лицо: «Банк России сохранил оценку» — это первоисточник, а не «банк-актер»,
-    «Сбербанка» после замазывания остаётся и опознаётся признаком."""
-    chars = list(zone)
-    for _key, (_spec, patterns) in _ALIASES.items():
-        for pattern in patterns:
-            for match in pattern.finditer(zone):
-                for index in range(match.start(), min(match.end(), len(chars))):
-                    chars[index] = " "
-    return "".join(chars)
 
 
 def _is_dictionary_alias_name(name: str) -> bool:
@@ -741,12 +727,26 @@ def attribute_value_in_fragment(
     matched: dict[str, str] = {}
     for fragment in _fragments(scanned):
         keys = _attributed_keys(fragment)
-        if not keys:
+        # T7.98: relay-кандидат строгого режима — прогноз первоисточника без шаблона.
+        # Он не ослабляет шаблонную пару: тот же фрагмент, то же окно, то же вето; при
+        # разногласии шаблона и relay в одном фрагменте разночтение решает тот же код ниже.
+        # Relay различает два вопроса (гвард (е)): «первоисточник назван субъектом прогноза»
+        # (атрибуция основания) и «значение утверждения стоит на позиции значения прогноза»
+        # (атрибуция значения): «составила 5,59%, оказавшись ниже прогноза Банка России 6–7%»
+        # называет ЦБ в основании, но 5,59 ЦБ не принадлежит → value_not_attributed, а не
+        # ложный пересказ.
+        relay = _relay_forecast_keys(fragment)
+        if not keys and not relay:
             continue
-        attributed.update(dict.fromkeys(keys, fragment))
+        attributed.update(dict.fromkeys({**relay, **keys}, fragment))
         if values and not (_measured_numbers(fragment) & set(values)):
             continue  # «другое число»: первоисточник назван, но не про значение утверждения
-        matched.update(dict.fromkeys(keys, fragment))
+        relay_value = (
+            _relay_forecast_keys(fragment, required_numbers=frozenset(values))
+            if relay and values
+            else relay
+        )
+        matched.update(dict.fromkeys({**relay_value, **keys}, fragment))
 
     def fallback(refusal: ValueAttributionDecision) -> ValueAttributionDecision:
         """Честный отказ строгого режима ещё не значит «пересказа нет»: страница могла объявить

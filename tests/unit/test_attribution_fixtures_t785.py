@@ -124,12 +124,14 @@ def test_fixture_is_the_stand_page(name: str) -> None:
 
 
 def test_page_decisions_on_stand_texts() -> None:
-    """Страничный детектор v3 (то же решение, что пишет `research.fetch`)."""
+    """Страничный детектор v4 (то же решение, что пишет `research.fetch`)."""
     expected_page = {
         # сам Банк России: страница первоисточника не бывает пересказом самой себя
         "cbr_Infl_exp_25-12": ("self_primary", None),
-        # «Росстат» на странице CPD не назван ни разу → undecided, а не «производная CBR»
-        "cbr_CPD_2025-12": ("no_value_attribution", None),
+        # T7.98: на CPD назван собственный прогноз ЦБ («По прогнозу Банка России … снизится до
+        # 4,0–5,0% в 2026 году») — relay-кандидат ЦБ на домашнем хосте ЦБ → self_primary вместо
+        # undecided; Росстат на странице по-прежнему не назван ни разу, указатель не ставится
+        "cbr_CPD_2025-12": ("self_primary", None),
         # страница ЦБ про Москву пересказывает Росстат — указатель был и остался
         "cbr_reginfl_64837": ("derivative", "rosstat"),
         "expert_5-59": ("derivative", "rosstat"),
@@ -138,7 +140,11 @@ def test_page_decisions_on_stand_texts() -> None:
         "garant_1963171": ("no_value_attribution", None),
         # две атрибуции рядом (Росстат и консенсус-прогноз «Интерфакса») → честный отказ
         "interfax_1068021_a": ("ambiguous_primaries", None),
-        "interfax_1068021_b": ("derivative", "rosstat"),
+        # T7.98: на странице b, кроме пересказа Росстата, назван прогноз ЦБ своими словами
+        # («Прогноз Банка России от октября … 6,5-7%», «Прогноз Банка России на 2026 год был
+        # сохранен на уровне 4-5%») — два первоисточника на одной странице → честный отказ
+        # вместо прежнего указателя «производная Росстата»
+        "interfax_1068021_b": ("ambiguous_primaries", None),
         # страница без страничной атрибуции: производность признаётся только по значению 14,5
         "kommersant_8294535": ("no_value_attribution", None),
         "nbj_71790": ("no_value_attribution", None),
@@ -149,7 +155,7 @@ def test_page_decisions_on_stand_texts() -> None:
     for name, (status, primary) in expected_page.items():
         decision = detect_source_attribution(canonical_uri=STAND_URI[name], text=_text(name))
         assert (decision.status, decision.primary_key) == (status, primary), name
-    assert ATTRIBUTION_METHOD_VERSION == "host-source-attribution-v3"
+    assert ATTRIBUTION_METHOD_VERSION == "host-source-attribution-v4"
 
 
 @pytest.mark.parametrize(
@@ -162,8 +168,10 @@ def test_page_decisions_on_stand_texts() -> None:
         ("ria_2068393962", STATEMENT_559, "derivative", "rosstat", PAIRING_VALUE_AND_PRIMARY),
         ("sbercib_2025", STATEMENT_559, "derivative", "rosstat", PAIRING_VALUE_AND_PRIMARY),
         # ── честные отказы: значение без первоисточника в том же фрагменте ───────
-        # CPD Банка России: «годовая инфляция в декабре уменьшилась до 5,59%» — Росстат не назван
-        ("cbr_CPD_2025-12", STATEMENT_559, "no_value_attribution", None, PAIRING_VALUE_AND_PRIMARY),
+        # CPD Банка России: «годовая инфляция в декабре уменьшилась до 5,59%» — Росстат не назван;
+        # T7.98: собственный прогноз ЦБ на странице назван рядом с другим числом (4,0–5,0%) →
+        # первоисточник в основании есть, но значение там другое → value_not_attributed
+        ("cbr_CPD_2025-12", STATEMENT_559, "value_not_attributed", None, PAIRING_VALUE_AND_PRIMARY),
         # cbr.ru про Москву: 5,59 приведено без атрибуции именно этого числа
         ("cbr_reginfl_64837", STATEMENT_559, "value_not_attributed", None, PAIRING_VALUE_AND_PRIMARY),
         # garant.ru: «по данным Росстата» стоит у другой цифры (6,1% месяц) — не атрибуция 5,59
@@ -205,7 +213,7 @@ def test_value_decisions_on_stand_texts(
     )
     assert (decision.status, decision.primary_key) == (status, primary), (name, statement[:40])
     assert decision.pairing == pairing, (name, statement[:40])
-    assert VALUE_ATTRIBUTION_METHOD_VERSION == "host-value-attribution-v5"
+    assert VALUE_ATTRIBUTION_METHOD_VERSION == "host-value-attribution-v6"
 
 
 def test_publication_window_never_overrides_a_refusal_of_its_own_kind() -> None:
