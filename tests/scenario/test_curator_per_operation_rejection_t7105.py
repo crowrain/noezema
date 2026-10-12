@@ -207,6 +207,16 @@ async def test_stand_case_replay_two_claims_written_estimate_bounced_by_name(
     assert payload["claims_applied"] == 2
     # прежнее предложение остаётся видимым в журнале целиком (снятое не вырезано)
     assert [c["statement"] for c in payload["claims"]] == [CLAIM_MAY, CLAIM_AUG, CLAIM_ESTIMATE]
+    # частичный публичный summary называет факт отказа честно (ADR-0034 §8 п.6)
+    summary_rows = await _all(
+        scratch_url,
+        "SELECT public_summary FROM audit_events WHERE session_id = :s AND type = 'claim_created' "
+        "AND jsonb_typeof(payload -> 'claims') = 'array'",
+        {"s": str(session_id)},
+    )
+    assert summary_rows[0]["public_summary"] == (
+        "curator: 2 of 3 claims applied, 1 questions, 1 operations rejected by host validation"
+    )
 
     rejected = payload["rejected_operations"]
     assert len(rejected) == 1
