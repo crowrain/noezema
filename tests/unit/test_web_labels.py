@@ -192,6 +192,9 @@ def _sources() -> dict[str, list[str]]:
         "estimate_row": list(web_estimates.ESTIMATE_ROW_KEYS),
         "estimate_value": list(web_estimates.ESTIMATE_VALUE_KEYS),
         "estimate_section": list(web_estimates.ESTIMATE_SECTION_KEYS),
+        # T7.99 (ADR-0033 §13): подписи свёрнутой повторной записи карточки ответа —
+        # закрытый набор построителя карточки apps/web/answer.py.
+        "claim_duplicate": list(web_answer.DUPLICATE_KEYS),
     }
 
 
@@ -338,6 +341,8 @@ def test_answer_builder_keys_are_all_labelled() -> None:
         ("estimate_row", web_estimates.ESTIMATE_ROW_KEYS),
         ("estimate_value", web_estimates.ESTIMATE_VALUE_KEYS),
         ("estimate_section", web_estimates.ESTIMATE_SECTION_KEYS),
+        # T7.99: свёрнутая повторная запись того же значения (ADR-0033 §13).
+        ("claim_duplicate", web_answer.DUPLICATE_KEYS),
     ):
         assert keys, f"пустой набор ключей: {category}"
         unlabeled = [key for key in keys if not labels.describe(category, key)["hint"]]

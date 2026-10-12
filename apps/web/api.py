@@ -628,6 +628,24 @@ function renderClaim(claim,inactive){
     const line=document.createElement('div'); line.className='muted';
     line.textContent=reason; row.appendChild(line);
   }
+  // T7.99 (ADR-0033 §13): повторная запись того же значения свёрнута под основной:
+  // сервер даёт и счётчик («и 1 …»), и строку дубля с его собственной оценкой-бейджем,
+  // и подпись ссылки; JS печатает присланное и ведёт в карточку свёрнутой записи.
+  const dupLead=claim.duplicates_lead;
+  if(dupLead){ const d0=document.createElement('div'); d0.className='muted';
+    d0.textContent=dupLead; row.appendChild(d0); }
+  for(const dup of (claim.duplicates||[])){
+    if(!dup||!dup.text) continue;
+    const line=document.createElement('div'); line.className='muted';
+    if(dup.reliability) line.appendChild(badgeFor(dup.reliability));
+    const txt=document.createElement('span'); txt.textContent=dup.text; line.appendChild(txt);
+    if(dup.duplicate_hint) line.title=dup.duplicate_hint;
+    row.appendChild(line);
+    const dmeta=[dup.type_label,dup.grade_label,dup.freshness_label,dup.relation_label].filter(Boolean).join(' · ');
+    if(dmeta){ const m=document.createElement('div'); m.className='muted'; m.textContent=dmeta; row.appendChild(m); }
+    const dlink=document.createElement('a'); dlink.href='/claim/'+esc(dup.id);
+    dlink.textContent=dup.link_label||''; row.appendChild(dlink);
+  }
   // T7.88 (ADR-0035 вариант D): «Независимые оценки» — каждую строку подраздела составил
   // сервер, JS печатает то, что пришло, и бейдж уже вычисленной оценки кандидата.
   const est=claim.estimates;

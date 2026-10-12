@@ -58,7 +58,9 @@ apps/orchestrator/value_duplicate.py): здесь нет второго слов
 
 from __future__ import annotations
 
+import datetime as dt
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from fractions import Fraction
@@ -75,6 +77,7 @@ from apps.orchestrator.value_duplicate import (
     statement_indicator_words,
     statement_values,
     statement_years,
+    value_duplicate_pair,
 )
 from apps.web.labels import describe
 
@@ -91,8 +94,10 @@ __all__ = [
     "EstimateCandidate",
     "EstimateRow",
     "EstimateSource",
+    "FoldRecord",
     "ValueRoles",
     "estimate_rows_for_source",
+    "fold_value_duplicate_pairs",
     "value_roles",
 ]
 
@@ -936,3 +941,68 @@ def estimate_rows_for_source(
 
 def estimate_section_heading() -> str:
     return describe("estimate_section", ESTIMATE_SECTION_KEYS[0])["label"]
+
+
+# ─── T7.99 (ADR-0033 §13): свёртка уже записанных дублей на карточке ─────────
+#
+# Витрина решает только показ: две действующие записи карточки, которые гейт T7.83
+# назвал бы дублями по значению, показываются одной строкой — повторная свёрнута под
+# основной. Ничего не записывается, не удаляется и не склеивается: обе записи остаются
+# в знаниях и в своей карточке `/claim/<id>`.
+#
+# Якорь (основная запись) — более РАННЯЯ по `created_at` запись, при равенстве — по
+# каноническому порядку `id` (тот же детерминизм, что у сортировок витрины). Это ровно
+# семантика гейта: кандидат (уже записанный, видимый куратору) — якорь, операция
+# (более поздняя) в него вливается. Выбирать «более сильную оценку» нельзя: витрина
+# не имеет права решать, чья оценка представляет факт, — слабая честная оценка не
+# должна молча заменяться сильной (и наоборот).
+#
+# Разбор пары — предикат `value_duplicate_pair` из модуля гейта: те же type+values+
+# period+indicator, без `relied` и без условий улик (они про запись, не про показ).
+
+
+@dataclass(frozen=True)
+class FoldRecord:
+    """Одна действующая запись карточки для решения о свёртке.
+
+    `created_at` — долговременная колонка `claims.created_at`; `as_of_year` и `metric`
+    — те же прочитанные формы, что питают гейт (`as_of` утверждения и метрика из
+    `assessed_scope` действующей головы)."""
+
+    claim_id: str
+    statement: str
+    claim_type: str
+    created_at: dt.datetime
+    as_of_year: int | None = None
+    metric: str | None = None
+
+
+def fold_value_duplicate_pairs(records: Sequence[FoldRecord]) -> list[tuple[str, str]]:
+    """Пары `(primary_id, duplicate_id)` среди записей карточки.
+
+    Обход в хронологическом порядке (при равенстве `created_at` — по `id`): каждая
+    запись пробует встать под самую раннюю из ещё не свёрнутых, с которой у неё
+    совпадает предикат дубля. Запись сворачивается ровно один раз; якорем может быть
+    только несвёрнутая запись (цепочки A←B←C собираются под самой ранней). Пары, не
+    прошедшие предикат, не упоминаются: карточка без дублей не меняется вовсе."""
+    ordered = sorted(records, key=lambda record: (record.created_at, record.claim_id))
+    pairs: list[tuple[str, str]] = []
+    folded: set[str] = set()
+    for index, duplicate in enumerate(ordered):
+        for primary in ordered[:index]:
+            if primary.claim_id in folded:
+                continue
+            if value_duplicate_pair(
+                op_claim_type=duplicate.claim_type,
+                op_statement=duplicate.statement,
+                op_as_of_year=duplicate.as_of_year,
+                candidate_claim_type=primary.claim_type,
+                candidate_statement=primary.statement,
+                candidate_as_of_year=primary.as_of_year,
+                op_metric=duplicate.metric,
+                candidate_metric=primary.metric,
+            ):
+                pairs.append((primary.claim_id, duplicate.claim_id))
+                folded.add(duplicate.claim_id)
+                break
+    return pairs

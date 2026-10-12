@@ -746,10 +746,11 @@ async def _relied_claims_rows(db: AsyncSession, session_ids: Sequence[str]) -> l
                     )
                     SELECT DISTINCT ON (c.id)
                            c.id, c.statement, c.claim_type, c.freshness_status,
-                           c.created_in_session, c.created_at, refs.session_id AS relied_in_session,
+                           c.created_in_session, c.created_at, c.as_of,
+                           refs.session_id AS relied_in_session,
                            COALESCE(h.assessment_state, 'none') AS head_state,
                            h.epistemic_status, a.effective_grade, a.confidence,
-                           a.id AS assessment_id
+                           a.id AS assessment_id, a.assessed_scope
                     FROM refs
                     JOIN claims c ON c.id::text = refs.claim_ref
                     LEFT JOIN claim_assessment_heads h
@@ -994,10 +995,104 @@ async def _attach_estimate_sections(
         rows = estimate_rules.estimate_rows_for_source(
             estimate_rules.EstimateSource(**source_fields), candidates
         )
+        # T7.99 (ADR-0033 §13): пара уже показана свёрнутой (блок «duplicates» под
+        # основной записью) — зеркальная строка «другая запись того же показателя»
+        # про свёрнутого дубля убирается: одна и та же пара на карточке один раз.
+        # Строки других видов (независимая оценка, вероятный пересказ, смежные) не
+        # трогаются: они говорят не про пару, а про отношение к другим записям.
+        folded_under = {str(dup.get("id") or "") for dup in (item.get("duplicates") or [])}
+        if folded_under:
+            rows = tuple(
+                row
+                for row in rows
+                if not (row.kind == "other_record" and str(row.candidate_id) in folded_under)
+            )
         item["estimates"] = {
             "heading": estimate_rules.estimate_section_heading(),
             "rows": [_estimate_row_json(row, pool_by_id, rules) for row in rows],
         }
+
+
+# ─── T7.99 (ADR-0033 §13): свёртка уже записанных дублей — только показ ───────
+#
+# Знание не трогается: обе записи остаются в базе, в `/knowledge` и в своей карточке
+# `/claim/<id>`; гейт T7.83/T7.83a не вызывается и ничего не склеивает. Витрина
+# показывает пару одной строкой: более ранняя запись — основная, более поздняя —
+# свёрнутый блок под ней со своей формулировкой, своей оценкой/бейджем, своей связью
+# с вопросом и ссылкой на свою карточку. Разбор пары — чистый предикат гейта без
+# условия опоры (`value_duplicate_pair`), отбор якоря — `fold_value_duplicate_pairs`.
+
+
+#: Закрытый набор подписей свёрнутой повторной записи (полнота сверяется тестом
+#: словаря): метка самой строки, подпись ссылки и счётчик-подпись «и N …».
+DUPLICATE_KEYS: tuple[str, ...] = (
+    "duplicate_record",
+    "duplicate_link",
+    "duplicate_count_one",
+    "duplicate_count_few",
+    "duplicate_count_many",
+)
+
+
+def _duplicates_lead(count: int) -> str:
+    """Честный счётчик под основной записью: свёрнутые записи не теряются — они
+    названы числом («и 1 повторная запись того же значения»)."""
+    if count == 1:
+        key = "duplicate_count_one"
+    elif count <= 4:
+        key = "duplicate_count_few"
+    else:
+        key = "duplicate_count_many"
+    return f"и {count} {ui_labels.describe('claim_duplicate', key)['label']}"
+
+
+def _duplicate_view(item: JsonDict) -> JsonDict:
+    """Свёрнутая строка: все уже собранные поля записи (формулировка, связь с
+    вопросом, оценка, бейдж) плюс серверные подписи свёртки и готовая строка текста
+    (JS печатает её дословно, своей человеческой фразы в JS нет)."""
+    out = dict(item)
+    entry = ui_labels.describe("claim_duplicate", "duplicate_record")
+    out["duplicate_label"] = entry["label"]
+    out["duplicate_hint"] = entry["hint"]
+    out["link_label"] = ui_labels.describe("claim_duplicate", "duplicate_link")["label"]
+    out["text"] = f"{entry['label']}: {item.get('statement') or ''}"
+    return out
+
+
+def _fold_value_duplicates(
+    *,
+    claims: list[JsonDict],
+    relied_claims: list[JsonDict],
+    facts: Sequence[estimate_rules.FoldRecord],
+) -> list[JsonDict]:
+    """Свёртка пар «дубль по значению» среди действующих записей карточки.
+
+    Повторная (более поздняя) запись уходит из основного списка и становится
+    свёрнутым блоком под основной (более ранней). Возвращает свёрнутые записи,
+    убранные из `claims`: они всё ещё записи этого вопроса, и счётчик ответа обязан
+    их учитывать (ловушка AGENTS §7: карточка не имеет права «потерять» запись).
+    """
+    pairs = estimate_rules.fold_value_duplicate_pairs(facts)
+    if not pairs:
+        return []
+    by_id = {str(item.get("id") or ""): item for item in [*claims, *relied_claims]}
+    folded_from_claims: list[JsonDict] = []
+    for primary_id, duplicate_id in pairs:
+        primary = by_id.get(primary_id)
+        duplicate = by_id.get(duplicate_id)
+        if primary is None or duplicate is None:
+            continue
+        for bucket in (claims, relied_claims):
+            if any(str(entry.get("id") or "") == duplicate_id for entry in bucket):
+                bucket[:] = [entry for entry in bucket if str(entry.get("id") or "") != duplicate_id]
+                if bucket is claims:
+                    folded_from_claims.append(duplicate)
+                break
+        duplicates = [dict(entry) for entry in (primary.get("duplicates") or [])]
+        duplicates.append(_duplicate_view(duplicate))
+        primary["duplicates"] = duplicates
+        primary["duplicates_lead"] = _duplicates_lead(len(duplicates))
+    return folded_from_claims
 
 
 async def question_answer(db: AsyncSession, question_id: uuid.UUID) -> JsonDict | None:
@@ -1052,6 +1147,9 @@ async def question_answer(db: AsyncSession, question_id: uuid.UUID) -> JsonDict 
     claims: list[JsonDict] = []
     other_claims: list[JsonDict] = []
     relied_claims: list[JsonDict] = []
+    # T7.99: свёрнутые повторные записи, убранные из основного списка `claims`
+    # (они всё ещё записи этого вопроса — для честного счётчика и связей).
+    folded_claims: list[JsonDict] = []
     evidence_rows: list[Any] = []
     touched_by_claim: dict[str, str] = {}
     if session_ids:
@@ -1068,10 +1166,10 @@ async def question_answer(db: AsyncSession, question_id: uuid.UUID) -> JsonDict 
                         WITH {touched_claims_cte(scope)}
                         SELECT r.relation, r.session_id AS touched_in_session,
                                c.id, c.statement, c.claim_type, c.freshness_status,
-                               c.created_in_session, c.created_at,
+                               c.created_in_session, c.created_at, c.as_of,
                                COALESCE(h.assessment_state, 'none') AS head_state,
                                h.epistemic_status, a.effective_grade, a.confidence,
-                               a.id AS assessment_id
+                               a.id AS assessment_id, a.assessed_scope
                         FROM ranked r
                         JOIN claims c ON c.id = r.claim_id
                         LEFT JOIN claim_assessment_heads h
@@ -1272,6 +1370,31 @@ async def question_answer(db: AsyncSession, question_id: uuid.UUID) -> JsonDict 
             item["active"] = head_state == "current"
             relied_claims.append(item)
 
+        # T7.99 (ADR-0033 §13): уже записанные дубли — свёрнуты на карточке (только
+        # показ; знание и гейт не тронуты). Действующие записи карты отдаются чистому
+        # отборщику в тех же прочитанных формах, что питают гейт: `as_of` утверждения
+        # и метрика из `assessed_scope` действующей головы. Свёртка идёт ДО
+        # подраздела «Независимые оценки»: свёрнутая запись не получает собственный
+        # подраздел, а у основной зеркальная строка пары подавляется.
+        fold_facts: list[estimate_rules.FoldRecord] = []
+        for row in [*claim_rows, *relied_rows]:
+            if str(row["head_state"]) != "current":
+                continue
+            as_of = row["as_of"]
+            fold_facts.append(
+                estimate_rules.FoldRecord(
+                    claim_id=str(row["id"]),
+                    statement=str(row["statement"]),
+                    claim_type=str(row["claim_type"]),
+                    created_at=row["created_at"],
+                    as_of_year=as_of.year if as_of is not None else None,
+                    metric=declared_scope_metric(row.get("assessed_scope")),
+                )
+            )
+        folded_claims = _fold_value_duplicates(
+            claims=claims, relied_claims=relied_claims, facts=fold_facts
+        )
+
         # T7.88 (ADR-0035 вариант D): подраздел «Независимые оценки» — одна фиксированная
         # выборка на всю карту (бюджет T7.74), подбор и тексты — чистый модуль apps.web.estimates.
         await _attach_estimate_sections(db, claims=claims, relied_claims=relied_claims, rules=rules)
@@ -1280,7 +1403,7 @@ async def question_answer(db: AsyncSession, question_id: uuid.UUID) -> JsonDict 
     # T7.74: для перепроверенного или принятого повторно утверждения такая работа — сессия
     # этого вопроса, а не та, что записала строку в прошлом (она другому вопросу).
     work_session_id: str | None = None
-    for item in claims:
+    for item in [*claims, *folded_claims]:
         touched = touched_by_claim.get(str(item["id"]))
         if isinstance(touched, str) and touched:
             work_session_id = touched
@@ -1316,15 +1439,17 @@ async def question_answer(db: AsyncSession, question_id: uuid.UUID) -> JsonDict 
         ).scalar_one_or_none()
 
     groups, failed_actions = executed_actions(events)
-    answer_ids = {str(item["id"]) for item in claims}
+    # T7.99: свёрнутые повторные записи — тоже записи этого вопроса: их подтверждения
+    # и их связи участвуют в честных счётчиках карточки (запись не «теряется»).
+    answer_ids = {str(item["id"]) for item in [*claims, *folded_claims]}
     steps = build_answer_steps(events)
     result = build_answer_result(
         question_state=question["state"],
         sessions=[dict(row) for row in sessions],
-        answer_claim_count=len(claims),
+        answer_claim_count=len(claims) + len(folded_claims),
         # T7.74: итог учитывает и те действующие утверждения, которые этот вопрос
         # перепроверил или принял повторно, а не только записанные им заново.
-        relations=[str(item.get("relation")) for item in claims],
+        relations=[str(item.get("relation")) for item in [*claims, *folded_claims]],
     )
     honesty = build_honesty_notes(
         saw_research_fetch=any(tool == "research.fetch" for tool, _count, _domain in groups),
@@ -1332,7 +1457,7 @@ async def question_answer(db: AsyncSession, question_id: uuid.UUID) -> JsonDict 
         evidence_kinds=evidence_kind_counts(
             row for row in evidence_rows if str(row.get("claim_id")) in answer_ids
         ),
-        answer_claim_count=len(claims),
+        answer_claim_count=len(claims) + len(folded_claims),
         failed_actions=failed_actions,
     )
 

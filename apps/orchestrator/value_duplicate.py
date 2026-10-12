@@ -917,3 +917,51 @@ def find_value_duplicates(
             )
         )
     return decisions
+
+
+# ── T7.99 (ADR-0033 §13): тот же предикат пары для витрины — без условия опоры ──────────
+#
+# Решение пользователя 2026-10-12: уже записанные дубли показывать свёрнутыми на карточке
+# ответа (только витрина; знание не трогается). Витрине нужен ровно тот же ответ, что даёт
+# строгий кандидат гейта, НО без фильтра `relied_claim_ids` и без условий улик:
+# `relied` и `has_support_link`/`has_counter_link` существуют, чтобы хост не решал за
+# куратора СКЛЕЙКУ записи (запись — территория гейта); витрина ничего не записывает и
+# ничего не склеивает — она лишь решает, показывать ли две уже записанные строки одной.
+# Поэтому витрине нужны четыре условия строгого кандидата: равный `claim_type`, равное
+# НЕПУСТОЕ множество значений, непустой период операции, покрытый периодом кандидата, и
+# `indicator_check` со всеми вето T7.83a/T7.96/T7.96a и чтением диапазонов T7.98.
+# Направление то же, что у гейта: `op_*` — более поздняя запись (ту, что гейт предложил бы
+# склеить), `candidate_*` — более ранняя (якорь). Гейт (`find_value_duplicates`) эту
+# функцию НЕ вызывает: его решения с причинами по каждому шагу остаются прежними.
+
+
+def value_duplicate_pair(
+    *,
+    op_claim_type: str,
+    op_statement: str,
+    op_as_of_year: int | None,
+    candidate_claim_type: str,
+    candidate_statement: str,
+    candidate_as_of_year: int | None,
+    op_metric: str | None = None,
+    candidate_metric: str | None = None,
+) -> bool:
+    """True ровно когда две уже записанные формулировки — «дубль по значению» по
+    определению гейта T7.83/T7.83a/T7.98 (type + values + period + indicator), без
+    условий записи (`relied`, улики). Консервативная тишина сохранена: непустые
+    значения, покрытый период, совпавший показатель."""
+    op_values = statement_values(op_statement)
+    if not op_values:
+        return False  # целые/годы — тихий отказ (T7.9 владеет побайтовыми дублями)
+    if op_claim_type != candidate_claim_type:
+        return False
+    if statement_values(candidate_statement) != op_values:
+        return False
+    op_period = _period(op_statement, op_as_of_year)
+    if not op_period:
+        return False
+    if op_period > _period(candidate_statement, candidate_as_of_year):
+        return False
+    return indicator_check(
+        op_statement, candidate_statement, op_metric, candidate_metric
+    ).matched
