@@ -22,6 +22,8 @@
   `ATTRIBUTION_WINDOW_CHARS` — то же, что у страничного детектора);
 - маркеры собственной оценки в основании улики отвергают производность;
 - число, отличное от числа утверждения («другое число»), не даёт атрибуции этому утверждению;
+- диапазон на странице — одно значение: его концы не самостоятельные измеренные числа, одиночное
+  значение утверждения концу диапазона не приписывается (T7.109a);
 - голое упоминание первоисточника без значения — не атрибуция;
 - страница самого первоисточника не бывает пересказом себя;
 - два первоисточника для одного и того же значения утверждения — отказ.
@@ -161,7 +163,26 @@ from packages.memory.scope import (
 #: Словарь первоисточников пополнен записью «Минэкономразвития России» (детектор страниц v6).
 #: Поведение метода изменилось → номер поднят, и переатрибуция пересматривает записи эпох
 #: v2…v7 тем же предикатом «метка записи ≠ текущий метод».
-VALUE_ATTRIBUTION_METHOD_VERSION: Final = "host-value-attribution-v8"
+#: v9 (T7.109a, ложная склейка, найденная на приёмке T7.109): диапазон — одно значение и на
+#: стороне ТЕКСТА. Диапазон страницы («6-7%», «6–7%», «от 6 до 7%»; соединители те же
+#: `_RANGE_CONNECTOR`, левый конец без своей единицы, единица после правого) сравнивается как
+#: одно целое — составной токен `6-7` (`_range_value_spans`, `_measured_value_tokens`): его концы
+#: не самостоятельные измеренные числа. Одиночное значение утверждения концу диапазона не
+#: приписывается — та была ложная склейка на interfax_1121468: консенсус «7,0%» приписывался
+#: правому концу диапазона ЦБ «(6-7%)»; правый конец диапазона «5-7%» — тоже не «7»,
+#: левый конец «6-7%» — не «6». Диапазон утверждения совпадает только с диапазоном
+#: текста с теми же концами (эквиваленция T7.109 сохранена: «6,0–7,0%» и «6-7%» — оба `6-7`);
+#: одиночное число страницы по-прежнему
+#: приписывает одиночное значение утверждения. Правило действует во всех точках сравнения
+#: детектора значений: фильтр «другого числа», гвард (е) relay (сама функция
+#: `_relay_forecast_keys` не изменена — требуемые числа плоские, диапазон отсекается фильтром
+#: вызывающего кода раньше), окно публикации (`_measured_value_spans`), режим близости
+#: (`_measured_spans`), библиография. Значения утверждения для сравнения — `claim_match_values`;
+#: `claim_value_numbers` остаётся плоским списком (запись, гейт T7.108a, позиции relay).
+#: Pairing-правила, окна, вето и страничный детектор не изменены: страничный значения утверждения
+#: с числами страницы не сравнивает → его версия остаётся v6. Поведение метода значений изменилось
+#: → переатрибуция пересматривает записи эпох v2…v8 тем же предикатом «метка ≠ текущий метод».
+VALUE_ATTRIBUTION_METHOD_VERSION: Final = "host-value-attribution-v9"
 
 #: честный отказ этого детектора: первоисточник в основании назван, но значение там другое — не то,
 #: на котором стоит утверждение. Отличие от `no_value_attribution` (атрибуции нет вовсе) нужно,
@@ -459,6 +480,76 @@ def _measured_numbers(text: str) -> set[str]:
 _RANGE_CONNECTOR: Final = re.compile(r"[ ]{0,3}[-\u2013\u2014][ ]{0,3}|[ ]+до[ ]+")
 #: конец диапазона обязан читаться как одно десятичное число («3.2.5» диапазоном не становится)
 _SIMPLE_CANONICAL: Final = re.compile(r"\d+(?:\.\d+)?")
+#: разделитель составного токена диапазона (T7.109a): канонические формы левого и правого конца,
+#: склеенные через него. Символ не встречается в выводе `_canonical_number`
+#: (`VALUE_NUMBER_PATTERN` не читает «-»), поэтому составной токен не может совпасть с
+#: одиночным числом: сравнение диапазонов работает только через него.
+_RANGE_TOKEN_SEP: Final = "-"
+
+
+def _range_value_spans(text: str) -> list[tuple[int, int, str]]:
+    """Диапазоны ТЕКСТА (T7.109a) — те же условия, что диапазонная ветка `_claim_measured_numbers`:
+    соединитель вплотную между концами (`_RANGE_CONNECTOR`), у левого конца нет своей единицы
+    (иначе это уже измеренное число: «6,0% – 7,0%» — пара замеров, не диапазон), единица стоит
+    после правого конца, оба конца читаются как одно десятичное число. Возвращает кортежи
+    (позиция левого конца, позиция после правого, составной канонический токен). Диапазон
+    страницы — ОДНО значение: его концы не самостоятельные измеренные числа."""
+    spans: list[tuple[int, int, str]] = []
+    tokens = list(VALUE_NUMBER_PATTERN.finditer(text))
+    for index, left in enumerate(tokens):
+        if index + 1 >= len(tokens):
+            continue
+        left_tail = text[left.end() : left.end() + _UNIT_TAIL_CHARS]
+        if _UNIT_SCAN.match(left_tail):
+            continue  # у левого конца своя единица: он уже измеренное число, не начало диапазона
+        canonical_left = _canonical_number(left.group())
+        if not _SIMPLE_CANONICAL.fullmatch(canonical_left):
+            continue  # токен не читается как число: диапазона из него не собирают
+        right = tokens[index + 1]
+        if not _RANGE_CONNECTOR.fullmatch(text[left.end() : right.start()]):
+            continue  # концы не смежны: это не диапазон
+        right_tail = text[right.end() : right.end() + _UNIT_TAIL_CHARS]
+        if not _UNIT_SCAN.match(right_tail):
+            continue  # единица стоит не после правого конца: значения в диапазоне нет
+        canonical_right = _canonical_number(right.group())
+        if not _SIMPLE_CANONICAL.fullmatch(canonical_right):
+            continue  # правый конец тоже обязан читаться как одно число
+        spans.append(
+            (left.start(), right.end(), f"{canonical_left}{_RANGE_TOKEN_SEP}{canonical_right}")
+        )
+    return spans
+
+
+def _measured_value_tokens(text: str) -> frozenset[str]:
+    """Измеренные значения ТЕКСТА с учётом диапазонов (T7.109a): одиночные измеренные числа
+    плюс диапазоны целиком (составной токен); концы диапазона одиночными числами не становятся —
+    правый конец «6-7%» — это не «7», а значение «6-7». Правило действует с обеих сторон:
+    одиночное значение утверждения приписывается только одиночному числу текста (число,
+    стоящее в тексте одиночно, например «…граница прогноза 7%…», по-прежнему приписывается),
+    диапазон утверждения совпадает только с диапазоном текста с теми же концами."""
+    ranges = _range_value_spans(text)
+    values: set[str] = {token for _start, _end, token in ranges}
+    for match in VALUE_NUMBER_PATTERN.finditer(text):
+        tail = text[match.end() : match.end() + _UNIT_TAIL_CHARS]
+        if not _UNIT_SCAN.match(tail):
+            continue  # число без единицы — не значение (тот же измеритель, что у `_measured_numbers`)
+        if any(start <= match.start() and match.end() <= end for start, end, _token in ranges):
+            continue  # конец диапазона: не самостоятельный замер (T7.109a)
+        values.add(_canonical_number(match.group()))
+    return frozenset(values)
+
+
+def claim_match_values(claim_statement: str | None) -> frozenset[str]:
+    """Значения утверждения для СРАВНЕНИЯ (T7.109a): одиночные измеренные значения утверждения и
+    его диапазоны составными токенами. В отличие от `claim_value_numbers` концы диапазона не
+    становятся самостоятельными значениями: конец диапазона утверждения сопоставляется только с
+    концом другого диапазона — и никогда с одиночным числом страницы (ложная склейка консенсуса
+    «7,0%» с правым концом диапазона ЦБ «(6-7%)» на interfax_1121468 — то, что правится). Плоский
+    список (`claim_value_numbers`) остаётся для записи улики, текстового гейта T7.108a и позиций
+    гварда (е) relay — «значения ли это фрагмента» решает этот набор."""
+    if not claim_statement:
+        return frozenset()
+    return _measured_value_tokens(normalize_scan_text(claim_statement))
 
 
 def _claim_measured_numbers(text: str) -> set[str]:
@@ -641,27 +732,42 @@ def claim_values_found_in_texts(
     return frozenset(found)
 
 
-def _measured_value_spans(text: str, values: set[str]) -> list[tuple[int, int]]:
-    """Позиции в тексте каждого измеренного числа утверждения (то же сравнение чисел, что и
-    `_measured_numbers`): окно публикации привязывается к месту, где значение стоит на странице."""
-    return [
+def _measured_value_spans(text: str, match_values: frozenset[str]) -> list[tuple[int, int]]:
+    """Позиции в тексте каждого значения утверждения (то же сравнение, что и
+    `_measured_value_tokens`, T7.109a: одиночные измеренные числа и диапазоны целиком): окно
+    публикации привязывается к месту, где значение стоит на странице (для диапазона — к его
+    левому концу)."""
+    ranges = _range_value_spans(text)
+    spans = [(start, end) for start, end, token in ranges if token in match_values]
+    covered = {(start, end) for start, end, _token in ranges}
+    spans.extend(
         (match.start(), match.end())
         for match in VALUE_NUMBER_PATTERN.finditer(text)
         if _UNIT_SCAN.match(text[match.end() : match.end() + _UNIT_TAIL_CHARS])
-        and _canonical_number(match.group()) in values
-    ]
+        and not any(
+            start <= match.start() and match.end() <= end for start, end in covered
+        )  # конец диапазона: не самостоятельная позиция значения (T7.109a)
+        and _canonical_number(match.group()) in match_values
+    )
+    return spans
 
 
 def _measured_spans(text: str) -> list[tuple[int, int, frozenset[str]]]:
-    """Измеренные числа текста с их позициями и каноничной формой: (start, end, {сравнение}).
+    """Измеренные значения текста с их позициями и токенами сравнения: (start, end, {значение}).
     Тот же измеритель, что у `_measured_numbers` (единица рядом с числом), — позиция добавлена
     для режима «ближайший первоисточник» (T7.109): там важно не только «какие числа есть»,
-    но и «какое из них ближайшее после алиаса»."""
+    но и «какое из них ближайшее после алиаса». С T7.109a диапазон — один интервал от левого
+    конца до правого с составным токеном: его концы отдельными интервалами не становятся."""
     spans: list[tuple[int, int, frozenset[str]]] = []
+    ranges = _range_value_spans(text)
+    spans.extend((start, end, frozenset({token})) for start, end, token in ranges)
     for match in VALUE_NUMBER_PATTERN.finditer(text):
         tail = text[match.end() : match.end() + _UNIT_TAIL_CHARS]
-        if _UNIT_SCAN.match(tail):
-            spans.append((match.start(), match.end(), frozenset({_canonical_number(match.group())})))
+        if not _UNIT_SCAN.match(tail):
+            continue
+        if any(start <= match.start() and match.end() <= end for start, end, _token in ranges):
+            continue  # конец диапазона: не самостоятельный замер (T7.109a)
+        spans.append((match.start(), match.end(), frozenset({_canonical_number(match.group())})))
     return spans
 
 
@@ -898,6 +1004,7 @@ def _bibliography_known_producer_decision(
     canonical_uri: str | None,
     values: tuple[str, ...],
     known_claim_primaries: frozenset[str],
+    match_values: frozenset[str],
 ) -> ValueAttributionDecision | None:
     """Третий, последний режим pairing (T7.107): кому принадлежит значение утверждения, когда
     страница назвала список источников, а производителя уже назвала другая улика того же
@@ -911,8 +1018,9 @@ def _bibliography_known_producer_decision(
     lines = _bibliography_lines(scanned_page)
     if not lines:
         return None  # (i) строки-списка нет
-    if not any(number in _measured_numbers(scanned_page) for number in values):
-        return None  # (ii) значения утверждения на странице нет
+    if not (match_values and (_measured_value_tokens(scanned_page) & match_values)):
+        return None  # (ii) значения утверждения на странице нет (T7.109a: диапазон — значение
+        # целиком, его концы одиночным числом утверждения не подтверждают)
     named_known = [
         (key, line)
         for line in lines
@@ -949,7 +1057,11 @@ def _bibliography_known_producer_decision(
 
 
 def _publication_decision(
-    *, scanned: str, canonical_uri: str | None, values: tuple[str, ...]
+    *,
+    scanned: str,
+    canonical_uri: str | None,
+    values: tuple[str, ...],
+    match_values: frozenset[str],
 ) -> ValueAttributionDecision | None:
     """Второй режим pairing (T7.85): страница объявила публикацию первоисточника в предыдущих
     предложениях того же блока, а значение называет позже.
@@ -980,12 +1092,12 @@ def _publication_decision(
     именем собственным вне словаря (`_latin_proper_name_sign`: «…ожидания стабильны. Gallup
     reported observed inflation of 15,2%»). Строгий режим не тронут: английская пара
     «значение + первоисточник» в одном фрагменте решалась по нему и раньше."""
-    if not values:
+    if not match_values:
         return None  # значения нет: расширять pairing нечем (строгий режим строже)
     candidates_all: dict[str, str] = {}  # кандидаты до вето — прежнее поведение режима (T7.85)
     candidates: dict[str, str] = {}  # кандидаты, пережившие вето «другого источника числа» (T7.85a)
     ambiguity_basis: str | None = None
-    for start, end in _measured_value_spans(scanned, set(values)):
+    for start, end in _measured_value_spans(scanned, match_values):
         window, window_lower = _publication_window(scanned, start, end)
         if not any(pattern.search(window) for pattern in _PUBLICATIONS):
             continue  # публикация первоисточника не названа: окно не расширяем
@@ -1044,7 +1156,7 @@ def _publication_decision(
     )
 
 
-def _nearest_primary_keys(fragment: str, values: set[str]) -> dict[str, str]:
+def _nearest_primary_keys(fragment: str, match_values: frozenset[str]) -> dict[str, str]:
     """T7.109 (часть б2, решение пользователя 2026-10-13) «ближайший первоисточник»: кому
     принадлежит значение во фрагменте, называющем ДВУХ и более словарных первоисточников.
 
@@ -1063,7 +1175,7 @@ def _nearest_primary_keys(fragment: str, values: set[str]) -> dict[str, str]:
 
     Вето home-host и разночтение двух претендентов решает вызывающий код (тот же, что у relay и
     шаблонных пар): эта функция называет кандидатов фрагмента, не больше."""
-    if not values:
+    if not match_values:
         return {}
     keys = named_primary_keys(fragment)
     if len(keys) < 2:
@@ -1083,7 +1195,7 @@ def _nearest_primary_keys(fragment: str, values: set[str]) -> dict[str, str]:
                     key=lambda span: span[0],
                     default=None,
                 )
-                if following is not None and following[2] & values:
+                if following is not None and following[2] & match_values:
                     candidates[key] = fragment
                     claimed = True
                     break
@@ -1093,7 +1205,11 @@ def _nearest_primary_keys(fragment: str, values: set[str]) -> dict[str, str]:
 
 
 def _nearest_primary_decision(
-    *, scanned: str, canonical_uri: str | None, values: tuple[str, ...]
+    *,
+    scanned: str,
+    canonical_uri: str | None,
+    values: tuple[str, ...],
+    match_values: frozenset[str],
 ) -> ValueAttributionDecision | None:
     """Решение режима «ближайший первоисточник» (T7.109) либо None — режима нет, когда ни один
     фрагмент не называет двух словарных первоисточников, заявляющих значение утверждения.
@@ -1104,11 +1220,11 @@ def _nearest_primary_decision(
     самой себе, и если все претенденты — домашние для прочитанной страницы, режим молчит
     (собственную публикацию утверждает не этот режим, а `self_primary`). Два претендента —
     прежнее `ambiguous_primaries`; кандидата нет — прежний честный отказ вызывающего кода."""
-    if not values:
+    if not match_values:
         return None
     candidates_all: dict[str, str] = {}
     for fragment in _fragments(scanned):
-        for key, basis in _nearest_primary_keys(fragment, set(values)).items():
+        for key, basis in _nearest_primary_keys(fragment, match_values).items():
             candidates_all.setdefault(key, basis)
     if not candidates_all:
         return None
@@ -1139,11 +1255,16 @@ def _nearest_primary_decision(
     )
 
 
-def _pairing_maps(scanned: str, values: tuple[str, ...]) -> tuple[dict[str, str], dict[str, str]]:
+def _pairing_maps(
+    scanned: str, values: tuple[str, ...], match_values: frozenset[str]
+) -> tuple[dict[str, str], dict[str, str]]:
     """Пары фрагментов: `attributed` — фрагменты, где названа атрибуция (независимо от значения),
     `matched` — пары «первоисточник → фрагмент» про значение утверждения. Вынесено из
     `attribute_value_in_fragment` дословно (T7.101): решение о собственной публикации обязано
-    строиться на ровно том же pairing, что и решение об атрибуции, — второй копии логики нет."""
+    строиться на ровно том же pairing, что и решение об атрибуции, — второй копии логики нет.
+    С T7.109a фильтр «другого числа» сравнивает значения фрагмента с профилем утверждения
+    (`_measured_value_tokens`: диапазон страницы — одно значение, его концы — не числа):
+    фрагмент с единственным диапазоном «6-7%» больше не пропускает одиночное значение «7»."""
     attributed: dict[str, str] = {}
     matched: dict[str, str] = {}
     for fragment in _fragments(scanned):
@@ -1155,13 +1276,15 @@ def _pairing_maps(scanned: str, values: tuple[str, ...]) -> tuple[dict[str, str]
         # (атрибуция основания) и «значение утверждения стоит на позиции значения прогноза»
         # (атрибуция значения): «составила 5,59%, оказавшись ниже прогноза Банка России 6–7%»
         # называет ЦБ в основании, но 5,59 ЦБ не принадлежит → value_not_attributed, а не
-        # ложный пересказ.
+        # ложный пересказ. С T7.109a требуемые числа relay остаются плоскими (позиции значений
+        # прогноза в тексте не меняются), но одиночное значение до relay-проверки не доходит:
+        # диапазон отсекается фильтром профиля раньше.
         relay = _relay_forecast_keys(fragment)
         if not keys and not relay:
             continue
         attributed.update(dict.fromkeys({**relay, **keys}, fragment))
-        if values and not (_measured_numbers(fragment) & set(values)):
-            continue  # «другое число»: первоисточник назван, но не про значение утверждения
+        if match_values and not (_measured_value_tokens(fragment) & match_values):
+            continue  # «другое число»: первоисточник назван, но не про значение утверждения (T7.109a)
         relay_value = (
             _relay_forecast_keys(fragment, required_numbers=frozenset(values))
             if relay and values
@@ -1199,6 +1322,9 @@ def attribute_value_in_fragment(
 
     scanned = normalize_scan_text(text)[:MAX_SCAN_CHARS]
     values = claim_value_numbers(claim_statement)
+    # T7.109a: профиль значений утверждения для сравнения «значение ли это в этом фрагменте»;
+    # плоский `values` остаётся для записи, гейта и позиций relay
+    match_values = claim_match_values(claim_statement)
 
     # T7.107: вето собственной оценки — по копии с вырезанными шаблонными плашками площадки
     # (`SITE_DISCLAIMER_PHRASES`); словарь маркеров не сокращён
@@ -1206,7 +1332,7 @@ def attribute_value_in_fragment(
         # своя оценка/альтернативный расчёт в основании улики: склеивать нельзя
         return ValueAttributionDecision(status=STATUS_OWN_ASSESSMENT, claim_values=values)
 
-    attributed, matched = _pairing_maps(scanned, values)
+    attributed, matched = _pairing_maps(scanned, values, match_values)
 
     def fallback(refusal: ValueAttributionDecision) -> ValueAttributionDecision:
         """Честный отказ строгого режима ещё не значит «пересказа нет»: страница могла объявить
@@ -1223,12 +1349,12 @@ def attribute_value_in_fragment(
         только после честного отказа строгого и публикационного режимов и ничего в них не
         меняет; pairing его решения — строгий, новых статусов и ключей нет."""
         wider = _publication_decision(
-            scanned=scanned, canonical_uri=canonical_uri, values=values
+            scanned=scanned, canonical_uri=canonical_uri, values=values, match_values=match_values
         )
         if wider is not None:
             return wider
         nearest = _nearest_primary_decision(
-            scanned=scanned, canonical_uri=canonical_uri, values=values
+            scanned=scanned, canonical_uri=canonical_uri, values=values, match_values=match_values
         )
         if nearest is not None:
             return nearest
@@ -1242,6 +1368,7 @@ def attribute_value_in_fragment(
             canonical_uri=canonical_uri,
             values=values,
             known_claim_primaries=known_claim_primaries,
+            match_values=match_values,
         )
         return refusal if bibliography is None else bibliography
 
@@ -1353,7 +1480,7 @@ def self_publication_candidate(
     if not canonical_uri or not text:
         return None  # защита: без адреса прочитанной страницы домашний хост не проверить
     scanned = normalize_scan_text(text)[:MAX_SCAN_CHARS]
-    _, matched = _pairing_maps(scanned, decision.claim_values)
+    _, matched = _pairing_maps(scanned, decision.claim_values, claim_match_values(claim_statement))
     if not matched:
         return None  # защита: `self_primary` без pairing не бывает, но и проверка не на слепке
     specs = [
