@@ -134,7 +134,13 @@ def test_page_decisions_on_stand_texts() -> None:
         "cbr_CPD_2025-12": ("self_primary", None),
         # страница ЦБ про Москву пересказывает Росстат — указатель был и остался
         "cbr_reginfl_64837": ("derivative", "rosstat"),
-        "expert_5-59": ("derivative", "rosstat"),
+        # T7.109: словарь вырос записью «Минэкономразвития России» (minec) — на странице, кроме
+        # пересказа Росстата, назван обзор Минэкономразвития («…ускорилась до 6,27%, следует из
+        # обзора Минэкономразвития „О текущей ценовой ситуации“») прежним шаблоном «следует из».
+        # Две атрибуции на одной странице → прежнее (T7.87) правило честного отказа вместо
+        # прежнего указателя «производная Росстата». Решение по ЗНАЧЕНИЮ 5,59 ниже не изменилось:
+        # оно стоит в росстатовском фрагменте строгого режима.
+        "expert_5-59": ("ambiguous_primaries", None),
         # «следует из опроса … опубликованного ЦБ» + «ЦБ сообщил»: страница пересказ ЦБ
         "forbes_552221": ("derivative", "cbr"),
         "garant_1963171": ("no_value_attribution", None),
@@ -155,7 +161,7 @@ def test_page_decisions_on_stand_texts() -> None:
     for name, (status, primary) in expected_page.items():
         decision = detect_source_attribution(canonical_uri=STAND_URI[name], text=_text(name))
         assert (decision.status, decision.primary_key) == (status, primary), name
-    assert ATTRIBUTION_METHOD_VERSION == "host-source-attribution-v5"
+    assert ATTRIBUTION_METHOD_VERSION == "host-source-attribution-v6"
 
 
 @pytest.mark.parametrize(
@@ -213,7 +219,7 @@ def test_value_decisions_on_stand_texts(
     )
     assert (decision.status, decision.primary_key) == (status, primary), (name, statement[:40])
     assert decision.pairing == pairing, (name, statement[:40])
-    assert VALUE_ATTRIBUTION_METHOD_VERSION == "host-value-attribution-v7"
+    assert VALUE_ATTRIBUTION_METHOD_VERSION == "host-value-attribution-v8"
 
 
 def test_publication_window_never_overrides_a_refusal_of_its_own_kind() -> None:

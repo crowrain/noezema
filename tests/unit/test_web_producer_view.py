@@ -170,9 +170,16 @@ def test_one_producer_through_the_recorded_attribution() -> None:
     assert _name(*rows) == "Росстат"
 
 
-def test_attribution_and_page_pointer_must_agree() -> None:
-    """Запись говорит «Росстат», страничный указатель ведёт на Банк России — один производитель не доказан."""
-    assert _name(_row(primary_key="rosstat", primary_name="Росстат", parent_uri=CBR)) is None
+def test_recorded_attribution_wins_over_the_page_pointer() -> None:
+    """T7.109 (часть б3, решение пользователя 2026-10-13): запись о происхождении значения
+    приоритетнее страничного указателя.
+
+    Было (T7.87): «запись говорит „Росстат“, указатель ведёт на Банк России — один
+    производитель не доказан» → None. Стало: запись — решение детектора значения, прочитанного
+    прямо на этой улике; якорь-родитель ЭТОЙ ЖЕ строки в выборке имени не участвует. Прежний
+    fail-closed сохранён по краям: разночтение записей двух разных строк (тест ниже) и строки
+    без записи (указатель ведёт, как вёл)."""
+    assert _name(_row(primary_key="rosstat", primary_name="Росстат", parent_uri=CBR)) == "Росстат"
 
 
 def test_two_producers_keep_the_previous_wording() -> None:

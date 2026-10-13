@@ -141,7 +141,27 @@ from packages.memory.scope import (
 #: режим публикации решают первыми и не ослаблены ни на пункт: новый режим рассматривается
 #: только после их отказа. Поведение метода изменилось → номер поднят, и переатрибуция пересматривает
 #: записи эпох v2…v6 тем же предикатом «метка записи ≠ текущий метод».
-VALUE_ATTRIBUTION_METHOD_VERSION: Final = "host-value-attribution-v7"
+#: v8 (T7.109, решение пользователя 2026-10-13): три изменения одного направления — «значения
+#: стали ровнее, первоисточник — ближе». (1) Сравнение чисел: хвостовые нули дробной части не
+#: значимы (`_canonical_number` в детекторе страниц — единственная точка сравнения: 7,0 ≡ 7,
+#: 2,20 ≡ 2,2; целая часть сравнивается по-прежнему, «52.22» и «122,2» не равны «2,2»).
+#: (2) Диапазон в утверждении («6,0–7,0%», «6–7%», «от 6 до 7%», дефис/короткое/длинное тире):
+#: оба конца диапазона считаются значениями, когда единица стоит после правого конца
+#: (`_claim_measured_numbers`); на стороне ТЕКСТА измерительный критерий не изменён — диапазон
+#: без единицы у левого конца остаётся одним числом с единицей (консервативно). (3) Новый выход
+#: строгого режима — «ближайший первоисточник» (`_nearest_primary_decision`): во фрагменте,
+#: называющем ДВУХ словарных первоисточников (там, где молчит гвард (а) relay), значение
+#: приписывается тому алиасу, который стоит ближе всего перед ним и отделяется от него только
+#: текстом прогноза: собственное число алиаса, ближайшее после его вхождения, обязано нести
+#: значение утверждения — иначе значение этому алиасу не принадлежит. Два претендента — то же
+#: прежнее `ambiguous_primaries`, никто — прежний честный отказ. Pairing решения — прежний
+#: строгий `value_and_primary_in_fragment`: новых ключей evidence scope и новых pairing нет.
+#: Строгий (шаблон + relay) и публикационный режимы решают первыми и не ослаблены ни на пункт;
+#: новый режим рассматривается только после их честного отказа — перед третьим режимом T7.107.
+#: Словарь первоисточников пополнен записью «Минэкономразвития России» (детектор страниц v6).
+#: Поведение метода изменилось → номер поднят, и переатрибуция пересматривает записи эпох
+#: v2…v7 тем же предикатом «метка записи ≠ текущий метод».
+VALUE_ATTRIBUTION_METHOD_VERSION: Final = "host-value-attribution-v8"
 
 #: честный отказ этого детектора: первоисточник в основании назван, но значение там другое — не то,
 #: на котором стоит утверждение. Отличие от `no_value_attribution` (атрибуции нет вовсе) нужно,
@@ -433,13 +453,58 @@ def _measured_numbers(text: str) -> set[str]:
     return found
 
 
+#: T7.109 (часть а): соединитель диапазона в утверждении — дефис, короткое или длинное тире
+#: (могут быть окружены пробелами) либо слово «до». Один пробельный промежуток: «6 до 7%» —
+#: диапазон; «6 рублей до 7%» — уже не соединитель, а текст между числами.
+_RANGE_CONNECTOR: Final = re.compile(r"[ ]{0,3}[-\u2013\u2014][ ]{0,3}|[ ]+до[ ]+")
+#: конец диапазона обязан читаться как одно десятичное число («3.2.5» диапазоном не становится)
+_SIMPLE_CANONICAL: Final = re.compile(r"\d+(?:\.\d+)?")
+
+
+def _claim_measured_numbers(text: str) -> set[str]:
+    """Значения утверждения: измеренные числа (`_measured_numbers`) плюс оба конца диапазона
+    (T7.109, решение пользователя 2026-10-13): «прогноз 6,0–7,0%», «6–7%», «от 6 до 7%» несут и
+    6, и 7 — когда единица измерения стоит после ПРАВОГО конца («6,0–7,0%»: единица у правого
+    конца, оба конца значения; «2025–2026 год»: единицы нет ни у одного конца — годы, не
+    значения). Соединитель обязан стоять вплотную между концами: между ними не может быть других
+    слов. Левый конец без своей единицы учитывается один раз: правый конец уже измерен обычно.
+
+    Только сторона УТВЕРЖДЕНИЯ. На стороне текста измерительный критерий прежен
+    (`_measured_numbers`): диапазон без единицы у левого конца остаётся одним числом с единицей
+    — ложный пропуск безопаснее ложной склейки (AGENTS §7, T7.98)."""
+    found = _measured_numbers(text)
+    tokens = list(VALUE_NUMBER_PATTERN.finditer(text))
+    for index, left in enumerate(tokens):
+        left_tail = text[left.end() : left.end() + _UNIT_TAIL_CHARS]
+        if _UNIT_SCAN.match(left_tail):
+            continue  # у левого конца своя единица: он уже учтён общим измерителем
+        canonical_left = _canonical_number(left.group())
+        if not _SIMPLE_CANONICAL.fullmatch(canonical_left):
+            continue  # токен не читается как число: диапазона из него не собирают
+        if index + 1 >= len(tokens):
+            continue
+        right = tokens[index + 1]
+        if not _RANGE_CONNECTOR.fullmatch(text[left.end() : right.start()]):
+            continue  # концы не смежны: это не диапазон
+        right_tail = text[right.end() : right.end() + _UNIT_TAIL_CHARS]
+        if not _UNIT_SCAN.match(right_tail):
+            continue  # единица стоит не после правого конца: значения в диапазоне нет
+        found.add(canonical_left)
+        found.add(_canonical_number(right.group()))
+    return found
+
+
 def claim_value_numbers(statement: str | None) -> tuple[str, ...]:
     """Значения утверждения (детерминированно, тем же сравнением чисел). Пусто — когда утверждение
     не называет измеренного значения: тогда выбор фрагмента идёт по всему основанию улики, и отказ
-    при двух первоисточниках становится строже."""
+    при двух первоисточниках становится строже.
+
+    T7.108a: этим же числом пользуется текстовый гейт «значение на связи»
+    (`claim_values_found_in_texts`): с T7.109 оба конца диапазона утверждения участвуют и в
+    проверке связи, и в атрибуции — сравнение чисел у гейта и детекторов одно (`_canonical_number`)."""
     if not statement:
         return ()
-    return tuple(sorted(_measured_numbers(normalize_scan_text(statement))))
+    return tuple(sorted(_claim_measured_numbers(normalize_scan_text(statement))))
 
 
 # ─── T7.108a (ADR-0034 §10): текстовые формы значения для гейта «значение на связи» ──────
@@ -585,6 +650,19 @@ def _measured_value_spans(text: str, values: set[str]) -> list[tuple[int, int]]:
         if _UNIT_SCAN.match(text[match.end() : match.end() + _UNIT_TAIL_CHARS])
         and _canonical_number(match.group()) in values
     ]
+
+
+def _measured_spans(text: str) -> list[tuple[int, int, frozenset[str]]]:
+    """Измеренные числа текста с их позициями и каноничной формой: (start, end, {сравнение}).
+    Тот же измеритель, что у `_measured_numbers` (единица рядом с числом), — позиция добавлена
+    для режима «ближайший первоисточник» (T7.109): там важно не только «какие числа есть»,
+    но и «какое из них ближайшее после алиаса»."""
+    spans: list[tuple[int, int, frozenset[str]]] = []
+    for match in VALUE_NUMBER_PATTERN.finditer(text):
+        tail = text[match.end() : match.end() + _UNIT_TAIL_CHARS]
+        if _UNIT_SCAN.match(tail):
+            spans.append((match.start(), match.end(), frozenset({_canonical_number(match.group())})))
+    return spans
 
 
 def _publication_window(text: str, start: int, end: int) -> tuple[str, int]:
@@ -966,6 +1044,101 @@ def _publication_decision(
     )
 
 
+def _nearest_primary_keys(fragment: str, values: set[str]) -> dict[str, str]:
+    """T7.109 (часть б2, решение пользователя 2026-10-13) «ближайший первоисточник»: кому
+    принадлежит значение во фрагменте, называющем ДВУХ и более словарных первоисточников.
+
+    Именно там молчит гвард (а) relay («два первоисточника названы — чей прогноз, неизвестно»);
+    во фрагментах с одним алиасом прежние режимы решают как решали, этот код к ним не
+    прикасается. Вето третьего актора — то же, что у гварда (б) relay (`_third_actor_present`:
+    поиск по фону замазанных алиасов словаря): «прогноз ЦБ (6-7%) и прогноз Минэкономразвития
+    (6,8%), по оценке аналитиков...» не решает ничего.
+
+    Правило близости: значение приписывается алиасу, который стоит ближе всего перед значением,
+    — собственное измеренное число алиаса, ближайшее после его вхождения, обязано нести значение
+    утверждения. Если ближайшее число другое, это вхождение алиаса значение не заявляет («ЦБ
+    сохранил ставку 14%. Прогноз инфляции ЦБ — 6-7%»: 6–7 принадлежит ЦБ по второму вхождению,
+    а 14 к значению 6–7 не относится). Между алиасом и его числом не может стоять другое
+    измеренное число — оно и будет ближайшим собственным числом алиаса.
+
+    Вето home-host и разночтение двух претендентов решает вызывающий код (тот же, что у relay и
+    шаблонных пар): эта функция называет кандидатов фрагмента, не больше."""
+    if not values:
+        return {}
+    keys = named_primary_keys(fragment)
+    if len(keys) < 2:
+        return {}  # одиночный алиас: гвард (а) relay и прежние режимы уже отработали
+    if _third_actor_present(fragment):
+        return {}  # фрагмент называет третье действующее лицо — как гвард (б) relay
+    spans = _measured_spans(fragment)
+    if not spans:
+        return {}
+    candidates: dict[str, str] = {}
+    for key in keys:
+        for pattern in _ALIASES[key][1]:
+            claimed = False
+            for occurrence in pattern.finditer(fragment):
+                following = min(
+                    (span for span in spans if span[0] >= occurrence.end()),
+                    key=lambda span: span[0],
+                    default=None,
+                )
+                if following is not None and following[2] & values:
+                    candidates[key] = fragment
+                    claimed = True
+                    break
+            if claimed:
+                break
+    return candidates
+
+
+def _nearest_primary_decision(
+    *, scanned: str, canonical_uri: str | None, values: tuple[str, ...]
+) -> ValueAttributionDecision | None:
+    """Решение режима «ближайший первоисточник» (T7.109) либо None — режима нет, когда ни один
+    фрагмент не называет двух словарных первоисточников, заявляющих значение утверждения.
+
+    Pairing решения — прежний строгий `value_and_primary_in_fragment` (значение и первоисточник
+    в одном фрагменте, связь выражена близостью алиаса к значению): новых pairing-значений и
+    новых ключей evidence scope нет. Home-host правило то же: страница не бывает пересказом
+    самой себе, и если все претенденты — домашние для прочитанной страницы, режим молчит
+    (собственную публикацию утверждает не этот режим, а `self_primary`). Два претендента —
+    прежнее `ambiguous_primaries`; кандидата нет — прежний честный отказ вызывающего кода."""
+    if not values:
+        return None
+    candidates_all: dict[str, str] = {}
+    for fragment in _fragments(scanned):
+        for key, basis in _nearest_primary_keys(fragment, set(values)).items():
+            candidates_all.setdefault(key, basis)
+    if not candidates_all:
+        return None
+    candidates = {
+        key: basis
+        for key, basis in candidates_all.items()
+        if not is_home_host(canonical_uri, _home_hosts(key))
+    }
+    if not candidates:
+        return None  # значение заявлено самой прочитанной страницей: режим не решает
+    if len(candidates) > 1:
+        return ValueAttributionDecision(
+            status=STATUS_AMBIGUOUS,
+            basis_fragment=_basis(next(iter(candidates.values()))),
+            claim_values=values,
+        )
+    key = next(iter(candidates))
+    spec = primary_source(key)
+    if spec is None:  # защита: решение не строится на несуществующей записи словаря
+        return None
+    return ValueAttributionDecision(
+        status=STATUS_DERIVATIVE,
+        primary_key=spec.key,
+        primary_name=spec.name,
+        parent_uri=spec.home_uri,
+        basis_fragment=_basis(candidates[key]),
+        claim_values=values,
+    )
+
+
 def _pairing_maps(scanned: str, values: tuple[str, ...]) -> tuple[dict[str, str], dict[str, str]]:
     """Пары фрагментов: `attributed` — фрагменты, где названа атрибуция (независимо от значения),
     `matched` — пары «первоисточник → фрагмент» про значение утверждения. Вынесено из
@@ -1045,12 +1218,20 @@ def attribute_value_in_fragment(
         контроль T7.85: собственная страница ЦБ по опросу «инФОМ» не становится пересказом).
 
         Третий режим T7.107 (`_bibliography_known_producer_decision`) рассматривается только после
-        отказа обоих прежних — прежние режимы не ослаблены ни на пункт."""
+        отказа прежних — прежние режимы не ослаблены ни на пункт. С T7.109 между ними встаёт
+        режим «ближайший первоисточник» (`_nearest_primary_decision`): он тоже рассматривается
+        только после честного отказа строгого и публикационного режимов и ничего в них не
+        меняет; pairing его решения — строгий, новых статусов и ключей нет."""
         wider = _publication_decision(
             scanned=scanned, canonical_uri=canonical_uri, values=values
         )
         if wider is not None:
             return wider
+        nearest = _nearest_primary_decision(
+            scanned=scanned, canonical_uri=canonical_uri, values=values
+        )
+        if nearest is not None:
+            return nearest
         if not known_claim_primaries:
             return refusal  # известного производителя утверждения нет — третьему режиму не на что опереться
         bibliography_page = (

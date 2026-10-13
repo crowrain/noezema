@@ -211,4 +211,4 @@ def test_method_version_is_v5_after_the_veto_fixes() -> None:
     T7.85c — на v5 (окно публикации только для русского текста и латинское имя собственного вне
     словаря), T7.98 — на v6 (relay в строгом режиме; окно публикации не тронуто).
     Переатрибуция по этому номеру пересматривает записи эпох v2, v3, v4 и v5."""
-    assert VALUE_ATTRIBUTION_METHOD_VERSION == "host-value-attribution-v7"
+    assert VALUE_ATTRIBUTION_METHOD_VERSION == "host-value-attribution-v8"

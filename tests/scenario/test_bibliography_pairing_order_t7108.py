@@ -38,7 +38,7 @@ from tests.scenario.test_scope_coverage import _all, _scalar, _seed_question
 
 pytestmark = pytest.mark.scenario
 
-CURRENT_VALUE_METHOD = "host-value-attribution-v7"
+CURRENT_VALUE_METHOD = "host-value-attribution-v8"
 
 PLAQUE = (
     "Данная публикация является личным мнением автора. "
