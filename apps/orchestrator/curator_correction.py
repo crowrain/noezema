@@ -21,7 +21,7 @@ T7.106a (ADR-0034 §9): раздел НИКОГДА не теряет опера
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from packages.domain.models.base import JsonDict
@@ -65,6 +65,15 @@ class BoundaryAccepted:
     value_duplicates: list[JsonDict]
     relied_claim_ids: list[str]
     relied_claims_rejected: list[str]
+    #: T7.108 (часть а, ADR-0034 §10): записи снятых гейтом значения связей — аддитивный
+    #: ключ `rejected_links` в payload уже существующего события claim_created (паттерн
+    #: `rejected_operations` T7.105). Пусто по умолчанию: сессии без снятых связей остаются
+    #: байт в байт прежними.
+    rejected_links: list[JsonDict] = field(default_factory=list)
+    #: Индексы связей предложения, снятых гейтом значения: staging их не пишет (наблюдение
+    #: и источник остаются в базе — знание не удаляется). Покрытые записью снятой операции
+    #: связи сюда тоже входят: связь снята в любом случае.
+    removed_link_indices: frozenset[int] = frozenset()
 
 
 @dataclass(frozen=True)

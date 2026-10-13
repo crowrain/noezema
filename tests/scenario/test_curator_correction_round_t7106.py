@@ -331,11 +331,37 @@ async def test_fixture_off_by_one_link_replay_gets_one_correction_round(
     round_key = claim_events[0]["correction_round"]
     assert round_key["reasons"] == [_FIXTURE_REASON]
     assert len(round_key["rejected_proposal"]["claims"]) == 4
-    # принято целиком: `claims_applied` (ключ частичного отказа T7.105) не появляется
-    assert len(claim_events[0]["claims"]) == 4 and "claims_applied" not in claim_events[0]
+    # было (до T7.108): принято целиком, `claims_applied` не появляется, в базе все четыре
+    # утверждения. стало (гейт «значение на связи», ADR-0034 §10): у стендового ответа часть
+    # связей ведёт на страницы БЕЗ значения утверждения (июльская страница у августовского
+    # claim'а; обзоры «Веер» без 2,3 — у июльского; список газеты без цифр — у claim'а про
+    # динамику). Связь без значения снимается с названной причиной; claim, у которого не
+    # осталось ни одной связи, снимается как операция (механизм T7.105) — отказ частичный,
+    # раунд исправления при этом НЕ запускается (снят не весь ответ)
+    payload = claim_events[0]
+    assert len(payload["claims"]) == 4
+    assert payload["claims_proposed"] == 4 and payload["claims_applied"] == 2
+    assert [entry["reason"] for entry in payload["rejected_operations"]] == [
+        "claim[1]: no linked evidence contains the claim value",
+        "claim[3]: no linked evidence contains the claim value",
+    ]
+    # связь, снятая у Оставшейся операции, названа записью связи; связи снятых операций
+    # описаны их записями операций и в `rejected_links` не дублируются
+    assert payload["rejected_links"] == [
+        {
+            "link_index": 1,
+            "evidence_index": 1,
+            "claim_index": 0,
+            "relation": "supports",
+            "reason": "evidence_link[1]: evidence 1 does not contain the value of claim 0",
+        }
+    ]
 
-    # все четыре утверждения стендового случая записаны
-    assert await _db_statements(scratch_url) == sorted(c["statement"] for c in _CLAIMS_FIXTURE)
+    # записаны утверждения, чьи улики несут значение: август (служба занятости) и
+    # конкуренция «Веер» (утверждение без измеренного значения гейтом не проверяется)
+    assert await _db_statements(scratch_url) == sorted(
+        _CLAIMS_FIXTURE[i]["statement"] for i in (0, 2)
+    )
 
     # оба обращения к куратору — фазовые записи consolidating (шаговый бюджет исследователя
     # раунд НЕ расходует: второй вызов живёт в фазе consolidating)
@@ -495,7 +521,12 @@ async def test_gate4_rules_kind_mismatch_gets_one_round_and_retyped_claim_lands(
     activation = await _run_online(engine, _payload())
     assert activation.state == "active"
 
-    statement = "Вероятно, безработица в Тармении к концу 2026 года сохранится около 2 процентов."
+    # T7.108 (а), ADR-0034 §10: утверждение переформулировано без измеренного значения —
+    # иначе обе связки с `_SHORT_URLS` снимались бы гейтом «значение на связи» и тест
+    # ловил бы отказ по причине гейта вместо предмета теста (несоответствие `claim_type`
+    # правилам). Мера правила не зависит от значения: `empirical_conjecture` с уликами
+    # чтения отклоняется движком и с пустым значением.
+    statement = "Вероятно, безработица в Тармении к концу 2026 года сохранится на уровне последних месяцев."
     bad = _curator_answer(
         [{"statement": statement, "claim_type": "empirical_conjecture"}], _links((0, 0), (1, 0))
     )

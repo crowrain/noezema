@@ -40,6 +40,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Final
 
@@ -439,6 +440,37 @@ def claim_value_numbers(statement: str | None) -> tuple[str, ...]:
     if not statement:
         return ()
     return tuple(sorted(_measured_numbers(normalize_scan_text(statement))))
+
+
+def claim_values_found_in_texts(
+    *, values: frozenset[str], texts: Iterable[str | None]
+) -> frozenset[str]:
+    """T7.108 (часть а, ADR-0034 §10): какие значения утверждения встречаются в текстах улики.
+
+    То же сравнение чисел, что у детектора атрибуции: `VALUE_NUMBER_PATTERN` целыми максимально
+    жадными токенами + `_canonical_number` (запятая → точка). Отличие от `_measured_numbers`:
+    со стороны ТЕКСТА единица измерения не требуется — табличная страница пишет «2.2» без «%».
+    Число внутри другого числа («122,2» против «2,2») и граничные числа страницы (размер файла
+    «52.22 Кб», объём «12,2 Мб», годы выпуска) подтверждением не считаются: сопоставление целым
+    токеном. Максимально-жадный токен наследует и его quirk («12 2,2» читается одним числом
+    «122.2») — ограничение зафиксирован в ADR-0034 §10; он не открывает ложного подтверждения:
+    слить два числа в одно можно, выдумать значение утверждения из текста — нельзя.
+    Бюджет сканирования общий с детектором страниц: `MAX_SCAN_CHARS` (тот же
+    `RESEARCH_CONTEXT_BUDGET`); сохранённый текст страницы длиннее бюджета всё равно не существует.
+    """
+    if not values:
+        return frozenset()
+    value_set = set(values)
+    found: set[str] = set()
+    for text in texts:
+        if not text:
+            continue
+        scanned = normalize_scan_text(text)[:MAX_SCAN_CHARS]
+        for match in VALUE_NUMBER_PATTERN.finditer(scanned):
+            canonical = _canonical_number(match.group())
+            if canonical in value_set:
+                found.add(canonical)
+    return frozenset(found)
 
 
 def _measured_value_spans(text: str, values: set[str]) -> list[tuple[int, int]]:

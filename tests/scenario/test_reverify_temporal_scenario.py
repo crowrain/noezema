@@ -75,7 +75,10 @@ _PAGES: dict[str, str] = {
         "The yearly inflation rate came out at 5.59 percent, independent calculation shows."
     ),
     "http://gamma.example/news": (
-        "A second look at the yearly figure: independent estimate puts it near 5.6 percent."
+        # T7.108 (а), ADR-0034 §10: перепроверяющая страница обязана нести значение
+        # утверждения целым токеном — «near 5.6» больше не подтверждает 5,59: такая
+        # связь снимается гейтом с названной причиной и доказательственная база не растёт
+        "A second look at the yearly figure: independent estimate puts it at 5.59 percent."
     ),
 }
 

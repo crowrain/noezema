@@ -33,6 +33,7 @@ from typing import Any
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from apps.orchestrator.attribution_keys import known_primary_key_from_decision
 from apps.orchestrator.curator_correction import (
     BoundaryAccepted,
     BoundaryRejected,
@@ -41,6 +42,8 @@ from apps.orchestrator.curator_correction import (
 )
 from apps.orchestrator.curator_rejections import (
     claim_index_from_line,
+    links_without_claim_value,
+    rejected_link_entries,
     rejected_operation_entries,
     rules_problems_by_operation,
     split_structural_problems,
@@ -67,9 +70,15 @@ from apps.orchestrator.value_duplicate import (
 )
 from apps.research_proxy.derivative_pointer import resolve_primary_source
 from apps.research_proxy.normalization import PARSER_FINGERPRINT
-from apps.research_proxy.source_attribution import STATUS_SELF_PRIMARY, primary_source
+from apps.research_proxy.source_attribution import (
+    STATUS_NO_VALUE_ATTRIBUTION,
+    STATUS_SELF_PRIMARY,
+    primary_source,
+)
 from apps.research_proxy.value_attribution import (
+    STATUS_VALUE_NOT_ATTRIBUTED,
     VALUE_ATTRIBUTION_METHOD_VERSION,
+    ValueAttributionDecision,
     attribute_value_in_fragment,
     self_publication_scope_for_fragment,
 )
@@ -177,7 +186,6 @@ from packages.memory.scope import (
     VALUE_ATTRIBUTION_PAIRING_STRICT,
     VALUE_ATTRIBUTION_SCHEMA,
     build_value_attribution,
-    parse_value_attribution,
 )
 from packages.memory.session_admission import register_session_admission
 from packages.policy.engine import PolicyEngine
@@ -2504,30 +2512,22 @@ class Orchestrator:
             .all()
         )
 
-    async def _value_attribution(
+    def _value_attribution_decision(
         self,
-        db: AsyncSession,
         record: EvidenceRecord,
         claim_statement: str,
         known_claim_primaries: frozenset[str] = frozenset(),
         page_text: str | None = None,
-    ) -> JsonDict | None:
-        """Происхождение ЗНАЧЕНИЯ этой улики (T7.78, ADR-0029): чей пересказ читает утверждение.
-
-        Хостовое решение, модель к нему не допускается: детектор видит только текст основания улики
-        и формулировку утверждения. Замораживается решение здесь же — в staging-операции `evidence`
-        (единственное место, где пара «утверждение ↔ улика» существует вместе с обоими текстами),
-        а commit boundary переносит её в `evidence.scope`. Строку источника не трогаем: страничный
-        указатель T7.75 решает, когда он есть, а здесь решается только этот фрагмент. Первоисточник,
-        которого узел не читал, разрешается существующим механизмом якоря (T7.75).
-        """
+    ) -> ValueAttributionDecision | None:
+        """Чистое решение детектора для этой улики (без БД и без записи) — T7.108 (часть б):
+        два прохода цикла формулировки нуждаются в решении раньше, чем в разворачивании."""
         if record.kind is not EvidenceKind.SOURCE_ASSERTION:
             return None
         fragment = str(record.payload.get("assertion_text") or "")
         source_id = str(record.source_id or "")
         if not fragment or not source_id:
             return None
-        decision = attribute_value_in_fragment(
+        return attribute_value_in_fragment(
             canonical_uri=str(record.payload.get("url") or "") or None,
             text=fragment,
             claim_statement=claim_statement,
@@ -2537,6 +2537,19 @@ class Orchestrator:
             known_claim_primaries=known_claim_primaries,
             page_text=page_text,
         )
+
+    async def _write_value_attribution(
+        self,
+        db: AsyncSession,
+        record: EvidenceRecord,
+        claim_statement: str,
+        decision: ValueAttributionDecision | None,
+    ) -> JsonDict | None:
+        """Разворачивание решения детектора в запись staging-операции `evidence` (T7.78):
+        якорь первоисточника разрешается здесь — это единственная часть пути, которой нужна БД."""
+        if decision is None:
+            return None
+        source_id = str(record.source_id or "")
         if decision.status == STATUS_SELF_PRIMARY:
             # T7.104 (ADR-0035 §19 дополнение): собственная публикация производителя на его
             # домашнем хосте — та же запись и те же гейты, что пишет `research-reattribute
@@ -2544,7 +2557,7 @@ class Orchestrator:
             # Строку источника не трогаем: запись не склейка, группировка и оценки её не читают.
             return self_publication_scope_for_fragment(
                 canonical_uri=str(record.payload.get("url") or "") or None,
-                text=fragment,
+                text=str(record.payload.get("assertion_text") or ""),
                 claim_statement=claim_statement,
             )
         if not decision.is_derivative or decision.primary_key is None:
@@ -2571,6 +2584,37 @@ class Orchestrator:
         if attribution is None:
             return None
         return {EVIDENCE_VALUE_ATTRIBUTION_KEY: attribution.as_scope()}
+
+    async def _value_attribution(
+        self,
+        db: AsyncSession,
+        record: EvidenceRecord,
+        claim_statement: str,
+        known_claim_primaries: frozenset[str] = frozenset(),
+        page_text: str | None = None,
+    ) -> JsonDict | None:
+        """Происхождение ЗНАЧЕНИЯ этой улики (T7.78, ADR-0029): чей пересказ читает утверждение.
+
+        Хостовое решение, модель к нему не допускается: детектор видит только текст основания улики
+        и формулировку утверждения. Замораживается решение здесь же — в staging-операции `evidence`
+        (единственное место, где пара «утверждение ↔ улика» существует вместе с обоими текстами),
+        а commit boundary переносит её в `evidence.scope`. Строку источника не трогаем: страничный
+        указатель T7.75 решает, когда он есть, а здесь решается только этот фрагмент. Первоисточник,
+        которого узел не читал, разрешается существующим механизмом якоря (T7.75).
+
+        С T7.108 (часть б) цикл формулировки вызывает два шага отдельно (`_value_attribution_decision`
+        и `_write_value_attribution`): решение собирается для всех связей до записи ключей. Этот
+        метод сохранён как прежний вызов «решение + запись» одним шагом.
+        """
+        decision = self._value_attribution_decision(
+            record,
+            claim_statement,
+            known_claim_primaries=known_claim_primaries,
+            page_text=page_text,
+        )
+        if decision is None:
+            return None
+        return await self._write_value_attribution(db, record, claim_statement, decision)
 
     async def _curator(
         self,
@@ -2905,20 +2949,55 @@ class Orchestrator:
             )
         # evidence links (M3): the only channel for evidence changes; the
         # trusted host recomputes every identity at the commit boundary
-        # T7.107 (ADR-0029 дополнение): третий режим детектора значений (`bibliography_known_producer`)
-        # знает о производителе утверждения только из ключей, собранных здесь. Два источника без
-        # перестройки цикла: (1) записи уже существующего утверждения — перепроверка и гейт дублей
-        # по значению дают `existing_claim_id`, читаем улики якоря из БД; (2) решения по другим
-        # уликам ЭТОГО ЖЕ утверждения в том же предложении (накапливаются по ходу цикла; staging
-        # виден в `evidence` только на границе коммита). Связка работает, если предшествующая
-        # улика несёт запись строгого режима или режима публикации; остальное догоняет переатрибуция
-        # `--evidence-level` (собирает те же ключи из записей БД) — gap честно зафиксирован в
-        # STATUS T7.107.
+        # T7.108 (часть б, ADR-0029 дополнение) закрывает gap T7.107: третий режим детектора
+        # значений (`bibliography_known_producer`) знает о производителе утверждения только из
+        # ключей, собранных с решений СТРОГОГО режима и РЕЖИМА ПУБЛИКАЦИИ, — и эти ключи должны
+        # быть известны независимо от того, где в списке связей стоит строгая запись. Прежний
+        # один проход зависел от порядка `evidence_links`: библиография, записанная РАНЬШЕ
+        # строгой улики, оставалась без pairing (стенд: блог с «Источники: Росстат и данные
+        # портала HeadHunter» не связывался с Росстатом, если строгая улика шла позже).
+        # Два прохода без перестройки границ:
+        #   проход 1 — чистое решение детектора для каждой связи БЕЗ ключей (для строгого
+        #     режима, режима публикации, собственной публикации и отказов оно байт в байт
+        #     совпадает с прежним: ключи эти режимы не расширяют); ключи собираются ТОЛЬКО из
+        #     этих решений сборщиком `apps/orchestrator/attribution_keys.py` — запись третьего
+        #     режима ключей не даёт, цепочка «блог → блог» невозможна по построению;
+        #   проход 2 — пересчёт третьего режима только для связей, где атрибуция не найдена:
+        #     ключи того же утверждения из ВСЕХ решений прохода 1 плюс якорь БД (перепроверка
+        #     и склейка гейта дублей — улики уже записанного утверждения, T7.107 источник (1)).
+        # Известное усиление (fail-closed, ADR-0029 §дополнение T7.108): на связке теперь могут
+        # проявиться ДВА названных производителя — неоднозначность, которой прежний порядок
+        # не видел; честный отказ pairing'а безопаснее ложной атрибуции. Записи остальных
+        # статусов пишутся из решения прохода 1. Порядок и содержимое staging-записей для
+        # случаев без новых связок не меняются.
+        removed_link_indices = accepted.removed_link_indices
         known_primaries_by_claim: dict[int, set[str]] = {}
-        for link in proposal.evidence_links:
-            if link.claim_index in dropped:
+        link_decisions: dict[int, ValueAttributionDecision | None] = {}
+        for link_index, link in enumerate(proposal.evidence_links):
+            if link.claim_index in dropped or link_index in removed_link_indices:
                 # T7.105: связь снятой операции снимается вместе с ней (с причиной в записи
-                # отказа); наблюдение и источник остаются в базе — знание не удаляется.
+                # отказа); T7.108 (часть а): связь, снятая гейтом значения, не пишется —
+                # наблюдение и источник остаются в базе, знание не удаляется.
+                continue
+            if not (
+                0 <= link.evidence_index < len(ctx.evidence)
+                and 0 <= link.claim_index < len(proposal.claims)
+            ):
+                continue  # вне диапазона отвергает структурный гейт границы; здесь — молча
+            evidence_record = ctx.evidence[link.evidence_index]
+            decision = self._value_attribution_decision(
+                evidence_record,
+                proposal.claims[link.claim_index].statement,
+                page_text=ctx.evidence_source_texts.get(evidence_record.identity_hash),
+            )
+            link_decisions[link_index] = decision
+            primary_key = known_primary_key_from_decision(decision)
+            if primary_key is not None:
+                # известная производность того же утверждения для прохода 2; третий режим
+                # и отказные статусы ключей не дают (страх цепочек, T7.107)
+                known_primaries_by_claim.setdefault(link.claim_index, set()).add(primary_key)
+        for link_index, link in enumerate(proposal.evidence_links):
+            if link.claim_index in dropped or link_index in removed_link_indices:
                 continue
             evidence_payload: JsonDict = {
                 "evidence_index": link.evidence_index,
@@ -2928,36 +3007,34 @@ class Orchestrator:
             # T7.78 (ADR-0029): сюда же хост кладёт решение о происхождении ЗНАЧЕНИЯ этой улики
             # (пересказ первоисточника или отказ) — единственный конверт, где пара «утверждение ↔
             # улика» существует вместе с обоими текстами. Пусто = детектор не решил фрагмент.
-            if 0 <= link.evidence_index < len(ctx.evidence) and 0 <= link.claim_index < len(
-                proposal.claims
-            ):
+            if link_index in link_decisions:
                 evidence_record = ctx.evidence[link.evidence_index]
-                known_keys = set(known_primaries_by_claim.get(link.claim_index, set()))
-                anchor_claim_id = staged_claims[link.claim_index].existing_claim_id
-                if anchor_claim_id:
-                    # перепроверка/склейка по значению: якорь уже в БД — читаем его записанные улики
-                    known_keys |= await self._known_claim_primaries(db, uuid.UUID(str(anchor_claim_id)))
-                origin = await self._value_attribution(
-                    db,
-                    evidence_record,
-                    proposal.claims[link.claim_index].statement,
-                    known_claim_primaries=frozenset(known_keys),
-                    page_text=ctx.evidence_source_texts.get(evidence_record.identity_hash),
+                claim_statement = proposal.claims[link.claim_index].statement
+                page_text = ctx.evidence_source_texts.get(evidence_record.identity_hash)
+                decision = link_decisions[link_index]
+                if decision is not None and decision.status in (
+                    STATUS_NO_VALUE_ATTRIBUTION,
+                    STATUS_VALUE_NOT_ATTRIBUTED,
+                ):
+                    # проход 2: связка по списку источников того же утверждения
+                    known_keys = set(known_primaries_by_claim.get(link.claim_index, set()))
+                    anchor_claim_id = staged_claims[link.claim_index].existing_claim_id
+                    if anchor_claim_id:
+                        # перепроверка/склейка по значению: якорь уже в БД — читаем его записанные улики
+                        known_keys |= await self._known_claim_primaries(
+                            db, uuid.UUID(str(anchor_claim_id))
+                        )
+                    decision = self._value_attribution_decision(
+                        evidence_record,
+                        claim_statement,
+                        known_claim_primaries=frozenset(known_keys),
+                        page_text=page_text,
+                    )
+                origin = await self._write_value_attribution(
+                    db, evidence_record, claim_statement, decision
                 )
                 if origin is not None:
                     evidence_payload.update(origin)
-                    written_attribution = parse_value_attribution(origin)
-                    if (
-                        written_attribution is not None
-                        and written_attribution.pairing
-                        in (VALUE_ATTRIBUTION_PAIRING_STRICT, VALUE_ATTRIBUTION_PAIRING_PUBLICATION)
-                        and written_attribution.primary_key
-                    ):
-                        # T7.107: это решение — известная производность того же утверждения для
-                        # следующих улик цикла; запись нового режима сюда не попадает (без цепочек)
-                        known_primaries_by_claim.setdefault(link.claim_index, set()).add(
-                            written_attribution.primary_key
-                        )
             await staging.record(
                 db,
                 audit,
@@ -3003,6 +3080,13 @@ class Orchestrator:
             claim_event_payload["rejected_operations"] = rejected_operation_entries(proposal, dropped)
             claim_event_payload["claims_proposed"] = len(proposal.claims)
             claim_event_payload["claims_applied"] = len(active_claims)
+        # T7.108 (часть а, ADR-0034 §10): связи без значения утверждения названы в payload
+        # уже существующего события (паттерн rejected_operations T7.105: нового AuditEventType
+        # нет, миграции нет). Ключ появляется только когда связи действительно сняты — сессии
+        # без снятий остаются байт в байт прежними. Связи покрытых операций в этом журнале
+        # не дублируются: их называет запись операции (`evidence_links_rejected`).
+        if accepted.rejected_links:
+            claim_event_payload["rejected_links"] = accepted.rejected_links
         # T7.106 (ADR-0034 вариант C): раунд был и предложение принято — additive-ключ
         # уже существующего события: что именно возвращалось на исправление (причины и
         # дайджест ПЕРВОГО ответа). Без раунда ключа нет: сессии без коррекций остаются
@@ -3159,6 +3243,58 @@ class Orchestrator:
                 reasons=list(dropped.values())[:10],
             )
 
+        # T7.108 (часть а, ADR-0034 §10): значение на связи. `supports` утверждения остаётся
+        # только если фрагмент ИЛИ весь сохранённый текст страницы содержит хотя бы одно
+        # измеренное значение утверждения целым числовым токеном (то же сравнение чисел, что у
+        # детектора атрибуции и relay-гейта: ADR-0034 §9). Стенд 2026-08-29: три страницы
+        # Росстата без значения «2,2» (= раздел, открытый реестр, список файлов) были связаны
+        # как подтверждающие — карточка утверждала сверку с источником, которого нет.
+        # Опровержение (`counters`) живёт и без значения: гейт его не трогает принципиально.
+        # Утверждение без измеренного значения не проверяется; улики не `source_assertion` —
+        # вне гейта. Снятая связь не становится уликой: наблюдение и источник остаются в базе,
+        # знания не удаляются. Связи уже снятых операций не перепроверяются: их описывает
+        # запись операции. Дальнейшие шаги границы (гейт дублей, предпроверка правил) видят
+        # уже отфильтрованные связи: движок не проверяет то, что не будет записано (ADR-0034 §10).
+        link_value_texts: dict[int, tuple[str | None, str | None] | None] = {}
+        for link_index, link in enumerate(proposal.evidence_links):
+            if not 0 <= link.evidence_index < len(ctx.evidence):
+                continue
+            evidence_record = ctx.evidence[link.evidence_index]
+            if evidence_record.kind is not EvidenceKind.SOURCE_ASSERTION:
+                continue  # улики других видов гейтом не проверяются
+            page_text = ctx.evidence_source_texts.get(evidence_record.identity_hash)
+            fragment = str(evidence_record.payload.get("assertion_text") or "") or None
+            link_value_texts[link_index] = (fragment, page_text)
+        removed_links, value_claim_drops = links_without_claim_value(
+            proposal=proposal,
+            dropped=dropped,
+            link_texts=link_value_texts,
+        )
+        # гейт заполняет только ещё не снятые операции: причины сняты ранее — первые (T7.105)
+        dropped.update(value_claim_drops)
+        rejected_links_all = rejected_link_entries(proposal=proposal, removed_links=removed_links)
+        # связи снятых этим гейтом операций названы их записями отказа (`rejected_operations`):
+        # отдельной записью связи не дублируются — остаётся пометка только за активные операции
+        rejected_links_active = [
+            entry for entry in rejected_links_all if int(entry["claim_index"]) not in value_claim_drops
+        ]
+        if value_claim_drops and proposal.claims and len(dropped) == len(proposal.claims):
+            # все операции сняты из-за связей без значения — отказ предложения целиком
+            # (тот же event, аддитивный `curator_reject_kind`; связи названы полностью:
+            # записей операций при отказе целиком нет) -> вариант C (T7.106) догоняет раунд
+            return BoundaryRejected(
+                payload={
+                    "curator_rejected": list(dropped.values())[:10],
+                    "curator_reject_kind": "evidence_value_absent",
+                    "rejected_proposal": rejected_proposal_digest(proposal),
+                    **({"rejected_links": rejected_links_all} if rejected_links_all else {}),
+                },
+                public_summary=(
+                    "curator proposal rejected: linked evidence does not contain the claim value"
+                ),
+                reasons=[*list(dropped.values())[:10], *list(removed_links.values())[:10]],
+            )
+
         # T7.82 (B), ADR-0032: опора на существующее знание (факультативное поле
         # curator-v9). Хост принимает ТОЛЬКО id, видимые в контекст-паке этой сессии —
         # тот же разрешатель, что у перепроверки (полный UUID или единственный
@@ -3253,7 +3389,12 @@ class Orchestrator:
                     for row in candidate_rows
                 ]
                 links_by_claim: dict[int, list[str]] = {}
-                for link in proposal.evidence_links:
+                for k_link, link in enumerate(proposal.evidence_links):
+                    if k_link in removed_links:
+                        # T7.108 (часть а): снятая гейтом значения связь не участвует в гейте
+                        # дублей — она не будет записана (ADR-0034 §10: гейты видят связи
+                        # уже отфильтрованными)
+                        continue
                     links_by_claim.setdefault(link.claim_index, []).append(link.relation.value)
                 claims_input = [
                     ValueDuplicateClaim(
@@ -3340,6 +3481,9 @@ class Orchestrator:
                     "curator_rejected": list(dropped.values())[:10],
                     "rejected_proposal": rejected_proposal_digest(proposal),
                     **({"value_duplicates": value_duplicates} if value_duplicates else {}),
+                    # T7.108 (часть а): при отказе целиком связи, снятые гейтом значения,
+                    # названы полностью (записей операций здесь нет) — только если они были
+                    **({"rejected_links": rejected_links_all} if rejected_links_all else {}),
                 },
                 public_summary="curator proposal rejected by host validation",
                 reasons=list(dropped.values())[:10],
@@ -3363,7 +3507,10 @@ class Orchestrator:
                     "claim_index": link.claim_index,
                     "relation": link.relation.value,
                 }
-                for link in proposal.evidence_links
+                # T7.108 (часть а, ADR-0034 §10): движок видит связи уже отфильтрованными:
+                # снятая гейтом значения связь не будет записана, и проверять её бессмысленно
+                for k_link, link in enumerate(proposal.evidence_links)
+                if k_link not in removed_links
             ],
             list(ctx.evidence),
         )
@@ -3389,6 +3536,9 @@ class Orchestrator:
                     # именно `kept`-запись объясняет, почему хост не склеил значение)
                     "rejected_proposal": rejected_proposal_digest(proposal),
                     **({"value_duplicates": value_duplicates} if value_duplicates else {}),
+                    # T7.108 (часть а): связи, снятые гейтом значения, названы полностью
+                    # (записей операций при отказе целиком нет) — только если они были
+                    **({"rejected_links": rejected_links_all} if rejected_links_all else {}),
                 },
                 public_summary=(
                     f"curator proposal rejected by the rules engine: {rule_problems[0][:200]}"
@@ -3401,6 +3551,11 @@ class Orchestrator:
             value_duplicates=value_duplicates,
             relied_claim_ids=relied_claim_ids,
             relied_claims_rejected=relied_claims_rejected,
+            # T7.108 (часть а): снятые связи активны для журнала (`rejected_links` в
+            # claim_created) и не пишутся в staging (`removed_link_indices`); связи, покрытые
+            # записью снятой операции, в журнал не дублируются
+            rejected_links=rejected_links_active,
+            removed_link_indices=frozenset(removed_links),
         )
 
 

@@ -929,6 +929,7 @@ async def test_full_session_relative_date_curator_as_of_reaches_E3(
     migrated_db: tuple[str, Any],
     fake_llm: FakeLLM,
     fake_fetch: None,
+    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     """T7.18 (full session on the fake LLM through the real
@@ -941,6 +942,19 @@ async def test_full_session_relative_date_curator_as_of_reaches_E3(
     date, not the model's."""
     scratch_url, engine = migrated_db
     store = FilesystemArtifactStore(tmp_path / "artifacts")
+
+    # T7.108 (а), ADR-0034 §10: `supports`-связь остаётся только если страница несёт
+    # измеренное значение утверждения целым токеном (гейт «значение на связи»). Базовые
+    # страницы test_research_evidence не тронуты: названные вопросом страницы подменяются
+    # на время этого теста и возвращаются после него (тот же приём, что у gamma-страницы).
+    monkeypatch.setitem(
+        PAGES, "http://alpha.example/apollo", "Key rate watch: the key rate stands at 14.00 percent."
+    )
+    monkeypatch.setitem(
+        PAGES,
+        "http://beta.example/landing",
+        "Money policy note: staff estimate the key rate at 14.00 percent, quick assessment says.",
+    )
 
     payload = copy.deepcopy(BOOTSTRAP_PAYLOAD)
     rp = payload["research_proxy"]

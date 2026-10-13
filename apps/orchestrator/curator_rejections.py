@@ -27,6 +27,18 @@
 `curator_rejected_by_rules` остаются тем, чем были: отказом предложения ЦЕЛИКОМ (так же и
 когда сняты все операции — поведение как раньше).
 
+Гейт «значение на связи» (T7.108 часть а, ADR-0034 §10) использует тот же механизм снятия
+операций: `links_without_claim_value` называет уликовые связи, у которых измеренного
+значения claim'а нет ни во фрагменте улики, ни во всём сохранённом тексте страницы (проверка
+касается только `supports`-связей улик `source_assertion`; claim без измеренного значения и
+связи опровержения гейтом не проверяются), `rejected_link_entries` даёт записи снятых связей
+для ленты отказа. Связь снимается ещё до проверки правил; снятая связь не переносится ни на
+какой другой claim (тот же запрет, что у T7.105). Если у операции не осталось ни одной
+supports-связи со значением, она снимается этой функцией целиком с причиной
+`no linked evidence contains the claim value` — ровно как отказ по правилам, через
+`rejected_operations`; когда сняты все операции, предложение отклоняется целиком (публичный
+отказ называет и причину гейта, и снятые связи).
+
 Модуль чистый: никаких БД и LLM — только разбор строк и дайджесты (формы записей совпадают
 с дайджестом T7.84: те же `_claim_entry` / `_link_entry` из `rejected_proposal`, чтобы
 «digest операции» в записи отказа был тем же снимком операции, что видит оператор в отказе
@@ -36,9 +48,12 @@
 from __future__ import annotations
 
 import re
+from collections import Counter
+from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 from apps.orchestrator.rejected_proposal import _claim_entry, _link_entry
+from apps.research_proxy.value_attribution import claim_value_numbers, claim_values_found_in_texts
 from packages.domain.models.base import JsonDict
 
 if TYPE_CHECKING:
@@ -128,5 +143,89 @@ def rejected_operation_entries(
         ]
         if dependencies:
             entry["dependencies_rejected"] = dependencies
+        entries.append(entry)
+    return entries[:REJECTED_OPERATIONS_LIMIT]
+
+
+# ─── T7.108 (часть а, ADR-0034 §10): гейт «значение на связи» ────────────────
+#
+# Связь `supports` обязана нести значение утверждения: она остаётся только если фрагмент
+# ИЛИ весь сохранённый текст страницы содержит хотя бы одно измеренное значение утверждения
+# целым числовым токеном (стенд 2026-08-29: supports-связи к страницам без значения
+# «2,2» — карточка утверждала сверку с источником, которого нет). `link_texts[k]` —
+# (фрагмент улики, полный текст страницы) для улик `source_assertion`; None — улика другого
+# вида или вне диапазона (гейт молчит). `counters` гейт не трогает принципиально:
+# опровержение обязано жить, даже когда опровергающий текст значения не называет.
+# Утверждение без измеренного значения не проверяется. Снятая связь — запись
+# `rejected_links` (аддитивный ключ уже существующего события, паттерн `rejected_operations`
+# выше); если у операции сняты ВСЕ её связи, она снимается своей причиной (вариант B),
+# и её связи остаются названными её записью (отдельной записью связи не дублируются).
+
+
+def links_without_claim_value(
+    *,
+    proposal: CuratorProposal,
+    dropped: dict[int, str],
+    link_texts: Mapping[int, tuple[str | None, str | None] | None],
+) -> tuple[dict[int, str], dict[int, str]]:
+    """Связи без значения утверждения и операции, у которых сняты все связи.
+
+    Возвращает `(removed, claim_drops)`: `removed` — индекс связи в `proposal.evidence_links`
+    -> именованная причина; `claim_drops` — индекс операции -> причина снятия (только
+    операции, которых задел этот гейт и у которых после снятия не осталось ни одной связи).
+    Связи уже снятых операций не проверяются и не снимаются повторно: их описывает запись
+    операции. Функция чистая и вызывается ДО предпроверки правил и гейта дублей: они обязаны
+    видеть отфильтрованные связи (ADR-0034 §10).
+    """
+    removed: dict[int, str] = {}
+    claims_count = len(proposal.claims)
+    for k, link in enumerate(proposal.evidence_links):
+        if link.relation.value != "supports":
+            continue  # опровержение без значения живёт: гейт его не трогает
+        claim_index = link.claim_index
+        if claim_index in dropped or not 0 <= claim_index < claims_count:
+            continue  # снятую операцию описывает её запись; вне диапазона — структурный гейт
+        texts = link_texts.get(k)
+        if texts is None:
+            continue  # улика не `source_assertion` (или вне диапазона): гейт молчит
+        values = frozenset(claim_value_numbers(proposal.claims[claim_index].statement))
+        if not values:
+            continue  # утверждение без измеренного значения не проверяется
+        if claim_values_found_in_texts(values=values, texts=texts):
+            continue
+        removed[k] = (
+            f"evidence_link[{k}]: evidence {link.evidence_index} "
+            f"does not contain the value of claim {claim_index}"
+        )
+    claim_drops: dict[int, str] = {}
+    if removed:
+        kept_links = Counter(
+            link.claim_index
+            for k, link in enumerate(proposal.evidence_links)
+            if k not in removed
+        )
+        touched = sorted({proposal.evidence_links[k].claim_index for k in removed})
+        for claim_index in touched:
+            if kept_links.get(claim_index, 0) == 0:
+                claim_drops[claim_index] = (
+                    f"claim[{claim_index}]: no linked evidence contains the claim value"
+                )
+    return removed, claim_drops
+
+
+def rejected_link_entries(
+    *,
+    proposal: CuratorProposal,
+    removed_links: Mapping[int, str],
+) -> list[JsonDict]:
+    """Записи снятых связей: индекс связи + тот же снимок связи, что дайджест T7.84
+    (`_link_entry`), + именованная причина. Связи покрытых записью снятой операции сюда
+    не пишутся — это решает вызывающая сторона (двойного счёта в журнале быть не должно)."""
+    entries: list[JsonDict] = []
+    for k in sorted(removed_links):
+        if not 0 <= k < len(proposal.evidence_links):
+            continue
+        entry: JsonDict = {"link_index": k, **_link_entry(proposal.evidence_links[k])}
+        entry["reason"] = removed_links[k]
         entries.append(entry)
     return entries[:REJECTED_OPERATIONS_LIMIT]
