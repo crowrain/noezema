@@ -16,7 +16,12 @@
     `correction_error` {kind, error ≤300 (+truncated_attempts)}; третьего вызова нет;
   * событие раунда — SESSION_STATE_CHANGED с ключом `curator_correction_requested`
     (единственный новый ключ журнала), поэтому прежние фильтры отказа видят ровно один
-    финальный отказ.
+    финальный отказ;
+  * T7.106a (ADR-0034 §9): раздел строится ПОЛНЫМ (целиком JSON + перечень по всем
+    claims). Если полный раздел не помещается в `CORRECTION_SECTION_MAX_CHARS`, раунда
+    НЕТ: прежний отказ ПЕРВОГО ответа прежними ключами плюс аддитивный
+    `correction_skipped` {reason, chars, limit}; ровно один вызов куратора, события
+    `curator_correction_requested` нет.
 
 Фикстура репроигрывания — случай 3701d1ce (.92, фикстура fixtures-t7106): куратор v13
 считал индексы claims с единицы и связь `evidence_link[3]` указывала на несуществующий
@@ -35,7 +40,13 @@ from typing import Any
 
 import pytest
 
+from apps.orchestrator.curator_correction import (
+    CORRECTION_SECTION_MAX_CHARS,
+    CorrectionOverLimit,
+    build_correction_section,
+)
 from packages.domain.models.base import JsonDict
+from packages.domain.schemas.staging import CuratorProposal
 from tests.conftest import FakeLLM
 from tests.scenario.test_online_activation import _run_online
 from tests.scenario.test_research_evidence import PAGES, FakeFetchClient
@@ -736,4 +747,80 @@ async def test_first_call_failure_never_starts_a_correction_round(
     payloads = await _all_state_payloads(scratch_url, session_id)
     assert any(p.get("curator_error_kind") == "unavailable" for p in payloads)
     assert await _db_statements(scratch_url) == []
+
+
+# ── т8: полный раздел не влезает в потолок → раунда НЕТ, отказ с correction_skipped ─
+# (T7.106a, ADR-0034 §9, правило 3)
+
+_LONG_CLAIMS: list[dict[str, Any]] = [
+    {
+        "statement": f"Утверждение {i}. " + "длинная формулировка показателя со временем и областью "*35,
+        "claim_type": "external_fact",
+    }
+    for i in range(30)
+]
+
+
+@pytest.mark.asyncio
+async def test_section_over_cap_skips_the_round_with_correction_skipped(
+    migrated_db: tuple[str, Any],
+    fake_llm: FakeLLM,
+    fake_fetch: None,
+    tmp_path: Path,
+) -> None:
+    """30 claims по ~1900 знаков (стенд: ответы куратора доходят до полной длины): целиком
+    JSON такого предложения с перечнем по всем claims не влезает в потолок раздела.
+    Прежнее правило резало JSON и перечень хвостами и тихо теряло claims; теперь раунда
+    нет вовсе — прежний отказ целиком плюс аддитивный `correction_skipped`."""
+    scratch_url, engine = migrated_db
+    activation = await _run_online(engine, _payload())
+    assert activation.state == "active"
+
+    bad_answer = _curator_answer(
+        _LONG_CLAIMS, _links((0, 0), (1, 99)), summary="Длинный ответ без исправимой связи."
+    )
+    outcome = await _run(
+        scratch_url,
+        fake_llm,
+        tmp_path,
+        _q("Конкуренция соискателей и безработица в Тармении в 2026 году."),
+        _short_script(bad_answer, _CANARY),
+    )
+    session_id = outcome.session_id
+    assert outcome.final_state.value == "succeeded"
+
+    # ровно ОДИН вызов куратора: раздела исправления модель не видела, канарейка цела
+    assert len(_curator_calls(fake_llm)) == 1
+    assert _fixation_events(fake_llm) == []
+    assert fake_llm.state()["queue_left"] >= 1
+
+    # события раунда нет (раунд не состоялся); ключей прежнего отказа это не меняет
+    for key in ("curator_correction_requested", "correction_round", "correction_error"):
+        assert not await _events(scratch_url, session_id, key)
+
+    # отказ — целиком ПЕРВЫЙ ответ, прежними ключами, плюс аддитивный correction_skipped
+    rejections = await _rejection_events(scratch_url, session_id)
+    assert len(rejections) == 1
+    payload = dict(rejections[0]["payload"])
+    assert payload["curator_rejected"] == ["evidence_link[1]: claim index 99 out of range"]
+    assert len(payload["rejected_proposal"]["claims"]) >= 1
+    skipped = payload["correction_skipped"]
+    assert skipped["reason"] == "section_over_limit"
+    assert skipped["limit"] == CORRECTION_SECTION_MAX_CHARS
+
+    # длина названа честно: это длина полного раздела того же предложения (тот же чистый
+    # построитель, без LLM и БД), а не произвольное число
+    recomputed = build_correction_section(
+        payload["curator_rejected"], CuratorProposal.model_validate(bad_answer["content"])
+    )
+    assert isinstance(recomputed, CorrectionOverLimit)
+    assert recomputed.chars == skipped["chars"] > skipped["limit"]
+
+    # summary отказа сохраняет прежнюю голову (отказ прежний) и называет пропуск раунда
+    assert str(rejections[0]["public_summary"]).startswith("curator proposal rejected by host validation")
+    assert "correction skipped" in str(rejections[0]["public_summary"])
+
+    # знание не изменилось: ни записей, ни staging
+    assert await _db_statements(scratch_url) == []
+    assert await _claim_created_payloads(scratch_url, session_id) == []
 

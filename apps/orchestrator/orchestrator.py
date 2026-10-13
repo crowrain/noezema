@@ -36,6 +36,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from apps.orchestrator.curator_correction import (
     BoundaryAccepted,
     BoundaryRejected,
+    CorrectionOverLimit,
     build_correction_section,
 )
 from apps.orchestrator.curator_rejections import (
@@ -2675,6 +2676,33 @@ class Orchestrator:
             # уже существующий event БЕЗ ключей curator_rejected*: итоговый отказ в
             # журнале остаётся ровно одним событием с прежними ключами; additive-ключ
             # называет сам раунд.
+            rejected_first = outcome
+            # T7.106a (ADR-0034 §9, правило 3): раздел строится ПОЛНЫМ — целиком JSON
+            # отклонённого предложения и перечень по всем claims. Если полный раздел не
+            # помещается в потолок — раунда НЕТ: прежний отказ ПЕРВОГО ответа целиком
+            # прежними ключами плюс аддитивный `correction_skipped` {reason, chars,
+            # limit}. Второго обращения к модели нет и события
+            # `curator_correction_requested` нет — раунд не состоялся; модель не получает
+            # предложение, из которого что-то тихо выпало.
+            correction_section = build_correction_section(rejected_first.reasons, proposal)
+            if isinstance(correction_section, CorrectionOverLimit):
+                await audit.record(
+                    AuditEventType.SESSION_STATE_CHANGED,
+                    session_id=session.id,
+                    payload={
+                        **rejected_first.payload,
+                        "correction_skipped": {
+                            "reason": "section_over_limit",
+                            "chars": correction_section.chars,
+                            "limit": correction_section.limit,
+                        },
+                    },
+                    public_summary=(
+                        f"{rejected_first.public_summary}; correction skipped: section "
+                        f"{correction_section.chars} chars exceeds the {correction_section.limit}-char limit"
+                    ),
+                )
+                return 0, 0
             await audit.record(
                 AuditEventType.SESSION_STATE_CHANGED,
                 session_id=session.id,
@@ -2686,14 +2714,11 @@ class Orchestrator:
                 },
                 public_summary="curator proposal returned for one correction round",
             )
-            rejected_first = outcome
             correction_round = {
                 "reasons": rejected_first.reasons,
                 "rejected_proposal": rejected_proposal_digest(proposal),
             }
-            correction_user = user + "\n" + build_correction_section(
-                rejected_first.reasons, proposal
-            )
+            correction_user = user + "\n" + correction_section
             try:
                 second = await self._curator_chat(
                     db, session, snapshot, curator, correction_user, fingerprint

@@ -7,6 +7,12 @@
 «# Исправление предложения» и повторная проверка тем же помощником. Вариант B (T7.105)
 не затронут: частичный пооперационный отказ раунд НЕ запускает.
 
+T7.106a (ADR-0034 §9): раздел НИКОГДА не теряет операции и связи — JSON отклонённого
+предложения полный (без omitted_* счётчиков), перечень `[i]` — по ВСЕМ claims. Если
+полный раздел не помещается в потолок, построитель возвращает «не помещается»
+(`CorrectionOverLimit` с длиной), а не урезанный текст: раунда нет, прежний отказ
+целиком стоит с аддитивным ключом `correction_skipped` (ветка `_curator`).
+
 Модуль держит ЧИСТЫЕ части этого потока: исходы граничной проверки (`BoundaryAccepted`
 / `BoundaryRejected`) и раздел исправления второго запроса. Ни БД, ни LLM-шлюза здесь
 нет — та же дисциплина, что у apps/orchestrator/curator_rejections.py.
@@ -25,9 +31,21 @@ if TYPE_CHECKING:
     from packages.domain.schemas.staging import ClaimProposal, CuratorProposal
 
 #: Потолок длины раздела исправления во втором запросе куратора (символов).
-#: Раздел не может раздуть контекст: предложения claims режутся ЦЕЛЫМИ записями
-#: (хвост списка), как в apps/orchestrator/rejected_proposal.py.
-CORRECTION_SECTION_MAX_CHARS = 6000
+#: T7.106a: раздел не режется — JSON полный, перечень по всем claims, поэтому потолок
+#: выбирается из бюджета ВХОДА куратора (§5.4.1), а не из скромности самого раздела:
+#: input_budget = min(131072, 131072) − 8192 − 2048 = 120832 оценённых токенов
+#: (model-блок config-v24; packages/cognition/tokenizer.py:48-50). Остальной вход
+#: куратора ограничен: суммы лимитов секций контекст-пака = 26624 токена
+#: (token_budgets config-v24, проверяются тем же модулем tokenizer.py:62-67), системный
+#: промпт curator-v14 ≈ 3418 токенов, блок «# Evidence» при потолке
+#: max_evidence_items_per_session = 64 и фрагментах ≤ 2 × SOURCE_ASSERTION_TEXT_BUDGET
+#: (apps/orchestrator/evidence.py:73, :83) ≈ ≤ 45568 токенов измеримого худшего
+#: случая; вопрос ≤ 2000 знаков. Оценка токенов никогда не превышает число знаков
+#: (packages/cognition/tokenizer.py:28-32), поэтому раздел в 24000 знаков добавляет
+#: ≤ 24000 токенов в абсолютном худшем случае (измеренная плотность полного JSON
+#: claims — ≈ 4 раза меньше). Худшая сумма ≈ 99610 < 120832: потолок 24000 знаков не
+#: способен вывести запрос куратора за бюджет входа.
+CORRECTION_SECTION_MAX_CHARS = 24_000
 #: Потолок длины одной строки перечня claims (в JSON остаётся дословно).
 CORRECTION_CLAIM_SNIPPET_CHARS = 120
 
@@ -61,6 +79,18 @@ class BoundaryRejected:
     reasons: list[str]
 
 
+@dataclass(frozen=True)
+class CorrectionOverLimit:
+    """T7.106a (ADR-0034 §9, правило 3): ПОЛНЫЙ раздел (целиком JSON предложения и
+    перечень по всем claims) не помещается в `CORRECTION_SECTION_MAX_CHARS`. Раздел не
+    урезается: построитель называет длину (`chars`) и потолок (`limit`), а `_curator`
+    оставляет прежний отказ целиком с аддитивным ключом `correction_skipped`. Раунда
+    исправления нет — модель не получает предложение, из которого что-то пропало."""
+
+    chars: int
+    limit: int
+
+
 def _snippet(text: str) -> str:
     clean = mask_nul(text)
     if len(clean) <= CORRECTION_CLAIM_SNIPPET_CHARS:
@@ -87,57 +117,6 @@ def _reasons_block(reasons: list[str], budget: int) -> tuple[str, int]:
     return text, omitted
 
 
-def _proposal_json(proposal: CuratorProposal, budget: int) -> tuple[str, list[ClaimProposal], int, int]:
-    """JSON отклонённого предложения (то, что вернула модель, model_dump(mode="json")).
-    При переполнении режется ЦЕЛЫМИ записями: сначала хвост claims, затем хвост
-    evidence_links; пропущенное количество названо ключами omitted_claims /
-    omitted_evidence_links. Возвращает (json_text, сохранённые_claims,
-    omitted_claims, omitted_evidence_links)."""
-
-    data: JsonDict = dict(proposal.model_dump(mode="json"))
-    dump_claims = list(data.get("claims", []))
-    dump_links = list(data.get("evidence_links", []))
-    dump_relied = list(data.get("relied_claim_ids", []))
-    dump_questions = list(data.get("new_questions", []))
-    staged = list(proposal.claims)
-    omitted_claims = 0
-    omitted_links = 0
-    omitted_relied = 0
-    omitted_questions = 0
-    while True:
-        payload: JsonDict = dict(data)
-        payload["claims"] = dump_claims
-        payload["evidence_links"] = dump_links
-        payload["relied_claim_ids"] = dump_relied
-        payload["new_questions"] = dump_questions
-        if omitted_claims:
-            payload["omitted_claims"] = omitted_claims
-        if omitted_links:
-            payload["omitted_evidence_links"] = omitted_links
-        if omitted_relied:
-            payload["omitted_relied_claim_ids"] = omitted_relied
-        if omitted_questions:
-            payload["omitted_new_questions"] = omitted_questions
-        text = json.dumps(payload, ensure_ascii=False)
-        if len(text) <= budget or (
-            not dump_claims and not dump_links and not dump_relied and not dump_questions
-        ):
-            return text, staged[: len(dump_claims)], omitted_claims, omitted_links
-        if dump_claims:
-            dump_claims.pop()
-            staged.pop()
-            omitted_claims += 1
-        elif dump_links:
-            dump_links.pop()
-            omitted_links += 1
-        elif dump_relied:
-            dump_relied.pop()
-            omitted_relied += 1
-        else:
-            dump_questions.pop()
-            omitted_questions += 1
-
-
 _CORRECTION_INTRO = (
     "# Исправление предложения\n"
     "Хост отклонил твоё предложение ЦЕЛИКОМ. Верни ПОЛНОЕ предложение заново, по той же\n"
@@ -147,47 +126,32 @@ _CORRECTION_INTRO = (
 )
 
 
-def build_correction_section(reasons: list[str], proposal: CuratorProposal) -> str:
-    """Раздел второго запроса куратора (ADR-0034 вариант C, T7.106).
+def build_correction_section(reasons: list[str], proposal: CuratorProposal) -> str | CorrectionOverLimit:
+    """Раздел второго запроса куратора (ADR-0034 вариант C, T7.106; правило T7.106a).
 
-    Состав: дословные причины хоста; отклонённое предложение JSON'ом (то, что вернула
-    сама модель); перечень claims с индексами `[0] …`, `[1] …` и их число; напоминание
-    про индексы с нуля и полный повтор предложения. Никакого внешнего текста (страниц,
-    улик) раздел не несёт: только причины хоста и собственные данные модели.
-    Детерминирован и ограничен `CORRECTION_SECTION_MAX_CHARS` (режется целыми
-    записями, пропущенное количество названо в самом JSON).
+    Состав: дословные причины хоста; отклонённое предложение JSON'ом ЦЕЛИКОМ (то, что
+    вернула сама модель, model_dump(mode="json") — без резки и без omitted_* счётчиков);
+    перечень ВСЕХ claims с индексами `[0] …`, `[1] …` и их число; напоминание про
+    индексы с нуля и полный повтор предложения. Резать целыми строками с маркером
+    разрешено только причины хоста (T7.106a, правило 1): они описывают отказ, а не
+    входят в предложение. Никакого внешнего текста (страниц, улик) раздел не несёт:
+    только причины хоста и собственные данные модели.
+    Детерминирован и чист (ни БД, ни шлюза). Если полный раздел превышает потолок
+    `CORRECTION_SECTION_MAX_CHARS`, возвращается `CorrectionOverLimit` (с длиной), а не
+    урезанный текст: раунда исправления не будет (T7.106a, правило 3).
     """
 
     intro = _CORRECTION_INTRO
     remaining = CORRECTION_SECTION_MAX_CHARS - len(intro) - 8
     reasons_text, _omitted_reasons = _reasons_block(reasons, remaining // 3)
     reasons_part = f"\nПричины хоста (дословно):\n{reasons_text}\n"
-    json_budget = max(600, CORRECTION_SECTION_MAX_CHARS - len(intro) - len(reasons_part) - 400)
-    json_text, kept_claims, omitted_claims, omitted_links = _proposal_json(proposal, json_budget)
+    json_text = json.dumps(proposal.model_dump(mode="json"), ensure_ascii=False)
     json_part = f"\nОтклонённое предложение (JSON, как ты его вернул):\n{json_text}\n"
 
     header = f"\nClaims отклонённого предложения (всего {len(proposal.claims)}), индексы с нуля:\n"
-    lines: list[str] = []
-    budget = max(0, CORRECTION_SECTION_MAX_CHARS - len(intro) - len(reasons_part) - len(json_part) - len(header))
-    used = 0
-    shown = 0
-    for index, claim in enumerate(kept_claims):
-        line = f"[{index}] «{_snippet(str(claim.statement))}»"
-        if used + len(line) + 1 > budget:
-            break
-        lines.append(line)
-        used += len(line) + 1
-        shown += 1
-    claims_part = header + "\n".join(lines)
-    hidden = len(kept_claims) - shown
-    if hidden or omitted_claims:
-        parts_note: list[str] = []
-        if hidden:
-            parts_note.append(f"{hidden} claims не показаны из-за ограничения длины")
-        if omitted_claims:
-            parts_note.append(f"{omitted_claims} claims опущены из JSON (omitted_claims)")
-        if omitted_links:
-            parts_note.append(f"{omitted_links} evidence_links опущены из JSON (omitted_evidence_links)")
-        claims_part += "\n…" + "; ".join(parts_note)
-    claims_part += "\n"
-    return intro + reasons_part + json_part + claims_part
+    claims_part = header + "\n".join(f"[{i}] «{_snippet(c.statement)}»" for i, c in enumerate(proposal.claims)) + "\n"
+
+    section = intro + reasons_part + json_part + claims_part
+    if len(section) > CORRECTION_SECTION_MAX_CHARS:
+        return CorrectionOverLimit(chars=len(section), limit=CORRECTION_SECTION_MAX_CHARS)
+    return section
