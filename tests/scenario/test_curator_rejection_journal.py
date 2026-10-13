@@ -45,6 +45,22 @@ async def _rejection_payloads(scratch_url: str, session_id: uuid.UUID) -> list[d
     return [dict(row["payload"]) for row in rows]
 
 
+async def _fixation_events(scratch_url: str, session_id: uuid.UUID) -> list[dict[str, Any]]:
+    """События возврата предложения на исправление (T7.106, ADR-0034 вариант C)."""
+    rows = await _all(
+        scratch_url,
+        "SELECT payload, public_summary FROM audit_events WHERE session_id = :s "
+        "AND payload ? 'curator_correction_requested'",
+        {"s": str(session_id)},
+    )
+    return [dict(row) for row in rows]
+
+
+def _correction_requests(fake_llm: FakeLLM) -> int:
+    """Сколько раз модель получала раздел «# Исправление предложения»."""
+    return sum(1 for r in fake_llm.requests() if "# Исправление предложения" in str(r.get("last_user", "")))
+
+
 async def _run(scratch_url: str, fake_llm: FakeLLM, workspace: Path, question_id: uuid.UUID) -> Any:
     orch, gateway, engine = _make_orchestrator(scratch_url, fake_llm, workspace)
     try:
@@ -62,23 +78,27 @@ async def test_new_temporal_fact_without_as_of_records_what_was_rejected(
     дату, отсутствие ссылки перепроверки и ключи scope."""
     scratch_url, _engine = migrated_db
     question_id = await _seed_question(scratch_url, "Какая официальная инфляция в России за 2025 год?")
+    bad_answer = _curator(
+        [
+            {
+                "statement": (
+                    "Официальная годовая инфляция в России по итогам 2025 года "
+                    "составила 5,59% (по данным Росстата)."
+                ),
+                "claim_type": "temporal_fact",
+                "scope": {"объект": "инфляция"},
+            }
+        ],
+        [{"evidence_index": 0, "claim_index": 0, "relation": "supports"}],
+    )
     fake_llm.script(
         [
             _tool("python.execute", {"code": "print('rosstat')"}),
             _complete(),
-            _curator(
-                [
-                    {
-                        "statement": (
-                            "Официальная годовая инфляция в России по итогам 2025 года "
-                            "составила 5,59% (по данным Росстата)."
-                        ),
-                        "claim_type": "temporal_fact",
-                        "scope": {"объект": "инфляция"},
-                    }
-                ],
-                [{"evidence_index": 0, "claim_index": 0, "relation": "supports"}],
-            ),
+            bad_answer,
+            # T7.106 (ADR-0034 вариант C): идентичный ответ на ОДНО исправление — отклонён
+            # вторично, финальный отказ ровно один
+            bad_answer,
         ]
     )
     outcome = await _run(scratch_url, fake_llm, tmp_path / "ws1", question_id)
@@ -90,6 +110,14 @@ async def test_new_temporal_fact_without_as_of_records_what_was_rejected(
     payload = payloads[0]
     # прежний ключ на месте и прежней строкой причины
     assert any("temporal_fact requires as_of" in problem for problem in payload["curator_rejected"])
+
+    # аддитивный ключ раунда: причины и дайджест ПЕРВОГО ответа
+    round_key = payload["correction_round"]
+    assert any("temporal_fact requires as_of" in reason for reason in round_key["reasons"])
+    fixations = await _fixation_events(scratch_url, outcome.session_id)
+    assert [f["public_summary"] for f in fixations] == ["curator proposal returned for one correction round"]
+    assert _correction_requests(fake_llm) == 1
+    assert fake_llm.state()["queue_left"] == 0
 
     digest = payload["rejected_proposal"]
     entry = digest["claims"][0]
@@ -118,21 +146,24 @@ async def test_reverify_unresolved_rejection_records_what_was_rejected(
 
     unknown = uuid.uuid4()
     question_id = await _seed_question(scratch_url, "Сколько будет 6*7? Проверь ещё раз.")
+    bad_answer = _curator(
+        [
+            {
+                "statement": "6*7 равно 42 (перепроверено)",
+                "claim_type": "computed_result",
+                "scope": {"expr": "6*7"},
+                "existing_claim_id": str(unknown),
+            }
+        ],
+        [{"evidence_index": 0, "claim_index": 0, "relation": "supports"}],
+    )
     fake_llm.script(
         [
             _tool("python.execute", {"code": "print(6*7)"}),
             _complete(),
-            _curator(
-                [
-                    {
-                        "statement": "6*7 равно 42 (перепроверено)",
-                        "claim_type": "computed_result",
-                        "scope": {"expr": "6*7"},
-                        "existing_claim_id": str(unknown),
-                    }
-                ],
-                [{"evidence_index": 0, "claim_index": 0, "relation": "supports"}],
-            ),
+            bad_answer,
+            # T7.106: один раунд исправления — та же неразрешимая ссылка отклоняется вторично
+            bad_answer,
         ]
     )
     outcome = await _run(scratch_url, fake_llm, tmp_path / "ws2", question_id)
@@ -148,6 +179,12 @@ async def test_reverify_unresolved_rejection_records_what_was_rejected(
     assert entry["claim_type"] == "computed_result"
     assert entry["scope_keys"] == ["expr"]
 
+    # T7.106: раунд ровно один, финальный отказ несёт дайджест ПЕРВОГО ответа
+    assert len(await _fixation_events(scratch_url, outcome.session_id)) == 1
+    assert _correction_requests(fake_llm) == 1
+    assert fake_llm.state()["queue_left"] == 0
+    assert any("reverify reference" in r for r in payload["correction_round"]["reasons"])
+
 
 @pytest.mark.asyncio
 async def test_rules_engine_rejection_records_what_was_rejected(
@@ -160,21 +197,24 @@ async def test_rules_engine_rejection_records_what_was_rejected(
     `tests/scenario/test_commit_boundary.py`."""
     scratch_url, _engine = migrated_db
     question_id = await _seed_question(scratch_url, "Сколько непустых строк в файле notes/reading.md?")
+    bad_answer = _curator(
+        [
+            {
+                "statement": "Количество непустых строк в файле notes/reading.md равно 3.",
+                "claim_type": "computed_result",
+                "scope": {"path": "notes/reading.md", "metric": "nonempty_lines", "value": 3},
+            }
+        ],
+        [{"evidence_index": 0, "claim_index": 0, "relation": "supports"}],
+    )
     fake_llm.script(
         [
             _tool("workspace.write", {"path": "notes/reading.md", "content": READING_MD}),
             _tool("workspace.read", {"path": "notes/reading.md"}),
             _complete(),
-            _curator(
-                [
-                    {
-                        "statement": "Количество непустых строк в файле notes/reading.md равно 3.",
-                        "claim_type": "computed_result",
-                        "scope": {"path": "notes/reading.md", "metric": "nonempty_lines", "value": 3},
-                    }
-                ],
-                [{"evidence_index": 0, "claim_index": 0, "relation": "supports"}],
-            ),
+            bad_answer,
+            # T7.106: один раунд исправления — та же запрещённая комбинация отклоняется вторично
+            bad_answer,
         ]
     )
     outcome = await _run(scratch_url, fake_llm, tmp_path / "ws1", question_id)
@@ -190,3 +230,9 @@ async def test_rules_engine_rejection_records_what_was_rejected(
     assert sorted(digest["claims"][0]["scope_keys"]) == sorted(["path", "metric", "value"])
     assert digest["relied_claim_ids"] == []
     assert digest["new_questions"] == 0
+
+    # T7.106: раунд ровно один; дайджест ПЕРВОГО ответа — в аддитивном ключе отказа
+    assert len(await _fixation_events(scratch_url, outcome.session_id)) == 1
+    assert _correction_requests(fake_llm) == 1
+    assert fake_llm.state()["queue_left"] == 0
+    assert payload["correction_round"]["rejected_proposal"]["claims"][0]["claim_index"] == 0

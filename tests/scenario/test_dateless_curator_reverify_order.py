@@ -233,14 +233,18 @@ async def _run_compare_session(
     *,
     statements: list[str],
     relied_ids: list[str],
+    repeat: int = 1,
 ) -> tuple[Any, uuid.UUID]:
     question_id = await _seed_question(scratch_url, COMPARE_QUESTION)
+    answer = _curator_answer(ids, statements=statements, relied_ids=relied_ids)
     fake_llm.script(
         [
             _fetch("http://epsilon.example/survey"),
             _fetch("http://zeta.example/obzor"),
             _COMPLETE,
-            _curator_answer(ids, statements=statements, relied_ids=relied_ids),
+            # repeat>1 (T7.106, ADR-0034 вариант C): скриптованный ответ на ОДНО
+            # исправления — идентичный первому, он будет отклонён вторично
+            *([answer] * repeat),
         ]
     )
     outcome = await _run_session(
@@ -624,6 +628,9 @@ async def test_new_dateless_temporal_fact_without_a_candidate_is_still_refused(
         ids,
         statements=[NEW_RATE],
         relied_ids=[str(ids["official"])],
+        # T7.106 (ADR-0034 вариант C): ОДИН раунд исправления — идентичный датless ответ
+        # возвращается хосту и отклоняется вторично; отказ по-прежнему ровно один
+        repeat=2,
     )
     session_id = outcome.session_id
     assert outcome.claims_proposed == 0
@@ -644,6 +651,21 @@ async def test_new_dateless_temporal_fact_without_a_candidate_is_still_refused(
         scratch_url, "SELECT count(*) FROM session_staging WHERE session_id = :s", {"s": str(session_id)}
     )
     assert staging is not None and staging[0] == 0
+
+    # раунд ровно один: событие возврата, одно обращение с разделом, съеденный скрипт,
+    # дайджест ПЕРВОГО ответа в аддитивном ключе финального отказа
+    fixations = await _all(
+        scratch_url,
+        "SELECT public_summary FROM audit_events WHERE session_id = :s "
+        "AND payload ? 'curator_correction_requested'",
+        {"s": str(session_id)},
+    )
+    assert [dict(row)["public_summary"] for row in fixations] == [
+        "curator proposal returned for one correction round"
+    ]
+    assert sum(1 for r in fake_llm.requests() if "# Исправление предложения" in str(r.get("last_user", ""))) == 1
+    assert fake_llm.state()["queue_left"] == 0
+    assert payload["correction_round"]["reasons"] == ["claim[0]: temporal_fact requires as_of"]
 
 
 # ── датless-операция с as_of: поведение и payload не изменились вовсе ───────────

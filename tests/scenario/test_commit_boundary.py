@@ -199,6 +199,19 @@ async def test_disallowed_evidence_kind_rejected_at_consolidating(
                 ],
                 [{"evidence_index": 0, "claim_index": 0, "relation": "supports"}],
             ),
+            # T7.106 (ADR-0034 вариант C): хост возвращает отклонённое целиком предложение
+            # на ОДНО исправление — скриптован идентичный ответ: он отклоняется вторично,
+            # финальный отказ ровно один (пустая очередь больше не «случайный» путь)
+            _curator(
+                [
+                    {
+                        "statement": "Количество непустых строк в файле notes/reading.md равно 3.",
+                        "claim_type": "computed_result",
+                        "scope": {"path": "notes/reading.md", "metric": "nonempty_lines", "value": 3},
+                    }
+                ],
+                [{"evidence_index": 0, "claim_index": 0, "relation": "supports"}],
+            ),
         ]
     )
     orch, gateway, orch_engine = _make_orchestrator(scratch_url, fake_llm, tmp_path / "ws1")
@@ -258,10 +271,31 @@ async def test_disallowed_evidence_kind_rejected_at_consolidating(
             assert "support evidence kind 'local_observation' not allowed for computed_result" in (
                 rejected[0]
             )
+            # T7.106: финальный отказ несёт аддитивный ключ раунда (дайджест ПЕРВОГО ответа)
+            assert '"correction_round"' in rejected[0]
+            # раунд ровно один: событие возврата на исправление — единственное
+            fixations = (
+                (
+                    await db.execute(
+                        text(
+                            "SELECT public_summary FROM audit_events WHERE session_id = :s "
+                            "AND payload ? 'curator_correction_requested'"
+                        ),
+                        {"s": str(outcome.session_id)},
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            assert fixations == ["curator proposal returned for one correction round"]
         state, _reason = await _session_state(scratch_url, outcome.session_id)
     finally:
         await engine.dispose()
     assert state == "succeeded"
+
+    # ровно одно исправление запрашивалось у модели, и оба ответа съедены скриптом
+    assert sum(1 for r in fake_llm.requests() if "# Исправление предложения" in str(r.get("last_user", ""))) == 1
+    assert fake_llm.state()["queue_left"] == 0
 
     assert await _unresolved_attempts(scratch_url) == 0
 
@@ -448,6 +482,19 @@ async def test_disallowed_evidence_kind_bounces_only_that_operation(
             ).scalars().all()
             assert rejected == []
 
+            # T7.106 (ADR-0034 вариант C): частичный отказ варианта B раунд исправления
+            # НЕ запускает — события раунда нет
+            fixations = (
+                await db.execute(
+                    text(
+                        "SELECT payload FROM audit_events WHERE session_id = :s "
+                        "AND payload ? 'curator_correction_requested'"
+                    ),
+                    {"s": str(outcome.session_id)},
+                )
+            ).scalars().all()
+            assert fixations == []
+
             rows = (
                 await db.execute(
                     text(
@@ -461,6 +508,7 @@ async def test_disallowed_evidence_kind_bounces_only_that_operation(
             payload = dict(rows[0])
             assert payload["claims_proposed"] == 2
             assert payload["claims_applied"] == 1
+            assert payload.get("correction_round") is None  # T7.106: варианта B раунд не касается
             entries = payload["rejected_operations"]
             assert len(entries) == 1
             assert entries[0]["claim_index"] == 0
@@ -489,14 +537,21 @@ async def test_disallowed_evidence_kind_bounces_only_that_operation(
 
     assert await _unresolved_attempts(scratch_url) == 0
 
+    # раздел исправления модели не предлагался вовсе, единственный ответ съеден скриптом:
+    # частичный отказ варианта B раунда не имеет (T7.106)
+    assert sum(1 for r in fake_llm.requests() if "# Исправление предложения" in str(r.get("last_user", ""))) == 0
+    assert fake_llm.state()["queue_left"] == 0
+
 
 @pytest.mark.asyncio
 async def test_all_claims_rejected_by_rules_still_rejects_whole_proposal(
     migrated_db: Any, fake_llm: FakeLLM, tmp_path: Path
 ) -> None:
-    """T7.105 (ADR-0034 §7): когда сняты ВСЕ операции, поведение не меняется вовсе —
-    прежний отказ предложения целиком, прежний event с прежними ключами
-    (`curator_rejected_by_rules` + `rejected_proposal`), нулевой staging."""
+    """T7.105 (ADR-0034 §7): когда сняты ВСЕ операции, отказ предложения целиком сохраняется —
+    прежние ключи события (`curator_rejected_by_rules` + `rejected_proposal`), нулевой staging.
+    T7.106 (ADR-0034 вариант C): поверх этого — ровно ОДИН раунд исправления: второй ответ
+    скриптован идентичным, отклоняется вторично, финальный отказ один и несёт дайджест ПЕРВОГО
+    ответа в аддитивном ключе `correction_round`."""
     scratch_url, _engine = migrated_db
     question_id = await _seed_question(scratch_url, "Сколько строк в двух заметках?")
     fake_llm.script(
@@ -507,6 +562,25 @@ async def test_all_claims_rejected_by_rules_still_rejects_whole_proposal(
             _tool("workspace.write", {"path": "notes/b.md", "content": "One\nTwo\n"}),
             _tool("workspace.read", {"path": "notes/b.md"}),
             _complete(),
+            _curator(
+                [
+                    {
+                        "statement": "Количество непустых строк в notes/a.md равно 3.",
+                        "claim_type": "computed_result",
+                        "scope": {"path": "notes/a.md", "metric": "nonempty_lines", "value": 3},
+                    },
+                    {
+                        "statement": "Количество непустых строк в notes/b.md равно 2.",
+                        "claim_type": "computed_result",
+                        "scope": {"path": "notes/b.md", "metric": "nonempty_lines", "value": 2},
+                    },
+                ],
+                [
+                    {"evidence_index": 0, "claim_index": 0, "relation": "supports"},
+                    {"evidence_index": 1, "claim_index": 1, "relation": "supports"},
+                ],
+            ),
+            # T7.106: ОДИН раунд исправления — идентичный ответ отклоняется вторично
             _curator(
                 [
                     {
@@ -553,6 +627,18 @@ async def test_all_claims_rejected_by_rules_still_rejects_whole_proposal(
             assert len(rejected) == 1
             assert "claim 0 (computed_result):" in rejected[0]
             assert "claim 1 (computed_result):" in rejected[0]
+            # T7.106: аддитивный ключ раунда — дайджест ПЕРВОГО ответа внутри финального отказа
+            assert '"correction_round"' in rejected[0]
+            fixations = (
+                await db.execute(
+                    text(
+                        "SELECT public_summary FROM audit_events WHERE session_id = :s "
+                        "AND payload ? 'curator_correction_requested'"
+                    ),
+                    {"s": str(outcome.session_id)},
+                )
+            ).scalars().all()
+            assert fixations == ["curator proposal returned for one correction round"]
             digest = (
                 await db.execute(
                     text(
@@ -576,3 +662,7 @@ async def test_all_claims_rejected_by_rules_still_rejects_whole_proposal(
         await engine.dispose()
 
     assert await _unresolved_attempts(scratch_url) == 0
+
+    # один раунд = ровно одно обращение с разделом исправления; скрипт съеден
+    assert sum(1 for r in fake_llm.requests() if "# Исправление предложения" in str(r.get("last_user", ""))) == 1
+    assert fake_llm.state()["queue_left"] == 0

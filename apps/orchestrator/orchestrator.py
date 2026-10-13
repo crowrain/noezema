@@ -33,6 +33,11 @@ from typing import Any
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from apps.orchestrator.curator_correction import (
+    BoundaryAccepted,
+    BoundaryRejected,
+    build_correction_section,
+)
 from apps.orchestrator.curator_rejections import (
     claim_index_from_line,
     rejected_operation_entries,
@@ -2560,16 +2565,13 @@ class Orchestrator:
         )
         try:
             # T3.30: renew the lease in the background while the model
-            # call is in flight (§5.2.3: TTL = several heartbeat intervals)
-            async with LeaseHeartbeatGuard(self.lease, db, session.id, self.node_owner):
-                proposal, record = await self.gateway.chat(
-                    system=curator.text,
-                    user=user,
-                    response_schema=CuratorProposal,
-                    fingerprint=fingerprint,
-                    phase=PHASE_CONSOLIDATION,
-                    reasoning_mode=self._reasoning_mode(snapshot, PHASE_CONSOLIDATION),
-                )
+            # call is in flight (§5.2.3: TTL = several heartbeat intervals).
+            # T7.106 (ADR-0034 вариант C): учёт вызова (строка model_runs и попытки
+            # непригодного ответа этого вызова) — внутри _curator_chat, поэтому вызов
+            # первый и вызов второго раунда (раунд исправления) учитываются одинаково.
+            proposal = await self._curator_chat(
+                db, session, snapshot, curator, user, fingerprint
+            )
         except LLMTruncatedResponseError as exc:
             # T7.80 (ADR-0030): the curator answer was STOPPED BY THE OUTPUT
             # LIMIT. Not a schema hiccup and not "model unavailable": the model
@@ -2658,36 +2660,289 @@ class Orchestrator:
                 public_summary="lease lost during curator call; host failure report",
             )
             raise
+        outcome = await self._curator_boundary(
+            db, session, ctx, snapshot, knowledge, proposal
+        )
+        correction_round: JsonDict | None = None
+        accepted: BoundaryAccepted
+        if isinstance(outcome, BoundaryRejected):
+            # T7.106 (ADR-0034 вариант C, решение пользователя 2026-10-13): хост
+            # отклонил предложение ЦЕЛИКОМ — ровно ОДИН раунд исправления на вызов
+            # куратора (= на сессию). Частичные отказы варианта B (BoundaryAccepted с
+            # dropped) до этой ветки не доходят; ошибки ПЕРВОГО вызова обработаны
+            # except'ами выше и раунда тоже не дают. Раунд живёт в фазе consolidating
+            # и НЕ расходует шаговый бюджет исследователя (ADR-0034 §9). Событие раунда —
+            # уже существующий event БЕЗ ключей curator_rejected*: итоговый отказ в
+            # журнале остаётся ровно одним событием с прежними ключами; additive-ключ
+            # называет сам раунд.
+            await audit.record(
+                AuditEventType.SESSION_STATE_CHANGED,
+                session_id=session.id,
+                payload={
+                    "curator_correction_requested": {
+                        "reasons": outcome.reasons,
+                        "rejected_proposal": rejected_proposal_digest(proposal),
+                    }
+                },
+                public_summary="curator proposal returned for one correction round",
+            )
+            rejected_first = outcome
+            correction_round = {
+                "reasons": rejected_first.reasons,
+                "rejected_proposal": rejected_proposal_digest(proposal),
+            }
+            correction_user = user + "\n" + build_correction_section(
+                rejected_first.reasons, proposal
+            )
+            try:
+                second = await self._curator_chat(
+                    db, session, snapshot, curator, correction_user, fingerprint
+                )
+            except LLMTruncatedResponseError as exc:
+                # Ошибка ВТОРОГО вызова: отказ ПЕРВОГО ответа со старыми ключами +
+                # correction_error; непригодные попытки второго вызова — в model_runs.
+                written = await self._record_unusable_attempts(
+                    db,
+                    session,
+                    exc.attempts,
+                    fingerprint=fingerprint,
+                    prompt_version=curator.version,
+                    prompt_sha256=curator.sha256,
+                    tool_schema_hash=None,
+                )
+                await audit.record(
+                    AuditEventType.SESSION_STATE_CHANGED,
+                    session_id=session.id,
+                    payload={
+                        **rejected_first.payload,
+                        "correction_error": {
+                            "kind": "truncated_output",
+                            "error": str(exc)[:300],
+                            "truncated_attempts": written,
+                        },
+                    },
+                    public_summary=(
+                        f"{rejected_first.public_summary}; correction attempt truncated "
+                        "by the output limit — see model_runs for the cut attempts"
+                    ),
+                )
+                return 0, 0
+            except LLMRequestRejectedError as exc:
+                await audit.record(
+                    AuditEventType.SESSION_STATE_CHANGED,
+                    session_id=session.id,
+                    payload={
+                        **rejected_first.payload,
+                        "correction_error": {
+                            "kind": "request_rejected",
+                            "error": str(exc)[:300],
+                        },
+                    },
+                    public_summary=(
+                        f"{rejected_first.public_summary}; correction request refused by "
+                        "engine (schema/params) — check schema_profile for this engine"
+                    ),
+                )
+                return 0, 0
+            except LLMError as exc:
+                # T7.80: непригодный ответ второго вызова тоже оставляет попытки в журнале.
+                if isinstance(exc, LLMAnswerUnusableError):
+                    await self._record_unusable_attempts(
+                        db,
+                        session,
+                        exc.attempts,
+                        fingerprint=fingerprint,
+                        prompt_version=curator.version,
+                        prompt_sha256=curator.sha256,
+                        tool_schema_hash=None,
+                    )
+                await audit.record(
+                    AuditEventType.SESSION_STATE_CHANGED,
+                    session_id=session.id,
+                    payload={
+                        **rejected_first.payload,
+                        "correction_error": {
+                            "kind": "unavailable",
+                            "error": str(exc)[:300],
+                        },
+                    },
+                    public_summary=(
+                        f"{rejected_first.public_summary}; correction attempt failed: "
+                        "curator unavailable"
+                    ),
+                )
+                return 0, 0
+            except LeaseLost as exc:
+                # T3.30 тот же закон, что и у первого вызова: утрата lease среди раунда
+                # исправления — abort; фазу разрешает reconciler (§5.2.3), не угаданный откат.
+                await audit.record(
+                    AuditEventType.SESSION_FAILED,
+                    session_id=session.id,
+                    payload={"error": str(exc)[:500], "phase": "consolidating"},
+                    public_summary="lease lost during curator call; host failure report",
+                )
+                raise
+            second_outcome = await self._curator_boundary(
+                db, session, ctx, snapshot, knowledge, second
+            )
+            if isinstance(second_outcome, BoundaryRejected):
+                # Отказ ПОСЛЕ раунда — тот же event и прежние ключи для отказа ВТОРОГО
+                # ответа; additive-ключ correction_round называет, что именно возвращалось
+                # на исправление (причины и дайджест ПЕРВОГО ответа). Третьего вызова нет.
+                await audit.record(
+                    AuditEventType.SESSION_STATE_CHANGED,
+                    session_id=session.id,
+                    payload={**second_outcome.payload, "correction_round": correction_round},
+                    public_summary=second_outcome.public_summary,
+                )
+                return 0, 0
+            proposal = second
+            accepted = second_outcome
+        else:
+            accepted = outcome
+        staged_claims = accepted.staged_claims
+        dropped = accepted.dropped
+        value_duplicates = accepted.value_duplicates
+        relied_claim_ids = accepted.relied_claim_ids
+        relied_claims_rejected = accepted.relied_claims_rejected
 
-        run = ORMModelRun(
+        # T7.105: если после снятий остались активные операции — предложение применяется
+        # частично: снятые операции называются в payload уже существующего CLAIM_CREATED
+        # (паттерн value_duplicates/relied_claims_rejected; нового типа события нет).
+
+        # T2.13: proposals go to session_staging, applied at commit
+        # (T7.83: staged_claims — копия списка; конвертированные дубли подменены
+        #  операциями с existing_claim_id, остальные объекты — те же самые)
+        # T7.105 (ADR-0034 вариант B): снятые операции в staging не пишутся. Индексы
+        # оставшихся claims перенумеровываются так, чтобы на границе коммита claim
+        # соответствовал связям по позиции — ровно как если бы снятых операций в предложении
+        # не было; чужим операциям связи НЕ переносятся (решение 3 ADR-0034 §7).
+        active_claims = [index for index in range(len(staged_claims)) if index not in dropped]
+        staged_index = {old: new for new, old in enumerate(active_claims)}
+        for claim_index in active_claims:
+            await staging.record(
+                db,
+                audit,
+                session,
+                "claim",
+                staged_claims[claim_index].model_dump(mode="json"),
+                proposed_claims=1,
+            )
+        # evidence links (M3): the only channel for evidence changes; the
+        # trusted host recomputes every identity at the commit boundary
+        for link in proposal.evidence_links:
+            if link.claim_index in dropped:
+                # T7.105: связь снятой операции снимается вместе с ней (с причиной в записи
+                # отказа); наблюдение и источник остаются в базе — знание не удаляется.
+                continue
+            evidence_payload: JsonDict = {
+                "evidence_index": link.evidence_index,
+                "claim_index": staged_index[link.claim_index],
+                "relation": link.relation.value,
+            }
+            # T7.78 (ADR-0029): сюда же хост кладёт решение о происхождении ЗНАЧЕНИЯ этой улики
+            # (пересказ первоисточника или отказ) — единственный конверт, где пара «утверждение ↔
+            # улика» существует вместе с обоими текстами. Пусто = детектор не решил фрагмент.
+            if 0 <= link.evidence_index < len(ctx.evidence) and 0 <= link.claim_index < len(
+                proposal.claims
+            ):
+                origin = await self._value_attribution(
+                    db,
+                    ctx.evidence[link.evidence_index],
+                    proposal.claims[link.claim_index].statement,
+                )
+                if origin is not None:
+                    evidence_payload.update(origin)
+            await staging.record(
+                db,
+                audit,
+                session,
+                "evidence",
+                evidence_payload,
+                proposed_evidence=1,
+            )
+        for q in proposal.new_questions:
+            await staging.record(
+                db,
+                audit,
+                session,
+                "question",
+                {"text": q.text, "origin": q.origin.value},
+                proposed_questions=1,
+            )
+
+        claim_event_payload: JsonDict = {
+            "claims": [c.model_dump(mode="json") for c in proposal.claims],
+            "evidence_links": [link.model_dump() for link in proposal.evidence_links],
+            "new_questions": [q.model_dump(mode="json") for q in proposal.new_questions],
+            "summary": proposal.summary,
+        }
+        # T7.82 (B), ADR-0032: факт «ответ оперся на эти строки знания» живёт в payload
+        # уже существующего события; ключи появляются только когда поле было непустым —
+        # прежние сессии и их аудит остаются байт-в-байт прежними.
+        if relied_claim_ids:
+            claim_event_payload["relied_claim_ids"] = relied_claim_ids
+        if relied_claims_rejected:
+            claim_event_payload["relied_claims_rejected"] = relied_claims_rejected[:10]
+        # T7.83 (ADR-0033): ключ появляется только при непустом решении гейта —
+        # прежние сессии и их аудит остаются байт-в-байт прежними
+        if value_duplicates:
+            claim_event_payload["value_duplicates"] = value_duplicates
+        # T7.105 (ADR-0034 §4, §7): снятые операции называются в payload УЖЕ СУЩЕСТВУЮЩЕГО
+        # события (паттерн value_duplicates / relied_claims_rejected: нового AuditEventType
+        # нет, миграции нет). Счётчики разделены и названы; ключи появляются только когда что-то
+        # действительно снято — сессии без отказов остаются байт в байт прежними. Массивы
+        # `claims` и `evidence_links` выше — ПРЕЖНЕЕ предложение целиком: журнал обязан
+        # показывать и снятое (с причиной), а не только применённое.
+        if dropped:
+            claim_event_payload["rejected_operations"] = rejected_operation_entries(proposal, dropped)
+            claim_event_payload["claims_proposed"] = len(proposal.claims)
+            claim_event_payload["claims_applied"] = len(active_claims)
+        # T7.106 (ADR-0034 вариант C): раунд был и предложение принято — additive-ключ
+        # уже существующего события: что именно возвращалось на исправление (причины и
+        # дайджест ПЕРВОГО ответа). Без раунда ключа нет: сессии без коррекций остаются
+        # байт в байт прежними.
+        if correction_round is not None:
+            claim_event_payload["correction_round"] = correction_round
+        public_summary = f"curator: {len(proposal.claims)} claims, {len(proposal.new_questions)} questions"
+        if dropped:
+            public_summary = (
+                f"curator: {len(active_claims)} of {len(proposal.claims)} claims applied, "
+                f"{len(proposal.new_questions)} questions, "
+                f"{len(dropped)} operations rejected by host validation"
+            )
+        await audit.record(
+            AuditEventType.CLAIM_CREATED,
             session_id=session.id,
-            turn_id=uuid.uuid4(),
-            phase=session.state,
-            model_fingerprint=fingerprint,
-            prompt_version=curator.version,
-            prompt_sha256=curator.sha256,
-            tool_schema_hash=None,
-            input_tokens=record.input_tokens,
-            output_tokens=record.output_tokens,
-            latency_ms=record.latency_ms,
-            finish_reason=record.finish_reason,
-            output_schema_valid=record.output_schema_valid,
+            payload=claim_event_payload,
+            public_summary=public_summary,
         )
-        await ModelRunRepository.create(db, run)
+        return len(proposal.claims), len(proposal.new_questions)
 
-        # T7.80 (ADR-0030): a call that was cut by the output limit and then
-        # recovered must not erase the evidence of the cut — every unusable attempt
-        # of THIS call gets its own model_runs row alongside the valid one.
-        await self._record_unusable_attempts(
-            db,
-            session,
-            record.attempts_detail,
-            fingerprint=fingerprint,
-            prompt_version=curator.version,
-            prompt_sha256=curator.sha256,
-            tool_schema_hash=None,
-        )
 
+    async def _curator_boundary(
+        self,
+        db: AsyncSession,
+        session: ORMSession,
+        ctx: SessionContext,
+        snapshot: ORMConfigSnapshot,
+        knowledge: str,
+        proposal: CuratorProposal,
+    ) -> BoundaryAccepted | BoundaryRejected:
+        """Граничная проверка кураторского предложения до staging (T7.105,
+        ADR-0034 вариант B; метод вынесен в T7.106 ради варианта C). Порядок и тексты
+        проверок — прежние: структурные проблемы, перепроверочные ссылки (T7.34),
+        гейт дублей по значению (T7.83/ADR-0033), опорная `as_of` (T7.84 часть B),
+        предпроверка движка правил (T7.9). Целиком-отказ -> BoundaryRejected с РОВНО
+        тем payload и public_summary, которые хост писал в журнал раньше; частичное
+        применение -> BoundaryAccepted с величинами, нужными _curator для staging.
+
+        Ожидание менеджера (T7.106, ПРОВЕРЬ: до staging — только чтения): метод не
+        пишет ни audit_events, ни session_staging — из БД только SELECT якорей
+        перепроверки и кандидатов гейта дублей; записи model_runs относятся к самим
+        LLM-вызовам (_curator_chat), не к этой проверке. Ни одна staging-операция не
+        исполняется, пока весь исход проверки не определён.
+        """
         max_questions = int(snapshot.session_limits.get("max_new_questions_per_session", 4))
         # T7.84 (часть B, ADR-0033 §8): первым — только то, чему безразлично, каким ВИДОМ
         # операция закончит (индексы связей, бюджеты вопросов, search_statements, дубли
@@ -2709,16 +2964,14 @@ class Orchestrator:
             # чем именно были два temporal_fact без as_of, нельзя узнать ниоткуда).
             # T7.105: здесь же — когда пооперационные снятия оставили БЕЗ операций всё
             # предложение: поведение как раньше (ADR-0034 §7, решение 5).
-            await audit.record(
-                AuditEventType.SESSION_STATE_CHANGED,
-                session_id=session.id,
+            return BoundaryRejected(
                 payload={
                     "curator_rejected": problems[:10],
                     "rejected_proposal": rejected_proposal_digest(proposal),
                 },
                 public_summary="curator proposal rejected by host validation",
+                reasons=problems[:10],
             )
-            return 0, 0
 
         # T7.34 (ADR-0018): reverify references — resolved BEFORE the
         # rules pre-check (the reverify is validated under the ANCHOR's
@@ -2791,17 +3044,15 @@ class Orchestrator:
         if proposal.claims and reverify_drops and len(dropped) == len(proposal.claims):
             # T7.105: сняты ВСЕ операции — поведение как раньше (отказ предложения целиком,
             # тот же event, прежние ключи; строки причин — все снявшие операцию причины).
-            await audit.record(
-                AuditEventType.SESSION_STATE_CHANGED,
-                session_id=session.id,
+            return BoundaryRejected(
                 payload={
                     "curator_rejected": list(dropped.values())[:10],
                     "curator_reject_kind": "reverify_unresolved",
                     "rejected_proposal": rejected_proposal_digest(proposal),
                 },
                 public_summary=reverify_summary,
+                reasons=list(dropped.values())[:10],
             )
-            return 0, 0
 
         # T7.82 (B), ADR-0032: опора на существующее знание (факультативное поле
         # curator-v9). Хост принимает ТОЛЬКО id, видимые в контекст-паке этой сессии —
@@ -2979,17 +3230,15 @@ class Orchestrator:
             # T7.105: «temporal_fact без даты» по-прежнему отказывает предложение ЦЕЛИКОМ,
             # когда без даты осталась каждая его операция: тот же event, прежние ключи, тот
             # же текст причины (fail-closed политика T7.84 не меняется).
-            await audit.record(
-                AuditEventType.SESSION_STATE_CHANGED,
-                session_id=session.id,
+            return BoundaryRejected(
                 payload={
                     "curator_rejected": list(dropped.values())[:10],
                     "rejected_proposal": rejected_proposal_digest(proposal),
                     **({"value_duplicates": value_duplicates} if value_duplicates else {}),
                 },
                 public_summary="curator proposal rejected by host validation",
+                reasons=list(dropped.values())[:10],
             )
-            return 0, 0
 
         # T7.9 (EVAL-3b post-mortem P.2, §14.1): the rules engine
         # pre-commit check — a proposal the rules engine would reject
@@ -3027,9 +3276,7 @@ class Orchestrator:
             # Сняты ВСЕ операции — отказ предложения целиком, как раньше (тот же event,
             # прежние ключи `curator_rejected_by_rules` / `rejected_proposal`, прежний текст
             # причин — движок видел предложение целиком).
-            await audit.record(
-                AuditEventType.SESSION_STATE_CHANGED,
-                session_id=session.id,
+            return BoundaryRejected(
                 payload={
                     "curator_rejected_by_rules": rule_problems[:10],
                     # T7.84 (часть A): тот же снимок отклонённого предложения + решения
@@ -3041,114 +3288,72 @@ class Orchestrator:
                 public_summary=(
                     f"curator proposal rejected by the rules engine: {rule_problems[0][:200]}"
                 ),
+                reasons=rule_problems[:10],
             )
-            return 0, 0
-        # T7.105: если после снятий остались активные операции — предложение применяется
-        # частично: снятые операции называются в payload уже существующего CLAIM_CREATED
-        # (паттерн value_duplicates/relied_claims_rejected; нового типа события нет).
-
-        # T2.13: proposals go to session_staging, applied at commit
-        # (T7.83: staged_claims — копия списка; конвертированные дубли подменены
-        #  операциями с existing_claim_id, остальные объекты — те же самые)
-        # T7.105 (ADR-0034 вариант B): снятые операции в staging не пишутся. Индексы
-        # оставшихся claims перенумеровываются так, чтобы на границе коммита claim
-        # соответствовал связям по позиции — ровно как если бы снятых операций в предложении
-        # не было; чужим операциям связи НЕ переносятся (решение 3 ADR-0034 §7).
-        active_claims = [index for index in range(len(staged_claims)) if index not in dropped]
-        staged_index = {old: new for new, old in enumerate(active_claims)}
-        for claim_index in active_claims:
-            await staging.record(
-                db,
-                audit,
-                session,
-                "claim",
-                staged_claims[claim_index].model_dump(mode="json"),
-                proposed_claims=1,
-            )
-        # evidence links (M3): the only channel for evidence changes; the
-        # trusted host recomputes every identity at the commit boundary
-        for link in proposal.evidence_links:
-            if link.claim_index in dropped:
-                # T7.105: связь снятой операции снимается вместе с ней (с причиной в записи
-                # отказа); наблюдение и источник остаются в базе — знание не удаляется.
-                continue
-            evidence_payload: JsonDict = {
-                "evidence_index": link.evidence_index,
-                "claim_index": staged_index[link.claim_index],
-                "relation": link.relation.value,
-            }
-            # T7.78 (ADR-0029): сюда же хост кладёт решение о происхождении ЗНАЧЕНИЯ этой улики
-            # (пересказ первоисточника или отказ) — единственный конверт, где пара «утверждение ↔
-            # улика» существует вместе с обоими текстами. Пусто = детектор не решил фрагмент.
-            if 0 <= link.evidence_index < len(ctx.evidence) and 0 <= link.claim_index < len(
-                proposal.claims
-            ):
-                origin = await self._value_attribution(
-                    db,
-                    ctx.evidence[link.evidence_index],
-                    proposal.claims[link.claim_index].statement,
-                )
-                if origin is not None:
-                    evidence_payload.update(origin)
-            await staging.record(
-                db,
-                audit,
-                session,
-                "evidence",
-                evidence_payload,
-                proposed_evidence=1,
-            )
-        for q in proposal.new_questions:
-            await staging.record(
-                db,
-                audit,
-                session,
-                "question",
-                {"text": q.text, "origin": q.origin.value},
-                proposed_questions=1,
-            )
-
-        claim_event_payload: JsonDict = {
-            "claims": [c.model_dump(mode="json") for c in proposal.claims],
-            "evidence_links": [link.model_dump() for link in proposal.evidence_links],
-            "new_questions": [q.model_dump(mode="json") for q in proposal.new_questions],
-            "summary": proposal.summary,
-        }
-        # T7.82 (B), ADR-0032: факт «ответ оперся на эти строки знания» живёт в payload
-        # уже существующего события; ключи появляются только когда поле было непустым —
-        # прежние сессии и их аудит остаются байт-в-байт прежними.
-        if relied_claim_ids:
-            claim_event_payload["relied_claim_ids"] = relied_claim_ids
-        if relied_claims_rejected:
-            claim_event_payload["relied_claims_rejected"] = relied_claims_rejected[:10]
-        # T7.83 (ADR-0033): ключ появляется только при непустом решении гейта —
-        # прежние сессии и их аудит остаются байт-в-байт прежними
-        if value_duplicates:
-            claim_event_payload["value_duplicates"] = value_duplicates
-        # T7.105 (ADR-0034 §4, §7): снятые операции называются в payload УЖЕ СУЩЕСТВУЮЩЕГО
-        # события (паттерн value_duplicates / relied_claims_rejected: нового AuditEventType
-        # нет, миграции нет). Счётчики разделены и названы; ключи появляются только когда что-то
-        # действительно снято — сессии без отказов остаются байт в байт прежними. Массивы
-        # `claims` и `evidence_links` выше — ПРЕЖНЕЕ предложение целиком: журнал обязан
-        # показывать и снятое (с причиной), а не только применённое.
-        if dropped:
-            claim_event_payload["rejected_operations"] = rejected_operation_entries(proposal, dropped)
-            claim_event_payload["claims_proposed"] = len(proposal.claims)
-            claim_event_payload["claims_applied"] = len(active_claims)
-        public_summary = f"curator: {len(proposal.claims)} claims, {len(proposal.new_questions)} questions"
-        if dropped:
-            public_summary = (
-                f"curator: {len(active_claims)} of {len(proposal.claims)} claims applied, "
-                f"{len(proposal.new_questions)} questions, "
-                f"{len(dropped)} operations rejected by host validation"
-            )
-        await audit.record(
-            AuditEventType.CLAIM_CREATED,
-            session_id=session.id,
-            payload=claim_event_payload,
-            public_summary=public_summary,
+        return BoundaryAccepted(
+            staged_claims=staged_claims,
+            dropped=dropped,
+            value_duplicates=value_duplicates,
+            relied_claim_ids=relied_claim_ids,
+            relied_claims_rejected=relied_claims_rejected,
         )
-        return len(proposal.claims), len(proposal.new_questions)
+
+
+    async def _curator_chat(
+        self,
+        db: AsyncSession,
+        session: ORMSession,
+        snapshot: ORMConfigSnapshot,
+        curator: LoadedPrompt,
+        user: str,
+        fingerprint: JsonDict,
+    ) -> CuratorProposal:
+        """One curator call: the lease is renewed in the background while the model
+        call is in flight (T3.30, §5.2.3) and the call is accounted for in model_runs —
+        including the T7.80 (ADR-0030) rows of the unusable attempts of THIS call.
+        T7.106 (ADR-0034 вариант C): оба вызова раунда исправления идут через этот
+        метод, поэтому учитываются одинаково; ошибки не обрабатываются здесь —
+        маркер аудита для каждой ошибки выбирает вызывающий код.
+        """
+        async with LeaseHeartbeatGuard(self.lease, db, session.id, self.node_owner):
+            proposal, record = await self.gateway.chat(
+                system=curator.text,
+                user=user,
+                response_schema=CuratorProposal,
+                fingerprint=fingerprint,
+                phase=PHASE_CONSOLIDATION,
+                reasoning_mode=self._reasoning_mode(snapshot, PHASE_CONSOLIDATION),
+            )
+
+        run = ORMModelRun(
+            session_id=session.id,
+            turn_id=uuid.uuid4(),
+            phase=session.state,
+            model_fingerprint=fingerprint,
+            prompt_version=curator.version,
+            prompt_sha256=curator.sha256,
+            tool_schema_hash=None,
+            input_tokens=record.input_tokens,
+            output_tokens=record.output_tokens,
+            latency_ms=record.latency_ms,
+            finish_reason=record.finish_reason,
+            output_schema_valid=record.output_schema_valid,
+        )
+        await ModelRunRepository.create(db, run)
+
+        # T7.80 (ADR-0030): a call that was cut by the output limit and then
+        # recovered must not erase the evidence of the cut — every unusable attempt
+        # of THIS call gets its own model_runs row alongside the valid one.
+        await self._record_unusable_attempts(
+            db,
+            session,
+            record.attempts_detail,
+            fingerprint=fingerprint,
+            prompt_version=curator.version,
+            prompt_sha256=curator.sha256,
+            tool_schema_hash=None,
+        )
+        return proposal
 
     async def _apply_host_side(
         self,

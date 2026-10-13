@@ -58,6 +58,22 @@ from tests.scenario.test_web_answer_api import _client, _make
 
 pytestmark = pytest.mark.scenario
 
+
+async def _fixation_count(scratch_url: str, session_id: Any) -> int:
+    """Сколько событий возврата предложения на исправление (T7.106, ADR-0034 вариант C)."""
+    rows = await _all(
+        scratch_url,
+        "SELECT count(*) AS n FROM audit_events WHERE session_id = :s "
+        "AND payload ? 'curator_correction_requested'",
+        {"s": str(session_id)},
+    )
+    return int(dict(rows[0])["n"])
+
+
+def _correction_requests(fake_llm: FakeLLM) -> int:
+    """Сколько раз модель получала раздел «# Исправление предложения»."""
+    return sum(1 for r in fake_llm.requests() if "# Исправление предложения" in str(r.get("last_user", "")))
+
 # ── фикстура стендового случая e6c8959b (fixtures-t7105, SELECT с витрины .92) ──
 
 STAND_QUESTION = (
@@ -276,6 +292,12 @@ async def test_stand_case_replay_two_claims_written_estimate_bounced_by_name(
     assert card["result"]["kind"] == "answered"
     assert any("отклонена правилами: 1" in note for note in card["honesty"]), card["honesty"]
 
+    # T7.106 (ADR-0034 вариант C): частичный отказ варианта B раунд исправления НЕ запускает
+    assert await _fixation_count(scratch_url, session_id) == 0
+    assert _correction_requests(fake_llm) == 0
+    assert fake_llm.state()["queue_left"] == 0
+    assert payload.get("correction_round") is None
+
 
 # ── 2. search_statements: проверка одной операции снимает только её ──────────
 
@@ -366,6 +388,12 @@ async def test_bad_search_statement_bounces_only_that_claim(
     assert linked[0]["s"] == "6+6 равно 12"
     assert linked[0]["k"] == "computation"
 
+    # T7.106: частичный отказ варианта B — без раунда исправления
+    assert await _fixation_count(scratch_url, outcome.session_id) == 0
+    assert _correction_requests(fake_llm) == 0
+    assert fake_llm.state()["queue_left"] == 0
+    assert payload.get("correction_round") is None
+
 
 # ── 3. свойства предложения целиком по-прежнему отказывают предложение полностью ──
 
@@ -375,26 +403,30 @@ async def test_out_of_range_link_still_rejects_whole_proposal(
     migrated_db: Any, fake_llm: FakeLLM, tmp_path: Path
 ) -> None:
     """Связь с индексом вне списка улик — свойство предложения целиком: даже при одном
-    безупречном claim предложение отклоняется полностью (прежний отказ, прежний event)."""
+    безупречном claim предложение отклоняется полностью (прежний отказ, прежний event).
+    T7.106 (ADR-0034 вариант C): поверх — ровно ОДИН раунд исправления; идентичный скриптованный
+    ответ отклоняется вторично, финальный отказ один и несёт `correction_round`."""
     scratch_url, _engine = migrated_db
     question_id = await _seed_question(scratch_url, "Сколько будет 6*7?")
+    bad_answer = _curator(
+        [
+            {
+                "statement": "6*7 равно 42",
+                "claim_type": "computed_result",
+                "scope": {"expr": "6*7"},
+            }
+        ],
+        [
+            {"evidence_index": 0, "claim_index": 0, "relation": "supports"},
+            {"evidence_index": 99, "claim_index": 0, "relation": "supports"},
+        ],
+    )
     fake_llm.script(
         [
             _tool("python.execute", {"code": "print(6*7)"}),
             _complete(),
-            _curator(
-                [
-                    {
-                        "statement": "6*7 равно 42",
-                        "claim_type": "computed_result",
-                        "scope": {"expr": "6*7"},
-                    }
-                ],
-                [
-                    {"evidence_index": 0, "claim_index": 0, "relation": "supports"},
-                    {"evidence_index": 99, "claim_index": 0, "relation": "supports"},
-                ],
-            ),
+            bad_answer,
+            bad_answer,  # ОДНО исправление — та же недоступная связь, отказ вторично
         ]
     )
     orch, gateway, engine = _make_orchestrator(scratch_url, fake_llm, tmp_path / "ws1")
@@ -415,6 +447,12 @@ async def test_out_of_range_link_still_rejects_whole_proposal(
     assert staging is not None and staging[0] == 0
     claims = await _scalar(scratch_url, "SELECT count(*) FROM claims")
     assert claims is not None and claims[0] == 0
+
+    # T7.106: раунд ровно один, дайджест ПЕРВОГО ответа — в аддитивном ключе отказа
+    assert events[0]["correction_round"]["reasons"] == ["evidence_link[1]: index 99 out of range"]
+    assert await _fixation_count(scratch_url, outcome.session_id) == 1
+    assert _correction_requests(fake_llm) == 1
+    assert fake_llm.state()["queue_left"] == 0
 
 
 @pytest.mark.asyncio
@@ -442,7 +480,13 @@ async def test_questions_budget_overflow_still_rejects_whole_proposal(
         }
     }
     fake_llm.script(
-        [_tool("python.execute", {"code": "print(6*7)"}), _complete(), answer]
+        [
+            _tool("python.execute", {"code": "print(6*7)"}),
+            _complete(),
+            answer,
+            # T7.106: ОДИН раунд исправления — те же пять вопросов, отказ вторично
+            answer,
+        ]
     )
     orch, gateway, engine = _make_orchestrator(scratch_url, fake_llm, tmp_path / "ws1")
     try:
@@ -460,6 +504,12 @@ async def test_questions_budget_overflow_still_rejects_whole_proposal(
     )
     assert staging is not None and staging[0] == 0
 
+    # T7.106: раунд ровно один; бюджет вопросов — не то, что модель «исправит» молча
+    assert events[0]["correction_round"]["reasons"] == ["new_questions: 5 > 4"]
+    assert await _fixation_count(scratch_url, outcome.session_id) == 1
+    assert _correction_requests(fake_llm) == 1
+    assert fake_llm.state()["queue_left"] == 0
+
 
 @pytest.mark.asyncio
 async def test_mixed_search_statement_and_out_of_range_link_rejects_whole_proposal(
@@ -469,21 +519,24 @@ async def test_mixed_search_statement_and_out_of_range_link_rejects_whole_propos
     всё предложение прежним событием со ВСЕМИ строками причин (порядок `_walk` сохранён)."""
     scratch_url, _engine = migrated_db
     question_id = await _seed_question(scratch_url, "Сколько будет 6*7?")
+    bad_answer = _curator(
+        [
+            {
+                "statement": "6*7 равно 42",
+                "claim_type": "computed_result",
+                "scope": {"expr": "6*7"},
+                "search_statements": [""],
+            }
+        ],
+        [{"evidence_index": 9, "claim_index": 0, "relation": "supports"}],
+    )
     fake_llm.script(
         [
             _tool("python.execute", {"code": "print(6*7)"}),
             _complete(),
-            _curator(
-                [
-                    {
-                        "statement": "6*7 равно 42",
-                        "claim_type": "computed_result",
-                        "scope": {"expr": "6*7"},
-                        "search_statements": [""],
-                    }
-                ],
-                [{"evidence_index": 9, "claim_index": 0, "relation": "supports"}],
-            ),
+            bad_answer,
+            # T7.106: ОДИН раунд исправления — те же две причины, отказ вторично
+            bad_answer,
         ]
     )
     orch, gateway, engine = _make_orchestrator(scratch_url, fake_llm, tmp_path / "ws1")
@@ -500,6 +553,14 @@ async def test_mixed_search_statement_and_out_of_range_link_rejects_whole_propos
         "evidence_link[0]: index 9 out of range",
         "claim[0].search_statements[0]: empty",
     ]
+    # T7.106: обе строки причин — и в раундовом событии (модель получила их дословно)
+    assert events[0]["correction_round"]["reasons"] == [
+        "evidence_link[0]: index 9 out of range",
+        "claim[0].search_statements[0]: empty",
+    ]
+    assert await _fixation_count(scratch_url, outcome.session_id) == 1
+    assert _correction_requests(fake_llm) == 1
+    assert fake_llm.state()["queue_left"] == 0
     staging = await _scalar(
         scratch_url, "SELECT count(*) FROM session_staging WHERE session_id = :s", {"s": str(outcome.session_id)}
     )
@@ -591,3 +652,8 @@ async def test_dropped_claim_dependencies_dropped_with_it(
     assert deps is not None and deps[0] == 0
     claims = await _all(scratch_url, "SELECT statement FROM claims")
     assert sorted(row["statement"] for row in claims) == sorted(["6*7 равно 42", "6+6 равно 12"])
+
+    # T7.106: и здесь частичный отказ — без раунда исправления
+    assert await _fixation_count(scratch_url, outcome.session_id) == 0
+    assert _correction_requests(fake_llm) == 0
+    assert fake_llm.state()["queue_left"] == 0

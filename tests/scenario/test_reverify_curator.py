@@ -102,21 +102,25 @@ async def test_reverify_unknown_reference_rejects_whole_proposal(
 
     unknown = uuid.uuid4()
     qid = await _seed_question(scratch_url, "Сколько будет 6*7? Проверь ещё раз.")
+    bad_answer = _curator(
+        [
+            {
+                "statement": "6*7 равно 42 (перепроверено)",
+                "claim_type": "computed_result",
+                "scope": {"expr": "6*7"},
+                "existing_claim_id": str(unknown),
+            }
+        ],
+        [{"evidence_index": 0, "claim_index": 0, "relation": "supports"}],
+    )
     fake_llm.script(
         [
             _tool("python.execute", {"code": "print(6*7)"}),
             _complete(),
-            _curator(
-                [
-                    {
-                        "statement": "6*7 равно 42 (перепроверено)",
-                        "claim_type": "computed_result",
-                        "scope": {"expr": "6*7"},
-                        "existing_claim_id": str(unknown),
-                    }
-                ],
-                [{"evidence_index": 0, "claim_index": 0, "relation": "supports"}],
-            ),
+            bad_answer,
+            # T7.106 (ADR-0034 вариант C): ОДИН раунд исправления — идентичный ответ
+            # с неразрешимой ссылкой отклоняется вторично, отказ по-прежнему ровно один
+            bad_answer,
         ]
     )
     orch, gateway, engine = _make_orchestrator(scratch_url, fake_llm, tmp_path / "ws2")
@@ -174,12 +178,34 @@ async def test_reverify_unknown_reference_rejects_whole_proposal(
             assert len(rejected) == 1
             assert rejected[0][0] == "reverify_unresolved"
             assert "not visible" in rejected[0][1]
+            # T7.106: финальный отказ несёт аддитивный ключ раунда (дайджест ПЕРВОГО ответа)
+            round_key = (
+                (
+                    await db.execute(
+                        text(
+                            "SELECT payload->'correction_round'->'reasons' FROM audit_events "
+                            "WHERE session_id = :s AND payload ? 'curator_rejected' "
+                            "AND payload ? 'correction_round'"
+                        ),
+                        {"s": str(outcome.session_id)},
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            assert len(round_key) == 1
+            assert any("reverify reference" in reason for reason in round_key[0])
         state, _reason = await _session_state(scratch_url, outcome.session_id)
     finally:
         await eng.dispose()
     assert state == "succeeded"
 
     assert await _unresolved_attempts(scratch_url) == 0
+
+    # T7.106: ровно одно обращение с разделом исправления, оба ответа съедены скриптом
+    assert sum(1 for r in fake_llm.requests() if "# Исправление предложения" in str(r.get("last_user", ""))) == 1
+    assert fake_llm.state()["queue_left"] == 0
+
     # the next session is admitted and runs to a terminal state
     next_state = await _run_next_session(scratch_url, fake_llm, tmp_path / "ws3")
     assert next_state.value == "succeeded"
