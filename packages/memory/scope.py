@@ -450,10 +450,20 @@ VALUE_ATTRIBUTION_SCHEMA = "host-value-attribution-v1"
 #: строгий режим ADR-0029 (значение и первоисточник в одном фрагменте); `publication_window` —
 #: узкий второй режим: публикация первоисточника объявлена в предыдущих предложениях того же
 #: блока страницы. Поле записывается, чтобы более слабое основание было видно оператору.
+#: `bibliography_known_producer` (T7.107, ADR-0029 дополнение) — третий, самый узкий режим:
+#: страница назвала список источников, в нём стоит производитель X, значение утверждения
+#: измерено на странице, а ДРУГАЯ улика того же утверждения уже приписана X строгим режимом
+#: или режимом публикации (без цепочек новым режимом). Родитель записывается той же формой,
+#: что у строгого режима.
 VALUE_ATTRIBUTION_PAIRING_STRICT: Final = "value_and_primary_in_fragment"
 VALUE_ATTRIBUTION_PAIRING_PUBLICATION: Final = "publication_window"
+VALUE_ATTRIBUTION_PAIRING_BIBLIOGRAPHY: Final = "bibliography_known_producer"
 VALUE_ATTRIBUTION_PAIRINGS: Final[frozenset[str]] = frozenset(
-    {VALUE_ATTRIBUTION_PAIRING_STRICT, VALUE_ATTRIBUTION_PAIRING_PUBLICATION}
+    {
+        VALUE_ATTRIBUTION_PAIRING_STRICT,
+        VALUE_ATTRIBUTION_PAIRING_PUBLICATION,
+        VALUE_ATTRIBUTION_PAIRING_BIBLIOGRAPHY,
+    }
 )
 
 @dataclass(frozen=True)

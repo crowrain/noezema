@@ -62,6 +62,7 @@ from apps.research_proxy.source_attribution import (
     _canonical_number,
     _fragments,
     _mask_primary_aliases,
+    _mask_site_disclaimers,
     _relay_forecast_keys,
     is_home_host,
     named_primary_keys,
@@ -71,6 +72,7 @@ from apps.research_proxy.source_attribution import (
 from packages.domain.models.base import JsonDict
 from packages.memory.scope import (
     EVIDENCE_SELF_PUBLICATION_KEY,
+    VALUE_ATTRIBUTION_PAIRING_BIBLIOGRAPHY,
     VALUE_ATTRIBUTION_PAIRING_PUBLICATION,
     VALUE_ATTRIBUTION_PAIRING_STRICT,
     build_self_publication,
@@ -124,7 +126,21 @@ from packages.memory.scope import (
 #: (словарь действующих лиц `OTHER_SOURCE_ACTOR_MARKERS` переехал в детектор страниц без
 #: изменений и теперь один на оба режима). Поведение метода изменилось → номер поднят, и
 #: переатрибуция пересматривает записи эпох v2…v5 тем же предикатом.
-VALUE_ATTRIBUTION_METHOD_VERSION: Final = "host-value-attribution-v6"
+#: v7 (T7.107, стендовый дефект 7cfbe942/smart-lab): два изменения одного направления.
+#: (1) вето собственной оценки проверяется по копии скан-текста с вырезанными шаблонными
+#: плашками площадки (`SITE_DISCLAIMER_PHRASES`, `mask_site_disclaimers` в детекторе страниц) —
+#: плашка «Мнение владельца сайта может не совпадать с мнением автора» больше не делает блог
+#: самостоятельным исследованием; словарь маркеров не сокращён. (2) Добавлен ТРЕТИЙ, последний
+#: режим pairing — `bibliography_known_producer` (`_bibliography_known_producer_decision`):
+#: значение утверждения приписывается производителю X, когда на странице есть строка-список
+#: источников, в ней назван алиас X, значение измерено на странице, у ЭТОГО ЖЕ утверждения есть
+#: ДРУГАЯ улика с записью pairing строгого режима или режима публикации (ключи передаёт
+#: вызывающий — без цепочек новым режимом), ровно один известный производитель назван в
+#: списке, вето собственной оценки не сработало и страница не домашняя для X. Строгий режим и
+#: режим публикации решают первыми и не ослаблены ни на пункт: новый режим рассматривается
+#: только после их отказа. Поведение метода изменилось → номер поднят, и переатрибуция пересматривает
+#: записи эпох v2…v6 тем же предикатом «метка записи ≠ текущий метод».
+VALUE_ATTRIBUTION_METHOD_VERSION: Final = "host-value-attribution-v7"
 
 #: честный отказ этого детектора: первоисточник в основании назван, но значение там другое — не то,
 #: на котором стоит утверждение. Отличие от `no_value_attribution` (атрибуции нет вовсе) нужно,
@@ -380,6 +396,8 @@ _SENTENCE_BREAK: Final = re.compile(r"[.!?\u2026]+")
 #: как называется режим pairing.
 PAIRING_VALUE_AND_PRIMARY: Final = VALUE_ATTRIBUTION_PAIRING_STRICT
 PAIRING_PUBLICATION_WINDOW: Final = VALUE_ATTRIBUTION_PAIRING_PUBLICATION
+#: третий, самый узкий режим pairing (T7.107, ADR-0029 дополнение)
+PAIRING_BIBLIOGRAPHY_KNOWN_PRODUCER: Final = VALUE_ATTRIBUTION_PAIRING_BIBLIOGRAPHY
 
 
 @dataclass(frozen=True)
@@ -613,6 +631,110 @@ def _veto_zones(
     return zones
 
 
+# ─── T7.107 (ADR-0029 дополнение): третий режим pairing — список источников + известный производитель ──
+#
+# Стендовый дефект (утверждение 7cfbe942 «безработица 2,2% по данным Росстата», страница
+# smart-lab.ru/blog/1349924.php): блог пересказывает официальную цифру и честно перечисляет
+# источники внизу страницы («Источники: Росстат, обзор рынка труда hh.ru …, материалы Банка
+# России, …»), но ни строгий режим (пары «шаблон+алиас+значение» в теле нет), ни режим публикации
+# (публикация первоисточника не объявлена) не могли это увидеть, а вето сработало по плашке
+# площадки. Другая улика того же утверждения (interfax.ru/business/1119461) уже приписана
+# Росстату строгим режимом — знание о производителе утверждения УЖЕ ЕСТЬ у самого утверждения,
+# и его достаточно, чтобы прочесть строку-список как атрибуцию, не изобретая новый признак
+# «первоисточник на любой странице».
+#
+# Условия (все одновременно, fail-closed; ADR-0029 «Риски»: ложная склейка дороже пропуска):
+# (i)  на странице есть строка-список источников — строка нормализованного текста, начинающаяся
+#      с маркера ЗАКРЫТОГО списка `BIBLIOGRAPHY_LINE_MARKERS`, и в ЭТОЙ строке стоит словарный
+#      алиас производителя X;
+# (ii) число значения утверждения присутствует на странице как ИЗМЕРЕННОЕ число (тот же помощник
+#      `_measured_numbers`, что у режима публикации: «2026» годом не считается);
+# (iii) у ЭТОГО ЖЕ утверждения есть ДРУГАЯ улика, записанная pairing строгого режима или режима
+#      публикации, с primary_key = X; функция остаётся чистой — множество таких ключей передаёт
+#      вызывающий (`known_claim_primaries`), сами вызывающие его и собирают (`reattribution.py`,
+#      оркестратор). Цепочек нет: записью нового режима ключ не пополняется (собирающие читают
+#      pairing строгого режима и режима публикации);
+# (iv) ровно один известный производитель назван в строках-списках; два известных названы оба —
+#      отказ `ambiguous_primaries`; ни одного названного — честный отказ (не own_assessment);
+# (v)  вето собственной оценки (после маски плашек T7.107) на странице не сработало, и страница
+#      НЕ домашняя для X (первоисточник не пересказывает себя).
+#: маркеры начала строки-списка источников (закрытый список). «По данным:» и подобные шаблоны
+#: атрибуции сюда НЕ входят: они уже принадлежат строгому режиму.
+BIBLIOGRAPHY_LINE_MARKERS: Final[tuple[str, ...]] = (
+    "источник:",
+    "источники:",
+    "источники данных:",
+    "по материалам:",
+    "source:",
+    "sources:",
+)
+_BIBLIOGRAPHY_LINE: Final = re.compile(
+    r"^[ \t]*(?:" + "|".join(re.escape(marker) for marker in BIBLIOGRAPHY_LINE_MARKERS) + ")",
+    re.IGNORECASE,
+)
+
+
+def _bibliography_lines(scanned: str) -> list[str]:
+    """Строки нормализованного текста, начинающиеся с маркера закрытого списка (T7.107)."""
+    return [line for line in scanned.split("\n") if _BIBLIOGRAPHY_LINE.match(line)]
+
+
+def _bibliography_known_producer_decision(
+    *,
+    scanned_page: str,
+    canonical_uri: str | None,
+    values: tuple[str, ...],
+    known_claim_primaries: frozenset[str],
+) -> ValueAttributionDecision | None:
+    """Третий, последний режим pairing (T7.107): кому принадлежит значение утверждения, когда
+    страница назвала список источников, а производителя уже назвала другая улика того же
+    утверждения. None — честный отказ (условие не собрано); решение `ambiguous_primaries` —
+    два известных производителя названы. Родительский указатель разрешает вызывающий, как у
+    строгого режима."""
+    if not known_claim_primaries or not values:
+        return None  # известного производителя нет — новый режим нечем подтвердить (отказ)
+    if any(pattern.search(_mask_site_disclaimers(scanned_page)) for pattern in _OWN_ASSESSMENT):
+        return None  # (v) настоящая собственная оценка на странице — склейки не будет
+    lines = _bibliography_lines(scanned_page)
+    if not lines:
+        return None  # (i) строки-списка нет
+    if not any(number in _measured_numbers(scanned_page) for number in values):
+        return None  # (ii) значения утверждения на странице нет
+    named_known = [
+        (key, line)
+        for line in lines
+        for key in set(named_primary_keys(line)) & known_claim_primaries
+    ]
+    distinct_keys = {key for key, _line in named_known}
+    if len(distinct_keys) > 1:
+        # (iv) два известных производителя названы в списках — разночтение, не склеиваем
+        basis_line = next(line for key, line in named_known if key in distinct_keys)
+        return ValueAttributionDecision(
+            status=STATUS_AMBIGUOUS,
+            basis_fragment=_basis(basis_line),
+            claim_values=values,
+            pairing=PAIRING_BIBLIOGRAPHY_KNOWN_PRODUCER,
+        )
+    if not named_known:
+        return None  # (iv) известный производитель в списке не назван — честный отказ
+    key = next(iter(distinct_keys))
+    spec = primary_source(key)
+    if spec is None:  # защита: решение не строится на несуществующей записи словаря
+        return None
+    if is_home_host(canonical_uri, spec.home_hosts):
+        return None  # (v) страница самого X не бывает его пересказом
+    _named_key, basis_line = named_known[0]
+    return ValueAttributionDecision(
+        status=STATUS_DERIVATIVE,
+        primary_key=spec.key,
+        primary_name=spec.name,
+        parent_uri=spec.home_uri,
+        basis_fragment=_basis(basis_line),
+        claim_values=values,
+        pairing=PAIRING_BIBLIOGRAPHY_KNOWN_PRODUCER,
+    )
+
+
 def _publication_decision(
     *, scanned: str, canonical_uri: str | None, values: tuple[str, ...]
 ) -> ValueAttributionDecision | None:
@@ -746,6 +868,8 @@ def attribute_value_in_fragment(
     canonical_uri: str | None,
     text: str | None,
     claim_statement: str | None = None,
+    known_claim_primaries: frozenset[str] = frozenset(),
+    page_text: str | None = None,
 ) -> ValueAttributionDecision:
     """Кому принадлежит значение, на котором стоит утверждение.
 
@@ -753,6 +877,14 @@ def attribute_value_in_fragment(
     для уже существующей — весь сохранённый нормализованный текст страницы: долговременного фрагмента
     у строки улики нет, ограничение описано в STATUS T7.78). `canonical_uri` — адрес прочитанной
     страницы, `claim_statement` — формулировка утверждения (может отсутствовать).
+
+    T7.107: `known_claim_primaries` — primary_key производности, записанные pairing строгого режима
+    или режима публикации по ДРУГИМ уликам ЭТОГО ЖЕ утверждения; собирает их вызывающий
+    (`reattribution.py`, оркестратор), новый режим ключи не пополняет (цепочек нет). Пустое множество
+    — поведение ровно прежнее. `page_text` — весь нормализованный текст страницы, если он есть у
+    вызывающего: третий режим (`bibliography_known_producer`) читает строку-список источников по нему,
+    когда списка нет в основании улики; строгий режим и режим публикации решением `page_text` не
+    расширяются — их основанием остаётся `text`.
     """
     if not text:
         return ValueAttributionDecision(status=STATUS_NO_VALUE_ATTRIBUTION)
@@ -760,7 +892,9 @@ def attribute_value_in_fragment(
     scanned = normalize_scan_text(text)[:MAX_SCAN_CHARS]
     values = claim_value_numbers(claim_statement)
 
-    if any(pattern.search(scanned) for pattern in _OWN_ASSESSMENT):
+    # T7.107: вето собственной оценки — по копии с вырезанными шаблонными плашками площадки
+    # (`SITE_DISCLAIMER_PHRASES`); словарь маркеров не сокращён
+    if any(pattern.search(_mask_site_disclaimers(scanned)) for pattern in _OWN_ASSESSMENT):
         # своя оценка/альтернативный расчёт в основании улики: склеивать нельзя
         return ValueAttributionDecision(status=STATUS_OWN_ASSESSMENT, claim_values=values)
 
@@ -773,11 +907,27 @@ def attribute_value_in_fragment(
 
         `own_assessment` и `self_primary` сюда не приходят: первое — вето на весь документ,
         второе уже утверждает, что значение принадлежит прочитанной странице (отрицательный
-        контроль T7.85: собственная страница ЦБ по опросу «инФОМ» не становится пересказом)."""
+        контроль T7.85: собственная страница ЦБ по опросу «инФОМ» не становится пересказом).
+
+        Третий режим T7.107 (`_bibliography_known_producer_decision`) рассматривается только после
+        отказа обоих прежних — прежние режимы не ослаблены ни на пункт."""
         wider = _publication_decision(
             scanned=scanned, canonical_uri=canonical_uri, values=values
         )
-        return refusal if wider is None else wider
+        if wider is not None:
+            return wider
+        if not known_claim_primaries:
+            return refusal  # известного производителя утверждения нет — третьему режиму не на что опереться
+        bibliography_page = (
+            normalize_scan_text(page_text)[:MAX_SCAN_CHARS] if page_text is not None else scanned
+        )
+        bibliography = _bibliography_known_producer_decision(
+            scanned_page=bibliography_page,
+            canonical_uri=canonical_uri,
+            values=values,
+            known_claim_primaries=known_claim_primaries,
+        )
+        return refusal if bibliography is None else bibliography
 
     if not attributed:
         return fallback(

@@ -60,6 +60,10 @@ pytestmark = [pytest.mark.scenario]
 FIXTURE_DIR = Path(__file__).parent.parent / "fixtures" / "t7101"
 
 SINCE = datetime(2000, 1, 1, tzinfo=UTC)
+#: стенд T7.101 запечатан методом значений v6; с T7.107 текущий метод — v7, поэтому тест явно
+#: моделирует эпоху v6 подменой констант переатрибуции (тот же приём эпохи, что в
+#: `test_reattribute_stale_records`): таблица подписей закрепляет состояние стенда ЭПОХИ v6,
+#: а не случайный срез нового метода
 CURRENT_VALUE_METHOD = "host-value-attribution-v6"
 
 WEAK_LABEL = "Подтверждено слабо"
@@ -380,8 +384,15 @@ async def _run_window(
 
 @pytest.mark.asyncio
 async def test_twenty_stand_claims_label_table_was_becomes(
-    migrated_db: tuple[str, AsyncEngine], tmp_path: Path
+    migrated_db: tuple[str, AsyncEngine], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # эпоха v6 (комментарий у CURRENT_VALUE_METHOD): переатрибуция считает ТЕКУЩИМ методом v6,
+    # иначе стенд T7.101 пересматривался бы свежим v7 (T7.107) и таблица была бы о другом стенде
+    import apps.research_proxy.reattribution as reattribution
+
+    monkeypatch.setattr(reattribution, "CURRENT_VALUE_METHOD_VERSION", CURRENT_VALUE_METHOD)
+    monkeypatch.setattr(reattribution, "_SELF_PUBLICATION_METHOD", CURRENT_VALUE_METHOD)
+    monkeypatch.setattr(reattribution, "VALUE_ATTRIBUTION_METHOD_VERSION", CURRENT_VALUE_METHOD)
     scratch_url, engine = migrated_db
     store = FilesystemArtifactStore(tmp_path / "artifacts")
     claims, evidence = _load_fixture()

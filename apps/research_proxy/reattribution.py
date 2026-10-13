@@ -29,8 +29,10 @@ T7.98 (ADR-0029, узкая реализация «варианта C» из AGE
 
 T7.101 (ADR-0029 дополнение, ADR-0035 §19): у решения `self_primary` появился долговременный
 выход — запись о собственной публикации производителя (`packages/memory/scope.py::
-value_self_publication`). Переатрибуция — единственный механизм записи: новая улика рождается
-без неё (оркестратор пишет только производность), а перечитать окно умеет именно эта команда.
+value_self_publication`). Прежде эта команда была единственным механизмом такой записи: новая
+улика рождалась без неё, а перечитать окно умела только она. С T7.104 (ADR-0035 §20.7, этот
+абзац — закрытие того пункта) оркестратор сам дописывает собственную публикацию новой улике, и
+переатрибуции остаётся перечитывание уже сохранённых окон — включая прежние записи эпох метода.
 Запись не склеивает источники — для неё нет каскада переоценок (`changed_sources` не пополняется):
 группировка, оценки и движок правил эту запись не читают, её читает только витрина. Вето
 третьего актора (`SelfPublicationCandidate.actor_veto`, ADR-0035 §15) — честный отказ: значение
@@ -73,6 +75,9 @@ from packages.memory.reassessment import WorkerOutcome, run_reassessment_batch
 from packages.memory.scope import (
     EVIDENCE_SELF_PUBLICATION_KEY,
     EVIDENCE_VALUE_ATTRIBUTION_KEY,
+    VALUE_ATTRIBUTION_PAIRING_PUBLICATION,
+    VALUE_ATTRIBUTION_PAIRING_STRICT,
+    VALUE_ATTRIBUTION_SCHEMA,
     build_self_publication,
     build_value_attribution,
 )
@@ -668,6 +673,43 @@ async def _evidence_to_reevaluate(db: AsyncSession, source_id: uuid.UUID) -> lis
     ]
 
 
+async def _known_claim_primaries(
+    db: AsyncSession, *, claim_id: uuid.UUID, exclude_evidence_id: uuid.UUID
+) -> frozenset[str]:
+    """Ключи производности ЭТОГО ЖЕ утверждения, известные из других его улик (T7.107):
+    `primary_key` записей `value_attribution`, принятых pairing СТРОГОГО режима или режима
+    публикации (отсутствие pairing читается как строгий — тот же разбор, что
+    `parse_value_attribution`). Записи нового режима `bibliography_known_producer` в множество не
+    попадают: режим не разрешает строить решение на знании, порождённом самим собой (цепочек нет).
+    Улика, для которой собирают ключи, исключена: опираться можно только на ДРУГУЮ улику."""
+    return frozenset(
+        str(row["key"])
+        for row in (
+            await db.execute(
+                text(
+                    "SELECT DISTINCT e.scope -> 'value_attribution' ->> 'primary_key' AS key "
+                    "FROM evidence e "
+                    "WHERE e.claim_id = :c AND e.id <> :e AND e.evidence_kind = 'source_assertion' "
+                    "  AND jsonb_typeof(e.scope -> 'value_attribution') = 'object' "
+                    "  AND e.scope -> 'value_attribution' ->> 'schema' = :schema "
+                    "  AND COALESCE(e.scope -> 'value_attribution' ->> 'pairing', :strict) "
+                    "      IN (:strict, :publication) "
+                    "  AND e.scope -> 'value_attribution' ->> 'primary_key' IS NOT NULL"
+                ),
+                {
+                    "c": claim_id,
+                    "e": exclude_evidence_id,
+                    "schema": VALUE_ATTRIBUTION_SCHEMA,
+                    "strict": VALUE_ATTRIBUTION_PAIRING_STRICT,
+                    "publication": VALUE_ATTRIBUTION_PAIRING_PUBLICATION,
+                },
+            )
+        )
+        .mappings()
+        .all()
+    )
+
+
 async def _decided_evidence(db: AsyncSession, source_id: uuid.UUID) -> list[dict[str, Any]]:
     """Улики этого источника, решение по которым принято ТЕКУЩИМ методом: переатрибуция
     идемпотентна, и оператор обязан видеть, что пропущено и почему (молчание читалось бы как
@@ -770,10 +812,19 @@ async def _plan_evidence_window(
                     )
                 )
                 continue
+            # T7.107: производитель утверждения может быть уже известен другой уликой того же
+            # утверждения (запись строгого режима или режима публикации) — третий режим детектора
+            # читает об этом из строки-списка; новые ключи собираются здесь, режимом — нет (без цепочек)
+            known = await _known_claim_primaries(
+                db,
+                claim_id=uuid.UUID(claim_id),
+                exclude_evidence_id=uuid.UUID(str(item["evidence_id"])),
+            )
             decision = attribute_value_in_fragment(
                 canonical_uri=canonical_uri or None,
                 text=page_text,
                 claim_statement=statement,
+                known_claim_primaries=known,
             )
             if not decision.is_derivative:
                 # T7.101: `self_primary` — значение на прочитанной странице принадлежит её же

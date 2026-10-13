@@ -233,7 +233,7 @@ async def test_reattribute_marks_parents_and_regrades_honestly(
         record = dict(row["d"])
         # решение принято отложенным прогоном текущим страничным детектором — видно из provenance
         # (T7.85: метод v3, T7.98: v4 — relay прогноза; окно пересмотра — «любой метод, кроме текущего»)
-        assert record["method"] == "host-source-attribution-v4"
+        assert record["method"] == "host-source-attribution-v5"
         assert record["written_by"] == "research-reattribute"
         assert "Росстат" in record["basis_fragment"]
 

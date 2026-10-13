@@ -171,7 +171,14 @@ from packages.llm_gateway.roles import (
     tool_schema_hash,
 )
 from packages.memory.activation import ActivationInFlightError, activation_slot_busy
-from packages.memory.scope import EVIDENCE_VALUE_ATTRIBUTION_KEY, build_value_attribution
+from packages.memory.scope import (
+    EVIDENCE_VALUE_ATTRIBUTION_KEY,
+    VALUE_ATTRIBUTION_PAIRING_PUBLICATION,
+    VALUE_ATTRIBUTION_PAIRING_STRICT,
+    VALUE_ATTRIBUTION_SCHEMA,
+    build_value_attribution,
+    parse_value_attribution,
+)
 from packages.memory.session_admission import register_session_admission
 from packages.policy.engine import PolicyEngine
 from packages.policy.profiles import CapabilityProfile, ProfileError, effective_profile
@@ -2464,8 +2471,46 @@ class Orchestrator:
                 continue
             record.payload["assertion_text"] = fragment
 
+    async def _known_claim_primaries(self, db: AsyncSession, claim_id: uuid.UUID) -> frozenset[str]:
+        """Ключи производности уже существующего утверждения из записей его улик (T7.107):
+        pairing строгого режима или режима публикации (отсутствие pairing читается как строгий —
+        тот же разбор, что `parse_value_attribution`). Записи нового режима
+        `bibliography_known_producer` не учитываются: режим не строится на знании, порождённом
+        самим собой (цепочек нет). Строк новой улики в БД ещё нет — она родится на границе
+        коммита, поэтому здесь собираются только уже записанные улики якорного утверждения."""
+        return frozenset(
+            str(row["key"])
+            for row in (
+                await db.execute(
+                    text(
+                        "SELECT DISTINCT e.scope -> 'value_attribution' ->> 'primary_key' AS key "
+                        "FROM evidence e "
+                        "WHERE e.claim_id = :c AND e.evidence_kind = 'source_assertion' "
+                        "  AND jsonb_typeof(e.scope -> 'value_attribution') = 'object' "
+                        "  AND e.scope -> 'value_attribution' ->> 'schema' = :schema "
+                        "  AND COALESCE(e.scope -> 'value_attribution' ->> 'pairing', :strict) "
+                        "      IN (:strict, :publication) "
+                        "  AND e.scope -> 'value_attribution' ->> 'primary_key' IS NOT NULL"
+                    ),
+                    {
+                        "c": claim_id,
+                        "schema": VALUE_ATTRIBUTION_SCHEMA,
+                        "strict": VALUE_ATTRIBUTION_PAIRING_STRICT,
+                        "publication": VALUE_ATTRIBUTION_PAIRING_PUBLICATION,
+                    },
+                )
+            )
+            .mappings()
+            .all()
+        )
+
     async def _value_attribution(
-        self, db: AsyncSession, record: EvidenceRecord, claim_statement: str
+        self,
+        db: AsyncSession,
+        record: EvidenceRecord,
+        claim_statement: str,
+        known_claim_primaries: frozenset[str] = frozenset(),
+        page_text: str | None = None,
     ) -> JsonDict | None:
         """Происхождение ЗНАЧЕНИЯ этой улики (T7.78, ADR-0029): чей пересказ читает утверждение.
 
@@ -2486,6 +2531,11 @@ class Orchestrator:
             canonical_uri=str(record.payload.get("url") or "") or None,
             text=fragment,
             claim_statement=claim_statement,
+            # T7.107: третий режим pairing опирается на эти ключи; `page_text` — весь текст
+            # страницы, если он есть у сессии (строка-список источников может не попасть в
+            # окно улики). Строгий режим и режим публикации решением `page_text` не расширяются.
+            known_claim_primaries=known_claim_primaries,
+            page_text=page_text,
         )
         if decision.status == STATUS_SELF_PRIMARY:
             # T7.104 (ADR-0035 §19 дополнение): собственная публикация производителя на его
@@ -2855,6 +2905,16 @@ class Orchestrator:
             )
         # evidence links (M3): the only channel for evidence changes; the
         # trusted host recomputes every identity at the commit boundary
+        # T7.107 (ADR-0029 дополнение): третий режим детектора значений (`bibliography_known_producer`)
+        # знает о производителе утверждения только из ключей, собранных здесь. Два источника без
+        # перестройки цикла: (1) записи уже существующего утверждения — перепроверка и гейт дублей
+        # по значению дают `existing_claim_id`, читаем улики якоря из БД; (2) решения по другим
+        # уликам ЭТОГО ЖЕ утверждения в том же предложении (накапливаются по ходу цикла; staging
+        # виден в `evidence` только на границе коммита). Связка работает, если предшествующая
+        # улика несёт запись строгого режима или режима публикации; остальное догоняет переатрибуция
+        # `--evidence-level` (собирает те же ключи из записей БД) — gap честно зафиксирован в
+        # STATUS T7.107.
+        known_primaries_by_claim: dict[int, set[str]] = {}
         for link in proposal.evidence_links:
             if link.claim_index in dropped:
                 # T7.105: связь снятой операции снимается вместе с ней (с причиной в записи
@@ -2871,13 +2931,33 @@ class Orchestrator:
             if 0 <= link.evidence_index < len(ctx.evidence) and 0 <= link.claim_index < len(
                 proposal.claims
             ):
+                evidence_record = ctx.evidence[link.evidence_index]
+                known_keys = set(known_primaries_by_claim.get(link.claim_index, set()))
+                anchor_claim_id = staged_claims[link.claim_index].existing_claim_id
+                if anchor_claim_id:
+                    # перепроверка/склейка по значению: якорь уже в БД — читаем его записанные улики
+                    known_keys |= await self._known_claim_primaries(db, uuid.UUID(str(anchor_claim_id)))
                 origin = await self._value_attribution(
                     db,
-                    ctx.evidence[link.evidence_index],
+                    evidence_record,
                     proposal.claims[link.claim_index].statement,
+                    known_claim_primaries=frozenset(known_keys),
+                    page_text=ctx.evidence_source_texts.get(evidence_record.identity_hash),
                 )
                 if origin is not None:
                     evidence_payload.update(origin)
+                    written_attribution = parse_value_attribution(origin)
+                    if (
+                        written_attribution is not None
+                        and written_attribution.pairing
+                        in (VALUE_ATTRIBUTION_PAIRING_STRICT, VALUE_ATTRIBUTION_PAIRING_PUBLICATION)
+                        and written_attribution.primary_key
+                    ):
+                        # T7.107: это решение — известная производность того же утверждения для
+                        # следующих улик цикла; запись нового режима сюда не попадает (без цепочек)
+                        known_primaries_by_claim.setdefault(link.claim_index, set()).add(
+                            written_attribution.primary_key
+                        )
             await staging.record(
                 db,
                 audit,

@@ -287,7 +287,8 @@ async def test_evidence_level_decision_merges_the_page_with_the_primary(
     # T7.85a/T7.85b/T7.85c: метод значений v5 (строгое pairing осталось; после честного отказа
     # возможно оконное решение с вето «другого источника числа»; здесь решает строгий pairing);
     # T7.98: v6 (relay в строгом режиме); схема записи при этом остаётся host-value-attribution-v1
-    assert record["method"] == "host-value-attribution-v6"
+    # T7.107: v7 (маска плашки площадки + третий pairing-режим; строгий pairing здесь не тронут)
+    assert record["method"] == "host-value-attribution-v7"
     assert "По данным Росстата" in record["basis_fragment"]
     # эффективный родитель — тот же якорь первоисточника, что уже создан страничным указателем
     anchor = await _scalar(scratch_url, "SELECT id::text AS id FROM sources WHERE canonical_uri = :u", {"u": "https://rosstat.gov.ru/"})

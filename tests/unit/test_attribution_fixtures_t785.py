@@ -155,7 +155,7 @@ def test_page_decisions_on_stand_texts() -> None:
     for name, (status, primary) in expected_page.items():
         decision = detect_source_attribution(canonical_uri=STAND_URI[name], text=_text(name))
         assert (decision.status, decision.primary_key) == (status, primary), name
-    assert ATTRIBUTION_METHOD_VERSION == "host-source-attribution-v4"
+    assert ATTRIBUTION_METHOD_VERSION == "host-source-attribution-v5"
 
 
 @pytest.mark.parametrize(
@@ -213,7 +213,7 @@ def test_value_decisions_on_stand_texts(
     )
     assert (decision.status, decision.primary_key) == (status, primary), (name, statement[:40])
     assert decision.pairing == pairing, (name, statement[:40])
-    assert VALUE_ATTRIBUTION_METHOD_VERSION == "host-value-attribution-v6"
+    assert VALUE_ATTRIBUTION_METHOD_VERSION == "host-value-attribution-v7"
 
 
 def test_publication_window_never_overrides_a_refusal_of_its_own_kind() -> None:
