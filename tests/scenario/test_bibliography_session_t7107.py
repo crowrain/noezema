@@ -40,7 +40,7 @@ from tests.scenario.test_scope_coverage import _scalar, _seed_question
 
 pytestmark = [pytest.mark.scenario]
 
-CURRENT_VALUE_METHOD = "host-value-attribution-v9"
+CURRENT_VALUE_METHOD = "host-value-attribution-v10"
 SINCE_ISO = "2000-01-01T00:00:00+00:00"
 
 PLAQUE = (

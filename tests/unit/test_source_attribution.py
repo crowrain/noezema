@@ -86,7 +86,7 @@ def test_retelling_of_a_release_is_derivative(uri: str, text: str) -> None:
     # версия метода закреплена: T7.85 поднял её (алиасы/шаблоны по замерам живых страниц и
     # схлопывание пробела при склейке фрагмента), T7.98 — до v4 (relay-кандидат прогноза).
     # Само это решение — из v1, оно не изменилось.
-    assert ATTRIBUTION_METHOD_VERSION == "host-source-attribution-v6"
+    assert ATTRIBUTION_METHOD_VERSION == "host-source-attribution-v7"
 
 
 # ─── пересказ опознаётся и по-английски ──────────────────────────────────
@@ -399,4 +399,4 @@ def test_typography_fix_bumps_the_method_version() -> None:
     # пересматривает переатрибуция, а не отмена (STATUS T7.85, ADR-0029 дополнение).
     # T7.98 поднял версию до v4 тем же способом: relay-кандидат «первоисточник + глагол
     # прогноза + значение» без шаблона (ADR-0029 дополнение, STATUS T7.98).
-    assert ATTRIBUTION_METHOD_VERSION == "host-source-attribution-v6"
+    assert ATTRIBUTION_METHOD_VERSION == "host-source-attribution-v7"

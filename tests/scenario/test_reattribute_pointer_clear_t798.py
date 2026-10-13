@@ -328,7 +328,7 @@ async def test_pointer_clear_then_value_records_merge_groups_to_e1(
     for row in origins:
         record = dict(row["origin"])
         assert record["primary_key"] == "cbr" and record["primary_name"] == "Банк России"
-        assert record["method"] == "host-value-attribution-v9"
+        assert record["method"] == "host-value-attribution-v10"
         assert record["pairing"] == "value_and_primary_in_fragment"
         assert str(record["parent_source_id"]) == cbr_anchor
         assert "Банк России" in record["basis_fragment"]
