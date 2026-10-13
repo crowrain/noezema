@@ -442,34 +442,137 @@ def claim_value_numbers(statement: str | None) -> tuple[str, ...]:
     return tuple(sorted(_measured_numbers(normalize_scan_text(statement))))
 
 
+# ─── T7.108a (ADR-0034 §10): текстовые формы значения для гейта «значение на связи» ──────
+#
+# Поиск значения по стороне ТЕКСТА идёт не жадными токенами `VALUE_NUMBER_PATTERN`: жадный
+# токен склеивает соседние ячейки таблицы («2026 2,3 2,2» — строка таблицы Росстата)
+# через пробел, табуляцию, перевод строки и точку в один токен и тем самым прячет значение,
+# которое на странице стоит. Решения детекторов атрибуции (`_measured_numbers`,
+# `claim_value_numbers`, гварды relay), их версии и сам `VALUE_NUMBER_PATTERN` не изменены:
+# текстовые формы читает только гейт (`claim_values_found_in_texts`).
+
+_DECIMAL_SEPARATORS: Final = ".,"
+#: хвостовые нули дробной части в тексте: 2,2 ≡ 2,20; принимаются и более длинные хвосты
+#  (до потолка включительно).
+_MAX_TRAILING_ZEROS: Final = 3
+
+
+def _grouped_digits(digits: str) -> tuple[str, ...]:
+    """Формы целого числа: голые цифры и группы по три цифры через одиночный пробел
+    («1649» → «1649», «1 649»). После `normalize_scan_text` в тексте не остаётся
+    неразрывных и узких пробелов — они уже становятся обычными, поэтому пробел — единственный
+    видный гейту разделитель группировки. Группировка ровно по три цифры: «16 49» — не форма
+    числа 1649."""
+    if len(digits) < 4:
+        return (digits,)
+    groups: list[str] = []
+    rest = digits
+    while len(rest) > 3:
+        groups.insert(0, rest[-3:])
+        rest = rest[:-3]
+    groups.insert(0, rest)
+    return (digits, " ".join(groups))
+
+
+def _value_text_forms(value: str) -> tuple[str, ...]:
+    """Способы записать это каноническое значение в тексте: десятичный разделитель «.» или «,»;
+    хвостовые нули дробной части необязательны (2,2 ≡ 2,20); целая часть и целые значения —
+    с группировкой разрядов по три цифры («1 649» ≡ «1649»). Значение с несколькими точками
+    (патологический склеенный токен на стороне утверждения) остаётся пословным: каждая точка
+    заменяется «.» или «,», группировки и хвостовых нулей к нему не применяется.
+    """
+    parts = value.split(".")
+    if not all(part.isdigit() for part in parts):
+        return (value,)  # защитный путь: каноника не чисто цифровая — только дословное совпадение
+    if len(parts) > 2:
+        tails: list[str] = [""]
+        for part in reversed(parts[1:]):
+            tails = [sep + part + tail for tail in tails for sep in _DECIMAL_SEPARATORS]
+        return tuple(parts[0] + tail for tail in tails)
+    head_forms = _grouped_digits(parts[0])
+    frac_min = parts[1].rstrip("0") if len(parts) == 2 else None
+    forms: list[str] = []
+    for head_form in head_forms:
+        if frac_min:
+            for zeros in range(0, _MAX_TRAILING_ZEROS + 1):
+                for sep in _DECIMAL_SEPARATORS:
+                    forms.append(f"{head_form}{sep}{frac_min}{'0' * zeros}")
+        else:
+            forms.append(head_form)  # целое (или нулевая дробь): голое число — законная запись
+            for zeros in range(1, _MAX_TRAILING_ZEROS + 1):
+                for sep in _DECIMAL_SEPARATORS:
+                    forms.append(f"{head_form}{sep}{'0' * zeros}")
+    return tuple(forms)
+
+
+def _form_is_standalone(text: str, start: int, end: int, *, glued_space: bool) -> bool:
+    """Отдельно стоящая запись значения: перед формой нет цифры и нет пары «цифра + разделитель»
+    (это хвост другого числа: «122,2», «12,2», «3.2»), после формы нет цифры и нет пары
+    «разделитель + цифра» (это начало другого числа: «2,21», «2,2.5»). Пробел, табуляция,
+    перевод строки и точка с пробелом ПЕРЕД значением не препятствуют («2026 2,2»,
+    «Таблица 3. 2,2%»). Для сгруппированной формы дополнительно блокируется стык с соседней
+    группой цифр через пробел («1 12 345» не подтверждает 12345): пробел внутри группировки —
+    часть числа, а не межсловный промежуток."""
+    before_glue = any(
+        (
+            start > 0 and text[start - 1].isdigit(),
+            start > 1 and text[start - 1] in _DECIMAL_SEPARATORS and text[start - 2].isdigit(),
+            glued_space and start > 1 and text[start - 1] == " " and text[start - 2].isdigit(),
+        )
+    )
+    after_glue = any(
+        (
+            end < len(text) and text[end].isdigit(),
+            end + 1 < len(text) and text[end] in _DECIMAL_SEPARATORS and text[end + 1].isdigit(),
+            glued_space and end + 1 < len(text) and text[end] == " " and text[end + 1].isdigit(),
+        )
+    )
+    return not (before_glue or after_glue)
+
+
 def claim_values_found_in_texts(
     *, values: frozenset[str], texts: Iterable[str | None]
 ) -> frozenset[str]:
-    """T7.108 (часть а, ADR-0034 §10): какие значения утверждения встречаются в текстах улики.
+    """T7.108 (часть а, ADR-0034 §10; правка границ T7.108a): какие значения утверждения
+    встречаются в текстах улики.
 
-    То же сравнение чисел, что у детектора атрибуции: `VALUE_NUMBER_PATTERN` целыми максимально
-    жадными токенами + `_canonical_number` (запятая → точка). Отличие от `_measured_numbers`:
-    со стороны ТЕКСТА единица измерения не требуется — табличная страница пишет «2.2» без «%».
-    Число внутри другого числа («122,2» против «2,2») и граничные числа страницы (размер файла
-    «52.22 Кб», объём «12,2 Мб», годы выпуска) подтверждением не считаются: сопоставление целым
-    токеном. Максимально-жадный токен наследует и его quirk («12 2,2» читается одним числом
-    «122.2») — ограничение зафиксирован в ADR-0034 §10; он не открывает ложного подтверждения:
-    слить два числа в одно можно, выдумать значение утверждения из текста — нельзя.
+    Сторона утверждения не изменена: набор значений даёт `claim_value_numbers` (тот же
+    `_canonical_number`, что у детекторов). Сторона ТЕКСТА (T7.108a): значение найдено, если в
+    тексте есть его ТЕКСТОВАЯ ФОРМА (`_value_text_forms`: десятичный разделитель «.» или «,»,
+    допустимые хвостовые нули дробной части — 2,2 ≡ 2,20; целые и сгруппированные значения —
+    группы по три цифры через пробел, «1 649» ≡ «1649»), перед которой не стоит цифра и не
+    стоит пара «цифра + разделитель», и после которой не стоит цифра и не стоит пара
+    «разделитель + цифра» (`_form_is_standalone`). Пробел, табуляция, перевод строки и точка
+    с пробелом перед значением не препятствуют: табличные строки первоисточников («2026 2,3 2,2»,
+    «Таблица 3. 2,2%») подтверждают значение — прежде жадный токен склеивал соседние ячейки
+    в одно число и гейт снимал законные связи именно с первичных страниц. Число внутри другого
+    числа («122,2» против «2,2») и граничные числа страницы (размер файла «52.22 Кб», объём
+    «12,2 Мб», годы выпуска) подтверждением не считаются — их блокируют границы формы.
+    Соседние ячейки больше не склеиваются: «12 2,2» находит 2,2 как вторую ячейку — это допустимо
+    (группировка разрядов идёт тройками, «12 2,2» не может быть числом 122,2; ADR-0034 §10).
+    Со стороны ТЕКСТА единица измерения не требуется — табличная страница пишет «2.2» без «%».
     Бюджет сканирования общий с детектором страниц: `MAX_SCAN_CHARS` (тот же
     `RESEARCH_CONTEXT_BUDGET`); сохранённый текст страницы длиннее бюджета всё равно не существует.
     """
     if not values:
         return frozenset()
-    value_set = set(values)
+    forms = {value: _value_text_forms(value) for value in values}
     found: set[str] = set()
     for text in texts:
         if not text:
             continue
         scanned = normalize_scan_text(text)[:MAX_SCAN_CHARS]
-        for match in VALUE_NUMBER_PATTERN.finditer(scanned):
-            canonical = _canonical_number(match.group())
-            if canonical in value_set:
-                found.add(canonical)
+        for value, value_forms in forms.items():
+            if value in found:
+                continue
+            for form in value_forms:
+                glued_space = " " in form
+                start = scanned.find(form)
+                while start != -1:
+                    if _form_is_standalone(scanned, start, start + len(form), glued_space=glued_space):
+                        found.add(value)
+                        break
+                    start = scanned.find(form, start + 1)
     return frozenset(found)
 
 
