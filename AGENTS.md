@@ -1104,9 +1104,12 @@ config-v20 — `2b065470…`, хеш файла — другое число; о�
   отклоняет ответ куратора ЦЕЛИКОМ (любой из четырёх гейтов после модельного ответа: structural, снятие
   перепроверкой всех операций, as_of, движок правил), ровно ОДИН раз на вызов куратора (= на сессию)
   предложение возвращается модели вторым запросом с разделом «# Исправление предложения»
-  (`apps/orchestrator/curator_correction.py`, потолок `CORRECTION_SECTION_MAX_CHARS = 6000`, причины и
-  JSON режутся целыми записями) и перепроверяется тем же помощником `_curator_boundary` (до staging —
-  только чтения). Маркеры: событие SESSION_STATE_CHANGED с ключом `curator_correction_requested` (причины
+  (`apps/orchestrator/curator_correction.py`, потолок `CORRECTION_SECTION_MAX_CHARS = 24000`;
+  T7.106a: раздел не теряет операции — JSON полный без omitted-счётчиков, перечень `[i]` по всем
+  claims, целыми строками режутся только причины; не помещается — раунда нет: прежний отказ плюс
+  аддитивный `correction_skipped` {reason, chars, limit}, второго обращения нет) и перепроверяется
+  тем же помощником `_curator_boundary` (до staging — только чтения). Маркеры: событие
+  SESSION_STATE_CHANGED с ключом `curator_correction_requested` (причины
   дословно + дайджест ПЕРВОГО ответа, summary «curator proposal returned for one correction round») —
   единственный новый ключ на ленте отказа, поэтому фильтр `payload ? 'curator_rejected'` по-прежнему видит
   РОВНО ОДИН отказ; аддитивный `correction_round` — в `claim_created` (принято после раунда) или в payload
