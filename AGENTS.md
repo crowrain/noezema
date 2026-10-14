@@ -305,6 +305,7 @@ config-v20 — `2b065470…`, хеш файла — другое число; о�
   proxy и поисковый движок о них не знают. Тесты: `tests/unit/test_search_query_hygiene_t7111.py`,
   `tests/scenario/test_explorer_query_hygiene_t7111.py`, `tests/unit/test_host_availability_t7111.py`,
   `tests/scenario/test_explorer_host_availability_t7111.py`.
+- Дополнение к предыдущему пункту (T7.111a, 2026-10-14): решение пункта (а) — без порога: отклоняется новый запрос, не приносящий ни одного нового содержательного слова относительно выполненных ранее поисков сессии (основы слов схлопываются `_prefix_stem`, числа как есть, служебные слова — закрытый список `SEARCH_QUERY_SERVICE_WORDS` вне сравнения; `SEARCH_QUERY_NEAR_DUP_JACCARD` и `..._MIN_WORDS` удалены, доля Жаккара осталась только справочно в payload); перестановка, смена периода/актора со старым набором слов и повтор без новых слов отклоняются, любое новое слово — проход; пересчёт фикстуры 11 -> 6 (STATUS T7.111a, ADR-0036 §1а).
 - Eval/wake/smoke исполняют инструменты через `StubToolExecutor` (dev-подставка, хост .87 без изоляции —
   риск python.execute осознанный DEV ONLY); sandboxed ToolBroker — только в тестах. Из списка инструментов
   снапшота при этом живут и неисполнимые в stub: shell.execute → Observation `tool_not_supported:` (T7.57(b),
