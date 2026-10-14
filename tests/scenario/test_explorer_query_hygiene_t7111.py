@@ -1,13 +1,14 @@
-"""Scenario (T7.111 часть 1; поправка T7.111a): почти-повтор поискового запроса отклоняется в
-живом цикле сессии, смена периода и актора — выполняется.
+"""Scenario (T7.111 часть 1; поправки T7.111a и T7.112б): почти-повтор поискового запроса
+отклоняется в живом цикле сессии, законная смена угла и сужение/расширение — выполняются.
 
-`web.search`, который не приносит ни одного нового содержательного слова относительно уже
-ВЫПОЛНЕННЫХ запросов этой сессии (основы слов нового запроса — подмножество основ прежнего),
-отклоняется как T7.12 (ACTION_FAILED c `denied: True`, без строки действия) и стоит один шаг.
-Расширение формулировки новым словом («прогноз») после поправки T7.111a выполняется. Тексты
-запросов — из замера менеджера (сессия b357a12b, фикстура `fixtures-t7111/step-budget-2026-10-14.txt`).
-Отдельный тест: перебор акторов («ВТБ …» -> «Газпромбанк …») выполняется в сессии — ровно та
-независимая сторона, ради которой делался T7.111.
+`web.search`, чьи основы содержательных слов РАВНЫ основам уже ВЫПОЛНЕННОГО запроса этой
+сессии (правило T7.112 (б) вместо «подмножество» T7.111a; ADR-0036 §1а), отклоняется как
+T7.12 (ACTION_FAILED c `denied: True`, без строки действия) и стоит один шаг. Расширение
+формулировки новым словом («прогноз»), смена актора и сужение запроса (меньше акторов, чем в
+прежнем — случай стендовой сессии 73c33c72) выполняются. Тексты запросов — из замера
+менеджера (сессия b357a12b, фикстура `fixtures-t7111/step-budget-2026-10-14.txt`).
+Отдельные тесты: перебор акторов («ВТБ …» -> «Газпромбанк …») и сужение широкого запроса по
+банкам — ровно та независимая сторона, ради которой делался T7.111.
 
 Поисковый движок — локальный фейк SearXNG; внешних запросов тест не делает.
 """
@@ -178,10 +179,10 @@ async def test_near_duplicate_search_is_denied_like_t712(
     fake_llm: FakeLLM,
     tmp_path: Path,
 ) -> None:
-    """Повтор-копия, повтор без слова «год» и перестановка слов отклоняются с названием прежнего
-    запроса и его шага; расширение формулировки новым словом «прогноз» и смена угла (назвать
-    акторов) выполняются (поправка T7.111a). Шаги считаются как прежде (T7.76): каждая попытка —
-    шаг, отказанная тоже."""
+    """Повтор-копия, повтор без слова «год» (основы равны: «год» — служебное слово T7.112б)
+    и перестановка слов отклоняются с названием прежнего запроса и его шага; расширение
+    формулировки новым словом «прогноз» и смена угла (назвать акторов) выполняются (поправки
+    T7.111a, T7.112б). Шаги считаются как прежде (T7.76): каждая попытка — шаг, отказанная тоже."""
     scratch_url, engine = migrated_db
     store = FilesystemArtifactStore(tmp_path / "artifacts")
     result = await _run_online(
@@ -305,4 +306,69 @@ async def test_actor_switch_in_session_runs(
     executed = await _rows(scratch_url, "SELECT count(*) FROM actions WHERE tool = 'web.search'")
     assert executed[0][0] == 2
     assert outcome.steps == 3
+    assert fake_llm.state()["queue_left"] == 0
+
+
+async def test_narrowing_from_a_broad_actor_query_runs(
+    migrated_db: tuple[str, Any],
+    search_engine: FakeSearchEngine,
+    fake_llm: FakeLLM,
+    tmp_path: Path,
+) -> None:
+    """Случай стендовой сессии 73c33c72 (решение пользователя 2026-10-14): после широкого
+    запроса про несколько банков следуют сужения по одному банку. Было (T7.111a «без новых
+    слов»): сужения отклонялись и ломали вторую линию независимых оценок; стало (T7.112 (б)
+    равенство основ): основы сужений НЕ равны основам широкого запроса — оба выполняются.
+    Буквальный повтор сужения по-прежнему отказ (основы равны), и это единственный отказ."""
+    scratch_url, engine = migrated_db
+    store = FilesystemArtifactStore(tmp_path / "artifacts")
+    result = await _run_online(
+        engine,
+        _curated_payload(["research.fetch", "web.search"], search_engine.base, search_engine.allowlist),
+    )
+    assert result.state == "active"
+    question_id = await _seed_question(
+        scratch_url, "Какой прогноз инфляции в России на 2026 год дают крупные банки и аналитики?"
+    )
+
+    gateway = _gateway(fake_llm)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    orch = Orchestrator(
+        session_factory=factory,
+        gateway=gateway,
+        profile=ModelProfile(model_alias="fake-thinker"),
+        executor=StubToolExecutor(tmp_path / "ws"),
+        research_service=ResearchProxyService(factory, store),
+    )
+    broad = "прогноз инфляции 2026 год Сбербанк ВТБ Альфа-Банк Газпромбанк аналитики"
+    gazprom = "Газпромбанк прогноз инфляции 2026 год"
+    vtb = "ВТБ прогноз инфляции 2026 год аналитики"
+    fake_llm.script(
+        [
+            _search_call(broad),  # шаг 1: выполняется
+            _search_call(gazprom),  # шаг 2: сужение -> выполняется (T7.112б; было: отказ)
+            _search_call(vtb),  # шаг 3: сужение с новым набором -> выполняется (было: отказ)
+            _search_call(vtb),  # шаг 4: буквальный повтор шага 3 -> отказ (основы равны)
+            copy.deepcopy(_COMPLETE),  # шаг 5
+            copy.deepcopy(_CURATOR),
+        ]
+    )
+    try:
+        outcome = await orch.run_session(question_id)
+    finally:
+        await gateway.close()
+    assert outcome.final_state is SessionState.SUCCEEDED
+
+    denials = await _rows(
+        scratch_url,
+        "SELECT payload->>'similar_step', payload->>'similarity' FROM audit_events "
+        "WHERE type = :t AND payload->>'reason' = 'search_query_near_duplicate' ORDER BY sequence",
+        {"t": AuditEventType.ACTION_FAILED.value},
+    )
+    assert [(row[0], row[1]) for row in denials] == [("3", "1.0")], (
+        "сужения широкого запроса не могут быть почти-повторами; повтор — может (STATUS T7.112)"
+    )
+    executed = await _rows(scratch_url, "SELECT count(*) FROM actions WHERE tool = 'web.search'")
+    assert executed[0][0] == 3
+    assert outcome.steps == 5  # 4 попытки поиска + complete (учёт T7.76 не менялся)
     assert fake_llm.state()["queue_left"] == 0
