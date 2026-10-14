@@ -58,8 +58,10 @@ from apps.orchestrator.tool_context import (
     TOOL_CONTEXT_ADDENDA_CHARS,
     fetch_url_key,
     render_repeat_fetch_note,
+    render_search_near_duplicate_note,
     render_step_budget,
     render_tool_argument_schemas,
+    search_near_duplicate,
 )
 from apps.orchestrator.value_duplicate import (
     ValueDuplicateCandidate,
@@ -1736,6 +1738,12 @@ class Orchestrator:
         # есть в тексте источника, и вырезает окно из текста источника — текст модели
         # в доказательство не попадает и payload улики не расширяется.
         rationale_lines: list[str] = []
+        # T7.111 (часть 1, решение пользователя 2026-10-14): ранее ВЫПОЛНЕННЫЕ запросы web.search
+        # этой сессии (текст, шаг). Почти-повтор по множеству слов отклоняется до исполнения —
+        # результаты прежнего поиска уже наблюдались выше. Записываются только успешно выполненные
+        # поиски: у неудачного поиска результатов выше нет, и его перезапуск другой формулировкой —
+        # законная смена стратегии.
+        session_search_queries: list[tuple[str, int]] = []
         for step in range(1, max_steps + 1):
             steps = step
 
@@ -1993,6 +2001,35 @@ class Orchestrator:
                 )
                 continue
 
+            # T7.111 (часть 1, решение пользователя 2026-10-14): web.search, множество
+            # нормализованных слов которого совпадает с ранее выполненным поиском этой
+            # сессии (Жаккар >= SEARCH_QUERY_NEAR_DUP_JACCARD), — почти повтор: результаты
+            # прежнего запроса уже наблюдались выше, и перезапуск теми же словами шаг только
+            # сжигает. Отклонение до исполнения, записанное тем же способом, что и T7.12
+            # (ACTION_FAILED с `denied: True`); учёт шага не менялся (T7.76): отказ стоит шаг.
+            if tool_name == "web.search":
+                near = search_near_duplicate(str(args.get("query", "")), session_search_queries)
+                if near is not None:
+                    similar_query, similar_step, ratio = near
+                    await audit.record(
+                        AuditEventType.ACTION_FAILED,
+                        session_id=session.id,
+                        payload={
+                            "denied": True,
+                            "reason": "search_query_near_duplicate",
+                            "tool": tool_name,
+                            "arguments_hash": args_hash,
+                            "similar_query": similar_query[:200],
+                            "similar_step": similar_step,
+                            "similarity": round(ratio, 3),
+                        },
+                        public_summary=f"search query near duplicate (denied): {tool_name}",
+                    )
+                    ctx.observations.append(
+                        render_search_near_duplicate_note(step, similar_query, similar_step, ratio)
+                    )
+                    continue
+
             action = ORMAction(
                 session_id=session.id,
                 model_run_id=run.id,
@@ -2156,6 +2193,11 @@ class Orchestrator:
                     )
                 continue
             if tool_name == "web.search" and obs.ok:
+                # T7.111 (часть 1): выполненный успешно поиск записывается как прежний запрос
+                # сессии — следующие почти-повторы будут отклонены. Неудачный поиск (отказ
+                # движка, лимит) не записывается: его результатов выше нет, и перезапуск
+                # другой формулировкой — законное восстановление стратегии.
+                session_search_queries.append((str(args.get("query", "")), step))
                 # T7.71 (§5.12.1): a search hit is navigation, not knowledge and not evidence —
                 # observation_to_evidence has no mapping for web.search by design (asserted in tests), so
                 # nothing below turns it into an evidence/source/artifact row. The rendered fenced block
