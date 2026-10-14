@@ -1,10 +1,13 @@
-"""Scenario (T7.111 часть 1): почти-повтор поискового запроса отклоняется в живом цикле сессии.
+"""Scenario (T7.111 часть 1; поправка T7.111a): почти-повтор поискового запроса отклоняется в
+живом цикле сессии, смена периода и актора — выполняется.
 
-`web.search`, множество слов которого совпадает (Жаккар >= 0,6) с уже ВЫПОЛНЕННЫМ запросом этой
-сессии, отклоняется как T7.12 (ACTION_FAILED c `denied: True`, без строки действия) и стоит один
-шаг. Тексты запросов — из замера менеджера (сессия b357a12b, фикстура
-`fixtures-t7111/step-budget-2026-10-14.txt`): повтор-копия, перестановка слов и расширение
-формулировки. Смена угла (назвать акторов вместо перефразы) выполняется.
+`web.search`, который не приносит ни одного нового содержательного слова относительно уже
+ВЫПОЛНЕННЫХ запросов этой сессии (основы слов нового запроса — подмножество основ прежнего),
+отклоняется как T7.12 (ACTION_FAILED c `denied: True`, без строки действия) и стоит один шаг.
+Расширение формулировки новым словом («прогноз») после поправки T7.111a выполняется. Тексты
+запросов — из замера менеджера (сессия b357a12b, фикстура `fixtures-t7111/step-budget-2026-10-14.txt`).
+Отдельный тест: перебор акторов («ВТБ …» -> «Газпромбанк …») выполняется в сессии — ровно та
+независимая сторона, ради которой делался T7.111.
 
 Поисковый движок — локальный фейк SearXNG; внешних запросов тест не делает.
 """
@@ -175,9 +178,10 @@ async def test_near_duplicate_search_is_denied_like_t712(
     fake_llm: FakeLLM,
     tmp_path: Path,
 ) -> None:
-    """Повтор-копия и две перефразы выполненного запроса отклоняются с названием прежнего запроса
-    и его шага; смена угла (назвать акторов) выполняется. Шаги считаются как прежде (T7.76):
-    каждая попытка — шаг, отказанная тоже."""
+    """Повтор-копия, повтор без слова «год» и перестановка слов отклоняются с названием прежнего
+    запроса и его шага; расширение формулировки новым словом «прогноз» и смена угла (назвать
+    акторов) выполняются (поправка T7.111a). Шаги считаются как прежде (T7.76): каждая попытка —
+    шаг, отказанная тоже."""
     scratch_url, engine = migrated_db
     store = FilesystemArtifactStore(tmp_path / "artifacts")
     result = await _run_online(
@@ -204,8 +208,8 @@ async def test_near_duplicate_search_is_denied_like_t712(
             _search_call(SALARY_COPY),  # шаг 2: копия -> отказ (1.0 от шага 1)
             _search_call(ROSSTAT_SALARY_1),  # шаг 3: другой показатель -> выполняется
             _search_call(ROSSTAT_SALARY_2),  # шаг 4: та же формулировка без слова «год» -> отказ (0.833 от шага 3)
-            _search_call(SALARY_REORDERED),  # шаг 5: перестановка слов -> отказ (0.769 от шага 1)
-            _search_call(SALARY_EXTENDED),  # шаг 6: та же формулировка + «прогноз» -> отказ (0.923 от шага 1)
+            _search_call(SALARY_REORDERED),  # шаг 5: перестановка слов и падеж -> отказ (0.769 от шага 1)
+            _search_call(SALARY_EXTENDED),  # шаг 6: та же формулировка + «прогноз» -> выполняется (T7.111a)
             _search_call(SALARIED_ANALYSTS),  # шаг 7: назвать акторов -> выполняется (законная смена угла)
             copy.deepcopy(_COMPLETE),  # шаг 8
             copy.deepcopy(_CURATOR),
@@ -224,13 +228,14 @@ async def test_near_duplicate_search_is_denied_like_t712(
         "ORDER BY sequence",
         {"t": AuditEventType.ACTION_FAILED.value},
     )
-    assert len(denials) == 4, "копия, повтор без слова и две перефразы обязаны быть отклонены"
-    assert [(row[0], row[1]) for row in denials] == [("1", "1.0"), ("3", "0.833"), ("1", "0.769"), ("1", "0.923")]
+    assert len(denials) == 3, "копия, повтор без слова и перестановка обязаны быть отклонены"
+    assert [(row[0], row[1]) for row in denials] == [("1", "1.0"), ("3", "0.833"), ("1", "0.769")]
     assert denials[0][2] == SALARY_FIRST and SALARY_FIRST[:40] in denials[2][2]
 
-    # отказ записан как T7.12: denied-аудит без строки действия — выполненных поисков ровно 3
+    # отказ записан как T7.12: denied-аудит без строки действия — выполненных поисков ровно 4
+    # (копия, повтор без слова и перестановка отклонены; «прогноз» и акторы выполнены)
     executed = await _rows(scratch_url, "SELECT count(*) FROM actions WHERE tool = 'web.search'")
-    assert executed[0][0] == 3
+    assert executed[0][0] == 4
 
     # модель видит отказ по-русски, с прежним запросом и легальной заменой; наблюдения накапливаются,
     # поэтому текст отказа присутствует во всех запросах после первого отказа (шаги 3..8)
@@ -238,9 +243,66 @@ async def test_near_duplicate_search_is_denied_like_t712(
     assert len(denied_ctx) == 6
     assert any("почти повтор запроса шага 1" in ctx for ctx in denied_ctx)
     assert any("почти повтор запроса шага 3" in ctx for ctx in denied_ctx)
-    assert any("прочитай найденное (research.fetch) или смени формулировку по существу" in ctx for ctx in denied_ctx)
+    assert any("Новых содержательных слов в нём нет" in ctx for ctx in denied_ctx)
+    assert any("прочитай найденное (research.fetch)" in ctx for ctx in denied_ctx)
+    assert any("добавь другого актора, другой показатель или другой период" in ctx for ctx in denied_ctx)
     assert all("Отклонённое действие тоже стоит один шаг" in ctx for ctx in denied_ctx)
 
     # шаг за отклонённое действие платится по-прежнему: 8 шагов = 7 попыток поиска + complete
     assert outcome.steps == 8
+    assert fake_llm.state()["queue_left"] == 0
+
+
+async def test_actor_switch_in_session_runs(
+    migrated_db: tuple[str, Any],
+    search_engine: FakeSearchEngine,
+    fake_llm: FakeLLM,
+    tmp_path: Path,
+) -> None:
+    """Пара дефекта приёмки в живом цикле: «ВТБ прогноз инфляции 2026 Россия аналитики» ->
+    «Газпромбанк …» (на e00f73f..3e3dd9b — отказ с Жаккаром 0,714). Перебор акторов по одному —
+    законная вторая линия независимых оценок: оба поиска выполняются, отказов нет."""
+    scratch_url, engine = migrated_db
+    store = FilesystemArtifactStore(tmp_path / "artifacts")
+    result = await _run_online(
+        engine,
+        _curated_payload(["research.fetch", "web.search"], search_engine.base, search_engine.allowlist),
+    )
+    assert result.state == "active"
+    question_id = await _seed_question(
+        scratch_url, "Какой прогноз инфляции в России на 2026 год дают аналитики банков?"
+    )
+
+    gateway = _gateway(fake_llm)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    orch = Orchestrator(
+        session_factory=factory,
+        gateway=gateway,
+        profile=ModelProfile(model_alias="fake-thinker"),
+        executor=StubToolExecutor(tmp_path / "ws"),
+        research_service=ResearchProxyService(factory, store),
+    )
+    fake_llm.script(
+        [
+            _search_call("ВТБ прогноз инфляции 2026 Россия аналитики"),  # шаг 1: выполняется
+            _search_call("Газпромбанк прогноз инфляции 2026 Россия аналитики"),  # шаг 2: новый актор -> выполняется
+            copy.deepcopy(_COMPLETE),  # шаг 3
+            copy.deepcopy(_CURATOR),
+        ]
+    )
+    try:
+        outcome = await orch.run_session(question_id)
+    finally:
+        await gateway.close()
+    assert outcome.final_state is SessionState.SUCCEEDED
+
+    denials = await _rows(
+        scratch_url,
+        "SELECT count(*) FROM audit_events WHERE type = :t AND payload->>'reason' = 'search_query_near_duplicate'",
+        {"t": AuditEventType.ACTION_FAILED.value},
+    )
+    assert denials[0][0] == 0, "смена актора новым содержательным словом не может быть почти-повтором"
+    executed = await _rows(scratch_url, "SELECT count(*) FROM actions WHERE tool = 'web.search'")
+    assert executed[0][0] == 2
+    assert outcome.steps == 3
     assert fake_llm.state()["queue_left"] == 0
