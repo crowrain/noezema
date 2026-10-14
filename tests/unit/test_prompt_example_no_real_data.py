@@ -404,16 +404,29 @@ def _payload_files() -> list[Path]:
 
 def _current_prompt_targets() -> list[tuple[Path, Path]]:
     """(нынешний закреплённый промпт, прежняя закреплённая версия того же промпта) по последнему
-    payload. Роль без смены пина получает базой самое себя: нового текста у неё нет — проверка это
-    подтверждает и ждёт следующей редакции этого промпта."""
-    latest = json.loads(_payload_files()[-1].read_text(encoding="utf-8"))
-    previous = json.loads(_payload_files()[-2].read_text(encoding="utf-8"))
+    payload. Прежняя версия ищется походом назад по payload'ам (T7.111): роль без смены пина в
+    последнем payload получает базой пин из последнего payload, где её пин отличался (закреплённые
+    прежние версии промптов не переписываются, ADR-0019, и лежат на диске); пин отсутствующего на
+    диске файла — исторический след прежнего пути — пропускается. Роль без предшествующего пина
+    (или с одним лишь таким следом) получает базой самое себя: нового текста у неё нет — проверка
+    это подтверждает и ждёт следующей редакции."""
+    files = _payload_files()
+    latest = json.loads(files[-1].read_text(encoding="utf-8"))
     targets: list[tuple[Path, Path]] = []
     for role in sorted(latest["prompts"]):
-        path = REPO_ROOT / latest["prompts"][role]["path"]
+        pin = latest["prompts"][role]
+        path = REPO_ROOT / pin["path"]
         assert path.is_file(), f"{path} закреплён последним payload, но отсутствует на диске"
-        prev_pin = previous["prompts"].get(role)
-        base = REPO_ROOT / prev_pin["path"] if prev_pin else path
+        base = path
+        for previous_path in reversed(files[:-1]):
+            previous = json.loads(previous_path.read_text(encoding="utf-8"))
+            prev_pin = previous["prompts"].get(role)
+            if not prev_pin or (prev_pin["path"], prev_pin.get("sha256")) == (pin["path"], pin.get("sha256")):
+                continue
+            candidate = REPO_ROOT / prev_pin["path"]
+            if candidate.is_file():
+                base = candidate
+                break
         assert base.is_file(), f"{base}: прежний пин роли {role} отсутствует на диске"
         targets.append((path, base))
     return targets
