@@ -50,6 +50,13 @@ from apps.orchestrator.curator_rejections import (
 )
 from apps.orchestrator.evidence import observation_to_evidence, reselect_assertion_fragment
 from apps.orchestrator.executor import arguments_hash
+from apps.orchestrator.host_availability import (
+    classify_fetch_error,
+    fetch_url_host,
+    recently_unavailable_hosts,
+    render_host_availability_section,
+    render_host_unavailable_note,
+)
 from apps.orchestrator.rejected_proposal import rejected_proposal_digest
 from apps.orchestrator.search_view import render_search_results
 from apps.orchestrator.source_coverage import SourceCoverageTracker, named_source_urls
@@ -831,8 +838,17 @@ class Orchestrator:
         # value wins when it is larger.
         if ctx.source_coverage is not None:
             max_steps = max(max_steps, len(named) + 3)
+        # T7.111 (часть 2б, решение пользователя 2026-10-14): короткая секция контекста о хостах,
+        # которые отказывали research.fetch в прошлых сессиях последних семи суток (>= 2 отказа,
+        # без успешного чтения после последнего). Один read-only запрос к существующему журналу на
+        # старте сессии — без новых таблиц, миграций и типов событий. Секция только называет хосты:
+        # запрета она не вводит (отказ — не доказательство недоступности, T7.13 lesson 3).
+        host_note = render_host_availability_section(
+            await recently_unavailable_hosts(db, session.id)
+        )
         steps, stopped, aborted = await self._explorer_loop(
-            db, audit, session, ctx, max_steps, cap_profile, policy_engine, staging, lease, pack, snapshot
+            db, audit, session, ctx, max_steps, cap_profile, policy_engine, staging, lease, pack, snapshot,
+            host_note=host_note,
         )
         if aborted:
             # ABORTING was set in the loop; finish as cancelled in the SAME
@@ -1714,6 +1730,7 @@ class Orchestrator:
         lease: LeaseService,
         pack: Any,
         snapshot: ORMConfigSnapshot,
+        host_note: str = "",
     ) -> tuple[int, bool, bool]:
         """Returns (steps_done, stop_requested, abort_requested)."""
         explorer = self.prompts[Role.EXPLORER]
@@ -1744,6 +1761,10 @@ class Orchestrator:
         # поиски: у неудачного поиска результатов выше нет, и его перезапуск другой формулировкой —
         # законная смена стратегии.
         session_search_queries: list[tuple[str, int]] = []
+        # T7.111 (часть 2а): хосты, отказавшие research.fetch в этой сессии (401/403/429/таймаут) ->
+        # (вид отказа, шаг первой неудачи). 404, нечитаемый артефакт и транспортный сбой — свойства
+        # страницы/канала, а не хоста: classify_fetch_error их не считает.
+        unavailable_hosts: dict[str, tuple[str, int]] = {}
         for step in range(1, max_steps + 1):
             steps = step
 
@@ -1768,7 +1789,9 @@ class Orchestrator:
             # getting denied. With nothing to reply to, it is dropped from
             # the per-step tool list the model is shown.
             allowed_tools = filter_offered_tools(base_tools, has_message=bool(ctx.messages))
-            user_ctx = self._explorer_context(ctx, allowed_tools, pack, step=step, step_limit=max_steps)
+            user_ctx = self._explorer_context(
+                ctx, allowed_tools, pack, step=step, step_limit=max_steps, host_note=host_note
+            )
             fingerprint = build_model_fingerprint(
                 self.profile,
                 prompt_version=explorer.version,
@@ -2030,6 +2053,34 @@ class Orchestrator:
                     )
                     continue
 
+            # T7.111 (часть 2а): research.fetch к хосту, который уже отказывал в этой сессии
+            # (401/403/429/таймаут — см. classify_fetch_error), отклоняется до исполнения в той
+            # же форме; шаг стоит шаг. 404, нечитаемый артефакт и размер страницы — свойства
+            # страницы, такие хосты не помечаются.
+            if tool_name == "research.fetch":
+                fetch_host = fetch_url_host(str(args.get("url", "")))
+                blocked = unavailable_hosts.get(fetch_host) if fetch_host else None
+                if blocked is not None:
+                    blocked_kind, blocked_step = blocked
+                    await audit.record(
+                        AuditEventType.ACTION_FAILED,
+                        session_id=session.id,
+                        payload={
+                            "denied": True,
+                            "reason": "host_unavailable_in_session",
+                            "tool": tool_name,
+                            "arguments_hash": args_hash,
+                            "host": fetch_host,
+                            "error_kind": blocked_kind,
+                            "failed_step": blocked_step,
+                        },
+                        public_summary=f"host unavailable in session (denied): {fetch_host}",
+                    )
+                    ctx.observations.append(
+                        render_host_unavailable_note(step, fetch_host, blocked_kind, blocked_step)
+                    )
+                    continue
+
             action = ORMAction(
                 session_id=session.id,
                 model_run_id=run.id,
@@ -2219,6 +2270,15 @@ class Orchestrator:
                 first_step = fetched_urls.setdefault(url_key, step)
                 if first_step != step:
                     ctx.observations.append(render_repeat_fetch_note(step, first_step))
+                # T7.111 (часть 2а): отказ 401/403/429/таймаут помечает ХОСТ недоступным до конца
+                # сессии (шаг первой неудачи запоминается). Прочие неудачи — 404, нечитаемый
+                # артефакт, размер, сетевой сбой канала — хост не метят: они свойства страницы
+                # или момента, а не хоста.
+                if not obs.ok and not obs.result_unknown:
+                    failure_kind = classify_fetch_error(str(obs.error or ""))
+                    failed_host = fetch_url_host(str(args.get("url", "")))
+                    if failure_kind is not None and failed_host:
+                        unavailable_hosts.setdefault(failed_host, (failure_kind, step))
         else:
             # loop exhausted without complete
             ctx.complete_reason = CompleteReason.BUDGET_EXHAUSTED.value
@@ -2351,6 +2411,7 @@ class Orchestrator:
         pack: Any,
         step: int | None = None,
         step_limit: int | None = None,
+        host_note: str = "",
     ) -> str:
         # the bounded context pack (T3.8) carries the question/plan,
         # relevant claims and pending/invalid (labeled) claims; the
@@ -2368,6 +2429,7 @@ class Orchestrator:
             + render_tool_argument_schemas(allowed_tools)
         )
         budget_str = render_step_budget(step, step_limit)
+        host_str = host_note  # T7.111 (часть 2б): готовая секция «Недавно недоступны» либо пусто
         ev_str = ""
         if ctx.evidence:
             ev = "\n".join(
@@ -2414,6 +2476,10 @@ class Orchestrator:
                 # T7.76: the step accounting stands with the tool list — before the pack and the
                 # observations, so trimming old observations can never hide it
                 parts.append(budget_str)
+            if host_str:
+                # T7.111 (часть 2б): секция «Недавно недоступны» — фиксированная, как бюджет шага:
+                # она стоит до наблюдений и вырезание старых наблюдений не может её спрятать
+                parts.append(host_str)
             if pack_str:
                 parts.append(pack_str)
             if observations:
