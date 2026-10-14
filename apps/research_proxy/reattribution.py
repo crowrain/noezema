@@ -51,6 +51,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from apps.research_proxy.derivative_pointer import resolve_primary_source, write_derivative_pointer
+from apps.research_proxy.normalization import detect_declared_encoding, normalize_content
 from apps.research_proxy.source_attribution import (
     ATTRIBUTION_METHOD_VERSION,
     STATUS_AMBIGUOUS,
@@ -107,6 +108,57 @@ class ReattributionError(RuntimeError):
     """Понятная отказ-ошибка команды (некорректный аргумент, повреждённая запись журнала)."""
 
 
+#: T7.112 (а2): нижняя доля замещающих знаков U+FFFD, при которой сохранённый нормализованный
+#: текст считается испорченным ошибочным чтением кодировки. Честно декодированный UTF-8-текст не
+#: содержит их вовсе: U+FFFD рождается только из недекодируемых байтов. Случайные битые байты на
+#: странице в тысячи знаков — не основание перечитывать (объявленной не-UTF-8 кодировки там нет).
+#: Систематическая ошибка — windows-1251, прочитанное как UTF-8, — делает знаком замещения каждую
+#: кириллическую букву: замер на стендовой странице finmarket.ru/news/6727171 (фикстура
+#: tests/fixtures/t7112/) — 8679 U+FFFD на 11811 знаков, доля 0,735, то есть порог превышен более
+#: чем в 70 раз. Перечитывание требует и второго условия: объявленной в закрытом порядке (а1:
+#: Content-Type/BOM/meta) НЕ-UTF-8 кодировки оригинала — переатрибуция никогда не угадывает
+#: кодировку, она применяет только объявленную.
+CORRUPT_TEXT_REPLACEMENT_SHARE: Final = 0.01
+
+
+def _replacement_share(body: str) -> float:
+    return body.count("\ufffd") / max(1, len(body))
+
+
+def _repaired_page_text(
+    store: ArtifactStore,
+    stored_text: str,
+    original_sha256: Any,
+    content_type: Any,
+) -> str | None:
+    """T7.112 (а2): перечитанный из сохранённого оригинала текст страницы либо None (обычное
+    чтение сохранённого нормализованного текста).
+
+    Условие — конъюнкция: (1) в сохранённом нормализованном тексте доля U+FFFD выше
+    `CORRUPT_TEXT_REPLACEMENT_SHARE`; (2) артефакт оригинала доступен; (3) кодировка оригинала
+    объявлена не-UTF-8 в закрытом порядке а1 — без объявления перечитывания нет, угадывания нет.
+    Результат влияет только на решение: сохранённые артефакты, их хеши и улики НЕ перезаписываются
+    (стоп-критерий задачи). Неудачное перечитывание (тип тела без нормализации, читается хуже) —
+    None: решение остаётся на прежнем тексте, честная неполнота лучше выдуманного."""
+    if not isinstance(original_sha256, str) or not original_sha256:
+        return None
+    if _replacement_share(stored_text) <= CORRUPT_TEXT_REPLACEMENT_SHARE:
+        return None
+    try:
+        raw = store.get(original_sha256)
+    except (ArtifactStoreError, OSError):
+        return None
+    declared = detect_declared_encoding(
+        content_type if isinstance(content_type, str) else None, raw
+    )
+    if declared is None or declared == "utf-8":
+        return None
+    repaired = normalize_content(content_type if isinstance(content_type, str) else None, raw)
+    if repaired.text is None or _replacement_share(repaired.text) > CORRUPT_TEXT_REPLACEMENT_SHARE:
+        return None
+    return repaired.text
+
+
 @dataclass(frozen=True)
 class ReattributeRow:
     """Строка отчёта команды: один кандидат из окна журнала."""
@@ -161,6 +213,7 @@ async def _candidates(db: AsyncSession, since: datetime) -> list[dict[str, Any]]
                         "SELECT DISTINCT ON (payload->>'source_id') "
                         "  payload->>'source_id' AS source_id, "
                         "  payload->>'normalized_sha256' AS normalized_sha256, "
+                        "  payload->>'sha256' AS original_sha256, "
                         "  payload->>'attribution_status' AS was_status, "
                         "  payload->>'attribution_method' AS was_method "
                         "FROM audit_events "
@@ -211,7 +264,8 @@ async def _current_state(db: AsyncSession, source_id: uuid.UUID) -> dict[str, An
             await db.execute(
                 text(
                     "SELECT canonical_uri, parent_source_id IS NOT NULL AS has_parent, "
-                    "  metadata ? 'derivative_of' AS marked FROM sources WHERE id = :id"
+                    "  metadata ? 'derivative_of' AS marked, "
+                    "  metadata ->> 'content_type' AS content_type FROM sources WHERE id = :id"
                 ),
                 {"id": source_id},
             )
@@ -307,6 +361,14 @@ async def _plan_window(
                 )
             )
             continue
+        # T7.112 (а2): нормализованный текст испорчен ошибочным чтением кодировки, оригинал
+        # сохранён и объявлен не-UTF-8 — страничный детектор решает по тексту, перечитанному
+        # из оригинала (сохранённые артефакты и их хеши при этом не трогаются)
+        repaired = _repaired_page_text(
+            store, page_text, candidate["original_sha256"], state.get("content_type")
+        )
+        if repaired is not None:
+            page_text = repaired
 
         decision = detect_source_attribution(
             canonical_uri=str(state["canonical_uri"]), text=page_text
@@ -583,17 +645,21 @@ class _EvidencePlan:
     recorded_self_method: str = ""
 
 
-async def _read_pages(db: AsyncSession, since: datetime) -> dict[uuid.UUID, str]:
+async def _read_pages(db: AsyncSession, since: datetime) -> dict[uuid.UUID, tuple[str, str]]:
     """Сохранённый нормализованный текст каждой страницы окна журнала (последнее решение по
     каждой прочитанной строке источника; метод страничного детектора не важен — он мог отказаться
-    решать, а значение всё равно имеет первоисточник)."""
+    решать, а значение всё равно имеет первоисточник).
+
+    С T7.112 (а2) вместе с нормализованным текстом поднимается и хеш ОРИГИНАЛА: испорченный
+    ошибочным чтением кодировки нормализованный текст перечитывается из сохранённых байтов."""
     rows = (
         (
             await db.execute(
                 text(
                     "SELECT DISTINCT ON (payload->>'source_id') "
                     "  payload->>'source_id' AS source_id, "
-                    "  payload->>'normalized_sha256' AS normalized_sha256 "
+                    "  payload->>'normalized_sha256' AS normalized_sha256, "
+                    "  payload->>'sha256' AS original_sha256 "
                     "FROM audit_events "
                     "WHERE type = 'research_fetch_completed' "
                     "  AND occurred_at >= :since "
@@ -607,7 +673,7 @@ async def _read_pages(db: AsyncSession, since: datetime) -> dict[uuid.UUID, str]
         .mappings()
         .all()
     )
-    pages: dict[uuid.UUID, str] = {}
+    pages: dict[uuid.UUID, tuple[str, str]] = {}
     for row in rows:
         try:
             source_id = uuid.UUID(str(row["source_id"]))
@@ -616,19 +682,53 @@ async def _read_pages(db: AsyncSession, since: datetime) -> dict[uuid.UUID, str]
         sha = str(row["normalized_sha256"])
         if not sha:
             continue
-        pages[source_id] = sha
+        pages[source_id] = (sha, str(row["original_sha256"] or ""))
     return pages
 
 
-async def _open_pages(store: ArtifactStore, shas: dict[uuid.UUID, str]) -> tuple[dict[uuid.UUID, str], set[uuid.UUID]]:
-    """Тексты доступных артефактов + источники, текста которых нет (отказ честный, не молчаливый)."""
+async def _source_content_types(db: AsyncSession, source_ids: set[uuid.UUID]) -> dict[uuid.UUID, str]:
+    """Content-Type прочитанных страниц из строки источника (T7.112 а2): по нему закрытый
+    порядок а1 определяет объявленную кодировку оригинала. Источники без записи (старые эпохи)
+    остаются без типа — перечитывания для них не будет (угадывания нет)."""
+    if not source_ids:
+        return {}
+    rows = (
+        (
+            await db.execute(
+                text("SELECT id, metadata ->> 'content_type' AS content_type FROM sources WHERE id = ANY(:ids)"),
+                {"ids": list(source_ids)},
+            )
+        )
+        .mappings()
+        .all()
+    )
+    return {
+        uuid.UUID(str(row["id"])): str(row["content_type"])
+        for row in rows
+        if row["content_type"]
+    }
+
+
+async def _open_pages(
+    store: ArtifactStore,
+    shas: dict[uuid.UUID, tuple[str, str]],
+    content_types: dict[uuid.UUID, str],
+) -> tuple[dict[uuid.UUID, str], set[uuid.UUID]]:
+    """Тексты доступных артефактов + источники, текста которых нет (отказ честный, не молчаливый).
+
+    T7.112 (а2): если нормализованный текст испорчен ошибочным чтением кодировки, а оригинал
+    сохранён и объявлен не-UTF-8, тексту страницы заменяется перечитанным из оригинала — решение
+    принимается по живому тексту, сохранённые артефакты и их хеши не трогаются."""
     texts: dict[uuid.UUID, str] = {}
     missing: set[uuid.UUID] = set()
-    for source_id, sha in shas.items():
+    for source_id, (sha, original_sha) in shas.items():
         try:
-            texts[source_id] = store.get(sha).decode("utf-8")
+            stored = store.get(sha).decode("utf-8")
         except (ArtifactStoreError, OSError, UnicodeDecodeError):
             missing.add(source_id)
+            continue
+        repaired = _repaired_page_text(store, stored, original_sha, content_types.get(source_id))
+        texts[source_id] = stored if repaired is None else repaired
     return texts, missing
 
 
@@ -762,7 +862,8 @@ async def _plan_evidence_window(
     rows: list[EvidenceAttributionRow] = []
     plan: list[_EvidencePlan] = []
     shas = await _read_pages(db, since)
-    texts, missing = await _open_pages(store, shas)
+    content_types = await _source_content_types(db, set(shas))
+    texts, missing = await _open_pages(store, shas, content_types)
     corrected = await _operator_corrected_source_ids(db)
 
     for source_id in sorted(texts):

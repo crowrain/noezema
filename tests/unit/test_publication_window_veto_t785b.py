@@ -140,12 +140,14 @@ def test_another_author_inside_the_publication_window_is_not_retelling(
             "rosstat",
             PAIRING_PUBLICATION_WINDOW,
         ),
-        # «Банк России зафиксировал…» — сам первоисточник (алиас маскируется раньше)
+        # «Банк России зафиксировал…» — сам первоисточник (алиас маскируется раньше).
+        # С T7.112 (а3) «зафиксировал» — шаблон атрибуции: тот же первоисточник и тот же
+        # derivative, но pairing-основание теперь строгое (было: окно публикации; STATUS T7.112)
         (
             PREFIX_CBR + "Банк России зафиксировал оценку текущих темпов на уровне 14,5%.",
             "Наблюдаемая инфляция составила 14,5%.",
             "cbr",
-            PAIRING_PUBLICATION_WINDOW,
+            PAIRING_VALUE_AND_PRIMARY,
         ),
         # «ЦБ РФ зарегистрировал…» — алиас словаря («цб рф»), не чужое действующее лицо
         (
@@ -297,4 +299,4 @@ def test_method_version_is_v5_after_t785c() -> None:
     (tests/scenario/test_reattribute_stale_records.py). T7.98 поднял номер дальше (v6, relay в
     строгом режиме) — предикат тот же, окно публикации по-прежнему не тронуто."""
 
-    assert VALUE_ATTRIBUTION_METHOD_VERSION == "host-value-attribution-v10"
+    assert VALUE_ATTRIBUTION_METHOD_VERSION == "host-value-attribution-v11"

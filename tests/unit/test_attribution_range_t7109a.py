@@ -194,9 +194,10 @@ def test_nearest_mode_single_claim_vs_range_end_no_longer_glues() -> None:
     assert ranged.primary_key == "cbr"
 
 
-# ─── версии: значения v9, страницы v6 (страничный детектор значений не сравнивает) ────
+# ─── версии: значения v9, страницы v6 (страничный детектор значений не сравнивает);
+#     с T7.112 — значения v11, страницы v8 (STATUS T7.112) ──────────────────────────────
 
 
 def test_versions_after_t7109a() -> None:
-    assert VALUE_ATTRIBUTION_METHOD_VERSION == "host-value-attribution-v10"
-    assert ATTRIBUTION_METHOD_VERSION == "host-source-attribution-v7"
+    assert VALUE_ATTRIBUTION_METHOD_VERSION == "host-value-attribution-v11"
+    assert ATTRIBUTION_METHOD_VERSION == "host-source-attribution-v8"
