@@ -39,6 +39,15 @@ supports-связи со значением, она снимается этой 
 `rejected_operations`; когда сняты все операции, предложение отклоняется целиком (публичный
 отказ называет и причину гейта, и снятые связи).
 
+Дополнение T7.113 (часть 2, ADR-0034 §10): значение claim'а — диапазон
+(`claim_match_values`, составной токен вида `2.1-2.2`) — подтверждает связь только целиком:
+диапазон как одно значение (те же формы и эквивалентность T7.109/T7.109a) либо оба конца
+отдельными числами (таблица «мин./макс.» с ячейками «2,1» и «2,2»). Одна граница диапазона
+связью не подтверждается: стендовая связка 4e7ba8c2 («2,1–2,2% по данным Росстата») ↔ страница
+finmarket с одним «2,2%» проходила гейт эпохи T7.108a и подтверждала половину утверждения.
+Одиночные значения claim'а читает прежний `claim_values_found_in_texts` — их поведение не
+изменено ни на пункт; форма причины снятия не изменена.
+
 Модуль чистый: никаких БД и LLM — только разбор строк и дайджесты (формы записей совпадают
 с дайджестом T7.84: те же `_claim_entry` / `_link_entry` из `rejected_proposal`, чтобы
 «digest операции» в записи отказа был тем же снимком операции, что видит оператор в отказе
@@ -53,7 +62,13 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 from apps.orchestrator.rejected_proposal import _claim_entry, _link_entry
-from apps.research_proxy.value_attribution import claim_value_numbers, claim_values_found_in_texts
+from apps.research_proxy.value_attribution import (
+    claim_match_values,
+    claim_range_tokens,
+    claim_ranges_found_in_texts,
+    claim_value_numbers,
+    claim_values_found_in_texts,
+)
 from packages.domain.models.base import JsonDict
 
 if TYPE_CHECKING:
@@ -191,7 +206,15 @@ def links_without_claim_value(
         values = frozenset(claim_value_numbers(proposal.claims[claim_index].statement))
         if not values:
             continue  # утверждение без измеренного значения не проверяется
-        if claim_values_found_in_texts(values=values, texts=texts):
+        # T7.113 (часть 2): диапазоны утверждения подтверждают связь только целиком (один
+        # диапазон как значение либо оба конца отдельными числами); одиночные значения —
+        # прежний читатель текстовых форм T7.108a, его поведение не изменено
+        match_values = claim_match_values(proposal.claims[claim_index].statement)
+        ranges = claim_range_tokens(match_values)
+        singles = match_values - ranges
+        if claim_values_found_in_texts(values=singles, texts=texts):
+            continue
+        if claim_ranges_found_in_texts(ranges=ranges, texts=texts):
             continue
         removed[k] = (
             f"evidence_link[{k}]: evidence {link.evidence_index} "
