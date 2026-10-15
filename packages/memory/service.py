@@ -100,6 +100,30 @@ def _dependency_dict(value: Any) -> JsonDict | None:
 _CLAIM_REF_PREFIX_RE = re.compile(r"^[0-9a-f]{8,31}$")
 
 
+def _strip_claim_ref_pack(ref: str) -> str:
+    """T7.116 (часть в): снять хостовую упаковку ссылки на утверждение.
+
+    Формы конспекта контекст-пака — ``[c:<uuid>]`` и ``c:<uuid>`` — хост сам пишет
+    такие строки (``pack_claim_ids``), и оператор, передающий куратору
+    ``relied_claim_ids`` / ``existing_claim_id``, воспроизводит ровно их (стенд
+    53be7fd6: «unparseable claim reference» на «c:44bd1460-bb72-4521»). Снимаются
+    внешние скобки и метка ``c:`` (пробелы по краям — тоже); снимается ровно один
+    раз: «c:c:<uuid>» остаётся непарсируемым. Содержимое скобок без «c:» не
+    трогается — прежний отказ. После этого разбор прежний (T7.34): полный uuid или
+    однозначный hex-префикс; наборы ошибок и их тексты не изменены.
+    """
+
+    ref = ref.strip()
+    if ref.startswith("[") and ref.endswith("]"):
+        inner = ref[1:-1].strip()
+        if inner.lower().startswith("c:"):
+            return inner[2:].strip()
+        return ref
+    if ref.lower().startswith("c:"):
+        return ref[2:].strip()
+    return ref
+
+
 def resolve_claim_reference(
     raw: str, visible_ids: list[uuid.UUID]
 ) -> tuple[uuid.UUID | None, str | None]:
@@ -124,8 +148,12 @@ def resolve_claim_reference(
     point (curator boundary: the context pack's ``[c:<uuid>]`` lines;
     commit boundary: the claims with a head in the session's snapshot —
     the T7.9 dedup condition).
+
+    T7.116 (часть в): leading pack packaging ``c:`` / ``[c:…]`` is stripped before
+    parsing (see ``_strip_claim_ref_pack``); everything else about resolution is
+    unchanged.
     """
-    ref = str(raw).strip().lower()
+    ref = _strip_claim_ref_pack(str(raw)).lower()
     nodash = ref.replace("-", "")
     try:
         full = uuid.UUID(ref)
