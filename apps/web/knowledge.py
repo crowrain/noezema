@@ -204,7 +204,8 @@ def _assessment_explanations(
     """{claim_id: {"single_producer", "producer_supports", "reasons"}} по правилу ADR-0035 вариант A.
 
     `fact_rows` — улики с колонками действующей оценки (`claim_id`, `assessment_id`, колонки из
-    `CURRENT_ASSESSMENT_FACT_COLUMNS` плюс `scope`, `parent_source_id`, `parent_uri`). Никакого
+    `CURRENT_ASSESSMENT_FACT_COLUMNS` плюс `scope`, `parent_source_id`, `parent_uri` и
+    `claim_statement` — формулировка утверждения, T7.116 часть б). Никакого
     пересчёта групп и ролей: правило читает те же записанные значения, которые витрина уже
     показала (fail-closed внутри `apps.web.producer_view`).
     """
@@ -219,8 +220,13 @@ def _assessment_explanations(
             assessment_of[claim_id] = str(row["assessment_id"])
     out: dict[str, JsonDict] = {}
     for claim_id, rows in grouped.items():
+        # T7.116 (часть б): указатель называет строку только если формулировка утверждения
+        # называет того же производителя; колонка одна на группу (утверждение одно).
+        statement = next((r.get("claim_statement") for r in rows if r.get("claim_statement")), None)
         case = producer_publication_case(
-            rows, reasons=reasons_by_assessment.get(assessment_of.get(claim_id, ""), ())
+            rows,
+            reasons=reasons_by_assessment.get(assessment_of.get(claim_id, ""), ()),
+            claim_statement=str(statement) if statement is not None else None,
         )
         out[claim_id] = {
             "single_producer": case.name if case is not None else None,
@@ -255,8 +261,10 @@ async def current_assessment_explanation(
                     SELECT e.claim_id,
                            cur_a.current_assessment_id AS assessment_id,
                            {CURRENT_ASSESSMENT_FACT_COLUMNS},
-                           e.scope, s.parent_source_id, ps.canonical_uri AS parent_uri
+                           e.scope, s.parent_source_id, ps.canonical_uri AS parent_uri,
+                           c.statement AS claim_statement
                     FROM evidence e
+                    JOIN claims c ON c.id = e.claim_id
                     LEFT JOIN sources s ON s.id = e.source_id
                     LEFT JOIN sources ps ON ps.id = s.parent_source_id
                     {current_assessment_evidence_joins("e.claim_id", "e.id", "e.source_id")}

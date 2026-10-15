@@ -905,7 +905,11 @@ def _estimate_row_json(
         return out
     out["claim_id"] = row.candidate_id
     reasons = [str(reason) for reason in (claim_row.get("grade_reasons") or [])]
-    case = producer_publication_case(_estimate_facts(claim_row), reasons=reasons)
+    case = producer_publication_case(
+        _estimate_facts(claim_row),
+        reasons=reasons,
+        claim_statement=str(claim_row.get("statement") or ""),
+    )
     out.update(
         assessment_view(
             claim_type=claim_row["claim_type"],
@@ -1282,11 +1286,17 @@ async def question_answer(db: AsyncSession, question_id: uuid.UUID) -> JsonDict 
             str(row["id"]): ("" if row["assessment_id"] is None else str(row["assessment_id"]))
             for row in [*claim_rows, *relied_rows]
         }
+        # T7.116 (часть б): формулировка утверждения нужна правилу витрины — она уже прочитана
+        # в строках карточки (`c.statement`), отдельного запроса нет (бюджет T7.74).
+        statement_by_claim = {
+            str(row["id"]): str(row.get("statement") or "") for row in [*claim_rows, *relied_rows]
+        }
         publication_by_claim: dict[str, ProducerPublication] = {}
         for claim_id, rows in by_claim.items():
             case = producer_publication_case(
                 rows,
                 reasons=reason_by_assessment.get(assessment_id_by_claim.get(claim_id, ""), ()),
+                claim_statement=statement_by_claim.get(claim_id),
             )
             if case is not None:
                 publication_by_claim[claim_id] = case

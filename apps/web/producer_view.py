@@ -40,6 +40,11 @@
     имени не участвует (запись — решение детектора значения, прочитанного прямо на улике,
     он сильнее указателя, поставленного при чтении страницы); строки без такой записи называются
     якорем-родителем по-прежнему;
+    с T7.116 (часть б) страничный указатель называет строку только тогда, когда формулировка
+    самого утверждения (`claim_statement`, передаётся вызывающим) называет того же производителя
+    словарным алиасом: мнение third party с якорем на ведомственном хосте не подписывается
+    «Опубликовано производителем» (стенд 85220305/Коган). Записи называют по-прежнему —
+    правило касается только указателя, запись остаётся сильнее указателя (T7.109);
 (г) контр-улик у этой оценки нет.
 
 Сам прочитанный адрес вида `cbr.ru` производителем не называет: страница ЦБ может сообщать цифру
@@ -56,7 +61,12 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any, Final
 
-from apps.research_proxy.source_attribution import PRIMARY_SOURCES, is_home_host, primary_source
+from apps.research_proxy.source_attribution import (
+    _ALIASES,
+    PRIMARY_SOURCES,
+    is_home_host,
+    primary_source,
+)
 from packages.domain.models.enums import AssessmentEvidenceRole
 from packages.memory.scope import parse_self_publication, parse_value_attribution
 
@@ -165,10 +175,31 @@ class ProducerPublication:
     supports: int
 
 
+def _statement_names_producer(claim_statement: str | None, name: str) -> bool:
+    """T7.116 (часть б, ADR-0035): называет ли САМА формулировка утверждения этого производителя.
+
+    Страничный указатель (якорь-родитель, T7.109) даёт имя строки, но о самом утверждении он
+    ничего не говорит: стенд 53be7fd6 — мнение инвестбанкира («…до 7,0-7,5%») подписывалось
+    «Опубликовано производителем» только потому, что якорь улики вёл на minfin.gov.ru. Имя из
+    указателя используется, только та же формулировка называет того же производителя словарным
+    алиасом (тот же словарь `PRIMARY_SOURCES`, что у детектора значений). Утверждение без
+    передаваемой формулировки (None/пусто) — fail-closed: указатель для имени не участвует.
+    Записи (`value_attribution`, `value_self_publication`) называют по-прежнему: правило
+    касаются только страничного указателя."""
+    if not claim_statement or not claim_statement.strip():
+        return False
+    for spec, patterns in _ALIASES.values():
+        if spec.name != name:
+            continue
+        return any(pattern.search(claim_statement) for pattern in patterns)
+    return False
+
+
 def producer_publication_case(
     evidence_rows: Iterable[Mapping[str, Any]],
     *,
     reasons: Iterable[str],
+    claim_statement: str | None = None,
 ) -> ProducerPublication | None:
     """Признанный случай «значение опубликовал его производитель» либо None.
 
@@ -177,6 +208,8 @@ def producer_publication_case(
     `group_id` (записанная группа независимости из снимка этой оценки), `scope` (payload улики,
     включая `value_attribution` и `value_self_publication`) и `parent_uri`/`parent_source_id`
     (якорь-родитель источника). `reasons` — записанные причины этой же оценки.
+    `claim_statement` (T7.116 часть б) — формулировка самого утверждения; без неё страничный
+    указатель имени не даёт (fail-closed).
 
     None означает «случай не признан»: витрина показывает прежнюю подпись без изменений.
     """
@@ -221,7 +254,17 @@ def producer_publication_case(
             return None  # условие (в): запись о значении есть, но производитель по ней не читается
         pointers: list[Any] = [attribution, _self_publication_pointer(row)]
         if not isinstance(attribution, str) or not attribution:
-            pointers.append(_parent_pointer(row))
+            pointer = _parent_pointer(row)
+            # T7.116 (часть б): именованный якорь-родитель называет строку только если та же
+            # формулировка утверждения называет этого производителя; битый указатель
+            # (`_UNNAMED_POINTER`) остаётся fail-closed как прежде (условие (в) T7.109).
+            if (
+                isinstance(pointer, str)
+                and pointer
+                and not _statement_names_producer(claim_statement, pointer)
+            ):
+                pointer = None
+            pointers.append(pointer)
         for pointer in pointers:
             if pointer is _UNNAMED_POINTER:
                 return None  # условие (в): указатель есть, но производитель по нему не читается
@@ -237,12 +280,14 @@ def producer_publication_name(
     evidence_rows: Iterable[Mapping[str, Any]],
     *,
     reasons: Iterable[str],
+    claim_statement: str | None = None,
 ) -> str | None:
     """Имя производителя, вокруг которого свернулась действующая оценка, либо None.
 
     Прежний контракт (T7.87): то же правило, что у `producer_publication_case`, только имя.
+    `claim_statement` — T7.116 (часть б), см. `producer_publication_case`.
     """
-    case = producer_publication_case(evidence_rows, reasons=reasons)
+    case = producer_publication_case(evidence_rows, reasons=reasons, claim_statement=claim_statement)
     return case.name if case is not None else None
 
 
@@ -256,7 +301,10 @@ def evidence_producer_names(evidence_rows: Iterable[Mapping[str, Any]]) -> froze
 
     С T7.101 записью о собственной публикации здесь НЕ читается: полоса связанных оценок
     (ADR-0035 §11) закреплена прежними тестами, а запись обязана влиять только на метку
-    витрины (STATUS T7.101).
+    витрины (STATUS T7.101). С T7.116 (часть б) правило «указатель называет только если
+    утверждение называет производителя» к этой функции НЕ применяется: она отвечает на вопрос
+    «какие производители в записях названы» для полосы связанных оценок, а не подписывает
+    утверждение (ADR-0035 §11, STATUS T7.116).
     """
     names: set[str] = set()
     for row in evidence_rows:

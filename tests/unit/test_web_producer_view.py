@@ -4,6 +4,13 @@
 (роли улик, записанные группы независимости, записки атрибуции) и либо называет
 производителя, либо молчит. Оценок здесь никто не вычисляет (ADR-0026), и краснота этих
 тестов — про то же: правило не имеет права додумывать ни группу, ни имя.
+
+С T7.116 (часть б, решение пользователя 2026-10-15) страничный указатель (якорь-родитель)
+называет строку только когда формулировка утверждения называет того же производителя
+словарным алиасом; записи `value_attribution`/`value_self_publication` называют по-прежнему.
+Здесь это затронуло тесты, где имя давал один указатель: формулировка передаётся явно
+(стендовая форма «…по данным Росстата…») — намерение каждого теста сохранено; полный
+набор новых случаев закрепляет `tests/unit/test_producer_view_page_pointer_t7116.py`.
 """
 
 from __future__ import annotations
@@ -67,8 +74,16 @@ def _row(
     }
 
 
-def _name(*rows: dict[str, Any], reasons: list[str] = SHORTFALL) -> str | None:
-    return producer_publication_name(list(rows), reasons=reasons)
+def _name(
+    *rows: dict[str, Any], reasons: list[str] = SHORTFALL, statement: str | None = None
+) -> str | None:
+    return producer_publication_name(list(rows), reasons=reasons, claim_statement=statement)
+
+
+#: Называющая формулировка (T7.116 часть б): указатель даёт имя только ей (стендовая форма
+#: подписи «…по данным Росстата»). В тестах этого файла она подставляет ровно то имя,
+#: которое и раньше бралось из указателя, — намерение тестов не меняется.
+STATEMENT_ROSSTAT: str = "Инфляция в России по итогам 2025 года составила 5,59% по данным Росстата."
 
 
 # ─── условие (а): причину обязана давать нехватка подтверждений (T7.87 + T7.100) ────
@@ -76,7 +91,11 @@ def _name(*rows: dict[str, Any], reasons: list[str] = SHORTFALL) -> str | None:
 
 def test_the_rule_holds_on_too_few_independence_groups() -> None:
     """Базовый случай правила: одна записанная группа и указатель на одного производителя."""
-    assert _name(_row(parent_uri=ROSSTAT), _row(parent_uri="https://www.garant.ru/cpi")) == "Росстат"
+    assert _name(
+        _row(parent_uri=ROSSTAT),
+        _row(parent_uri="https://www.garant.ru/cpi"),
+        statement=STATEMENT_ROSSTAT,
+    ) == "Росстат"  # garant.ru не словарный хост: имя даёт Росстат-указатель
     assert frozenset({"insufficient_independence"}) == INDEPENDENCE_SHORTFALL_REASONS
 
 
@@ -88,7 +107,9 @@ def test_single_evidence_is_the_same_case() -> None:
     публикация производителя; метка не должна зависеть от того, какой из двух кодов
     записали правила. Решение пользователя 2026-10-12.
     """
-    assert _name(_row(parent_uri=ROSSTAT), reasons=["insufficient_evidence"]) == "Росстат"
+    assert _name(
+        _row(parent_uri=ROSSTAT), reasons=["insufficient_evidence"], statement=STATEMENT_ROSSTAT
+    ) == "Росстат"
     assert (
         _name(_row(primary_key="rosstat", primary_name="Росстат"), reasons=["insufficient_evidence"])
         == "Росстат"
@@ -120,10 +141,16 @@ def test_single_evidence_with_two_groups_stays_weak() -> None:
 
 def test_case_carries_the_support_count() -> None:
     """T7.100: правило отдаёт и число подтверждающих улик — из тех же записанных строк."""
-    single = producer_publication_case([_row(parent_uri=ROSSTAT)], reasons=["insufficient_evidence"])
+    single = producer_publication_case(
+        [_row(parent_uri=ROSSTAT)],
+        reasons=["insufficient_evidence"],
+        claim_statement=STATEMENT_ROSSTAT,
+    )
     assert single is not None and (single.name, single.supports) == ("Росстат", 1)
     cluster = producer_publication_case(
-        [_row(parent_uri=ROSSTAT), _row(parent_uri="https://www.garant.ru/cpi")], reasons=SHORTFALL
+        [_row(parent_uri=ROSSTAT), _row(parent_uri="https://www.garant.ru/cpi")],
+        reasons=SHORTFALL,
+        claim_statement=STATEMENT_ROSSTAT,
     )
     assert cluster is not None and (cluster.name, cluster.supports) == ("Росстат", 2)
 
@@ -159,7 +186,11 @@ def test_reason_gate_is_tied_to_the_rules_engine() -> None:
 
 
 def test_one_producer_through_the_page_pointer() -> None:
-    assert _name(_row(parent_uri=ROSSTAT), _row(parent_uri="https://rosstat.gov.ru/press/cpi.html")) == "Росстат"
+    assert _name(
+        _row(parent_uri=ROSSTAT),
+        _row(parent_uri="https://rosstat.gov.ru/press/cpi.html"),
+        statement=STATEMENT_ROSSTAT,
+    ) == "Росстат"  # хост самой улики именем по-прежнему не считается
 
 
 def test_one_producer_through_the_recorded_attribution() -> None:
@@ -231,7 +262,7 @@ def test_counterevidence_in_this_assessment_disqualifies() -> None:
 def test_evidence_of_another_assessment_is_ignored() -> None:
     """Строки без роли — улики не этой оценки: они не участвуют ни в группах, ни в указателях."""
     rows = [_row(parent_uri=ROSSTAT), _row(role=None, group="g7", parent_uri=CBR)]
-    assert _name(*rows) == "Росстат"
+    assert _name(*rows, statement=STATEMENT_ROSSTAT) == "Росстат"
 
 
 # ─── подпись: уровень сохранён, меняется только название случая ────────────────

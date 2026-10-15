@@ -6,7 +6,8 @@
   якорь-родитель — документ Банка России (`cbr.ru/Content/…/forecast_260724.pdf`), одна
   записанная группа `parent:`; оценка E1/0,15 hypothesis записана рабочим переоценки с
   причиной `insufficient_evidence`. До правки витрина молчала «Подтверждено слабо», хотя
-  подтверждение есть — публикация производителя и её пересказ.
+  подтверждение есть — публикация производителя и её пересказ. (С T7.116 (часть б) эта строка
+  вернулась к «Подтверждено слабо»: утверждение производителя не называет — см. абзац ниже.)
 * `7cc2b578…` — одна улика (sbercib.ru) с записью об атрибутции значения на Росстат;
   та же причина оценки.
 
@@ -15,6 +16,15 @@
 указателя нет (собственная оценка третьего актора, страница самого ЦБ без записанного
 решения о происхождении значения), витрина молчит по-прежнему (fail-closed). Карточка,
 список знаний, карточка утверждения и список вопросов показывают один и тот же бейдж.
+
+T7.116 (часть б), ADR-0035: указатель строки называет производителя ТОЛЬКО если его словарь
+стоит в самом утверждении. Репродюсер `6d9a12ff…` («Медианная оценка наблюдаемой инфляции …»
+— в утверждении производителя нет) был подписан «Опубликовано производителем» по одному лишь
+указателю на документ ЦБ; теперь он честный «Подтверждено слабо», как и стендовой случай
+`85220305…`. Строки с записанной атрибуцией значения (`7cc2b578…`) и строки, где утверждение
+называет производителя, подписываются по-прежнему — за это отвечают
+`test_card_labels_single_evidence_with_recorded_attribution` и
+`test_named_producer_in_statement_keeps_the_single_publication_label`.
 """
 
 from __future__ import annotations
@@ -105,11 +115,13 @@ async def test_card_labels_single_retelling_with_producer_anchor(
 
         item = card["claims"][0]
         badge = item["reliability"]
-        assert badge["label"] == PRODUCER_LABEL, badge
-        assert "Банк России" in badge["hint"], badge
-        # честная форма единственной улики: одна публикация, а не «все подтверждения — кластер»
-        assert "одна публикация" in badge["hint"] and "кластер" not in badge["hint"], badge
-        assert "истинность не проверена" in badge["hint"], badge
+        # T7.116 (часть б), ADR-0035: было — указатель строки называл «Банк России» и давал
+        # метку «Опубликовано производителем», хотя утверждение никакого производителя не
+        # называет (стенд 85220305 с его «Опубликовано производителем» по чужому указателю).
+        # Стало — указатель имени не даёт: метка прежняя честная, уровня и причин нет изменений.
+        assert badge["label"] == WEAK_LABEL, badge
+        assert "Банк России" not in badge["hint"], badge
+        assert "одна публикация" not in badge["hint"], badge
         assert badge["level"] == LEVEL_WEAK, badge
         assert len(badge["hint"]) <= MAX_HINT_CHARS, badge["hint"]
         # причина оценки — та же записанная, только подписанная словарём
@@ -270,17 +282,63 @@ async def test_knowledge_list_and_claim_detail_carry_the_same_single_hint(
         listed = [item for item in listing["claims"] if item["id"] == str(claim_id)]
         assert len(listed) == 1, listing
         badge = listed[0]["reliability"]
-        assert badge["label"] == PRODUCER_LABEL, badge
-        assert "Банк России" in badge["hint"] and "одна публикация" in badge["hint"], badge
+        # T7.116 (часть б): тот же флип, что у карточки ответа, во всех трёх витринах сразу —
+        # указатель на страницу производителя не называет его в утверждении, не называет и бейдж.
+        assert badge["label"] == WEAK_LABEL, badge
+        assert "Банк России" not in badge["hint"] and "одна публикация" not in badge["hint"], badge
         assert badge["level"] == LEVEL_WEAK, badge
 
-        assert detail["reliability"]["label"] == PRODUCER_LABEL, detail["reliability"]
-        assert "одна публикация" in detail["reliability"]["hint"], detail["reliability"]
+        assert detail["reliability"]["label"] == WEAK_LABEL, detail["reliability"]
+        assert detail["reliability"]["hint"] == badge["hint"], detail["reliability"]
 
         rows = [row for row in questions["questions"] if row["id"] == str(question_id)]
         assert len(rows) == 1, questions
         summary = rows[0]["answer"]
-        assert summary["reliability"]["label"] == PRODUCER_LABEL, summary
-        assert "одна публикация" in summary["reliability"]["hint"], summary
+        assert summary["reliability"]["label"] == WEAK_LABEL, summary
+        assert summary["reliability"]["hint"] == badge["hint"], summary
+    finally:
+        await app_engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_named_producer_in_statement_keeps_the_single_publication_label(
+    migrated_db: tuple[str, AsyncEngine], tmp_path: Any
+) -> None:
+    """Контроль к двум предыдущим тестам (T7.116 часть б): та же конструкция улики и указателя,
+    но утверждение называет производителя — метка «Опубликовано производителем» и честная
+    форма «одна публикация» остаются. Гвард снимает имя с указателя только когда сам текст
+    утверждения производителя не называет."""
+    scratch_url, engine = migrated_db
+    app, app_engine = await _make(scratch_url, tmp_path / "host", tmp_path / "unit.json")
+    try:
+        question_id, claim_id, assessment_id = await _single_evidence_claim(
+            engine,
+            statement="Инфляция в России в декабре 2025 года составила 13,1% (по данным Банка России)",
+            reasons=FEW_EVIDENCE,
+        )
+        anchor = await _source(engine, uri=CBR_FORECAST_PDF, tag="cbr-anchor")
+        source_id = await _source(engine, uri=FORBES, tag="forbes", parent=anchor)
+        evidence_id = await _evidence(
+            engine, claim_id=claim_id, source_id=source_id, tag="forbes-e", scope='{"x": 1}'
+        )
+        await _fix_groups(
+            engine,
+            assessment_id=assessment_id,
+            members=[(source_id, "g0", f"parent:{anchor}")],
+            roles={evidence_id: "support"},
+        )
+
+        async with _client(app) as client:
+            card = (await client.get(f"/api/v1/questions/{question_id}/answer")).json()
+
+        item = card["claims"][0]
+        badge = item["reliability"]
+        assert badge["label"] == PRODUCER_LABEL, badge
+        assert "Банк России" in badge["hint"], badge
+        # честная форма единственной улики: одна публикация, а не «все подтверждения — кластер»
+        assert "одна публикация" in badge["hint"] and "кластер" not in badge["hint"], badge
+        assert "истинность не проверена" in badge["hint"], badge
+        assert badge["level"] == LEVEL_WEAK, badge
+        assert len(badge["hint"]) <= MAX_HINT_CHARS, badge["hint"]
     finally:
         await app_engine.dispose()

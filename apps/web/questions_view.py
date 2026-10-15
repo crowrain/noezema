@@ -306,7 +306,11 @@ async def list_question_rows(
         # карточка ответа, поэтому имя производителя считается здесь той же чистой функцией
         # (`apps.web.producer_view`) из записанных фактов этой же оценки. Ничего не пересчитывается.
         item = dict(row)
-        case = producer_publication_case(_assessment_facts(item), reasons=_grade_reasons(item))
+        case = producer_publication_case(
+            _assessment_facts(item),
+            reasons=_grade_reasons(item),
+            claim_statement=str(item.get("statement") or ""),
+        )
         item["single_producer"] = case.name if case is not None else None
         item["producer_supports"] = case.supports if case is not None else None
         per_question_claims.setdefault(str(row["question_id"]), []).append(item)
