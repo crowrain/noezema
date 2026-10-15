@@ -944,14 +944,17 @@ function disputeCard(p){
   }
   if(uris.length){
     const opts = uris.map(u => `<option value="${esc(u)}">${esc(u.slice(0,70))}</option>`).join('');
+    const primaryOpts = primaryUris(p).map(u => `<option value="${esc(u)}">${esc(u.slice(0,70))}</option>`).join('');
     h += '<br><b>Оспорить (фактом о происхождении источника):</b>'+
-      '<div><label>первоисточник <select id="d-primary">'+opts+'</select></label>'+
+      '<div><label>первоисточник <select id="d-primary">'+primaryOpts+'</select></label>'+
       ' <label>пересказ <select id="d-retelling">'+opts+'</select></label>'+
       '<br><label>причина своими словами <input id="d-reason" size="40"></label>'+
       ' <label>admin token <input id="d-token" type="password" size="18" placeholder="X-Admin-Token"></label>'+
       '<br><button id="d-do">Оспорить</button> <button id="d-cancel">Снять спор</button>'+
       '<br><small>Здесь не выбирают оценку: спор убавляет независимость источников, а оценку и бейдж '+
-      'пересчитывают правила на ближайшем тике перепроверки. Действующая оценка видна до пересчёта.</small>'+
+      'пересчитывают правила на ближайшем тике перепроверки. Действующая оценка видна до пересчёта. '+
+      'Первоисточником можно назвать и производителя, которому хост уже приписал улики этого '+
+      'утверждения (они добавлены в список первоисточника); пересказ — только сама улика.</small>'+
       '<pre id="d-out">—</pre></div>';
   }
   h += '</div>';
@@ -961,6 +964,14 @@ function sourceUris(p){
   const seen = new Set(); const out = [];
   for(const e of p.evidence || []){
     const u = e.source && e.source.canonical_uri;
+    if(u && !seen.has(u)){ seen.add(u); out.push(u); }
+  }
+  return out;
+}
+function primaryUris(p){
+  const out = sourceUris(p); const seen = new Set(out);
+  for(const s of p.dispute_producers || []){
+    const u = s && s.canonical_uri;
     if(u && !seen.has(u)){ seen.add(u); out.push(u); }
   }
   return out;

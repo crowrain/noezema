@@ -24,7 +24,7 @@ from apps.web.producer_view import producer_publication_case
 from apps.web.reliability import describe_verification, reliability
 from packages.domain.models.base import JsonDict
 from packages.domain.models.enums import AuditEventType
-from packages.memory.dispute import list_claim_disputes
+from packages.memory.dispute import claim_producer_sources, list_claim_disputes
 
 # the effective snapshot pointer (fail-closed: the view is served from
 # the same head the runtime reads)
@@ -877,6 +877,14 @@ async def claim_provenance(db: AsyncSession, claim_id: uuid.UUID) -> JsonDict:
         "source_groups": source_groups,
         "environment_groups": env_groups,
         "assessment_evidence_roles": roles,
+        # Кандидаты первоисточника спора сверх самих улик (T7.114): производители,
+        # которым хост уже приписал улики утверждения (запись значения и страничный
+        # указатель). Список читается тем же запросом, что и сервис спора, и служит
+        # только подсказкой формы: view ничего не назначает.
+        "dispute_producers": [
+            {"source_id": _uuid(p.source_id), "canonical_uri": p.canonical_uri}
+            for p in await claim_producer_sources(db, claim_id)
+        ],
         # Операторские исправления графа источников этого утверждения (T7.81):
         # только уже записанные строки коррекции + причина из журнала; view ничего
         # не оценивает и действующую оценку не прячет.

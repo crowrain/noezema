@@ -10,6 +10,14 @@
 rules_engine.py). Бейдж «Проверено» уходит потому, что независимости стало
 меньше, а не потому, что так решил оператор.
 
+T7.114 (дополнение ADR-0031, решение пользователя): кандидатами на роль ПЕРВОИСТОЧНИКА
+в паре спора, кроме источников улик утверждения, являются также источники-производители,
+к которым хост УЖЕ приписал улики этого утверждения: запись значения
+`evidence.scope.value_attribution.parent_source_id` (любая версия метода) и страничный
+указатель `sources.parent_source_id` источников улик. Это не произвольная страница
+интернета: факт производности от неё уже записан хостом в истории знания. Роль ПЕРЕСКАЗА
+остаётся прежней — только источник собственной улики утверждения.
+
 Чего здесь сознательно нет (стоп-критерий T7.81):
 
 - нового значения `OperatorCommandType` и правки CHECK `operator_commands.type`
@@ -43,6 +51,7 @@ from packages.domain.services.audit import AuditService
 from packages.domain.services.question_intake import put_operator_question
 from packages.memory.independence import normalize_uri
 from packages.memory.rules_engine import RULES_ENGINE_VERSION
+from packages.memory.scope import VALUE_ATTRIBUTION_SCHEMA
 from packages.memory.source_graph import apply_source_graph_change
 
 #: Акторы: вход, через который оператор сделал действие. Хост называет себя
@@ -180,29 +189,46 @@ def resolve_dispute_pair(
     *,
     primary_uri: str,
     retelling_uri: str,
+    producer_sources: Sequence[ClaimSource] = (),
 ) -> DisputePair:
-    """Пара «первоисточник ← пересказ» среди улик именно этого утверждения.
+    """Пара «первоисточник ← пересказ» (T7.81; границы первоисточника расширены T7.114).
 
-    Fail-closed: адрес, которого нет среди источников claim'а, не разрешается
-    («оператор спорит про эту страницу», а не про произвольный источник).
-    Совпадение — по хосту, пути и query (схема http/https одной страницы не
-    важна); несколько источников с одним адресом — отказ, пока оператор не
-    назвал их разными адресами.
+    Fail-closed по ролям. ПЕРЕСКАЗ: адрес обязан стоять среди источников улик именно
+    этого утверждения («оператор спорит про эту страницу», а не про произвольный
+    источник). ПЕРВОИСТОЧНИК: источник улики ИЛИ источник-производитель, которому хост
+    уже приписал улики этого утверждения (`claim_producer_sources`): оператор называет
+    факт, уже записанный в истории знания, а не своё мнение о чужом сайте.
+
+    Совпадение — по хосту, пути и query (схема http/https одной страницы не важна).
+    Один и тот же источник, встреченный и как улика, и как производитель, считается
+    один раз (без двойного счёта); несколько РАЗНЫХ источников с одним адресом — отказ,
+    пока оператор не назвал их разными адресами.
     """
 
-    def _one(uri: str, role: str) -> ClaimSource:
-        matches = [s for s in sources if _uri_matches(s.canonical_uri, uri)]
+    def _one(uri: str, role: str, candidates: Sequence[ClaimSource]) -> ClaimSource:
+        matches: dict[Any, ClaimSource] = {}
+        for source in candidates:
+            if _uri_matches(source.canonical_uri, uri):
+                matches[source.source_id] = source
         if not matches:
             raise DisputeError(REFUSAL_SOURCE_NOT_FOUND, detail=f"{role}: {uri}")
         if len(matches) > 1:
             raise DisputeError(REFUSAL_SOURCE_NOT_FOUND, detail=f"{role}: {uri} (неоднозначно)")
-        return matches[0]
+        return next(iter(matches.values()))
 
-    primary = _one(primary_uri, "primary")
-    retelling = _one(retelling_uri, "retelling")
+    primary = _one(primary_uri, "primary", _primary_candidates(sources, producer_sources))
+    retelling = _one(retelling_uri, "retelling", sources)
     if primary.source_id == retelling.source_id:
         raise DisputeError(REFUSAL_SAME_SOURCE)
     return DisputePair(primary=primary, retelling=retelling)
+
+
+def _primary_candidates(
+    evidence: Sequence[ClaimSource], producers: Sequence[ClaimSource]
+) -> list[ClaimSource]:
+    """Кандидаты первоисточника: улики ∪ производители, дедупликация по строке источника."""
+    seen = {s.source_id for s in evidence}
+    return list(evidence) + [p for p in producers if p.source_id not in seen]
 
 
 def recheck_question_text(statement: str) -> str:
@@ -301,6 +327,94 @@ async def _claim_sources(db: AsyncSession, claim_id: uuid.UUID) -> list[ClaimSou
     return [ClaimSource(source_id=r["source_id"], canonical_uri=r["canonical_uri"]) for r in rows]
 
 
+async def claim_producer_sources(db: AsyncSession, claim_id: uuid.UUID) -> list[ClaimSource]:
+    """Источники-производители, к которым хост уже приписал улики утверждения (T7.114).
+
+    Две уже записанные формы решения хоста, читаемые так же, как их читает
+    группировщик (`source_graph.py::_value_attribution_parents`; детектор отсюда не
+    вызывается):
+
+    - страничный указатель `sources.parent_source_id` источника улики;
+    - запись значения `evidence.scope.value_attribution.parent_source_id` — любая
+      версия метода: маркер формы `VALUE_ATTRIBUTION_SCHEMA` с T7.85 не поднимался,
+      прежние записи читаются (урок T7.85(5)).
+
+    Родитель, совпадающий с самой уликой, отдельно не перечисляется: кандидат-улика
+    уже его содержит (`_primary_candidates` дедуплицирует по строке источника).
+    """
+    pointer_rows = (
+        (
+            await db.execute(
+                text(
+                    "SELECT DISTINCT p.id AS source_id, p.canonical_uri "
+                    "FROM evidence e "
+                    "JOIN sources es ON es.id = e.source_id "
+                    "JOIN sources p ON p.id = es.parent_source_id "
+                    "WHERE e.claim_id = :c AND e.source_id IS NOT NULL "
+                    "  AND es.parent_source_id IS NOT NULL AND es.parent_source_id <> es.id "
+                    "ORDER BY p.id"
+                ),
+                {"c": claim_id},
+            )
+        )
+        .mappings()
+        .all()
+    )
+    producers = [ClaimSource(source_id=r["source_id"], canonical_uri=r["canonical_uri"]) for r in pointer_rows]
+
+    attribution_rows = (
+        (
+            await db.execute(
+                text(
+                    "SELECT scope -> 'value_attribution' ->> 'parent_source_id' AS parent_id "
+                    "FROM evidence "
+                    "WHERE claim_id = :c AND source_id IS NOT NULL "
+                    "  AND jsonb_typeof(scope -> 'value_attribution') = 'object' "
+                    "  AND scope -> 'value_attribution' ->> 'schema' = :schema"
+                ),
+                {"c": claim_id, "schema": VALUE_ATTRIBUTION_SCHEMA},
+            )
+        )
+        .scalars()
+        .all()
+    )
+    seen = {p.source_id for p in producers}
+    extra: list[uuid.UUID] = []
+    for raw_parent in attribution_rows:
+        parent_id = _as_uuid(raw_parent)
+        if parent_id is None or parent_id in seen:
+            continue
+        seen.add(parent_id)
+        extra.append(parent_id)
+    if extra:
+        rows = (
+            (
+                await db.execute(
+                    text("SELECT id, canonical_uri FROM sources WHERE id = ANY(:ids) ORDER BY id"),
+                    {"ids": extra},
+                )
+            )
+            .mappings()
+            .all()
+        )
+        producers.extend(
+            ClaimSource(source_id=r["id"], canonical_uri=r["canonical_uri"]) for r in rows
+        )
+    return producers
+
+
+def _as_uuid(value: Any) -> uuid.UUID | None:
+    """asyncpg возвращает свой UUID-тип (AGENTS §7): guard перед приведением."""
+    if isinstance(value, uuid.UUID):
+        return value
+    if isinstance(value, str):
+        try:
+            return uuid.UUID(value)
+        except ValueError:
+            return None
+    return None
+
+
 async def _basis_artifact_id(db: AsyncSession, claim_id: uuid.UUID, source_id: uuid.UUID) -> uuid.UUID | None:
     """Артефакт прочитанной страницы пересказа — проверяемое основание коррекции.
 
@@ -357,6 +471,58 @@ async def _group_ids(
         key = source_id if isinstance(source_id, uuid.UUID) else uuid.UUID(str(source_id))
         out[key] = str(group_id)
     return out
+
+
+async def _producer_group_ids(
+    db: AsyncSession, *, assessment_id: uuid.UUID | None, parent_id: uuid.UUID, claim_id: uuid.UUID
+) -> set[str]:
+    """Группа производителя в снимке независимости действующей оценки (T7.114).
+
+    Производитель не входит в участники снимка (участники — только источники улик),
+    поэтому его группа читается из того же снимка — через улики этого утверждения,
+    которым хост записал его родителем (обе формы указателя). Группировщик склеивает
+    детей общего родителя в одну группу, поэтому обычно это ровно одна группа.
+    Ноль групп (снимка нет) или больше одной (указатель записан уже ПОСЛЕ снимка —
+    каскад ещё не пересчитал оценку) означает «группа производителя неизвестна»:
+    отказа «уже сгруппированы» нет, merge лишь приведёт группы к согласию на пересчёте.
+    """
+    if assessment_id is None:
+        return set()
+    snapshot_id = (
+        await db.execute(
+            text("SELECT source_independence_snapshot_id FROM claim_assessments WHERE id = :a"),
+            {"a": assessment_id},
+        )
+    ).scalar_one_or_none()
+    if snapshot_id is None:
+        return set()
+    rows = (
+        (
+            await db.execute(
+                text(
+                    "SELECT DISTINCT m.group_id "
+                    "FROM source_independence_members m "
+                    "JOIN evidence e ON e.source_id = m.source_id AND e.claim_id = :c "
+                    "LEFT JOIN sources es ON es.id = e.source_id "
+                    "WHERE m.snapshot_id = :s "
+                    "  AND (es.parent_source_id = :p "
+                    "       OR (jsonb_typeof(e.scope -> 'value_attribution') = 'object' "
+                    "           AND e.scope -> 'value_attribution' ->> 'schema' = :schema "
+                    "           AND e.scope -> 'value_attribution' ->> 'parent_source_id' = :p_text))"
+                ),
+                {
+                    "s": snapshot_id,
+                    "c": claim_id,
+                    "p": parent_id,
+                    "p_text": str(parent_id),
+                    "schema": VALUE_ATTRIBUTION_SCHEMA,
+                },
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return {str(group_id) for group_id in rows}
 
 
 async def _find_correction(
@@ -424,9 +590,18 @@ async def dispute_claim(
     primary_wanted = normalize_dispute_uri(primary_uri)
     retelling_wanted = normalize_dispute_uri(retelling_uri)
 
+    # T7.114: первоисточник разрешается среди улик утверждения И среди производителей,
+    # которым эти улики уже приписаны хостом; пересказ — только улика утверждения.
+
     claim = await _claim_row(db, claim_id)
     sources = await _claim_sources(db, claim_id)
-    pair = resolve_dispute_pair(sources, primary_uri=primary_wanted, retelling_uri=retelling_wanted)
+    producers = await claim_producer_sources(db, claim_id)
+    pair = resolve_dispute_pair(
+        sources,
+        primary_uri=primary_wanted,
+        retelling_uri=retelling_wanted,
+        producer_sources=producers,
+    )
 
     received = await audit.record(
         AuditEventType.OPERATOR_COMMAND_RECEIVED,
@@ -494,7 +669,16 @@ async def dispute_claim(
     groups = await _group_ids(
         db, assessment_id, (pair.primary.source_id, pair.retelling.source_id)
     )
-    if len(groups) == 2 and groups[pair.primary.source_id] == groups[pair.retelling.source_id]:
+    primary_group = groups.get(pair.primary.source_id)
+    if primary_group is None:
+        # первоисточник назван производителем (T7.114): его группа в снимке —
+        # группа улик, которым он записан родителем
+        derived = await _producer_group_ids(
+            db, assessment_id=assessment_id, parent_id=pair.primary.source_id, claim_id=claim_id
+        )
+        primary_group = next(iter(derived)) if len(derived) == 1 else None
+    retelling_group = groups.get(pair.retelling.source_id)
+    if primary_group is not None and primary_group == retelling_group:
         raise DisputeError(REFUSAL_ALREADY_GROUPED)
 
     if existing is not None:
