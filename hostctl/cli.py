@@ -414,6 +414,144 @@ def reassessment_tick(batch_size: int, lease_seconds: int) -> None:
     sys.exit(code)
 
 
+@main.command("independence-preview")
+@click.option(
+    "--apply",
+    is_flag=True,
+    default=False,
+    help="Применить: существующий каскад §11.3 (головы в pending + задачи переоценки) "
+    "и один рабочий батч; повторный предпросмотр после обработки.",
+)
+def independence_preview(apply: bool) -> None:
+    """Предпросмотр смены групп независимости (T7.117 часть б, ADR-0029 §22).
+
+    Read-only по умолчанию: для каждого утверждения с действующей головой
+    effective-снапшота сравнивает записанные группы независимости и оценку с тем, что
+    дадут чистые группировщик и правила при новом приоритете «запись значения выше
+    страничного указателя». Ничего не пишет. --apply применяет перечисленное существующим
+    каскадом `apply_source_graph_change` (тот же путь, что у переатрибуции), затем
+    выполняет один рабочий батч и повторяет предпросмотр: он обязан стать пустым.
+    """
+    import asyncio
+    import os
+
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    url = os.environ.get("NOEZEMA_DATABASE_URL", "")
+    if not url:
+        click.echo("NOEZEMA_DATABASE_URL is not set", err=True)
+        sys.exit(EXIT_USAGE_ERROR)
+
+    from packages.domain.db.uow import transaction
+    from packages.domain.services.audit import AuditService
+    from packages.memory.independence_preview import (
+        IndependencePreviewError,
+        IndependencePreviewRow,
+        apply_independence_preview,
+        preview_independence_changes,
+    )
+    from packages.memory.reassessment import run_reassessment_batch
+
+    engine = create_async_engine(url)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    def _fmt_partition(partition: tuple[tuple[str, ...], ...]) -> str:
+        if not partition:
+            return "нет источных улик"
+        return " | ".join("«" + ", ".join(items) + "»" for items in partition)
+
+    def _print_row(row: IndependencePreviewRow) -> None:
+        statement = " ".join(row.statement.split())
+        if len(statement) > 90:
+            statement = statement[:89] + "…"
+        click.echo(f"утверждение {str(row.claim_id)[:8]} · {row.claim_type}")
+        click.echo(f"    утверждение: {statement}")
+        if row.groups_changed:
+            click.echo(f"    группы было ({len(row.old_groups)}): {_fmt_partition(row.old_groups)}")
+            click.echo(f"    группы стало ({len(row.new_groups)}): {_fmt_partition(row.new_groups)}")
+        else:
+            click.echo("    группы не изменились")
+        for switch in row.parent_switches:
+            was = switch.pointer_parent_uri or "нет родителя по строке"
+            click.echo(
+                f"    улика {switch.evidence_uri}: родитель по указателю «{was}» → "
+                f"по записи «{switch.record_parent_uri}»"
+            )
+        if row.evaluation_computed:
+            click.echo(
+                f"    оценка было: {row.persisted_grade} {row.persisted_status} "
+                f"({row.persisted_confidence:.2f}) → стало: {row.new_grade} {row.new_status} "
+                f"({(row.new_confidence or 0.0):.2f})"
+            )
+        else:
+            click.echo(
+                f"    оценка было: {row.persisted_grade} {row.persisted_status} "
+                f"({row.persisted_confidence:.2f}); {row.evaluation_note or ''}"
+            )
+
+    def _print_totals(report: Any) -> None:
+        click.echo(
+            f"итог: утверждений с изменением групп: {report.groups_changed_count}; "
+            f"с изменением оценки: {report.assessment_changed_count}; "
+            f"проверено утверждений: {report.claims_checked}"
+        )
+
+    async def _run() -> int:
+        try:
+            async with factory() as db:
+                report = await preview_independence_changes(db)
+            snap = str(report.config_snapshot_id)[:8] if report.config_snapshot_id else "—"
+            click.echo(
+                f"independence-preview: только чтение (снимок правил {snap}); "
+                f"утверждений с изменениями: {len(report.rows)}"
+            )
+            for row in report.rows:
+                _print_row(row)
+            if not report.rows:
+                click.echo(
+                    "(изменений нет: записанные группы и оценки совпадают с пересчётом по новому правилу)"
+                )
+            _print_totals(report)
+
+            if not apply:
+                return 0
+            if not report.rows:
+                click.echo("(применять нечего: предпросмотр пуст)")
+                return 0
+            async with factory() as db, transaction(db):
+                cascade = await apply_independence_preview(db, AuditService(db), rows=report.rows)
+            click.echo(
+                f"каскад §11.3: затронуто утверждений: {cascade.affected_claims}; "
+                f"снятых голов: {cascade.invalidated}; задач переоценки создано: {cascade.jobs_created}"
+            )
+            if cascade.jobs_created:
+                async with factory() as db:
+                    outcome = await run_reassessment_batch(db)
+                click.echo(
+                    f"рабочий переоценки: processed={outcome.processed} completed={outcome.completed} "
+                    f"retried={outcome.retried} blocked={outcome.blocked} deferred={outcome.deferred}"
+                )
+            async with factory() as db:
+                after = await preview_independence_changes(db)
+            if after.rows:
+                click.echo(f"повторный предпросмотр после обработки: {len(after.rows)} изменений")
+                for row in after.rows:
+                    _print_row(row)
+            else:
+                click.echo(
+                    "повторный предпросмотр после обработки: пусто (оценки перестроены по новому правилу)"
+                )
+            return 0
+        except IndependencePreviewError as exc:
+            click.echo(f"independence-preview: отказ — {exc}", err=True)
+            return 2
+        finally:
+            # пул закрываем в том же event loop, где были соединения (ловушка CliRunner-тестов)
+            await engine.dispose()
+
+    sys.exit(asyncio.run(_run()))
+
+
 @main.command("research-reattribute")
 @click.option(
     "--since",
