@@ -281,6 +281,12 @@ class SessionContext:
     # реселекции окон после конца exploration; в БД ничего нового не пишется.
     evidence_source_texts: dict[str, str] = field(default_factory=dict)
     final_rationale_signal: str = ""
+    # T7.115 (ADR-0032 дополнение): публичная rationale шага `complete` ЦЕЛИКОМ в памяти
+    # сессии. Ни аудит-обрезок [:500], ни оконный сигнал final_rationale_signal не годятся:
+    # финальный ответ может быть длиннее окна, а ссылка `c:<id>` не должна обрезаться.
+    # Нужно для честной опоры на записанное знание на границе куратора; в БД ничего
+    # нового не пишется.
+    final_answer_rationale: str = ""
 
 
 @dataclass(frozen=True)
@@ -1921,6 +1927,10 @@ class Orchestrator:
                     )
                     continue
                 ctx.complete_reason = decision.reason
+                # T7.115 (ADR-0032 дополнение): финальным ответом сессии становится только
+                # rationale, прошедший хостовый гейт T7.21 (отклонённый COMPLETE — не ответ,
+                # его текст в опору не попадёт никогда). Хранится целиком, в памяти сессии.
+                ctx.final_answer_rationale = response.public_rationale
                 # T7.49 (ADR-0022): the RAW model text is kept in
                 # complete_reason as before; normalized_reason carries the
                 # canonical token (or null when the reason is free-form /
@@ -3034,6 +3044,38 @@ class Orchestrator:
         relied_claim_ids = accepted.relied_claim_ids
         relied_claims_rejected = accepted.relied_claims_rejected
 
+        # T7.115 (ADR-0032 дополнение): опора и из финального ответа исследователя.
+        # Хост добавляет в опору только те id ссылок `c:<...>` из целиком сохранённой
+        # rationale шага `complete`, которые видит в контекст-паке (тот же ресолвер
+        # `resolve_claim_reference` и тот же набор видимости `_pack_claim_ids`, что у
+        # опоры куратора T7.82; неоднозначный префикс — отказ, а не догадка). Операция
+        # этой сессии (перепроверка/склейка — в том числе конвертированная гейтом
+        # value-dup) в опору не дублируется. Приоритет за куратором: его id уже в
+        # списке, потолок RELIED_CLAIMS_LIMIT общий. Результат — прежние ключи payload;
+        # добавленные ответом id названы аддитивным ключом `relied_from_explorer` ниже.
+        relied_pack_ids = _pack_claim_ids(knowledge)
+        from packages.memory.service import resolve_claim_reference
+
+        session_operation_ids: set[uuid.UUID] = set()
+        for op_index, staged_claim in enumerate(staged_claims):
+            if op_index in dropped or staged_claim.existing_claim_id is None:
+                continue
+            op_target, _problem = resolve_claim_reference(
+                str(staged_claim.existing_claim_id), relied_pack_ids
+            )
+            if op_target is not None:
+                session_operation_ids.add(op_target)
+        relied_from_explorer, answer_rejections = _relied_from_answer(
+            ctx.final_answer_rationale,
+            relied_pack_ids,
+            {uuid.UUID(str(cid)) for cid in relied_claim_ids},
+            session_operation_ids,
+            RELIED_CLAIMS_LIMIT,
+        )
+        if relied_from_explorer or answer_rejections:
+            relied_claim_ids = [*relied_claim_ids, *relied_from_explorer]
+            relied_claims_rejected = [*relied_claims_rejected, *answer_rejections]
+
         # T7.105: если после снятий остались активные операции — предложение применяется
         # частично: снятые операции называются в payload уже существующего CLAIM_CREATED
         # (паттерн value_duplicates/relied_claims_rejected; нового типа события нет).
@@ -3175,6 +3217,11 @@ class Orchestrator:
             claim_event_payload["relied_claim_ids"] = relied_claim_ids
         if relied_claims_rejected:
             claim_event_payload["relied_claims_rejected"] = relied_claims_rejected[:10]
+        # T7.115 (ADR-0032 дополнение): какие id опоры добавил хост из финального ответа
+        # исследователя (-curator их не перечислил). Как и все новые ключи, пишется только
+        # непустым — сессии без ссылок в ответе остаются байт в байт прежними.
+        if relied_from_explorer:
+            claim_event_payload["relied_from_explorer"] = relied_from_explorer
         # T7.83 (ADR-0033): ключ появляется только при непустом решении гейта —
         # прежние сессии и их аудит остаются байт-в-байт прежними
         if value_duplicates:
@@ -3983,6 +4030,65 @@ def _pack_claim_ids(knowledge: str) -> list[uuid.UUID]:
         if cid not in seen:
             seen.append(cid)
     return seen
+
+
+#: T7.115 (ADR-0032 дополнение): форма ссылки ответа исследователя на утверждение знания —
+#: `c:<полный uuid>` или `c:<hex-префикс не короче 8>` (в том числе префикс канонической
+#: формы с дефисом внутри). Начало и конец группы захвата — hex, поэтому висячий дефис
+#: («c:118b76b3-») не входит в id; lookbehind не даёт матчить ссылку, приклеенную к слову
+#: («1c:...», «abc:...»). Короткие («c:abc123») и не-hex формы — не ссылка, молча.
+_ANSWER_CLAIM_REF_RE = re.compile(r"(?<![0-9a-zA-Z])c:([0-9a-fA-F][0-9a-fA-F-]{6,34}[0-9a-fA-F])")
+
+
+def _relied_from_answer(
+    answer_text: str,
+    visible_pack_ids: list[uuid.UUID],
+    taken_ids: set[uuid.UUID],
+    operation_ids: set[uuid.UUID],
+    limit: int,
+) -> tuple[list[str], list[str]]:
+    """T7.115 (ADR-0032 дополнение): хостовая опора на знание из ФИНАЛЬНОГО ответа
+    исследователя (случай 96a0c535: куратор предложил 0 claims и не назвал опору, хотя
+    итоговый ответ ссылался на записанные строки знания).
+
+    Из целиком сохранённой rationale шага `complete` извлекаются ссылки разрешителем
+    `resolve_claim_reference` СТРОГО по id контекст-пака (тот же ресолвер и тот же
+    набор видимости, что у опоры куратора T7.82): хост добавляет только те id, которые
+    видит, и никогда не догадывается о неоднозначном префиксе. Промежуточные шаги не
+    участвуют — вызывается только с финальным текстом.
+
+    - id уже в опоре куратора — молча пропускается (приоритет куратора, дублей нет);
+    - id — операция этой сессии (перепроверка/склейка) — в опору не дублируется,
+      отказ назван;
+    - общий потолок `limit` (id куратора считаются первыми), отказ по потолку назван.
+
+    Отказы ничего не отклоняют: пишутся в `relied_claims_rejected` с префиксом
+    `answer[k]:`. Возвращает (добавленные полные id, строки отказов)."""
+    from packages.memory.service import resolve_claim_reference
+
+    added: list[str] = []
+    rejected: list[str] = []
+    if not answer_text:
+        return added, rejected
+    taken = set(taken_ids)
+    used_total = len(taken)  # опора куратора уже дедуплицирована на границе
+    for k, raw in enumerate(_ANSWER_CLAIM_REF_RE.findall(answer_text)):
+        ref_id, problem = resolve_claim_reference(raw, visible_pack_ids)
+        if ref_id is None:
+            rejected.append(f"answer[{k}]: {problem or 'unparseable claim reference'}")
+            continue
+        if ref_id in taken:
+            continue
+        if ref_id in operation_ids:
+            rejected.append(f"answer[{k}]: claim {ref_id} is already an operation of this session")
+            continue
+        if used_total >= limit:
+            rejected.append(f"answer[{k}]: more than {limit} relied ids")
+            continue
+        taken.add(ref_id)
+        used_total += 1
+        added.append(str(ref_id))
+    return added, rejected
 
 
 def _cap_args(value: object) -> str:
