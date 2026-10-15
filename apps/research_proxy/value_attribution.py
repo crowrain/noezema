@@ -76,6 +76,7 @@ from packages.domain.models.base import JsonDict
 from packages.memory.scope import (
     EVIDENCE_SELF_PUBLICATION_KEY,
     VALUE_ATTRIBUTION_PAIRING_BIBLIOGRAPHY,
+    VALUE_ATTRIBUTION_PAIRING_KNOWN_PRODUCER_MENTIONED,
     VALUE_ATTRIBUTION_PAIRING_PUBLICATION,
     VALUE_ATTRIBUTION_PAIRING_STRICT,
     build_self_publication,
@@ -217,7 +218,27 @@ from packages.memory.scope import (
 #: формой finmarket и её зеркалом (T7.113 в), шаблон отчётности — формой «отчиталось»
 #: (общий словарь с детектором страниц). Решения v12 отличаются от решений v11 (замер свипа —
 #: STATUS T7.113) → переатрибуция пересматривает записи эпохи v11.
-VALUE_ATTRIBUTION_METHOD_VERSION: Final = "host-value-attribution-v12"
+#: v13 (T7.116 часть а, решение пользователя 2026-10-15): добавлен четвёртый, последний
+#: режим fallback «известный производитель упомянут на странице»
+#: (`_known_producer_mentioned_decision`, pairing `known_producer_mentioned`): у утверждения
+#: уже есть ДРУГАЯ улика, записанная строгим режимом или режимом публикации (первичный ключ
+#: собирается вызывающим из записей — `known_claim_primaries`), и на этой странице значение
+#: утверждения стоит (диапазон — целиком как токен или обоими самостоятельными концами,
+#: одиночное — одиночным; формы T7.109a и гейта T7.113), словарный алиас производителя назван
+#: на странице не менее двух раз (в двух строках) либо в одной строке со значением утверждения
+#: — единственное упоминание без значения остаётся отказом (гвард T7.107 про меню сайта),
+#: вето собственной оценки в окрестности значения не сработало, страница
+#: не домашняя для производителя и другой известный производитель на странице не назван
+#: (иначе `ambiguous_primaries`); если САМО утверждение называет словарного производителя,
+#: новый режим молчит, пока он не тот же самый (гвард против ложной склейки T7.107). Режим
+#: вызывается после всех прежних (strict → публикация → ближайший → bibliography) и ничего в
+#: прежних не меняет; записью нового pairing сборщики
+#: ключей знание не пополняют (цепочек нет — тот же гвард, что у T7.108). Решается стендовый
+#: случай: пересказ прогноза на лента-издании без шаблона атрибуции, где деловое издание той
+#: же формулировки уже приписано Банку России строгим режимом. Решения v13 отличаются от
+#: решений v12 (замер свипа — STATUS T7.116) → переатрибуция пересматривает записи эпохи v12.
+#: Страничный детектор не тронут: его версия остаётся v8.
+VALUE_ATTRIBUTION_METHOD_VERSION: Final = "host-value-attribution-v13"
 
 #: честный отказ этого детектора: первоисточник в основании назван, но значение там другое — не то,
 #: на котором стоит утверждение. Отличие от `no_value_attribution` (атрибуции нет вовсе) нужно,
@@ -828,6 +849,67 @@ def claim_ranges_found_in_texts(
     return frozenset(confirmed)
 
 
+#: T7.116 (часть а): обрыватели ПРЕДЛОЖНОЙ ОБЛАСТИ страницы — области, в которой алиас
+# известного производителя и значение утверждения должны стоять вместе, чтобы «упомянут на
+# странице» считался атрибуцией. Обрывают только концы предложения; перевод строки внутри
+# предложения (помеха нормализации) границей не считается.
+_SENTENCE_BREAK_CHARS: Final = ".!?"
+
+#: Потолок длины предложной области co-location: тот же порядок, что у окна публикации
+# (T7.85), помноженный на два — бесконечная «область» из навигации без точек не должна
+# склеивать разнесённые по странице числа с менюшным упоминанием производителя.
+_COLLOCATION_REGION_MAX_CHARS: Final = 2 * OWN_ASSESSMENT_PROXIMITY_CHARS
+
+
+def _sentence_regions(text: str) -> list[str]:
+    """Т7.116 (часть а): разбить скан-текст страницы на области между концами предложений.
+
+    Эти области — исходный материал co-location гварда нового режима: алиас производителя и
+    подтверждённая форма значения утверждения должны попасть в одну область. Точки внутри
+    числовых форм и сокращений область лишь укрупняют на один-два знака — гвард от этого
+    только строже."""
+    parts: list[str] = []
+    current: list[str] = []
+    for char in text:
+        if char in _SENTENCE_BREAK_CHARS:
+            parts.append("".join(current))
+            current = []
+        else:
+            current.append(char)
+    parts.append("".join(current))
+    return [part for part in parts if part and len(part) <= _COLLOCATION_REGION_MAX_CHARS]
+
+
+def _single_values_found_standalone(text: str, singletons: frozenset[str]) -> bool:
+    """T7.116 (часть а): подтверждение одиночных значений внутри области — с гвардом T7.109a.
+
+    Текстовые формы и границы те же, что у гейта T7.108a (`_value_text_forms`,
+    `_form_is_standalone`), но вхождение значения ВНУРИ составного диапазона страницы
+    («14,5–14,6» при значении утверждения 14,5) подтверждением не считается: конец чужого
+    интервала не бывает одиночной записью. Для форм диапазона это уже запрещено самим гейтом
+    T7.113 (оба конца отдельными числами), для одиночных значений гварда у гейта нет — он
+    стоит здесь, ровно как `claim_values_found_in_texts` никогда не подтверждал значение
+    числом внутри другого числа («122,2» против «2,2»)."""
+    if not singletons:
+        return False
+    covered = {(start, end) for start, end, _token in _range_value_spans(text)}
+    for value in singletons:
+        for form in _value_text_forms(value):
+            glued_space = " " in form
+            start = text.find(form)
+            while start != -1:
+                end = start + len(form)
+                if (
+                    _form_is_standalone(text, start, end, glued_space=glued_space)
+                    and not any(
+                        span_start <= start and end <= span_end for span_start, span_end in covered
+                    )
+                ):
+                    return True  # достаточно подтверждения любого одиночного значения режима
+                start = text.find(form, start + 1)
+    return False
+
+
 def claim_range_tokens(match_values: frozenset[str]) -> frozenset[str]:
     """T7.113 (часть 2): какие из значений сравнения `claim_match_values` — составные токены
     диапазонов (`2.1-2.2`). Одиночные значения канонического формата (`цифры.цифры`) дефис не
@@ -1199,6 +1281,147 @@ def _bibliography_known_producer_decision(
     )
 
 
+# ─── T7.116 часть а (ADR-0029 дополнение): четвёртый, последний режим pairing ──────────────
+#
+# Стендовый дефект (сессия 53be7fd6, утверждение c6729d4c «Прогноз Банка России … составляет
+# 6,0–7,0%»): улика делового издания приписана Банку России строгим режимом, а пересказ той же
+# формулировки на лента-издании не имел ни шаблона атрибуции, ни глагола сообщения, ни
+# строки-списка источников — прежние четыре режима молчали, пересказ оставался отдельной
+# группой независимости, оценка падала в E3 «Проверено» в третий раз.
+#
+# Знание о производителе УЖЕ ЕСТЬ у самого утверждения — его принесла другая улика, записанная
+# строгим режимом или режимом публикации. Опереться на него можно, если страница сама называет
+# этого производителя и подтверждает значение утверждения; признак «упомянут на странице» при
+# этом шире bibliography (там алиас обязан стоять в строке-списке), но не «любое упоминание»:
+# алиас и подтверждённая форма значения должны стоять в ОДНОЙ страничной области — между
+# концами предложения (свип old-vs-new на корпусе фикстур: «6%» прибыли Morgan Stanley в списке
+# новостей рядом с заголовком «выше ожиданий ЦБ» и «14,5%» прогноза ключевой ставки в абзаце,
+# следующем за фразой про опрос Банка России, — чужие числа в чужих предложениях). Единственное
+# менюшное упоминание остаётся отказом (гвард T7.107): вне области значения оно бесполезно.
+# Остальные условия: значение — по формам T7.109a/гейта T7.113, но проверенным внутри области;
+# вето окрестности значения T7.113; домашняя страница отвергается; второй известный производитель
+# на странице — `ambiguous_primaries`; утверждение не должно называть другого производителя.
+# Цепочек нет: сборщики `known_claim_primaries` pairing этого режима не
+# читают (тот же гвард T7.108), запись формы строгого режима сама по себе знание не пополняет.
+def _known_producer_mentioned_decision(
+    *,
+    scanned_page: str,
+    canonical_uri: str | None,
+    values: tuple[str, ...],
+    known_claim_primaries: frozenset[str],
+    match_values: frozenset[str],
+    statement_primaries: frozenset[str],
+) -> ValueAttributionDecision | None:
+    """Четвёртый, последний режим pairing (T7.116 часть а): значение утверждения принадлежит
+    производителю X, которого уже назвала другая улика того же утверждения, если X назван на
+    странице в одной области со подтверждённой формой значения этого утверждения. None — честный
+    отказ (условие не собрано); `ambiguous_primaries` — на странице названы два известных
+    производителя. Родительский указатель разрешает вызывающий, как у строгого режима.
+
+    Дополнительный отказ против ложной склейки (тот же дух, что у гварда T7.107 «алиас в
+    меню сайта не считается»): если САМО утверждение называет словарного производителя
+    (`statement_primaries` — `named_primary_keys` по формулировке утверждения), оно не должно
+    противоречить приписыванию — X обязан быть тем самым названным. Утверждение «2,2% по
+    данным Росстата», известное по чужой улике как минфиновское, новым режимом минфину не
+    отдаётся: страница с меню «Минфин России» не перебивает формулировку самого утверждения.
+
+    Co-location алиаса и значения (ужесточение после свипа old-vs-new на корпусе фикстур):
+    формы значения — прежние (гейт T7.113: диапазон целым токеном или оба конца отдельными
+    числами; одиночное значение — только одиночным числом, T7.109a), но проверяются внутри
+    страничной области между концами предложения (`_sentence_regions`), а не по всей странице,
+    и в той же области должен стоять алиас X. Страничные примеры, которые прежняя «любая
+    co-location» склеивала бы ложно: «6%» прибыли Morgan Stanley в строке списка новостей при
+    заголовке «выше ожиданий ЦБ»; «14,5%» базовой инфляции в предложении «такой же была
+    динамика» после абзаца «по оценкам Банка России» про другую величину; одиночное значение
+    14,5 утверждения, которое на странице стоит только концом чужого составного диапазона
+    «14,5–14,6%» прогноза средней ставки (`_single_values_found_standalone`, гвард T7.109a). Единственное
+    менюшное упоминание (закреплено тестом T7.107
+    `test_known_producer_named_only_outside_the_bibliography_lines_is_refused`) остаётся отказом:
+    вне области значения алиас бесполезен. Стенд T7.116 проходит ко-локацию: «выйдя за пределы
+    запланированного Банком России коридора в 6-7 процентов» — алиас внутри того же предложения,
+    что и значение (перевод строки посреди предложения помехой нормализации не считается)."""
+    if not known_claim_primaries or not values:
+        return None  # (i) известного производителя нет — режиму не на что опереться (отказ)
+    if _own_assessment_veto(
+        scanned=scanned_page,
+        masked=_mask_site_disclaimers(scanned_page),
+        match_values=match_values,
+    ):
+        return None  # (iv) настоящая собственная оценка в окрестности значения на странице —
+        # склейки не будет (T7.113: тот же критерий окрестности, что у строгой ветки; плашки
+        # площадки замазаны, словарь маркеров не сокращён)
+    ranges = claim_range_tokens(match_values)
+    singletons = match_values - ranges
+    if not ranges and not singletons:
+        return None  # (ii) у утверждения нет измеренного значения — режиму нечего подтверждать
+    named_known = sorted(
+        key for key in set(named_primary_keys(scanned_page)) & known_claim_primaries
+    )
+    if len(named_known) > 1:
+        # (vi) на странице назван ДРУГОЙ известный производитель утверждения — разночтение,
+        # не склеиваем (тот же отказ, что у bibliography-режима)
+        basis_line = next(
+            (
+                line
+                for line in scanned_page.split("\n")
+                if set(named_primary_keys(line)) & set(named_known)
+            ),
+            scanned_page,
+        )
+        return ValueAttributionDecision(
+            status=STATUS_AMBIGUOUS,
+            basis_fragment=_basis(basis_line),
+            claim_values=values,
+            pairing=VALUE_ATTRIBUTION_PAIRING_KNOWN_PRODUCER_MENTIONED,
+        )
+    if not named_known:
+        return None  # (iii) известный производитель на странице не назван — честный отказ
+    key = named_known[0]
+    if statement_primaries and statement_primaries != {key}:
+        return None  # (iii-а) утверждение называет ДРУГОГО словарного производителя (или двух):
+        # страница-меню не перебивает формулировку самого утверждения (гвард против ложной
+        # склейки T7.107 распространяется и на новый режим)
+    confirmed_region: str | None = None  # (ii+iii) алиас и подтверждённая форма значения — в одной
+    for region in _sentence_regions(scanned_page):  # области страницы (между концами предложения)
+        if key not in set(named_primary_keys(region)):
+            continue
+        if (singletons and _single_values_found_standalone(region, singletons)) or (
+            ranges and claim_ranges_found_in_texts(ranges=ranges, texts=[region])
+        ):
+            confirmed_region = region
+            break
+    if confirmed_region is None:
+        return None  # (ii+iii, свип T7116) алиас есть, но НЕ подтверждён в одной области со
+        # значением: «6%» прибыли банка Morgan Stanley в списке новостей и заголовок «выше
+        # ожиданий ЦБ»; алиас про опрос Банка России — в предложении про 10,7%, а «14,5%»
+        # другой величины — уже в следующем; либо одиночное значение 14,5 попадается только
+        # концом чужого составного диапазона «14,5–14,6%» (гвард T7.109a внутри области).
+        # Чужие числа в чужих предложениях атрибуцией не становятся. Формы значения — прежние
+        # (гейт T7.113: диапазон целиком или оба конца отдельными числами; одиночное значение —
+        # только одиночным числом, T7.109a), но проверены ВНУТРИ области, а не по всей странице;
+        # единственное менюшное упоминание (гвард T7.107) тонет здесь же: вне области значения
+        # оно бесполезно, а в одной области со значением его теперь достаточно.
+    spec = primary_source(key)
+    if spec is None:  # защита: решение не строится на несуществующей записи словаря
+        return None
+    if is_home_host(canonical_uri, spec.home_hosts):
+        return None  # (v) страница самого X не бывает его пересказом
+    basis_line = next(
+        (line for line in confirmed_region.split("\n") if key in set(named_primary_keys(line))),
+        confirmed_region,
+    )  # основание указывает строку подтверждённой области — то место страницы, где алиас
+    # и значение стоят вместе (строки вне области в основание не попадают)
+    return ValueAttributionDecision(
+        status=STATUS_DERIVATIVE,
+        primary_key=spec.key,
+        primary_name=spec.name,
+        parent_uri=spec.home_uri,
+        basis_fragment=_basis(basis_line),
+        claim_values=values,
+        pairing=VALUE_ATTRIBUTION_PAIRING_KNOWN_PRODUCER_MENTIONED,
+    )
+
+
 def _publication_decision(
     *,
     scanned: str,
@@ -1519,7 +1742,21 @@ def attribute_value_in_fragment(
             known_claim_primaries=known_claim_primaries,
             match_values=match_values,
         )
-        return refusal if bibliography is None else bibliography
+        if bibliography is not None:
+            return bibliography
+        # T7.116 часть а: последний, четвёртый режим — известный производитель упомянут на
+        # странице. Только после отказа всех прежних (strict → публикация → ближайший →
+        # bibliography); прежние режимы не ослаблены ни на пункт; тот же полный текст
+        # страницы, что читает bibliography-режим.
+        known_producer = _known_producer_mentioned_decision(
+            scanned_page=bibliography_page,
+            canonical_uri=canonical_uri,
+            values=values,
+            known_claim_primaries=known_claim_primaries,
+            match_values=match_values,
+            statement_primaries=frozenset(named_primary_keys(claim_statement or "")),
+        )
+        return refusal if known_producer is None else known_producer
 
     if not attributed:
         return fallback(

@@ -455,14 +455,25 @@ VALUE_ATTRIBUTION_SCHEMA = "host-value-attribution-v1"
 #: измерено на странице, а ДРУГАЯ улика того же утверждения уже приписана X строгим режимом
 #: или режимом публикации (без цепочек новым режимом). Родитель записывается той же формой,
 #: что у строгого режима.
+#: `known_producer_mentioned` (T7.116 часть а, ADR-0029 дополнение) — четвёртый, последний
+#: режим fallback: производитель X УЖЕ известен по другой улике того же утверждения (записан
+#: строгим режимом или режимом публикации — не этим режимом и не bibliography: сборщики
+#: `known_claim_primaries` pairing нового режима не читают, цепочек нет), значение утверждения
+#: стоит на странице (диапазон — целиком или обоими концами, одиночное — одиночным), словарный
+#: алиас X назван где-либо на странице, вето собственной оценки в окрестности значения не
+#: сработало, страница не домашняя для X и другой известный производитель на странице не
+#: назван. Форма записи — как у строгого режима (родитель → источник X), ключей scope новых
+#: нет.
 VALUE_ATTRIBUTION_PAIRING_STRICT: Final = "value_and_primary_in_fragment"
 VALUE_ATTRIBUTION_PAIRING_PUBLICATION: Final = "publication_window"
 VALUE_ATTRIBUTION_PAIRING_BIBLIOGRAPHY: Final = "bibliography_known_producer"
+VALUE_ATTRIBUTION_PAIRING_KNOWN_PRODUCER_MENTIONED: Final = "known_producer_mentioned"
 VALUE_ATTRIBUTION_PAIRINGS: Final[frozenset[str]] = frozenset(
     {
         VALUE_ATTRIBUTION_PAIRING_STRICT,
         VALUE_ATTRIBUTION_PAIRING_PUBLICATION,
         VALUE_ATTRIBUTION_PAIRING_BIBLIOGRAPHY,
+        VALUE_ATTRIBUTION_PAIRING_KNOWN_PRODUCER_MENTIONED,
     }
 )
 

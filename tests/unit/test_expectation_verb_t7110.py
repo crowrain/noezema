@@ -191,5 +191,5 @@ def test_method_versions_bumped() -> None:
     """Поведение обоих детекторов изменилось: значения v9→v10, страницы v6→v7 (ADR-0029).
     T7.112 поднял их ещё раз (закрытый словарь глаголов отчётности): значения v10→v11,
     страницы v7→v8 (STATUS T7.112)."""
-    assert VALUE_ATTRIBUTION_METHOD_VERSION == "host-value-attribution-v12"
+    assert VALUE_ATTRIBUTION_METHOD_VERSION == "host-value-attribution-v13"
     assert ATTRIBUTION_METHOD_VERSION == "host-source-attribution-v8"

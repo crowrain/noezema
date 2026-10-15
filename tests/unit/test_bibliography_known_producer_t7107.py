@@ -302,7 +302,7 @@ def test_method_versions_bumped_for_reattribution_review() -> None:
     """Метки метода подняты — переатрибуция пересмотрит прежние решения по предикату
     «метка ≠ текущая»; маркер формы записи (`host-value-attribution-v1`) не менялся."""
     assert ATTRIBUTION_METHOD_VERSION == "host-source-attribution-v8"
-    assert VALUE_ATTRIBUTION_METHOD_VERSION == "host-value-attribution-v12"
+    assert VALUE_ATTRIBUTION_METHOD_VERSION == "host-value-attribution-v13"
 
 
 def test_bibliography_pairing_is_a_known_scope_pairing() -> None:

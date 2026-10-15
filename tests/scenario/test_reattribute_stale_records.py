@@ -71,7 +71,7 @@ V3_VALUE_METHOD = "host-value-attribution-v3"
 V4_VALUE_METHOD = "host-value-attribution-v4"
 #: текущий метод значений (T7.85c, с T7.98 — v6: relay в строгом режиме): им пишется запись
 #: после пересмотра прежних эпох v2…v5
-CURRENT_VALUE_METHOD = "host-value-attribution-v12"
+CURRENT_VALUE_METHOD = "host-value-attribution-v13"
 
 # ─── тексты: та же синтаксическая форма, что у стендовых страниц (фикстуры T7.85) ───
 # абзац нормализованного текста = одна строка; страница первоисточника — на своём home host
