@@ -147,7 +147,8 @@ class HintSource:
 
 @dataclass(frozen=True)
 class HintTopic:
-    """Тема каталога: id, ключевые основы слов вопроса, источники."""
+    """Тема каталога: id, основы ключевых слов темы (получены из слов `keywords` той же
+    функцией, что и основы слов вопроса — T7.119a), источники."""
 
     topic_id: str
     stems: frozenset[str]
@@ -188,7 +189,7 @@ def parse_independent_hints(limits: dict[str, Any]) -> tuple[list[HintTopic], li
         if not isinstance(raw, dict):
             problems.append(f"тема #{index}: не словарь")
             continue
-        extra_keys = sorted(set(raw) - {"id", "stems", "sources"})
+        extra_keys = sorted(set(raw) - {"id", "keywords", "sources"})
         if extra_keys:
             problems.append(f"тема #{index}: неизвестные ключи {extra_keys}")
             continue
@@ -199,13 +200,13 @@ def parse_independent_hints(limits: dict[str, Any]) -> tuple[list[HintTopic], li
         if topic_id in seen_ids:
             problems.append(f"тема {topic_id}: повтор id")
             continue
-        stems_raw = raw.get("stems")
-        if not isinstance(stems_raw, list) or not stems_raw:
-            problems.append(f"тема {topic_id}: stems отсутствует или пуст")
+        keywords_raw = raw.get("keywords")
+        if not isinstance(keywords_raw, list) or not keywords_raw:
+            problems.append(f"тема {topic_id}: keywords отсутствует или пуст")
             continue
-        bad_stems = [s for s in stems_raw if not isinstance(s, str) or not s.strip()]
-        if bad_stems:
-            problems.append(f"тема {topic_id}: stems содержит не-строку или пустую основу")
+        bad_keywords = [k for k in keywords_raw if not isinstance(k, str) or not k.strip()]
+        if bad_keywords:
+            problems.append(f"тема {topic_id}: keywords содержит не-строку или пустое слово")
             continue
         sources_raw = raw.get("sources")
         if not isinstance(sources_raw, list) or not sources_raw:
@@ -232,18 +233,25 @@ def parse_independent_hints(limits: dict[str, Any]) -> tuple[list[HintTopic], li
         if not topic_ok:
             continue
         seen_ids.add(topic_id)
-        # основы темы нормализуются теми же функциями, что и слова вопроса (T7.111a/T7.112):
-        # многословная основа («оплат труд») разбирается на отдельные основы
-        stems = content_word_stems(" ".join(str(s) for s in stems_raw))
+        # T7.119a (дефект замера менеджера на config-v27): в каталоге хранятся СЛОВА темы, и они
+        # проходят ТОТ ЖЕ content_word_stems ОДИН раз, что и слова вопроса. Прежние «основы» в
+        # каталоге нормализовались вторично: уже-основа «инфляц» превращалась в «инфля» и не
+        # совпадала с основой вопроса «инфляция» -> «инфляц». Многословное ключевое слово
+        # («оплата труда») разбирается на отдельные основы.
+        stems = content_word_stems(" ".join(str(k) for k in keywords_raw))
         if not stems:
-            problems.append(f"тема {topic_id}: stems не даёт ни одной значимой основы")
+            problems.append(f"тема {topic_id}: keywords не даёт ни одной значимой основы")
             continue
         topics.append(HintTopic(topic_id=topic_id, stems=stems, sources=tuple(sources)))
     return topics, problems
 
 
 def select_hint_topics(question_text: str, topics: list[HintTopic]) -> list[HintTopic]:
-    """Темы подбираются пересечением основ темы с основами содержательных слов вопроса."""
+    """Тема подбирается, если основа содержательного слова вопроса РАВНА основе ключевого слова
+    темы при ОДИНАКОВОЙ нормализации обеих сторон (T7.119a): и слова каталога, и слова вопроса
+    проходят `content_word_stems` ровно один раз. Основы слов, различающихся в первых пяти-шести
+    знаках («рынок»/«рынка»), остаются различными — принятое ограничение сравнения (ADR-0037 §1а);
+    ложных тем из-за усечения основы нет: «центр» и «ценность» не равны основе «цена»/«цены»/«цен»."""
     stems = content_word_stems(question_text)
     return [topic for topic in topics if topic.stems & stems]
 

@@ -36,9 +36,11 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 V26_PAYLOAD = REPO_ROOT / "docs" / "eval" / "config-v26-payload.json"
 V27_PAYLOAD = REPO_ROOT / "docs" / "eval" / "config-v27-payload.json"
 
-# канонический хэш payload (canonical_sha256 из packages/domain/canonical.py) и хэш файла
-V27_CANONICAL_SHA256: Final = "3f8160f8eababe5149027cdacdbe1f2710a70fc885324ae7c08f02421da77562"
-V27_FILE_SHA256: Final = "edea91f0892f7b4ed6cf980188f5592048e47d0c7c6124af64eab28a9a71bbd6"
+# канонический хэш payload (canonical_sha256 из packages/domain/canonical.py) и хэш файла;
+# пересчитаны T7.119a (ключ research_hints: основы -> ключевые слова, строки labor_unemployment
+# дословно к тексту пользователя) — прежние значения 3f8160f8…/edea91f0… относятся к ed4d539
+V27_CANONICAL_SHA256: Final = "9d9ebba4937392da1b03156c9a39d2e5a9b244337720fee677148d1c29d8c83c"
+V27_FILE_SHA256: Final = "8a2d77cb60ed34031ef06db8a0d103a4926f327fa3e545f9c7fea41f511fb260"
 
 
 def _load(path: Path) -> dict[str, Any]:

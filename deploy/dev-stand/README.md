@@ -859,8 +859,10 @@ git pull                                    # пакет с docs/eval/config-v27
   --drain-wait-seconds 120
 ```
 
-Что видно после активации: `./status.sh` показывает снапшот по canonical-префиксу `3f8160f8` (полный
-canonical config-v27 — `3f8160f8eababe5149027cdacdbe1f2710a70fc885324ae7c08f02421da77562`; в
+Что видно после активации: `./status.sh` показывает снапшот по canonical-префиксу `9d9ebba4` (полный
+canonical config-v27 — `9d9ebba4937392da1b03156c9a39d2e5a9b244337720fee677148d1c29d8c83c`; хэш
+пересчитан правкой T7.119a — каталог теперь хранит ключевые слова тем `keywords` вместо основ, прежний
+canonical `3f8160f8…` относился к payload коммита `ed4d539`; в
 `config_snapshots.payload_sha256` попадает canonical, не хеш файла). Контрольный прогон (`control-run.sh`)
 на v27 отличается от прогона на v26 только для вопросов c1–c3: у них в журнале `explorer_budget` с
 `classified_official_independent: true` и потолком 20, а контекст каждого шага содержит секцию

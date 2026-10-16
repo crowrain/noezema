@@ -200,12 +200,14 @@ def test_catalog_from_payload_parses_clean() -> None:
         "gazprombank.ru",
         "raiffeisen.ru",
     }
-    # основы слов вопроса заданы списком и нормализуются той же функцией (многословная основа
-    # «оплат труд» разбирается на отдельные основы)
-    assert "оплат труд" in json.loads(V27_PAYLOAD.read_text(encoding="utf-8"))[
+    # T7.119a: в каталоге хранятся СЛОВА темы (ключ keywords), они нормализуются той же
+    # функцией и ровно один раз, что и слова вопроса (многословное ключевое слово «оплата
+    # труда» разобралось бы на отдельные основы)
+    payload_keywords = json.loads(V27_PAYLOAD.read_text(encoding="utf-8"))[
         "session_limits"
-    ]["research_hints"]["independent_sources"][0]["stems"]
-    assert wages.stems == {"зарабо", "зарпла", "доход", "оплат", "труд"}
+    ]["research_hints"]["independent_sources"][0]["keywords"]
+    assert "оплата" in payload_keywords
+    assert wages.stems == {"зарабо", "зарпла", "доход", "оплат"}
 
 
 def test_topic_selection_by_word_stems() -> None:
@@ -246,7 +248,7 @@ def test_hints_section_drops_whole_lines_on_overflow() -> None:
     sources = [
         {"domain": f"h{i:02d}.example", "what": f"что искать на источнике номер {i:02d}"} for i in range(30)
     ]
-    catalog = {"research_hints": {"independent_sources": [{"id": "many", "stems": ["текст"], "sources": sources}]}}
+    catalog = {"research_hints": {"independent_sources": [{"id": "many", "keywords": ["текст"], "sources": sources}]}}
     topics, problems = parse_independent_hints(catalog)
     assert problems == []
     section = render_independent_hints_section(topics)
@@ -268,20 +270,20 @@ def test_catalog_validation_names_problems_and_keeps_valid_topics() -> None:
     catalog = {
         "research_hints": {
             "independent_sources": [
-                {"id": "good", "stems": ["текст"], "sources": [{"domain": "a.example", "what": "что-то"}]},
-                {"stems": ["текст"], "sources": [{"domain": "b.example", "what": "что-то"}]},  # нет id
+                {"id": "good", "keywords": ["текст"], "sources": [{"domain": "a.example", "what": "что-то"}]},
+                {"keywords": ["текст"], "sources": [{"domain": "b.example", "what": "что-то"}]},  # нет id
                 {
                     "id": "bad-domain",
-                    "stems": ["текст"],
+                    "keywords": ["текст"],
                     "sources": [{"domain": "https://HH.example/", "what": "что-то"}],
                 },
                 {
                     "id": "extra-key",
-                    "stems": ["текст"],
+                    "keywords": ["текст"],
                     "sources": [{"domain": "c.example", "what": "что-то", "extra": 1}],
                 },
-                {"id": "good", "stems": ["другое"], "sources": [{"domain": "d.example", "what": "что-то"}]},
-                {"id": "no-sources", "stems": ["текст"], "sources": []},
+                {"id": "good", "keywords": ["другое"], "sources": [{"domain": "d.example", "what": "что-то"}]},
+                {"id": "no-sources", "keywords": ["текст"], "sources": []},
             ]
         }
     }
