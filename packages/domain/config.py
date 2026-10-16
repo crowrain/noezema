@@ -399,3 +399,37 @@ def bootstrap_payload_bytes() -> bytes:
 
 def activation_mode_name(mode: ActivationMode) -> str:
     return mode.value
+
+
+# T7.119 (решение пользователя 2026-10-16, пункты 2 и 4): два новых НЕОБЯЗАТЕЛЬНЫХ ключа внутри
+# существующей секции `session_limits` — `max_explorer_steps_official_independent` (потолок шагов
+# для вопросов вида «официальные + независимые») и `research_hints` (ручной каталог подсказок
+# независимых источников). Новая ВЕРХНЯЯ секция payload не использована: config_snapshots хранит
+# payload поимёнными колонками (packages/memory/activation.py), новая верхняя секция потребовала бы
+# новой колонки — миграции БД, чем задача не занимается. session_limits переносится целиком и
+# читается существующими потребителями только выборочно (`.get` конкретных ключей), поэтому новый
+# ключ инертен для них. Отсутствие ключа = прежнее поведение. `schema_version` не меняется: он
+# описывает форму секций, а форма `session_limits` — произвольный mapping уже сегодня.
+# Глубокую форму каталога проверяет потребитель (`apps/orchestrator/research_hints.py`), здесь —
+# примитивная проверка типов новых необязательных ключей.
+
+
+def optional_session_limits_problems(session_limits: Any) -> list[str]:
+    """Проблемы необязательных ключей T7.119 в секции session_limits (чистая функция, без БД).
+
+    Проверяются только сами новые ключи; известные ключи секции здесь не проверяются. Пустой
+    список — корректная или отсутствующая запись; пустой список для payload до config-v27 —
+    отсутствие новых ключей есть корректное прежнее поведение.
+    """
+    problems: list[str] = []
+    if not isinstance(session_limits, dict):
+        return ["session_limits: не словарь"]
+    raised = session_limits.get("max_explorer_steps_official_independent")
+    if raised is not None and (isinstance(raised, bool) or not isinstance(raised, int) or raised <= 0):
+        problems.append(
+            "session_limits.max_explorer_steps_official_independent: должно быть целое положительное число"
+        )
+    hints = session_limits.get("research_hints")
+    if hints is not None and not isinstance(hints, dict):
+        problems.append("session_limits.research_hints: должен быть словарём")
+    return problems

@@ -58,6 +58,13 @@ from apps.orchestrator.host_availability import (
     render_host_unavailable_note,
 )
 from apps.orchestrator.rejected_proposal import rejected_proposal_digest
+from apps.orchestrator.research_hints import (
+    classify_official_independent,
+    effective_explorer_step_cap,
+    parse_independent_hints,
+    render_independent_hints_section,
+    select_hint_topics,
+)
 from apps.orchestrator.search_view import render_search_results
 from apps.orchestrator.source_coverage import SourceCoverageTracker, named_source_urls
 from apps.orchestrator.state_machine import transition
@@ -743,7 +750,35 @@ class Orchestrator:
             )
         session.question_id = question.id
         question.state = QuestionState.RESEARCHING.value
+        # T7.119 (решение пользователя 2026-10-16, пункты 2 и 3): вопрос вида «официальные +
+        # независимые» поднимает потолок шагов исследователя — новый необязательный ключ
+        # `session_limits.max_explorer_steps_official_independent`; отсутствие ключа = прежнее
+        # поведение (как в config-v26). Каталог независимых источников (`session_limits.research_hints`)
+        # подбирает темы по совпадению основ и даёт их в контекст короткой подсказкой: подсказка,
+        # не белый список — поиск и чтение остаются свободными, каталог ничего не запрещает.
+        # Классификация — чистая функция `apps/orchestrator/research_hints.py` на тех же функциях
+        # нормализации, что гейты почти-дубликатов (T7.111a/T7.112). Факт классификации и итоговый
+        # потолок (уже с учётом пола T7.21) записываются в полезную нагрузку существующего события
+        # QUESTION_SELECTED: нового AuditEventType нет.
+        named = named_source_urls(question.text)
+        official_independent = classify_official_independent(question.text)
+        hint_topics, hint_catalog_problems = parse_independent_hints(limits)
+        selected_hint_topics = (
+            select_hint_topics(question.text, hint_topics) if official_independent else []
+        )
+        max_steps = effective_explorer_step_cap(
+            limits, classified=official_independent, named_count=len(named)
+        )
         selection_payload: dict[str, Any] = {"question_id": str(question.id)}
+        selection_payload["explorer_budget"] = {
+            "classified_official_independent": official_independent,
+            "max_explorer_steps": max_steps,
+            "independent_hint_topics": [topic.topic_id for topic in selected_hint_topics],
+        }
+        if hint_catalog_problems:
+            # неисправные записи каталога называются в журнале — сессия не получает половинчатый
+            # каталог молча и не падает из-за них
+            selection_payload["explorer_budget"]["hint_catalog_problems"] = hint_catalog_problems
         if question.score_components:
             # the curiosity selection record (T5.1, §5.3.1): normalized
             # components, final score, mode and the similarity fingerprint
@@ -765,8 +800,9 @@ class Orchestrator:
         # of the sources the QUESTION names (§3.7, §5.4, §11.2 — the
         # grade-relevant input is produced by the trusted host, not the
         # model): the release to consolidation is withheld until every
-        # named source has been fetched or errored.
-        named = named_source_urls(question.text)
+        # named source has been fetched or errored. (T7.119: `named` is
+        # already computed above — QUESTION_SELECTED carries the step cap
+        # built with this floor in mind.)
         ctx.named_sources = named
         ctx.source_coverage = SourceCoverageTracker(named) if named else None
         if ctx.source_coverage is not None:
@@ -837,13 +873,9 @@ class Orchestrator:
         # before the first step (phase 3 re-pins for the commit path)
         if hasattr(self.executor, "snapshot_id"):
             self.executor.snapshot_id = snapshot.id
-        max_steps = int(limits.get("max_explorer_steps", 10))
-        # T7.21: the step budget accounts for the named sources: at
-        # least one step per named source plus three (a fetch each, the
-        # probe, the final complete) — a host-side floor; the configured
-        # value wins when it is larger.
-        if ctx.source_coverage is not None:
-            max_steps = max(max_steps, len(named) + 3)
+        # T7.21 + T7.119: потолок шагов посчитан выше, до события QUESTION_SELECTED (хостовый пол
+        # T7.21 `названных источников + 3` учтён внутри effective_explorer_step_cap; повышение для
+        # вопросов вида «официальные + независимые» — там же). Здесь остаются только секции контекста.
         # T7.111 (часть 2б, решение пользователя 2026-10-14): короткая секция контекста о хостах,
         # которые отказывали research.fetch в прошлых сессиях последних семи суток (>= 2 отказа,
         # без успешного чтения после последнего). Один read-only запрос к существующему журналу на
@@ -852,9 +884,15 @@ class Orchestrator:
         host_note = render_host_availability_section(
             await recently_unavailable_hosts(db, session.id)
         )
+        # T7.119 (часть 3): короткая секция «Независимые источники по теме» — только для
+        # классифицированного вопроса и только если тема каталога подобрана; пусто при отсутствии
+        # совпадения. Каталог ничего не запрещает и не фильтрует: это названия мест, где обычно
+        # можно найти независимую оценку (подсказка, не белый список).
+        hints_note = render_independent_hints_section(selected_hint_topics)
         steps, stopped, aborted = await self._explorer_loop(
             db, audit, session, ctx, max_steps, cap_profile, policy_engine, staging, lease, pack, snapshot,
             host_note=host_note,
+            hints_note=hints_note,
         )
         if aborted:
             # ABORTING was set in the loop; finish as cancelled in the SAME
@@ -1737,6 +1775,7 @@ class Orchestrator:
         pack: Any,
         snapshot: ORMConfigSnapshot,
         host_note: str = "",
+        hints_note: str = "",
     ) -> tuple[int, bool, bool]:
         """Returns (steps_done, stop_requested, abort_requested)."""
         explorer = self.prompts[Role.EXPLORER]
@@ -1796,7 +1835,13 @@ class Orchestrator:
             # the per-step tool list the model is shown.
             allowed_tools = filter_offered_tools(base_tools, has_message=bool(ctx.messages))
             user_ctx = self._explorer_context(
-                ctx, allowed_tools, pack, step=step, step_limit=max_steps, host_note=host_note
+                ctx,
+                allowed_tools,
+                pack,
+                step=step,
+                step_limit=max_steps,
+                host_note=host_note,
+                hints_note=hints_note,
             )
             fingerprint = build_model_fingerprint(
                 self.profile,
@@ -2423,6 +2468,7 @@ class Orchestrator:
         step: int | None = None,
         step_limit: int | None = None,
         host_note: str = "",
+        hints_note: str = "",
     ) -> str:
         # the bounded context pack (T3.8) carries the question/plan,
         # relevant claims and pending/invalid (labeled) claims; the
@@ -2441,6 +2487,7 @@ class Orchestrator:
         )
         budget_str = render_step_budget(step, step_limit)
         host_str = host_note  # T7.111 (часть 2б): готовая секция «Недавно недоступны» либо пусто
+        hints_str = hints_note  # T7.119 (часть 3): готовая секция «Независимые источники по теме» либо пусто
         ev_str = ""
         if ctx.evidence:
             ev = "\n".join(
@@ -2491,6 +2538,10 @@ class Orchestrator:
                 # T7.111 (часть 2б): секция «Недавно недоступны» — фиксированная, как бюджет шага:
                 # она стоит до наблюдений и вырезание старых наблюдений не может её спрятать
                 parts.append(host_str)
+            if hints_str:
+                # T7.119 (часть 3): секция «Независимые источники по теме» — фиксированная позиция,
+                # как у бюджета шага и «Недавно недоступны»: вырезание наблюдений её не прячет
+                parts.append(hints_str)
             if pack_str:
                 parts.append(pack_str)
             if observations:
