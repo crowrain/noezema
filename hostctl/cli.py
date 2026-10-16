@@ -693,6 +693,138 @@ def research_reattribute(since: str, dry_run: bool, evidence_level: bool) -> Non
     sys.exit(asyncio.run(_run()))
 
 
+@main.command("honesty-report")
+@click.option(
+    "--since",
+    default=None,
+    metavar="ISO",
+    help="Начало окна в ISO (например 2026-10-14T00:00:00+00:00 или 2026-10-14): берутся вопросы, "
+    "у которых есть сессии, начатые не раньше.",
+)
+@click.option(
+    "--questions",
+    default=None,
+    metavar="id,id,...",
+    help="Явный список id вопросов через запятую.",
+)
+@click.option(
+    "--control-tag",
+    default=None,
+    metavar="TAG",
+    help="Метка контрольного прогона: берутся только вопросы, чей текст заканчивается на "
+    "' (контроль TAG)'.",
+)
+@click.option("--json", "json_path", default=None, metavar="ФАЙЛ", help="Записать JSON отчёта в этот файл.")
+@click.option(
+    "--baseline",
+    "baseline_path",
+    default=None,
+    metavar="ФАЙЛ",
+    help="Прежний JSON-отчёт той же схемы: к выводу добавляется сравнение итогов «было → стало».",
+)
+def honesty_report_cmd(
+    since: str | None,
+    questions: str | None,
+    control_tag: str | None,
+    json_path: str | None,
+    baseline_path: str | None,
+) -> None:
+    """Отчёт честности по уже записанным фактам (T7.118; ТОЛЬКО ЧТЕНИЕ).
+
+    Читает записанное и ничего не пишет: модуль `packages.memory.honesty_report` не содержит ни
+    одного INSERT/UPDATE/DELETE, не создаёт audit-событий и не меняет оценки, группы независимости
+    или карточку ответа. Показывает: какие вопросы взяты, ответ есть или не записан, сессии
+    (состояние, причина завершения, длительность, вызовы модели и токены), утверждения по отноше-
+    нию к сессиям (созданные / переиспользованные / перепроверенные / опертые) с действующей
+    оценкой активного снимка правил (E-уровень, статус, причины из ленты, подпись о производителе),
+    состав групп независимости для E2+ (источник → родитель по записи значения или страничный
+    указатель) и шаги исследователя из ленты событий (поиски и их доли, поиски без последующего
+    чтения, чтения и отказы по хостам, повторные заходы, отказы ворот).
+
+    Флаги Ф1–Ф3 — эвристики отчёта («требует ручной проверки»), а не вердикты оценки: их границы
+    и ограничения описаны в шапке модуля. Ровно один критерий отбора обязателен.
+
+    exit 0  -> отчёт собран
+    exit 2  -> NOEZEMA_DATABASE_URL не задан, критерий отбора не задан или испорчен, потолки
+              отбора превышены
+    exit 1  -> baseline-файл не читается или его схема не совпадает со схемой отчёта
+    """
+    import asyncio
+    import os
+
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from packages.memory.honesty_report import (
+        HonestyReportError,
+        collect_honesty_report,
+        load_baseline,
+        parse_since,
+        render_markdown,
+    )
+
+    url = os.environ.get("NOEZEMA_DATABASE_URL", "")
+    if not url:
+        click.echo("NOEZEMA_DATABASE_URL is not set", err=True)
+        sys.exit(EXIT_USAGE_ERROR)
+
+    question_ids: list[uuid.UUID] = []
+    if questions:
+        for raw in questions.split(","):
+            token = raw.strip()
+            if not token:
+                continue
+            try:
+                question_ids.append(uuid.UUID(token))
+            except ValueError:
+                click.echo(f"--questions: '{token}' — не uuid вопроса", err=True)
+                sys.exit(EXIT_USAGE_ERROR)
+    if since is None and not question_ids and control_tag is None:
+        click.echo("нужен хотя бы один критерий отбора: --since, --questions или --control-tag", err=True)
+        sys.exit(EXIT_USAGE_ERROR)
+
+    try:
+        since_ts = parse_since(since) if since is not None else None
+    except HonestyReportError as exc:
+        click.echo(f"honesty-report: {exc}", err=True)
+        sys.exit(EXIT_USAGE_ERROR)
+
+    baseline_doc: dict[str, Any] | None = None
+    if baseline_path is not None:
+        try:
+            baseline_doc = dict(load_baseline(baseline_path))
+        except HonestyReportError as exc:
+            click.echo(f"honesty-report: {exc}", err=True)
+            sys.exit(1)
+
+    engine = create_async_engine(url)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    async def _run() -> int:
+        try:
+            async with factory() as db:
+                report = await collect_honesty_report(
+                    db, since=since_ts, question_ids=question_ids, control_tag=control_tag
+                )
+        except HonestyReportError as exc:
+            click.echo(f"honesty-report: {exc}", err=True)
+            return EXIT_USAGE_ERROR
+        finally:
+            # пул закрываем в том же event loop, где были соединения (ловушка CliRunner-тестов)
+            await engine.dispose()
+        if json_path is not None:
+            try:
+                Path(json_path).write_text(
+                    json.dumps(report.to_dict(), ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+                )
+            except OSError as exc:
+                click.echo(f"honesty-report: JSON-файл не записан ({json_path}): {exc}", err=True)
+                return EXIT_USAGE_ERROR
+        click.echo(render_markdown(report, baseline_doc))
+        return 0
+
+    sys.exit(asyncio.run(_run()))
+
+
 @main.command("reconcile-tick")
 @click.option(
     "--max-probes", default=5, show_default=True, help="Probes per stuck session (fresh connection each)."
