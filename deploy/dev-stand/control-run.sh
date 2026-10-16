@@ -85,4 +85,5 @@ for line in open(sys.argv[1], encoding="utf-8"):
 ' "$CONTROL_SET")
 
 echo "CONTROL_DONE tag=$TAG"
-echo "отчёт: hostctl honesty-report --control-tag $TAG --json \"control-$TAG-honesty.json\""
+# команда в запускаемой на стенде форме: её печатают и выполняет оператор из каталога репозитория
+echo "отчёт: .venv/bin/python -m hostctl.cli honesty-report --control-tag $TAG --json \"control-$TAG-honesty.json\" (из каталога ~/noezema)"
