@@ -84,7 +84,10 @@ PAGE_STUDY = (
     "в отличие от официальных данных Росстата (5,59%), которые мы пересчитали по своей корзине."
 )
 
-URL_SBERCIB = "https://sbercib.example/inflyaciya-2025"
+# T7.120: страница названа домашним хостом производителя (алиас SberCIB теперь словарный):
+# на чужом хосте «sbercib.example» он был бы третьим названным первоисточником и значение
+# стало бы неоднозначным; на своём — пересказ Росстата, как и моделировал стендовый репродюсер.
+URL_SBERCIB = "https://www.sbercib.ru/inflyaciya-2025"
 URL_VEDOMOSTI = "https://vedomosti.example/inflyaciya-2025-goda"
 URL_STUDY = "https://research.example.org/inflation-estimate"
 
@@ -288,7 +291,7 @@ async def test_evidence_level_decision_merges_the_page_with_the_primary(
     # возможно оконное решение с вето «другого источника числа»; здесь решает строгий pairing);
     # T7.98: v6 (relay в строгом режиме); схема записи при этом остаётся host-value-attribution-v1
     # T7.107: v7 (маска плашки площадки + третий pairing-режим; строгий pairing здесь не тронут)
-    assert record["method"] == "host-value-attribution-v13"
+    assert record["method"] == "host-value-attribution-v14"
     assert "По данным Росстата" in record["basis_fragment"]
     # эффективный родитель — тот же якорь первоисточника, что уже создан страничным указателем
     anchor = await _scalar(scratch_url, "SELECT id::text AS id FROM sources WHERE canonical_uri = :u", {"u": "https://rosstat.gov.ru/"})

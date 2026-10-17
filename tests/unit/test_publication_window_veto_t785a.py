@@ -111,16 +111,23 @@ def test_two_named_primaries_stay_ambiguous() -> None:
     assert decision.pairing == PAIRING_PUBLICATION_WINDOW, decision
 
 
-def test_kommersant_form_indicator_noun_stays_derivative() -> None:
+def test_kommersant_form_indicator_noun_two_named_primaries_t7120() -> None:
     """(6) форма Коммерсанта: «Оценка текущих темпов роста цен … осталась на уровне 14,5%» —
-    существительное «оценка» здесь имя показателя, а не чья-то оценка: приписывание ЦБ остаётся."""
+    существительное «оценка» здесь имя показателя, а не чья-то оценка.
+
+    T7.120 (решение пользователя 2026-10-17, ADR-0029 дополнение): «инФОМ» — отдельный
+    производитель словаря, и в окне публикации названы двое («„инФОМ“ по заказу Банка
+    России») — решение не принимается вовсе. Было: derivative→cbr (окно публикации).
+    Стало: ambiguous_primaries с основой разночтения — та же консервативная ветка, что
+    случай (5) этого файла; ослабления вето не произошло: ложного приписывания нет."""
     decision = _decide(
         "Об этом следует из опубликованных 17 декабря данных опроса, проводимого «инФОМ» "
         "по заказу Банка России. Оценка текущих темпов роста цен при этом осталась на уровне 14,5%.",
         "Наблюдаемая населением годовая инфляция в декабре 2025 года составила 14,5%.",
     )
-    assert decision.is_derivative, decision
-    assert decision.primary_key == "cbr", decision.basis_fragment
+    assert not decision.is_derivative, decision
+    assert decision.primary_key is None, decision
+    assert decision.status == "ambiguous_primaries", decision
     assert decision.pairing == PAIRING_PUBLICATION_WINDOW, decision
 
 
@@ -153,7 +160,7 @@ def test_bank_of_russia_alias_is_not_an_actor_bank() -> None:
 
 
 @pytest.mark.parametrize(
-    ("text", "claim", "expected_status"),
+    ("text", "claim", "expected_status", "expected_pairing"),
     [
         # «по оценке ВШЭ»: оборот чужой оценки + название вне словаря
         (
@@ -161,6 +168,7 @@ def test_bank_of_russia_alias_is_not_an_actor_bank() -> None:
             "По оценке ВШЭ, реальная инфляция составила 14,5%.",
             "Реальная инфляция составила 14,5%.",
             "no_value_attribution",
+            PAIRING_VALUE_AND_PRIMARY,
         ),
         # «Независимые экономисты считают…»: действующее лицо + глагол мнения
         (
@@ -168,6 +176,7 @@ def test_bank_of_russia_alias_is_not_an_actor_bank() -> None:
             "Независимые экономисты считают реальную инфляцию в 14,5%.",
             "Реальная инфляция составила 14,5%.",
             "value_not_attributed",
+            PAIRING_VALUE_AND_PRIMARY,
         ),
         # «Компания «Ромир» зафиксировала…»: действующее лицо + название в кавычках вне словаря
         (
@@ -175,13 +184,20 @@ def test_bank_of_russia_alias_is_not_an_actor_bank() -> None:
             "Компания «Ромир» зафиксировала наблюдаемую инфляцию на уровне 14,5%.",
             "Наблюдаемая инфляция составила 14,5%.",
             "no_value_attribution",
+            PAIRING_VALUE_AND_PRIMARY,
         ),
-        # «эксперты ЦМАКП рассчитали…»: действующее лицо + глагол расчёта
+        # «эксперты ЦМАКП рассчитали…»: действующее лицо + глагол расчёта.
+        # T7.120 (решение пользователя 2026-10-17): ЦМАКП — отдельный производитель словаря,
+        # в окне публикации названы двое (Банк России и ЦМАКП) — разночтение двух
+        # первоисточников. Было: no_value_attribution (ЦМАКП был безымянным чужим актором).
+        # Стало: ambiguous_primaries (отказ с явной основой): приписывания числа по-прежнему
+        # нет, отказ стал честнее. Действующее лицо «эксперты» при этом замазанным не стало.
         (
             "Согласно опубликованному Банком России опросу, инфляционные ожидания выросли. "
             "Эксперты ЦМАКП рассчитали наблюдаемую инфляцию в 14,5%.",
             "Наблюдаемая инфляция составила 14,5%.",
-            "no_value_attribution",
+            "ambiguous_primaries",
+            PAIRING_PUBLICATION_WINDOW,
         ),
         # «по мнению аналитиков»: оборот мнения + действующее лицо
         (
@@ -189,17 +205,19 @@ def test_bank_of_russia_alias_is_not_an_actor_bank() -> None:
             "По мнению аналитиков, точная оценка — 14,5%.",
             "Оценка инфляции составила 14,5%.",
             "no_value_attribution",
+            PAIRING_VALUE_AND_PRIMARY,
         ),
     ],
 )
 def test_actor_or_estimate_sign_refuses_pairing(
-    text: str, claim: str, expected_status: str
+    text: str, claim: str, expected_status: str, expected_pairing: str
 ) -> None:
     decision = _decide(text, claim)
     assert not decision.is_derivative, decision
     assert decision.primary_key is None, decision
     assert decision.status == expected_status, decision
-    assert decision.pairing == PAIRING_VALUE_AND_PRIMARY, decision
+    # strict-случаи: честный отказ остаётся строгим; оконный разночтение названо pairing-основой
+    assert decision.pairing == expected_pairing, decision
 
 
 # ─── версия метода: поведение изменилось, записи v2 пересматриваются переатрибуцией ──
@@ -211,4 +229,4 @@ def test_method_version_is_v5_after_the_veto_fixes() -> None:
     T7.85c — на v5 (окно публикации только для русского текста и латинское имя собственного вне
     словаря), T7.98 — на v6 (relay в строгом режиме; окно публикации не тронуто).
     Переатрибуция по этому номеру пересматривает записи эпох v2, v3, v4 и v5."""
-    assert VALUE_ATTRIBUTION_METHOD_VERSION == "host-value-attribution-v13"
+    assert VALUE_ATTRIBUTION_METHOD_VERSION == "host-value-attribution-v14"

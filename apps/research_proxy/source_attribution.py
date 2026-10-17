@@ -79,7 +79,16 @@ from packages.domain.sanitization import mask_nul
 #: происходит на стороне переатрибуции (`apps/research_proxy/reattribution.py`), решение принимает
 #: этот метод по живому тексту страницы. Решения v8 отличаются от решений v7 (замер свипа —
 #: STATUS T7.112) → переатрибуция пересматривает страницы эпохи v7.
-ATTRIBUTION_METHOD_VERSION: Final = "host-source-attribution-v8"
+#: v9 (T7.120, решение пользователя 2026-10-17): словарь дополнен десятью негосударственными
+#: первоисточниками (SuperJob, hh.ru, SberCIB, ВТБ, Альфа-Банк, Газпромбанк, ПСБ, инФОМ, ЦМАКП,
+#: СберИндекс — ADR-0029 дополнение T7.120), и relay-гвард (б) получает белый список «аналитики
+#: именованного первоисточника»: действующее лицо, стоящее вплотную перед алиасом словаря
+#: («аналитики ВТБ ожидают 5–6%»), — собственное подразделение названного производителя, а не
+#: третий актор (тот же принцип, что замазанный «Банк России» не банк-актор). Вето окна
+#: публикации и вето третьего актора собственной публикации этим не тронуты: неназванный
+#: актор («аналитики Сбербанка») остаётся действующим лицом. Решения v9 отличаются от
+#: решений v8 → переатрибуция пересматривает страницы эпохи v8.
+ATTRIBUTION_METHOD_VERSION: Final = "host-source-attribution-v9"
 
 #: статусы решения. `derivative` — единственный, при котором хост ставит указатель;
 #: остальные четыре означают «не помечаем» и записываются в аудит как честный отказ.
@@ -221,6 +230,139 @@ PRIMARY_SOURCES: Final[tuple[PrimarySource, ...]] = (
             r"федеральн[а-яё]* налог[а-яё]* служб[а-яё]*",
             r"federal tax service",
             r"nalog\.gov\.ru",
+        ),
+    ),
+    # ─── T7.120 (решение пользователя 2026-10-17, ADR-0029 дополнение): негосударственные
+    # первоисточники. Десять записей признают пересказы производителей, которых словарь
+    # раньше не знал: страница, «пересказывающая» названного производителя, склеивается с
+    # его анкором и теряет независимость (стендовые случаи SuperJob и hh.ru — STATUS T7.120).
+    # Короткие имена («ВТБ», «ПСБ», «hh») матчены только отдельными словами с границами:
+    # «ВТБ24», «ВТБР» — другие имена, алиас в них не попадает (граница слова у цифр и букв).
+    PrimarySource(
+        key="superjob",
+        name="SuperJob",
+        home_uri="https://www.superjob.ru/",
+        home_hosts=("superjob.ru",),
+        alias_patterns=(
+            r"\bsuperjob\b",
+            r"superjob\.ru",
+        ),
+    ),
+    #: «hh.ru» — и имя, и хост; «hh» — короткая форма того же производителя: она матчена
+    #: с границами слова и попадает в составные названия индикатора («hh-индекс», «hh.индекс»)
+    #: как форма имени этого же производителя. «HeadHunter» — то же лицо латинской записью.
+    PrimarySource(
+        key="hh",
+        name="hh.ru",
+        home_uri="https://hh.ru/",
+        home_hosts=("hh.ru", "stats.hh.ru"),
+        alias_patterns=(
+            r"hh\.ru",
+            r"\bheadhunter\b",
+            r"headhunter\.ru",
+            r"\bhh\b",
+        ),
+    ),
+    #: SberCIB: алиасы обязаны нести аббревиатуру аналитического подразделения — «CIB».
+    #: Голое «Сбер»/«Сбербанк»/«Сбербанка» алиасом не стало: отличить «аналитиков Сбербанка»
+    #: от подразделения нельзя, а замазанный «Сбербанк» перестал бы быть банком-актором в
+    #: вето чужого источника (T7.85a). Разделитель между кириллическим «сбер» и латинской
+    #: аббревиатурой — только escape или квантификатор (AGENTS §7, защита от омоглифов).
+    PrimarySource(
+        key="sbercib",
+        name="SberCIB",
+        home_uri="https://www.sbercib.ru/",
+        home_hosts=("sbercib.ru",),
+        alias_patterns=(
+            r"\bsbercib\b",
+            r"sbercib\.ru",
+            r"сбер\s*CIB",
+            r"сбербанк\s+CIB",
+        ),
+    ),
+    #: короткое имя с границами слова: «ВТБ Мои Инвестиции», «ВТБ Капитал» — тот же
+    #: производитель (тот же ключ), «ВТБ24» и «ВТБР» — другие имена (алиас не матчится)
+    PrimarySource(
+        key="vtb",
+        name="ВТБ",
+        home_uri="https://www.vtb.ru/",
+        home_hosts=("vtb.ru",),
+        alias_patterns=(
+            r"\bвтб\b",
+            r"втб\.ru",
+        ),
+    ),
+    PrimarySource(
+        key="alfa",
+        name="Альфа-Банк",
+        home_uri="https://www.alfabank.ru/",
+        home_hosts=("alfabank.ru",),
+        alias_patterns=(
+            r"альфа\s*[\-–]?\s*банк[а-яё]*",
+            r"\balfa[\s\-]?bank\b",
+            r"alfabank\.ru",
+        ),
+    ),
+    #: алиас требует суффикса «банк»: голое «Газпром» (сырьевая компания) — не этот
+    #: производитель; замазанный «Газпромбанк» перестаёт быть банком-актором в вето —
+    #: это следствие статуса первоисточника, зафиксировано в ADR-0029 (T7.120)
+    PrimarySource(
+        key="gpb",
+        name="Газпромбанк",
+        home_uri="https://www.gazprombank.ru/",
+        home_hosts=("gazprombank.ru",),
+        alias_patterns=(
+            r"\bгазпромбанк[а-яё]*",
+            r"\bgazprombank\b",
+            r"gazprombank\.ru",
+        ),
+    ),
+    PrimarySource(
+        key="psb",
+        name="ПСБ",
+        home_uri="https://www.psbank.ru/",
+        home_hosts=("psbank.ru",),
+        alias_patterns=(
+            r"\bпсб\b",
+            r"промсвязьбанк[а-яё]*",
+            r"psbank\.ru",
+        ),
+    ),
+    #: инФОМ — отдельный производитель опросов, без склейки с Банком России (решение
+    #: пользователя 2026-10-17): фрагмент, называющий и «инФОМ», и «Банк России», даёт
+    #: два алиаса — то же разночтение, что решалось отказом всегда (ADR-0029 «Риски»);
+    #: алиас не матчит «информация»: «инфом» ≠ «инфор»
+    PrimarySource(
+        key="infom",
+        name="инФОМ",
+        home_uri="https://www.infom.org.ru/",
+        home_hosts=("infom.org.ru",),
+        alias_patterns=(
+            r"\bинфом[а-яё]*",
+            r"инфом\.org\.ru",
+        ),
+    ),
+    #: ЦМАКП — отдельный производитель прогнозов (решение пользователя 2026-10-17,
+    #: отменяющее пример T7.85b «ЦМАКП остаётся вне словаря»); домашний хост forecast.ru
+    PrimarySource(
+        key="cmakp",
+        name="ЦМАКП",
+        home_uri="https://www.forecast.ru/",
+        home_hosts=("forecast.ru",),
+        alias_patterns=(
+            r"\bцмакп\b",
+            r"forecast\.ru",
+        ),
+    ),
+    PrimarySource(
+        key="sberindex",
+        name="СберИндекс",
+        home_uri="https://www.sberindex.ru/",
+        home_hosts=("sberindex.ru",),
+        alias_patterns=(
+            r"\bсбериндекс[а-яё]*",
+            r"сбер\s*индекс[а-яё]*",
+            r"sberindex\.ru",
         ),
     ),
 )
@@ -524,6 +666,66 @@ def _canonical_number(raw: str) -> str:
     return text
 
 
+#: keys, для которых «аналитики <алиас>» — собственное подразделение производителя (T7.120).
+#: Государственные ведомства в список НЕ входят: «аналитики ЦБ прогнозируют 6,3%» остаётся
+#: третьим актором (гвард (б) прежний, тест T7.85a «two named primaries stay ambiguous» не тронут)
+_PRODUCER_ANALYST_KEYS: Final = frozenset(
+    {
+        "superjob",
+        "hh",
+        "sbercib",
+        "vtb",
+        "alfa",
+        "gpb",
+        "psb",
+        "infom",
+        "cmakp",
+        "sberindex",
+    }
+)
+
+
+def _producer_analyst_actor_spans(fragment: str) -> list[tuple[int, int]]:
+    """T7.120 (ADR-0029 дополнение): spans действующего лица, которое НЕ является третьим актором.
+
+    Действующее лицо («аналитики», «экономисты», «эксперты») стоит вплотную перед алиасом
+    словаря — это подразделение самого названного первоисточника, а не чужой источник числа:
+    «аналитики ВТБ ожидают инфляцию 5–6%» называет производителя, а не третье действующее
+    лицо. Тот же принцип, что замазанный «Банк России» не банк-актор (T7.85a). Вплотность —
+    промежуток не длиннее `RELAY_ALIAS_FORECAST_MAX_CHARS`, без конца предложения и без
+    двоеточия внутри промежутка; «аналитики Сбербанка ожидают 6,5%» в белый список не
+    попадает: «Сбербанка» алиасом словаря не является (алиас записи SberCIB требует
+    аббревиатуру CIB) и «Сбербанка» остаётся банком-актором. Белый список действует только
+    для ключей `_PRODUCER_ANALYST_KEYS` (десять дополнений T7.120): «аналитики» перед алиасом
+    государственного ведомства третьим актором остаётся. Этот список читается РОВНО
+    relay-гвардом (б):
+    вето окна публикации и вето третьего актора собственной публикации к нему не обращаются
+    — там «аналитики» по-прежнему действующее лицо (консервативная сторона не ослаблена)."""
+    alias_spans: list[tuple[int, int]] = [
+        (match.start(), match.end())
+        for key, (_spec, patterns) in _ALIASES.items()
+        if key in _PRODUCER_ANALYST_KEYS
+        for pattern in patterns
+        for match in pattern.finditer(fragment)
+    ]
+    if not alias_spans:
+        return []
+    spans: list[tuple[int, int]] = []
+    for actor in _OTHER_SOURCE_ACTORS:
+        for match in actor.finditer(fragment):
+            for alias_start, _alias_end in alias_spans:
+                if alias_start < match.end():
+                    continue
+                gap = fragment[match.end() : alias_start]
+                if len(gap) > RELAY_ALIAS_FORECAST_MAX_CHARS:
+                    continue
+                if any(char in gap for char in ".!?:"):
+                    continue  # конец предложения или пояснения — вплотности нет
+                spans.append((match.start(), match.end()))
+                break
+    return spans
+
+
 def _relay_forecast_keys(
     fragment: str, required_numbers: frozenset[str] | None = None
 ) -> dict[str, str]:
@@ -544,6 +746,10 @@ def _relay_forecast_keys(
         return {}  # гвард (а): два первоисточника названы — чей прогноз, неизвестно
     key = keys[0]
     masked = _mask_primary_aliases(fragment)
+    # T7.120: «аналитики <алиас словаря>» — подразделение названного производителя, не третий
+    # актор: его span вырезается из замазанной копии перед тем же поиском действующих лиц.
+    for span_start, span_end in _producer_analyst_actor_spans(fragment):
+        masked = masked[:span_start] + " " * (span_end - span_start) + masked[span_end:]
     if any(pattern.search(masked) for pattern in _OTHER_SOURCE_ACTORS):
         return {}  # гвард (б): в фрагменте третье действующее лицо
     alias_match: re.Match[str] | None = None

@@ -135,9 +135,15 @@ def test_actor_expectation_veto_unchanged() -> None:
     assert decision.pairing == PAIRING_VALUE_AND_PRIMARY, decision
 
 
-def test_expectation_indicator_noun_still_attributed() -> None:
+def test_expectation_indicator_noun_two_named_primaries_t7120() -> None:
     """«Инфляционные ожидания населения … выросли до 14,2%» — имя показателя, не чужая оценка:
-    приписывание ЦБ (окно публикации) остаётся прежним решением."""
+    вето ожиданиями по-прежнему молчит, когда оценки нет.
+
+    T7.120 (решение пользователя 2026-10-17, ADR-0029 дополнение): решение по оконному
+    приписыванию изменилось не из-за глагола, а из-за словаря: «инФОМ» — отдельный
+    производитель, в окне названы он и Банк России — разночтение двух первоисточников.
+    Было: derivative→cbr (окно публикации). Стало: ambiguous_primaries. Глагольный контроль
+    T7.110 (акторные формы ожидания) выше по этому тексту не изменился ни на пункт."""
     text = (
         "Об этом следует из опубликованных данных опроса, проводимого «инФОМ» по заказу Банка "
         "России. Инфляционные ожидания населения в декабре 2025 года выросли до 14,2%."
@@ -148,7 +154,8 @@ def test_expectation_indicator_noun_still_attributed() -> None:
         claim_statement="Наблюдаемые инфляционные ожидания населения в декабре 2025 года "
         "составляют 14,2%.",
     )
-    assert (decision.status, decision.primary_key) == ("derivative", "cbr"), decision
+    assert decision.status == "ambiguous_primaries", decision
+    assert decision.primary_key is None, decision
     assert decision.pairing == PAIRING_PUBLICATION_WINDOW, decision
 
 
@@ -191,5 +198,5 @@ def test_method_versions_bumped() -> None:
     """Поведение обоих детекторов изменилось: значения v9→v10, страницы v6→v7 (ADR-0029).
     T7.112 поднял их ещё раз (закрытый словарь глаголов отчётности): значения v10→v11,
     страницы v7→v8 (STATUS T7.112)."""
-    assert VALUE_ATTRIBUTION_METHOD_VERSION == "host-value-attribution-v13"
-    assert ATTRIBUTION_METHOD_VERSION == "host-source-attribution-v8"
+    assert VALUE_ATTRIBUTION_METHOD_VERSION == "host-value-attribution-v14"
+    assert ATTRIBUTION_METHOD_VERSION == "host-source-attribution-v9"

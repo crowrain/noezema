@@ -198,8 +198,11 @@ def test_english_strict_pairing_still_decides() -> None:
         " Gallup показал наблюдаемую инфляцию 15,2% ",
         " Reuters писал о наблюдаемой инфляции ",
         " Bloomberg Economics дал оценку 14,5% ",
-        # SberCIB виден и прежним правилом сокращённого имени (T7.85b), и новым признаком
-        " SberCIB опубликовал обзор инфляции ",
+        # имя организации вне словаря латиницей — признак. Прежний параметр « SberCIB
+        # опубликовал обзор инфляции » снят: T7.120 (решение пользователя) добавил SberCIB
+        # в словарь первоисточников — замазанный алиас признаком быть не может, новый пинь
+        # ниже в `test_alias_whitelist_and_lowercase_are_not_signs`
+        " Barclays опубликовал обзор инфляции ",
     ],
 )
 def test_latin_name_in_the_veto_zone_is_a_sign(zone: str) -> None:
@@ -213,6 +216,9 @@ def test_latin_name_in_the_veto_zone_is_a_sign(zone: str) -> None:
         " Rosstat опубликовал релиз о 5,59% ",
         " Bank of Russia зафиксировал оценку текущих темпов на уровне 14,5% ",
         " cbr.ru опубликовал обзор ожиданий ",
+        # T7.120: SberCIB — алиас записи `sbercib`, прежний признак латинского имени
+        # вне словаря (T7.85c) по нему больше не срабатывает
+        " SberCIB опубликовал обзор инфляции ",
         # белый список имён показателя и территории (в том числе новые позиции)
         " Показатель HICP в EU вырос на 5,59% ",
         " CPI и PPI в РФ выросли на 5,59% ",
@@ -318,19 +324,30 @@ def test_new_sign_does_not_leak_into_the_strict_mode(
 # ─── 8: живые тексты стенда не сломаны (окно ЦБ и строгое решение СберCIB) ────────────────
 
 
-def test_cbr_window_positives_on_live_texts_survive() -> None:
+def test_cbr_window_live_texts_now_ambiguous_t7120() -> None:
+    """T7.120 (решение пользователя 2026-10-17, ADR-0029 дополнение): «инФОМ» — отдельный
+    производитель словаря. Живые тексты Forbes и Коммерсанта называют в окне публикации и
+    «инФОМ», и Банк России («опрос, проводимый „инФОМ“ по заказу Банка России») — два
+    названных первоисточника. Прежнее решение (derivative→cbr окном публикации) заменено
+    честным разночтением: окно не выбирает производителя, приписывания нет."""
     for name in ("forbes_552221", "kommersant_8294535"):
         decision = _decide(_text(name), STATEMENT_145, STAND_URI[name])
-        assert (decision.status, decision.primary_key) == ("derivative", "cbr"), name
+        assert (decision.status, decision.primary_key) == ("ambiguous_primaries", None), name
         assert decision.pairing == PAIRING_PUBLICATION_WINDOW, name
 
 
 def test_sbercib_strict_decision_survives_its_own_latin_name() -> None:
-    """На странице СберCIB есть «SberCIB» — латинское имя вне словаря, и оно действительно признак
-    другого источника числа. Но решение о 5,59% выносит строгий pairing ДО оконного режима, и зона
-    вето для него не строится вовсе: строгое решение Росстата не тронуто."""
+    """Структурный контроль T7.85c: латинское имя организации вне словаря — признак другого
+    источника числа, но решение о 5,59% выносит строгий pairing ДО оконного режима, и зона
+    вето для него не строится вовсе: строгое решение Росстата не тронуто.
 
-    assert va._other_source_sign(" SberCIB выпустил обзор инфляции ")
+    T7.120 (решение пользователя 2026-10-17): «SberCIB» — алиас записи `sbercib` словаря
+    первоисточников, прежний признак по нему молчит (пинь в
+    `test_alias_whitelist_and_lowercase_are_not_signs`); контроль признака продолжен на
+    имени вне словаря (Barclays)."""
+
+    assert not va._other_source_sign(" SberCIB выпустил обзор инфляции ")
+    assert va._other_source_sign(" Barclays выпустил обзор инфляции ")
     decision = _decide(_text("sbercib_2025"), STATEMENT_559, STAND_URI["sbercib_2025"])
     assert (decision.status, decision.primary_key) == ("derivative", "rosstat"), decision
     assert decision.pairing == PAIRING_VALUE_AND_PRIMARY, decision

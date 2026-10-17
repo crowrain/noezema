@@ -237,8 +237,18 @@ from packages.memory.scope import (
 #: случай: пересказ прогноза на лента-издании без шаблона атрибуции, где деловое издание той
 #: же формулировки уже приписано Банку России строгим режимом. Решения v13 отличаются от
 #: решений v12 (замер свипа — STATUS T7.116) → переатрибуция пересматривает записи эпохи v12.
-#: Страничный детектор не тронут: его версия остаётся v8.
-VALUE_ATTRIBUTION_METHOD_VERSION: Final = "host-value-attribution-v13"
+#: v14 (T7.120, решение пользователя 2026-10-17): строгий pairing получает числовой фильтр и
+#: для утверждений без измеренного значения — «голое» десятичное число утверждения
+#: (`_claim_bare_values`) обязано стоять в фрагменте атрибуции текстовой формой T7.108a с
+#: гвардом одиночности T7.109a (стендовый случай 83e7a1c8: «hh-индекс … составил 9,6» не может
+#: приписываться фрагменту «По данным Росстата, в декабре 2008 года число безработных выросло
+#: на четверть», где этого числа нет). Фильтр только снимает пары; режимы публикации,
+#: ближайшего первоисточника, bibliography и упоминания не тронуты (все требуют измеренного
+#: профиля). Страничный детектор тоже меняется (словарь первоисточников и relay-гвард (б) —
+#: см. версию `host-source-attribution-v9`): обе версии поднимаются вместе, по правилам эпох
+#: (урок T7.110: любое изменение поведения детекторов поднимает обе версии). Решения v14
+#: отличаются от решений v13 → переатрибуция пересматривает записи эпохи v13.
+VALUE_ATTRIBUTION_METHOD_VERSION: Final = "host-value-attribution-v14"
 
 #: честный отказ этого детектора: первоисточник в основании назван, но значение там другое — не то,
 #: на котором стоит утверждение. Отличие от `no_value_attribution` (атрибуции нет вовсе) нужно,
@@ -670,6 +680,46 @@ def claim_value_numbers(statement: str | None) -> tuple[str, ...]:
     if not statement:
         return ()
     return tuple(sorted(_claim_measured_numbers(normalize_scan_text(statement))))
+
+
+#: «голое» десятичное число утверждения: разделитель стоит между цифрами, целая часть и дробная
+#: читаются одним числом (`_canonical_number` те же хвостовые нули), единиц измерения нет
+_BARE_DECIMAL_TOKEN: Final = re.compile(r"\d+[.,]\d+")
+
+
+def _claim_bare_values(statement: str | None) -> frozenset[str]:
+    """T7.120 (ADR-0029 дополнение, стендовый случай 83e7a1c8): «голые» значения утверждения —
+    десятичные числа без единицы измерения.
+
+    Измеренного значения нет (`claim_match_values` пуст), но число в утверждении есть:
+    «hh-индекс в России в 2026 году составил 9,6» — значение названо числом с разделителем без
+    единицы. Прежде такой профиль не работал ни в одном фильтре pairing: числовой фильтр строгого
+    режима при пустом профиле инертен, и одиночная атрибуция основания (например строка про
+    «декабрь 2008, выросло на четверть») приписывала утверждению первого названного первоисточника
+    — тот дефект стенда и есть. Теперь утверждение с голым значением требует ту же форму числа
+    в фрагменте атрибуции (текстовые формы T7.108a, гвард одиночности T7.109a — конец чужого
+    диапазона не подтверждение): нет числа в фрагменте — нет пары, честный отказ.
+
+    Целые числа (годы, «в 2 раза», номера) в голые значения не собираются: прежнее поведение для
+    утверждений без десятичного числа не меняется ни на пункт."""
+    if not statement:
+        return frozenset()
+    scanned = normalize_scan_text(statement)
+    measured = _claim_measured_numbers(scanned)
+    bare: set[str] = set()
+    for token in VALUE_NUMBER_PATTERN.finditer(scanned):
+        raw = re.sub(r"[\s\u00a0]+", "", token.group())
+        if not _BARE_DECIMAL_TOKEN.fullmatch(raw):
+            continue  # целое (год, «в 2 раза») или патологический склеенный токен
+        canonical = _canonical_number(raw)
+        if not _SIMPLE_CANONICAL.fullmatch(canonical):
+            continue  # токен не читается как одно десятичное число
+        if canonical in measured:
+            continue  # измеренное значение (единица после числа) уже в профиле сравнения
+        if _UNIT_SCAN.match(scanned[token.end() : token.end() + _UNIT_TAIL_CHARS]):
+            continue  # единица всё-таки стоит: это измеренное число, не голое
+        bare.add(canonical)
+    return frozenset(bare)
 
 
 # ─── T7.108a (ADR-0034 §10): текстовые формы значения для гейта «значение на связи» ──────
@@ -1622,7 +1672,10 @@ def _nearest_primary_decision(
 
 
 def _pairing_maps(
-    scanned: str, values: tuple[str, ...], match_values: frozenset[str]
+    scanned: str,
+    values: tuple[str, ...],
+    match_values: frozenset[str],
+    bare_values: frozenset[str] = frozenset(),
 ) -> tuple[dict[str, str], dict[str, str]]:
     """Пары фрагментов: `attributed` — фрагменты, где названа атрибуция (независимо от значения),
     `matched` — пары «первоисточник → фрагмент» про значение утверждения. Вынесено из
@@ -1630,7 +1683,11 @@ def _pairing_maps(
     строиться на ровно том же pairing, что и решение об атрибуции, — второй копии логики нет.
     С T7.109a фильтр «другого числа» сравнивает значения фрагмента с профилем утверждения
     (`_measured_value_tokens`: диапазон страницы — одно значение, его концы — не числа):
-    фрагмент с единственным диапазоном «6-7%» больше не пропускает одиночное значение «7»."""
+    фрагмент с единственным диапазоном «6-7%» больше не пропускает одиночное значение «7».
+    С T7.120 тот же фильтр работает и когда измеренного профиля нет: у утверждения с «голым»
+    десятичным значением (`_claim_bare_values`) фрагмент обязан подтвердить эту форму числа
+    текстовой формой T7.108a с гвардом одиночности T7.109a. Фильтр только снимает пары и никогда
+    их не добавляет; для утверждений без голого числа поведение прежнее ни на пункт не изменено."""
     attributed: dict[str, str] = {}
     matched: dict[str, str] = {}
     for fragment in _fragments(scanned):
@@ -1651,6 +1708,10 @@ def _pairing_maps(
         attributed.update(dict.fromkeys({**relay, **keys}, fragment))
         if match_values and not (_measured_value_tokens(fragment) & match_values):
             continue  # «другое число»: первоисточник назван, но не про значение утверждения (T7.109a)
+        if not match_values and bare_values and not _single_values_found_standalone(
+            fragment, bare_values
+        ):
+            continue  # «другое число» и для голого значения: формы числа в фрагменте нет (T7.120)
         relay_value = (
             _relay_forecast_keys(fragment, required_numbers=frozenset(values))
             if relay and values
@@ -1691,6 +1752,9 @@ def attribute_value_in_fragment(
     # T7.109a: профиль значений утверждения для сравнения «значение ли это в этом фрагменте»;
     # плоский `values` остаётся для записи, гейта и позиций relay
     match_values = claim_match_values(claim_statement)
+    # T7.120: когда измеренного профиля нет, pairing требует «голое» десятичное значение
+    # утверждения в фрагменте (см. `_claim_bare_values`); с измеренным профилем — прежнее
+    bare_values = frozenset() if match_values else _claim_bare_values(claim_statement)
 
     # T7.107/T7.113 (часть а): вето собственной оценки — по копии с вырезанными шаблонными
     # плашками площадки (`SITE_DISCLAIMER_PHRASES`), словарь маркеров не сокращён; когда у
@@ -1704,7 +1768,7 @@ def attribute_value_in_fragment(
         # своя оценка/альтернативный расчёт рядом со значением утверждения: склеивать нельзя
         return ValueAttributionDecision(status=STATUS_OWN_ASSESSMENT, claim_values=values)
 
-    attributed, matched = _pairing_maps(scanned, values, match_values)
+    attributed, matched = _pairing_maps(scanned, values, match_values, bare_values)
 
     def fallback(refusal: ValueAttributionDecision) -> ValueAttributionDecision:
         """Честный отказ строгого режима ещё не значит «пересказа нет»: страница могла объявить
@@ -1884,7 +1948,10 @@ def self_publication_candidate(
     if not canonical_uri or not text:
         return None  # защита: без адреса прочитанной страницы домашний хост не проверить
     scanned = normalize_scan_text(text)[:MAX_SCAN_CHARS]
-    _, matched = _pairing_maps(scanned, decision.claim_values, claim_match_values(claim_statement))
+    claim_match = claim_match_values(claim_statement)
+    # T7.120: тот же pairing, что решил `self_primary`, — с тем же голодным фильтром значения
+    claim_bare = frozenset() if claim_match else _claim_bare_values(claim_statement)
+    _, matched = _pairing_maps(scanned, decision.claim_values, claim_match, claim_bare)
     if not matched:
         return None  # защита: `self_primary` без pairing не бывает, но и проверка не на слепке
     specs = [

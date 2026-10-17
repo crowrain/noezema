@@ -297,16 +297,20 @@ async def test_pointer_clear_then_value_records_merge_groups_to_e1(
             for r in cbr_rows
         ), plan_ev.rows
         alfa_rows = [r for r in plan_ev.rows if r.claim_statement == STATEMENT_ALFA]
+        # T7.120 (часть 2): было — Альфа-Банка не было в словаре, собственная оценка на чужой
+        # странице оставалась «не собранной»; стало — Альфа-Банк в словаре: страница реле —
+        # пересказ его публикации, план записывает происхождение значения
         assert len(alfa_rows) == 1 and alfa_rows[0].action == (
-            "изменений нет: атрибуция значения не собрана"
+            "будет записано происхождение значения улики"
         ), plan_ev.rows
-        assert alfa_rows[0].now_status == "value_not_attributed"  # собственная оценка Альфы — не пересказ
+        assert (alfa_rows[0].now_status, alfa_rows[0].primary_name) == ("derivative", "Альфа-Банк")
         assert plan_ev.changed_evidence == 0
 
         # 4. боевая запись происхождения значения: две улики CBR-прогноза → ЦБ,
-        #    улика 5,59% на nbj — честный пересказ Росстата (её страница и есть пересказ)
+        #    улика 5,59% на nbj — честный пересказ Росстата (её страница и есть пересказ),
+        #    и (T7.120) улика Альфа-Банка → якорь Альфа-Банка
         report_ev = await reattribute_evidence_window(factory, store, since=SINCE)
-        assert report_ev.changed_evidence == 3, report_ev.rows
+        assert report_ev.changed_evidence == 4, report_ev.rows
         assert report_ev.jobs_created >= 1 and report_ev.worker is not None
     finally:
         await engine.dispose()
@@ -328,18 +332,29 @@ async def test_pointer_clear_then_value_records_merge_groups_to_e1(
     for row in origins:
         record = dict(row["origin"])
         assert record["primary_key"] == "cbr" and record["primary_name"] == "Банк России"
-        assert record["method"] == "host-value-attribution-v13"
+        assert record["method"] == "host-value-attribution-v14"
         assert record["pairing"] == "value_and_primary_in_fragment"
         assert str(record["parent_source_id"]) == cbr_anchor
         assert "Банк России" in record["basis_fragment"]
-    # Альфа: записи о происхождении значения нет (собственная оценка не приписана никому)
+    # стало (T7.120): у Альфа-Банка есть запись происхождения — пересказ его публикации на реле
+    # со строгим сопряжением и якорем самого Альфа-Банка (было: записи не было, оценка
+    # оставалась не приписанной никому)
     alfa_origin = await _scalar(
         scratch_url,
         "SELECT e.scope -> 'value_attribution' FROM evidence e JOIN claims c ON c.id = e.claim_id "
         "WHERE c.statement = :s",
         {"s": STATEMENT_ALFA},
     )
-    assert alfa_origin is None or alfa_origin[0] is None
+    assert alfa_origin is not None and alfa_origin[0] is not None
+    alfa_record = dict(alfa_origin[0])
+    assert alfa_record["primary_key"] == "alfa" and alfa_record["primary_name"] == "Альфа-Банк"
+    assert alfa_record["method"] == "host-value-attribution-v14"
+    assert alfa_record["pairing"] == "value_and_primary_in_fragment"
+    alfa_anchor = await _anchor_id(scratch_url, "https://www.alfabank.ru/")
+    assert str(alfa_record["parent_source_id"]) == alfa_anchor
+    # группа Альфа-Банка сворачивается на его собственный якорь (не на Росстат и не одиночна)
+    alfa_groups_after = await _group_snapshot(scratch_url, STATEMENT_ALFA)
+    assert {str(g["basis"]) for g in alfa_groups_after} == {f"parent:{alfa_anchor[:12]}"}
 
     # 5. идемпотентность: повторные прогоны ничего не меняют
     factory, engine = _factory(scratch_url)
@@ -397,7 +412,8 @@ async def test_operator_corrected_source_is_left_alone(
         ev = await reattribute_evidence_window(factory, store, since=SINCE)
         guard_ev = [r for r in ev.rows if r.canonical_uri == URL_GUARD]
         assert len(guard_ev) == 1 and "улики не переписываем" in guard_ev[0].action, ev.rows
-        assert ev.changed_evidence == 2, ev.rows  # только улики CBR-прогноза (intl + sbercib)
+        # стало (T7.120): плюс улика Альфа-Банка на intl — она не под коррекцией и переписывается
+        assert ev.changed_evidence == 3, ev.rows  # улики CBR-прогноза (intl + sbercib) + alfa на intl
     finally:
         await engine.dispose()
 

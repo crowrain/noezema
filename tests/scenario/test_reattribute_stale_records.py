@@ -21,6 +21,9 @@
 5. пересчёт делает только существующий каскад §11.3 (`apply_source_graph_change` + рабочий переоценки),
    а повторный прогон идемпотентен;
 6. «первоисточник + два его пересказа» не оценивается выше, чем одна независимая группа;
+   с T7.120 (часть 2) формулировка стала точнее: для текстов формы «инФОМ … опубликованного ЦБ»
+   пересмотара вообще нет — обе relay-страницы неоднозначны, группы остаются отдельными, а
+   сохранённая запись прежней эпохи продолжает сворачивать группы до ручной проверки (п.4);
 7. (T7.85a) записи, помеченные методом v2 (то окно публикации, поведение которого изменилось),
    пересматриваются текущим методом на том же основании «метки различаются»; с T7.85b и T7.85c
    тем же предикатом пересматриваются и метки v3, и v4 — прежних эпох в базе может быть несколько.
@@ -28,7 +31,11 @@
 Сеть подменена детерминированным FakeFetchClient (§6); staging, `MemoryService`, группировка, правила и
 переатрибуция — настоящие. «Эпоха v1» (и, с T7.85a/T7.85b/T7.85c, эпохи v2…v4) моделируется
 тем же приёмом, что
-`broken_v1_fetch` в T7.77/T7.81: подменяется метка метода, которой пишется запись. Прямых UPDATE
+`broken_v1_fetch` в T7.77/T7.81: подменяется метка метода, которой пишется запись. С T7.120
+(часть 2) для эпох v2…v4 добавлен второй слой подмены (`fake_derivative_for` в `_backfill_as_v1`):
+решение на подставных страницах эмулируется решением той эпохи, потому что ТЕКУЩИЙ метод на этих
+текстах ничего не собирает (два названных первоисточника в одном окне) и запечатать «запись эпохи»
+без подмены уже нельзя. Прямых UPDATE
 доменных таблиц в тесте нет.
 
 """
@@ -71,7 +78,7 @@ V3_VALUE_METHOD = "host-value-attribution-v3"
 V4_VALUE_METHOD = "host-value-attribution-v4"
 #: текущий метод значений (T7.85c, с T7.98 — v6: relay в строгом режиме): им пишется запись
 #: после пересмотра прежних эпох v2…v5
-CURRENT_VALUE_METHOD = "host-value-attribution-v13"
+CURRENT_VALUE_METHOD = "host-value-attribution-v14"
 
 # ─── тексты: та же синтаксическая форма, что у стендовых страниц (фикстуры T7.85) ───
 # абзац нормализованного текста = одна строка; страница первоисточника — на своём home host
@@ -251,28 +258,55 @@ async def _run_page_backfill(
 
 
 async def _backfill_as_v1(
-    scratch_url: str, store: FilesystemArtifactStore, *, stale_method: str = V1_VALUE_METHOD
+    scratch_url: str,
+    store: FilesystemArtifactStore,
+    *,
+    stale_method: str = V1_VALUE_METHOD,
+    fake_derivative_for: tuple[str, ...] = (),
 ) -> Any:
     """Тот же прогон, но запись помечена ПРЕЖНЕЙ версией метода — состояние эпохи `stale_method`
     (v1 по умолчанию; с T7.85a тем же приёмом моделируется эпоха v2).
 
     Метод значений v1 не знал окна публикации; здесь моделируется ровно то, от чего зависит
-    переатрибуция: метка записи, отличная от текущей (тот же приём, что `broken_v1_fetch`)."""
+    переатрибуция: метка записи, отличная от текущей (тот же приём, что `broken_v1_fetch`).
+
+    T7.120 (часть 2): страницы формы «инФОМ … опубликованного ЦБ» больше не дают пар у ТЕКУЩЕГО
+    метода (окно называет два первоисточника → ambiguous_primaries), поэтому для моделирования
+    состояния эпохи добавлен режим `fake_derivative_for`: на перечисленных адресах функция
+    решений подменяется эмуляцией решения той эпохи (derivative → Банк России, окно публикации)
+    — ровно тем, что прежний метод на этих страницах и писал."""
 
     import apps.research_proxy.reattribution as reattr
-    from apps.research_proxy.reattribution import reattribute_evidence_window
+    from apps.research_proxy.reattribution import ValueAttributionDecision, reattribute_evidence_window
 
     engine = create_async_engine(scratch_url)
     factory = async_sessionmaker(engine, expire_on_commit=False)
     current_value_method = reattr.VALUE_ATTRIBUTION_METHOD_VERSION
     current_page_method = reattr.CURRENT_VALUE_METHOD_VERSION
+    original_attribution = reattr.attribute_value_in_fragment
     reattr.CURRENT_VALUE_METHOD_VERSION = stale_method
     reattr.VALUE_ATTRIBUTION_METHOD_VERSION = stale_method
+
+    def _era_decision(*, canonical_uri: str, **kwargs: Any) -> ValueAttributionDecision:
+        if canonical_uri in fake_derivative_for:
+            return ValueAttributionDecision(
+                status="derivative",
+                primary_key="cbr",
+                primary_name="Банк России",
+                pairing="publication_window",
+                basis_fragment="по данным опроса «инФОМ», опубликованного Банком России",
+                claim_values=("14.5",),
+            )
+        return original_attribution(canonical_uri=canonical_uri, **kwargs)
+
+    if fake_derivative_for:
+        reattr.attribute_value_in_fragment = _era_decision
     try:
         return await reattribute_evidence_window(factory, store, since=_since())
     finally:
         reattr.CURRENT_VALUE_METHOD_VERSION = current_page_method
         reattr.VALUE_ATTRIBUTION_METHOD_VERSION = current_value_method
+        reattr.attribute_value_in_fragment = original_attribution
         await engine.dispose()
 
 
@@ -404,10 +438,16 @@ async def test_stale_value_record_is_reconsidered_and_existing_parent_survives(
 
 
 @pytest.mark.asyncio
-async def test_primary_plus_two_retellings_is_not_graded_above_one_group(
+async def test_primary_plus_two_retellings_stay_separate_when_infom_is_named_t7120(
     migrated_db: tuple[str, Any], tmp_path: Path, live_fetch: None
 ) -> None:
-    """Форма дефекта `391c4388` (E3/0.75): страница ЦБ плюс два пересказа одного опроса ЦБ."""
+    """Форма дефекта `391c4388` (E3/0.75): страница ЦБ плюс два пересказа одного опроса ЦБ.
+
+    T7.120 (часть 2): переименован и перепинен — словарь знает инФОМ как отдельного
+    производителя (решение пользователя: пересказы не-государственных производителей
+    распознаются до расширения куратора), поэтому обе relay-страницы теперь неоднозначны
+    и переписывания нет вообще; тест сохраняет ровно тот дефект, который моделировал
+    (`test_primary_plus_two_retellings_is_not_graded_above_one_group` на `11014ee`)."""
 
     scratch_url, _engine = migrated_db
     store = FilesystemArtifactStore(tmp_path / "artifacts")
@@ -423,8 +463,11 @@ async def test_primary_plus_two_retellings_is_not_graded_above_one_group(
     by_url = {row.canonical_uri: row for row in plan.rows}
     assert all(row.was_status == NO_DECISION_YET for row in plan.rows), plan.rows
     poll_row = by_url[URL_FORBES]
-    assert (poll_row.now_status, poll_row.primary_name) == ("derivative", "Банк России"), poll_row
-    assert poll_row.action == "будет записано происхождение значения улики", poll_row
+    # T7.120 (часть 2): было — страница сворачивалась к банку как к ближайшему первоисточнику;
+    # стало — в одном окне названы и «инФОМ» (запись опроса), и «Банк России» (публикатор):
+    # значение не атрибутировано, отдельность группы сохранена
+    assert (poll_row.now_status, poll_row.primary_name) == ("ambiguous_primaries", None), poll_row
+    assert poll_row.action == "изменений нет: атрибуция значения не собрана", poll_row
     own_plan_row = by_url[URL_CBR_HOME]
     assert own_plan_row.now_status == STATUS_SELF_PRIMARY, own_plan_row
     # T7.101: собственная страница первоисточника со своим значением — не «не собрано»:
@@ -437,12 +480,11 @@ async def test_primary_plus_two_retellings_is_not_graded_above_one_group(
     report = await _run_backfill(scratch_url, store)
     origins = await _records_of(scratch_url, STATEMENT_145)
     decided = {str(r["canonical_uri"]): dict(r["origin"]) for r in origins if r["origin"] is not None}
-    assert set(decided) == {URL_FORBES, URL_KOMMERSANT}, decided
-    assert all(rec["primary_key"] == "cbr" for rec in decided.values()), decided
-    # слабое основание видно оператору: это окно публикации, а не строгий pairing
-    assert all(rec["pairing"] == "publication_window" for rec in decided.values()), decided
-    assert all(rec["method"] == CURRENT_VALUE_METHOD for rec in decided.values()), decided
-    assert len({str(rec["parent_source_id"]) for rec in decided.values()}) == 1, decided
+    # T7.120 (часть 2): было (T7.85a/T7.100) — обе relay-страницы получали пересказ ЦБ по
+    # ближайшему первоисточнику (окно публикации, общий родитель); стало — словарь знает инФОМ
+    # как самостоятельного производителя, оба имени стоят в одном окне, решение неоднозначно:
+    # записей нет, ложное слияние групп не происходит
+    assert decided == {}, origins
 
     own = next(r for r in origins if r["canonical_uri"] == URL_CBR_HOME)
     assert own["origin"] is None, "собственная страница ЦБ стала пересказом сама себя"
@@ -456,12 +498,14 @@ async def test_primary_plus_two_retellings_is_not_graded_above_one_group(
     )
     assert self_rec is not None and self_rec[0] == "Банк России", self_rec
 
-    # T7.101: третья запись — собственная публикация на самой странице ЦБ (value_attribution
-    # у неё по-прежнему нет: пересказа нет, родителя нет — см. assert выше)
-    assert report.changed_evidence == 3 and report.jobs_created >= 1, report.rows
-    assert len(await _group_ids(scratch_url, STATEMENT_145)) == 1
-    # ровно то же, что даёт одна независимая группа: ложное «подтверждено независимо» снято
-    assert await _current_assessment(scratch_url, STATEMENT_145) == ("E1", "hypothesis")
+    # было (T7.101): три записи — два пересказа + собственная публикация на самой странице ЦБ,
+    # каскад переоценки и снятие ложного «подтверждено независимо»; стало (T7.120): только
+    # собственная публикация (она не свёртывает группы), каскада нет
+    assert report.changed_evidence == 1 and report.jobs_created == 0, report.rows
+    assert len(await _group_ids(scratch_url, STATEMENT_145)) == 3
+    # оценка не понижаются обманом: неоднозначность атрибуции не превращает E3 в E1 —
+    # «подтверждено независимо» остаётся потому, что группы действительно отдельны
+    assert await _current_assessment(scratch_url, STATEMENT_145) == ("E3", "supported")
 
 
 # ─── 3: коррекция оператора (ADR-0031) автоматический прогон не перешагивает ──────
@@ -598,8 +642,12 @@ async def test_records_tagged_v2_method_are_reconsidered_by_current_version(
     await _seed_claim(scratch_url, store, POLL_URLS, STATEMENT_145)
     assert len(await _group_ids(scratch_url, STATEMENT_145)) == 3
 
-    # эпоха v2: те же страницы, то же окно публикации — но запись помечена v2
-    era = await _backfill_as_v1(scratch_url, store, stale_method=V2_VALUE_METHOD)
+    # эпоха v2: те же страницы, то же окно публикации — но запись помечена v2.
+    # T7.120 (часть 2): CURRENT-метод на этих страницах уже ничего не собирает (два названных
+    # первоисточника), поэтому эпоха моделируется подменой решения (см. `_backfill_as_v1`)
+    era = await _backfill_as_v1(
+        scratch_url, store, stale_method=V2_VALUE_METHOD, fake_derivative_for=(URL_FORBES, URL_KOMMERSANT)
+    )
     assert era.changed_evidence == 2, era.rows
     written_era = {
         str(r["canonical_uri"]): dict(r["origin"])
@@ -618,21 +666,29 @@ async def test_records_tagged_v2_method_are_reconsidered_by_current_version(
     assert all(
         row.was_status == f"derivative → Банк России ({V2_VALUE_METHOD})" for row in stale
     ), stale
-    # синтетические страницы подставки чисты: вето не сработало, решение то же — пересмотренное
-    assert all(row.action == "будет записано прежнее происхождение значения улики" for row in stale), stale
+    # T7.120 (часть 2): было — страницы подставки чисты и план переписывал бы прежнее решение;
+    # стало — свежий метод видит в окне два названных первоисточника (инФОМ и Банк России),
+    # отказывается решать и ПРЕЖНЮЮ ЗАПИСЬ НЕ ТРОГАЕТ (записи эпохи не удаляются никогда)
+    assert all(row.now_status == "ambiguous_primaries" for row in stale), stale
+    assert all(
+        row.action.startswith("прежняя запись сохранена") for row in stale
+    ), stale
 
     report = await _run_backfill(scratch_url, store)
-    # T7.101: две прежние записи пересмотрены + собственная страница ЦБ получает запись о
-    # собственной публикации (эпохи v2…v4 такой записи не писали — gated-прогон эпохи её не пишет)
-    assert report.changed_evidence == 3, report.rows
+    # было (T7.101): changed_evidence == 3 — две прежние записи пересмотрены + собственная страница
+    # ЦБ получает запись о собственной публикации; стало (T7.120): только собственная запись —
+    # прежние v2 сохранены отказом и не перезаписаны
+    assert report.changed_evidence == 1, report.rows
     written_after = {
         str(r["canonical_uri"]): dict(r["origin"])
         for r in await _records_of(scratch_url, STATEMENT_145)
         if r["origin"] is not None
     }
-    assert all(rec["method"] == CURRENT_VALUE_METHOD for rec in written_after.values()), written_after
+    assert all(rec["method"] == V2_VALUE_METHOD for rec in written_after.values()), written_after
     assert all(rec["primary_key"] == "cbr" for rec in written_after.values()), written_after
     assert all(rec["pairing"] == "publication_window" for rec in written_after.values()), written_after
+    # сохранённые записи эпохи по-прежнему сворачивают группы: ложное «подтверждено независимо»
+    # живёт до ручной проверки оператором — это ровно тот смысл, который несёт действие плана
     assert len(await _group_ids(scratch_url, STATEMENT_145)) == 1
     assert await _current_assessment(scratch_url, STATEMENT_145) == ("E1", "hypothesis")
 
@@ -687,7 +743,9 @@ async def test_records_tagged_v3_and_v4_methods_are_reconsidered_by_current_vers
     await _seed_claim(scratch_url, store, POLL_URLS, STATEMENT_145)
     assert len(await _group_ids(scratch_url, STATEMENT_145)) == 3
 
-    era = await _backfill_as_v1(scratch_url, store, stale_method=V2_VALUE_METHOD)
+    era = await _backfill_as_v1(
+        scratch_url, store, stale_method=V2_VALUE_METHOD, fake_derivative_for=(URL_FORBES, URL_KOMMERSANT)
+    )
     assert era.changed_evidence == 2, era.rows
     await _relabel_value_method(scratch_url, URL_FORBES, V3_VALUE_METHOD)
     await _relabel_value_method(scratch_url, URL_KOMMERSANT, V4_VALUE_METHOD)
@@ -712,32 +770,41 @@ async def test_records_tagged_v3_and_v4_methods_are_reconsidered_by_current_vers
     assert all(
         row.was_status == f"derivative → Банк России ({row.was_method})" for row in stale.values()
     ), stale
-    # страницы подставки чисты: новые признаки вето на них не сработали, решение то же — пересмотренное
+    # T7.120 (часть 2): было — план переписывал бы прежнее решение на обеих страницах;
+    # стало — свежий метод отказывается решать (инФОМ и Банк России в одном окне) и сохраняет
+    # прежние записи неприкосновенными
+    assert all(row.now_status == "ambiguous_primaries" for row in stale.values()), stale
     assert all(
-        row.action == "будет записано прежнее происхождение значения улики" for row in stale.values()
+        row.action.startswith("прежняя запись сохранена") for row in stale.values()
     ), stale
     assert plan.dry_run and plan.changed_evidence == 0 and not plan.changed_source_ids, plan.rows
 
     report = await _run_backfill(scratch_url, store)
-    # T7.101: v3 и v4 пересмотрены + собственная страница ЦБ получает запись о собственной
-    # публикации (её прежние эпохи не писали)
-    assert report.changed_evidence == 3, report.rows
+    # было (T7.101): changed_evidence == 3 (v3 и v4 пересмотрены + собственная страница ЦБ
+    # получает запись о собственной публикации); стало (T7.120): только собственная запись
+    assert report.changed_evidence == 1, report.rows
     written_after = {
         str(r["canonical_uri"]): dict(r["origin"])
         for r in await _records_of(scratch_url, STATEMENT_145)
         if r["origin"] is not None
     }
     assert set(written_after) == {URL_FORBES, URL_KOMMERSANT}, written_after
-    assert all(rec["method"] == CURRENT_VALUE_METHOD for rec in written_after.values()), written_after
+    # прежние метки сохранены: отказ текущего метода не перезаписывает и не удаляет запись эпохи
+    assert written_after[URL_FORBES]["method"] == V3_VALUE_METHOD, written_after
+    assert written_after[URL_KOMMERSANT]["method"] == V4_VALUE_METHOD, written_after
     assert all(rec["primary_key"] == "cbr" for rec in written_after.values()), written_after
     assert all(rec["pairing"] == "publication_window" for rec in written_after.values()), written_after
     assert len(await _group_ids(scratch_url, STATEMENT_145)) == 1
     assert await _current_assessment(scratch_url, STATEMENT_145) == ("E1", "hypothesis")
 
-    # повторный прогон идемпотентен: ни v3-, ни v4-метка больше не считается устаревшей
+    # повторный прогон: ни v3-, ни v4-метка не становятся текущими — записи остаются прежними
+    # (было T7.101: они уже были перезаписаны текущим методом и больше не считались устаревшими)
     again = await _run_backfill(scratch_url, store)
     assert again.changed_evidence == 0 and not again.changed_source_ids, again.rows
     retouched = [row for row in again.rows if row.canonical_uri in (URL_FORBES, URL_KOMMERSANT)]
     assert len(retouched) == 2, again.rows
-    assert all(row.was_method == CURRENT_VALUE_METHOD for row in retouched), retouched
-    assert all(row.action == "изменений нет: решение уже записано ранее" for row in retouched), retouched
+    assert next(r for r in retouched if r.canonical_uri == URL_FORBES).was_method == V3_VALUE_METHOD, retouched
+    assert next(r for r in retouched if r.canonical_uri == URL_KOMMERSANT).was_method == V4_VALUE_METHOD, (
+        retouched
+    )
+    assert all(row.action.startswith("прежняя запись сохранена") for row in retouched), retouched

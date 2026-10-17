@@ -124,15 +124,22 @@ def test_cbr_forecast_evidence_is_derivative_cbr_on_both_stand_pages() -> None:
 
 
 def test_third_actor_own_estimates_stay_negative() -> None:
-    # Альфа-Банк (07126d06): собственная оценка на чужой странице — не пересказ Росстата
-    # и не пересказ ЦБ (гвард (б): «Альфа-Банк» — маркер третьего действующего лица)
+    # Альфа-Банк (07126d06). T7.120 (решение пользователя 2026-10-17, ADR-0029 дополнение):
+    # Альфа-Банк — первоисточник словаря (запись `alfa`). Прежнее ожидание
+    # (STATUS_VALUE_NOT_ATTRIBUTED, «Альфа-Банк» — маркер третьего действующего лица)
+    # заменено: на странице назван сам производитель со словом прогноза («Альфа-Банк
+    # повысил прогноз инфляции по итогам 2026 года … 7,5%») — это relay-посылка T7.98 про
+    # собственного производителя, и значение ему приписывается: derivative→alfa. Было:
+    # честный отказ; стало: пересказ Альфа-Банка (оценки Альфа-Банка больше не «чужие» —
+    # это оценки названного производителя).
     decision = attribute_value_in_fragment(
         canonical_uri=STAND_URI["internationalinvestment"],
         text=_text("internationalinvestment"),
         claim_statement=STATEMENT_ALFA,
     )
-    assert decision.status == STATUS_VALUE_NOT_ATTRIBUTED, decision.status
-    assert decision.primary_key is None
+    assert decision.status == STATUS_DERIVATIVE, decision.status
+    assert decision.primary_key == "alfa", decision
+    assert decision.pairing == PAIRING_VALUE_AND_PRIMARY, decision
 
     # SberCIB (44bd1460): собственная оценка на своей странице — прежнее поведение
     decision = attribute_value_in_fragment(
@@ -248,5 +255,5 @@ def test_relay_is_forecast_specific_no_forecast_word_no_candidate() -> None:
 
 
 def test_method_versions_bumped_for_reattribution_window() -> None:
-    assert ATTRIBUTION_METHOD_VERSION == "host-source-attribution-v8"
-    assert VALUE_ATTRIBUTION_METHOD_VERSION == "host-value-attribution-v13"
+    assert ATTRIBUTION_METHOD_VERSION == "host-source-attribution-v9"
+    assert VALUE_ATTRIBUTION_METHOD_VERSION == "host-value-attribution-v14"

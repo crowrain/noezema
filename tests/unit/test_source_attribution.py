@@ -87,7 +87,7 @@ def test_retelling_of_a_release_is_derivative(uri: str, text: str) -> None:
     # схлопывание пробела при склейке фрагмента), T7.98 — до v4 (relay-кандидат прогноза),
     # T7.112 — до v8 (закрытый словарь глаголов отчётности первоисточника, STATUS T7.112).
     # Само это решение — из v1, оно не изменилось.
-    assert ATTRIBUTION_METHOD_VERSION == "host-source-attribution-v8"
+    assert ATTRIBUTION_METHOD_VERSION == "host-source-attribution-v9"
 
 
 # ─── пересказ опознаётся и по-английски ──────────────────────────────────
@@ -402,4 +402,4 @@ def test_typography_fix_bumps_the_method_version() -> None:
     # прогноза + значение» без шаблона (ADR-0029 дополнение, STATUS T7.98).
     # T7.112 поднял её до v8 тем же способом: закрытый словарь глаголов отчётности
     # первоисточника («зафиксировал…», «обнародовал…», «опубликовал…», «отчитал(ся|ась|ись)»).
-    assert ATTRIBUTION_METHOD_VERSION == "host-source-attribution-v8"
+    assert ATTRIBUTION_METHOD_VERSION == "host-source-attribution-v9"

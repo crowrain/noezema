@@ -14,15 +14,24 @@ nbj → sbercib (ADR-0031, стенда), запечатанные группы 
   Таблица пересчитана T7.116 (часть б): `6d9a12ff` («…по данным опроса „инФОМ“.») раньше
   подписывался пятым — по одному лишь указателю на документ ЦБ; теперь его утверждение
   производителя не называет, указатель имени не даёт: метка честная «слабо», уровень тот же.
-* прогон `--evidence-level` по журналу окна: ровно две записи о собственной публикации
-  (`c6729d4c`, обе страницы ЦБ), вето третьего актора для `2d010d53`/`58e2d5d4`
+* прогон `--evidence-level` по журналу окна: было (T7.101) — ровно две записи о собственной
+  публикации (`c6729d4c`, обе страницы ЦБ), стало (T7.120, часть 2) — четыре: к ним
+  добавляются строгие пересказы `07126d06` (прогноз Альфа-Банка на internationalinvestment.biz)
+  и `cc75e97f` (значение опроса инФОМ на странице события ЦБ) — оба производителя теперь
+  в словаре, обе улики прежде были «не собраны». Вето третьего актора для `2d010d53`/`58e2d5d4`
   (ADR-0035 §15), пять улик под коррекцией оператора не переписываются (ADR-0031),
   восемь прежних записей v6 — «уже записано», прежние v1 под коррекцией остаются v1;
-* «стало»: единственная изменившаяся метка — `c6729d4c`: «Подтверждено слабо» →
-  «Опубликовано производителем» (Банк России); остальные 19 меток побайтово равны;
-* группировка, роли улик, оценки, причины и строки источников НЕ изменились вовсе
-  (снимки до и после равны; каскада нет: `changed_source_ids` пуст, рабочих не заведено);
-* повторный прогон идемпотентен: «собственная публикация уже записана», ноль изменений;
+* «стало»: было (T7.101) — единственная изменившаяся метка `c6729d4c`; стало (T7.120) —
+  три: `c6729d4c`, `07126d06` (Альфа-Банк) и `cc75e97f` (инФОМ); остальные 17 меток
+  побайтово равны;
+* стало (T7.120): оценки и причины НЕ изменились вовсе (снимки равны); группировка изменилась
+  ровно для трёх утверждений (`07126d06` — одиночная группа свернута на новый якорь
+  alfabank.ru, `cc75e97f` — добавлен родитель infom.org.ru, `c6729d4c` — прежняя доменная
+  группировка), созданы две строки источников-якорей; каскад: три снятых head'а, три
+  задачи переоценки;
+* стало (T7.120): второй прогон дописывает одну запись (`cc75e97f` на Infl_exp_26-09 —
+  режим ближайшего первоисточника собрал пару только после появления якоря инФОМ) и ставит
+  указатель страницы; идемпотентен только третий прогон (было T7.101: ноль со второго).
 * свёртка дублей значения (T7.99): пара `c6729d4c`/`136a0ca0` после прогона согласована
   (обе подписи «Опубликовано производителем»), пара `9266248e`/`e189c80d` остаётся
   несогласованной честно: у `e189c80d` (garant, пересказ без записанного указателя)
@@ -97,6 +106,15 @@ URL_CPD_2026_7 = "https://cbr.ru/analytics/dkp/dinamic/CPD_2026-7/"
 URL_INFL_25_12 = "https://cbr.ru/analytics/dkp/inflationary_expectations/Infl_exp_25-12/"
 URL_SBERCIB_2025 = "https://sbercib.ru/publication/inflyatsiya-v-2025-godu"
 URL_NBJ = "https://nbj.ru/publs/obshchaya_inflyatsiya_po_itogam_2025_goda_/71790/"
+URL_ALFA_INTL = "https://internationalinvestment.biz/analytics/8583-alfa-bank-uhudshil-prognoz-po-jekonomike-rossii.html"
+URL_EVENT_32879 = "https://cbr.ru/press/event/?id=32879"
+
+#: T7.120 (часть 2): новые записи словаря (Альфа-Банк, инФОМ) — две улики, прежде не
+#: собранные, становятся строгими пересказами: прогноз Альфа-Банка на ретрансляционной
+#: странице и значение опроса инФОМ, опубликованное ЦБ
+WRITE_ACTION = "будет записано происхождение значения улики"
+EVIDENCE_NEW_WRITES = ("5422d75c", "5fab715e")  # улики cc75e97f (инФОМ) и 07126d06 (Альфа-Банк)
+NEW_ANCHOR_URIS = {"https://www.alfabank.ru/", "https://www.infom.org.ru/"}
 
 #: метки «было» на состоянии 817f2cc: утверждение → имя производителя из словаря
 #: T7.116 (часть б): `6d9a12ff` убран из таблицы — при T7.101–T7.115 он подписывался
@@ -109,8 +127,15 @@ WAS_PRODUCER: dict[str, str] = {
     "136a0ca0": "Банк России",
     "7cc2b578": "Росстат",
 }
-#: «стало» после переатрибуции: добавляется ровно одна подпись
-BECAME_PRODUCER: dict[str, str] = {**WAS_PRODUCER, "c6729d4c": "Банк России"}
+#: «стало» после переатрибуции: T7.101 — добавлялась ровно одна подпись (c6729d4c);
+#: T7.120 (часть 2) — три: прогноз Альфа-Банка на реле-странице и значение опроса инФОМ
+#: на странице ЦБ получили записи происхождения, их утверждения подписаны производителем
+BECAME_PRODUCER: dict[str, str] = {
+    **WAS_PRODUCER,
+    "c6729d4c": "Банк России",
+    "07126d06": "Альфа-Банк",
+    "cc75e97f": "инФОМ",
+}
 
 
 def _load_fixture() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -374,6 +399,39 @@ async def _snapshot_sources(engine: AsyncEngine) -> list[tuple[str, str | None, 
     return [(str(r["id"]), r["parent"], bool(r["marked"])) for r in rows]
 
 
+async def _basis_kinds(engine: AsyncEngine, claim_id: uuid.UUID) -> set[str]:
+    """Виды оснований группировки под ТЕКУЩЕЙ оценкой утверждения (single/domain/parent).
+
+    T7.120 (часть 2): родительские uuid новых якорей различаются между прогонами,
+    поэтому группировку сравнивают по виду основания, а не по литералу."""
+
+    async with engine.connect() as conn:
+        rows = (
+            await conn.execute(
+                text(
+                    "SELECT DISTINCT split_part(m.basis, ':', 1) AS kind FROM source_independence_members m "
+                    "JOIN source_independence_snapshots sn ON sn.id = m.snapshot_id "
+                    "JOIN claim_assessments a ON a.source_independence_snapshot_id = sn.id "
+                    "JOIN claim_assessment_heads h ON h.current_assessment_id = a.id "
+                    "AND h.assessment_state = 'current' WHERE a.claim_id = :c"
+                ),
+                {"c": claim_id},
+            )
+        ).all()
+    return {str(r[0]) for r in rows}
+
+
+async def _source_uri(engine: AsyncEngine, source_id: str) -> str:
+    async with engine.connect() as conn:
+        row = (
+            await conn.execute(
+                text("SELECT canonical_uri FROM sources WHERE id = CAST(:id AS uuid)"), {"id": source_id}
+            )
+        ).first()
+    assert row is not None
+    return str(row[0])
+
+
 async def _run_window(
     scratch_url: str, store: FilesystemArtifactStore, *, dry_run: bool
 ) -> Any:
@@ -417,6 +475,11 @@ async def test_twenty_stand_claims_label_table_was_becomes(
     was_roles = await _snapshot_roles(engine)
     was_scopes = await _snapshot_scopes(engine)
     was_sources = await _snapshot_sources(engine)
+    # T7.120 (часть 2): «было» группировки трёх утверждений, чья группировка изменится
+    was_kinds = {
+        prefix: await _basis_kinds(engine, claim_ids[prefix])
+        for prefix in ("07126d06", "cc75e97f", "c6729d4c")
+    }
 
     producer_was = {p: lab for p, lab in was_labels.items() if lab["label"] == PRODUCER_LABEL}
     assert set(producer_was) == set(WAS_PRODUCER), producer_was
@@ -470,16 +533,30 @@ async def test_twenty_stand_claims_label_table_was_becomes(
     assert all(r.was_method == CURRENT_VALUE_METHOD for r in decided), decided
     assert {str(r.claim_id)[:8] for r in decided} == {"9266248e", "391c4388", "136a0ca0"}, decided
 
+    # T7.120 (часть 2): было — обе улики попадали в «не собрано» (16 строк); стало —
+    # производитель назван словарём, и план записывает им строгое происхождение
+    write_rows = _rows_with(WRITE_ACTION)
+    assert len(write_rows) == 2, write_rows
+    assert {(str(r.claim_id)[:8], r.canonical_uri) for r in write_rows} == {
+        ("07126d06", URL_ALFA_INTL),
+        ("cc75e97f", URL_EVENT_32879),
+    }, write_rows
+    assert all(r.now_status == "derivative" for r in write_rows), write_rows
+
     not_collected = _rows_with(NOT_COLLECTED_ACTION)
-    assert len(not_collected) == 33 - 2 - 2 - 5 - 8, [row.action for row in plan.rows]
+    assert len(not_collected) == 33 - 2 - 2 - 5 - 8 - 2, [row.action for row in plan.rows]
 
-    # ── apply: ровно две записи о собственной публикации; каскада нет ──
+    # ── apply: было (T7.101) — ровно две записи о собственной публикации, каскада нет;
+    # стало (T7.120) — четыре (две собственные + две строгие: Альфа-Банк, инФОМ) и
+    # каскад переоценки затронутых утверждений ──
     report = await _run_window(scratch_url, store, dry_run=False)
-    assert report.changed_evidence == 2, report.rows
-    assert not report.changed_source_ids and report.invalidated_heads == 0, report.rows
-    assert report.jobs_created == 0 and report.worker is None, report.worker
+    assert report.changed_evidence == 4, report.rows
+    assert len(report.changed_source_ids or ()) == 2, report.rows  # созданные якоря производителей
+    assert report.invalidated_heads == 3 and report.jobs_created == 3, report.rows
+    assert report.worker is not None and report.worker.completed == 3, report.worker
 
-    # записи появились ровно на двух уликах c6729d4c; скоупы остальных 31 улики не изменились
+    # записи появились на двух уликах c6729d4c и на двух новых (инФОМ, Альфа-Банк);
+    # скоупы остальных 29 улики не изменились
     after_scopes = await _snapshot_scopes(engine)
     changed_scopes = [
         (a[0], b[0]) for a, b in zip(was_scopes, after_scopes, strict=True) if a[1] != b[1]
@@ -487,7 +564,7 @@ async def test_twenty_stand_claims_label_table_was_becomes(
     assert sorted(x[0] for x in changed_scopes) == sorted(
         str(uuid.UUID(evidence[i]["evidence_id"]))
         for i in range(len(evidence))
-        if evidence[i]["evidence_id"][:8] in EVIDENCE_SELF
+        if evidence[i]["evidence_id"][:8] in EVIDENCE_SELF + EVIDENCE_NEW_WRITES
     ), changed_scopes
     for row in after_scopes:
         if row[0][:8] in EVIDENCE_SELF:
@@ -499,6 +576,21 @@ async def test_twenty_stand_claims_label_table_was_becomes(
             assert "parent_source_id" not in rec, "первоисточник не может быть родителем самого себя"
             assert scope.get("value_attribution") is None, rec
 
+    # T7.120 (часть 2): новые записи происхождения — строгое сопряжение во фрагменте
+    # (value_and_primary_in_fragment), а не слабое окно публикации
+    new_records = {
+        row[0][:8]: json.loads(row[1])["value_attribution"]
+        for row in after_scopes
+        if row[0][:8] in EVIDENCE_NEW_WRITES
+    }
+    assert set(new_records) == set(EVIDENCE_NEW_WRITES), new_records
+    assert {rec["primary_key"] for rec in new_records.values()} == {"alfa", "infom"}, new_records
+    assert {rec["primary_name"] for rec in new_records.values()} == {"Альфа-Банк", "инФОМ"}, new_records
+    for rec in new_records.values():
+        assert rec["pairing"] == "value_and_primary_in_fragment", rec
+        assert rec["method"] == CURRENT_VALUE_METHOD, rec
+        assert rec.get("parent_source_id"), rec
+
     # ── «стало»: единственная изменившаяся метка — c6729d4c ──
     now_labels = await _labels(scratch_url, claim_ids)
     producer_now = {p for p, lab in now_labels.items() if lab["label"] == PRODUCER_LABEL}
@@ -506,21 +598,55 @@ async def test_twenty_stand_claims_label_table_was_becomes(
     assert now_labels["c6729d4c"]["label"] == PRODUCER_LABEL
     assert "Банк России" in now_labels["c6729d4c"]["hint"], now_labels["c6729d4c"]
     assert now_labels["c6729d4c"]["level"] == LEVEL_WEAK, "витрина не назначает уровень"
+    # T7.120 (часть 2): две дополнительные подписи названы производителем из записи
+    assert "Альфа-Банк" in now_labels["07126d06"]["hint"], now_labels["07126d06"]
+    assert "инФОМ" in now_labels["cc75e97f"]["hint"], now_labels["cc75e97f"]
     for prefix in WAS_PRODUCER:
         assert now_labels[prefix] == was_labels[prefix], prefix
     for prefix, label in now_labels.items():
         if prefix not in BECAME_PRODUCER:
             assert label["label"] == WEAK_LABEL, (prefix, label)
 
-    # ── группировка, оценки, роли улик и строки источников — не изменились вовсе ──
-    assert await _snapshot_groups(engine) == was_groups
+    # ── стало (T7.120, часть 2): оценки не изменились вовсе; группировка изменилась
+    # ровно для трёх утверждений; в источниках созданы два якоря производителей; роли —
+    # тот же набор троек плюс строки новых снимков переоценки ──
     assert await _snapshot_assessments(engine) == was_assessments
-    assert await _snapshot_roles(engine) == was_roles
-    assert await _snapshot_sources(engine) == was_sources
+    now_groups = await _snapshot_groups(engine)
+    # три новых снимка переоценки: 2 (c6729d4c) + 1 (07126d06) + 2 (cc75e97f) строк участников
+    assert len(now_groups) == len(was_groups) + 5, (len(was_groups), len(now_groups))
+    now_kinds = {
+        prefix: await _basis_kinds(engine, claim_ids[prefix])
+        for prefix in ("07126d06", "cc75e97f", "c6729d4c")
+    }
+    # страница реле с прогнозом Альфа-Банка: была одиночной группой — свернута указателем
+    # на новый якорь alfabank.ru; страница события ЦБ: к домену ЦБ добавлен родитель-якорь
+    # infom.org.ru; группировка c6729d4c не изменилась (собственные публикации не свёртываются)
+    assert was_kinds["07126d06"] == {"single"} and now_kinds["07126d06"] == {"parent"}, was_kinds
+    assert was_kinds["cc75e97f"] == {"domain"} and now_kinds["cc75e97f"] == {"domain", "parent"}, was_kinds
+    assert was_kinds["c6729d4c"] == now_kinds["c6729d4c"] == {"domain"}, was_kinds
+    now_roles = await _snapshot_roles(engine)
+    assert set(now_roles) == set(was_roles) and len(now_roles) == len(was_roles) + 5, (
+        len(was_roles),
+        len(now_roles),
+    )
+    now_sources = await _snapshot_sources(engine)
+    assert all(row in now_sources for row in was_sources), now_sources
+    added_sources = [row for row in now_sources if row not in was_sources]
+    assert len(added_sources) == 2 and len(now_sources) == len(was_sources) + 2, added_sources
+    assert {await _source_uri(engine, row[0]) for row in added_sources} == NEW_ANCHOR_URIS, added_sources
 
-    # ── повторный прогон идемпотентен: «уже записана», ноль изменений ──
+    # ── стало (T7.120): второй прогон добавляет одну запись: значение опроса инФОМ на
+    # странице ЦБ Infl_exp_26-09 сопрягается режимом ближайшего первоисточника только
+    # после того, как якорь инФОМ появился в первом прогоне; тот же прогон ставит
+    # указатель на строку страницы ──
     again = await _run_window(scratch_url, store, dry_run=False)
-    assert again.changed_evidence == 0 and not again.changed_source_ids, again.rows
+    assert again.changed_evidence == 1, again.rows
+    assert len(again.changed_source_ids or ()) == 1, again.rows
+    again_written = [row for row in again.rows if row.action == "происхождение значения улики записано"]
+    assert [(str(r.claim_id)[:8], r.canonical_uri) for r in again_written] == [
+        ("cc75e97f", URL_INFL_26_09)
+    ], again.rows
+    assert await _source_uri(engine, str(next(iter(again.changed_source_ids)))) == URL_INFL_26_09, again.rows
     again_self = [
         row
         for row in again.rows
@@ -533,6 +659,11 @@ async def test_twenty_stand_claims_label_table_was_becomes(
         row.was_status == "собственная публикация → Банк России (host-value-attribution-v6)"
         for row in again_self
     ), again_self
+
+    # только теперь прогон идемпотентен (было T7.101: ноль изменений уже со второго прогона):
+    # третий прогон не меняет ничего
+    third = await _run_window(scratch_url, store, dry_run=False)
+    assert third.changed_evidence == 0 and not third.changed_source_ids, third.rows
 
     # ── свёртка дублей значения (T7.99): согласованность пары после прогона ──
     statements = {row["claim"][:8]: (row["detail"]["claim_type"], row["detail"]["statement"]) for row in claims}
