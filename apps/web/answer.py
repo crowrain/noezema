@@ -109,6 +109,9 @@ RESULT_KINDS: Final[tuple[str, ...]] = (
     "reverified",
     "partially_reverified",
     "reused",
+    # T7.121 (часть 5, стендовый случай с4): сессия ответила, опираясь на уже записанные
+    # утверждения (блок «Использовано из знаний»), и не записала ни одного нового.
+    "answered_from_relied",
 )
 #: Как вопрос связан с утверждением (T7.74): закрытый набор, подписи — категория
 #: `claim_relation`. `created` строку создала сессия этого вопроса; `reverified` —
@@ -401,6 +404,7 @@ def build_answer_result(
     sessions: Sequence[Mapping[str, Any]],
     answer_claim_count: int,
     relations: Iterable[object] = (),
+    relied_claim_count: int = 0,
 ) -> JsonDict:
     """Человеческий итог: {kind, label, hint, action, active}.
 
@@ -411,6 +415,13 @@ def build_answer_result(
     Ответом считается не только то, что вопрос записал: перепроверенное или принятое
     повторно этим вопросом действующее утверждение — тоже ответ, и «Ответ не записан»
     был бы неправдой.
+
+    `relied_claim_count` (T7.121 часть 5, случай с4) — сколько уже записанных утверждений
+    куратор этого ответа объявил опорой (блок карточки «Использовано из знаний»). Если
+    своих записей у ответа нет, но опора есть, «Ответ не записан» был бы неправдой ровно
+    того же рода, что и правка T7.74: ответ был, просто весь состоял из уже записанного
+    знания. Список вопросов этого поля не передаёт: там relied-строк нет по дизайну
+    (RELATION_KEYS: `relied` — отношение отдельного блока карточки), и его итог не меняется.
     """
     state = str(question_state)
     live = [session for session in sessions if not is_terminal_session(session.get("state"))]
@@ -426,6 +437,11 @@ def build_answer_result(
         kind = "in_progress"
     elif sessions and str(sessions[0].get("state")) in FAILED_SESSION_STATES:
         kind = "failed"
+    elif sessions and relied_claim_count > 0:
+        # T7.121 (с4): действующего утверждения от сессии не осталось нового, но ответ
+        # опирался на ранее записанное — честный исход «по уже записанным знаниям».
+        # Без сессий опору показать нечем: это по-прежнему `waiting`.
+        kind = "answered_from_relied"
     elif sessions:
         kind = "no_answer"
     else:
@@ -1488,6 +1504,9 @@ async def question_answer(db: AsyncSession, question_id: uuid.UUID) -> JsonDict 
         # T7.74: итог учитывает и те действующие утверждения, которые этот вопрос
         # перепроверил или принял повторно, а не только записанные им заново.
         relations=[str(item.get("relation")) for item in [*claims, *folded_claims]],
+        # T7.121 (с4): если своих записей нет, но куратор объявил опору на уже записанное —
+        # карточка показывает честный исход «по уже записанным знаниям», а не «не записан».
+        relied_claim_count=len(relied_claims),
     )
     honesty = build_honesty_notes(
         saw_research_fetch=any(tool == "research.fetch" for tool, _count, _domain in groups),
