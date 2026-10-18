@@ -64,7 +64,7 @@ def _row(
             "primary_name": primary_name,
             "primary_uri": primary_uri or CBR,
             "parent_source_id": str(uuid.uuid4()),
-            "method": "host-value-attribution-v14",
+            "method": "host-value-attribution-v15",
             "basis_fragment": "по данным первоисточника",
             "pairing": "value_and_primary_in_fragment",
         }
@@ -145,7 +145,7 @@ def test_self_publication_record_is_unaffected_but_named_pointer_still_conflicts
         "primary_key": "cbr",
         "primary_name": "Банк России",
         "primary_uri": CBR,
-        "method": "host-value-attribution-v14",
+        "method": "host-value-attribution-v15",
     }
     assert _name([_row(parent_uri=ROSSTAT, self_publication=self_pub)], STATEMENT_NO_ALIAS) == "Банк России"
     assert _name([_row(parent_uri=ROSSTAT, self_publication=self_pub)], STATEMENT_ROSSTAT) is None

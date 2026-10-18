@@ -435,7 +435,7 @@ def test_new_pairing_is_registered_in_scope() -> None:
         primary_name="Банк России",
         primary_uri="https://cbr.ru/",
         parent_source_id="6e70379e-e1f5-2284-0000-000000000000",
-        method="host-value-attribution-v14",
+        method="host-value-attribution-v15",
         basis_fragment="Спрогнозировано решение Банка России по инфляции",
         pairing=NEW_PAIRING,
     )
@@ -463,8 +463,8 @@ def test_bibliography_pairing_still_gives_no_key_to_collectors() -> None:
 def test_value_method_version_bumped_page_method_untouched() -> None:
     """Смена поведения видна переатрибуции только через подъём версии метода значений:
     v12 → v13; страничный детектор не тронут (его версия не поднимается)."""
-    assert VALUE_ATTRIBUTION_METHOD_VERSION == "host-value-attribution-v14"
-    assert ATTRIBUTION_METHOD_VERSION == "host-source-attribution-v9"
+    assert VALUE_ATTRIBUTION_METHOD_VERSION == "host-value-attribution-v15"
+    assert ATTRIBUTION_METHOD_VERSION == "host-source-attribution-v10"
 
 
 def test_strict_and_publication_modes_keep_their_own_pairings() -> None:

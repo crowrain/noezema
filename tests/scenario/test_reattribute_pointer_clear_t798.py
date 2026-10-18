@@ -332,7 +332,7 @@ async def test_pointer_clear_then_value_records_merge_groups_to_e1(
     for row in origins:
         record = dict(row["origin"])
         assert record["primary_key"] == "cbr" and record["primary_name"] == "Банк России"
-        assert record["method"] == "host-value-attribution-v14"
+        assert record["method"] == "host-value-attribution-v15"
         assert record["pairing"] == "value_and_primary_in_fragment"
         assert str(record["parent_source_id"]) == cbr_anchor
         assert "Банк России" in record["basis_fragment"]
@@ -348,7 +348,7 @@ async def test_pointer_clear_then_value_records_merge_groups_to_e1(
     assert alfa_origin is not None and alfa_origin[0] is not None
     alfa_record = dict(alfa_origin[0])
     assert alfa_record["primary_key"] == "alfa" and alfa_record["primary_name"] == "Альфа-Банк"
-    assert alfa_record["method"] == "host-value-attribution-v14"
+    assert alfa_record["method"] == "host-value-attribution-v15"
     assert alfa_record["pairing"] == "value_and_primary_in_fragment"
     alfa_anchor = await _anchor_id(scratch_url, "https://www.alfabank.ru/")
     assert str(alfa_record["parent_source_id"]) == alfa_anchor

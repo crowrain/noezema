@@ -14,24 +14,22 @@ nbj → sbercib (ADR-0031, стенда), запечатанные группы 
   Таблица пересчитана T7.116 (часть б): `6d9a12ff` («…по данным опроса „инФОМ“.») раньше
   подписывался пятым — по одному лишь указателю на документ ЦБ; теперь его утверждение
   производителя не называет, указатель имени не даёт: метка честная «слабо», уровень тот же.
-* прогон `--evidence-level` по журналу окна: было (T7.101) — ровно две записи о собственной
-  публикации (`c6729d4c`, обе страницы ЦБ), стало (T7.120, часть 2) — четыре: к ним
-  добавляются строгие пересказы `07126d06` (прогноз Альфа-Банка на internationalinvestment.biz)
-  и `cc75e97f` (значение опроса инФОМ на странице события ЦБ) — оба производителя теперь
-  в словаре, обе улики прежде были «не собраны». Вето третьего актора для `2d010d53`/`58e2d5d4`
-  (ADR-0035 §15), пять улик под коррекцией оператора не переписываются (ADR-0031),
-  восемь прежних записей v6 — «уже записано», прежние v1 под коррекцией остаются v1;
-* «стало»: было (T7.101) — единственная изменившаяся метка `c6729d4c`; стало (T7.120) —
-  три: `c6729d4c`, `07126d06` (Альфа-Банк) и `cc75e97f` (инФОМ); остальные 17 меток
-  побайтово равны;
-* стало (T7.120): оценки и причины НЕ изменились вовсе (снимки равны); группировка изменилась
-  ровно для трёх утверждений (`07126d06` — одиночная группа свернута на новый якорь
-  alfabank.ru, `cc75e97f` — добавлен родитель infom.org.ru, `c6729d4c` — прежняя доменная
-  группировка), созданы две строки источников-якорей; каскад: три снятых head'а, три
-  задачи переоценки;
-* стало (T7.120): второй прогон дописывает одну запись (`cc75e97f` на Infl_exp_26-09 —
-  режим ближайшего первоисточника собрал пару только после появления якоря инФОМ) и ставит
-  указатель страницы; идемпотентен только третий прогон (было T7.101: ноль со второго).
+* прогон `--evidence-level` по журналу окна: две записи о собственной публикации `c6729d4c`
+  (обе страницы ЦБ) плюс третья — `cc75e97f` на странице события ЦБ: T7.120a (ADR-0029 §24)
+  видит в ней собственную публикацию семьи `cbr` (инФОМ и Банк России — один производитель);
+  строгим пересказом остаётся только `07126d06` (прогноз Альфа-Банка на internationalinvestment.biz —
+  законное расширение словаря T7.120, к инФОМ отношения не имеет). Вето третьего актора для
+  `2d010d53`/`58e2d5d4` (ADR-0035 §15), пять улик под коррекцией оператора не переписываются
+  (ADR-0031), восемь прежних записей v6 — «уже записано», прежние v1 под коррекцией остаются v1;
+* «стало»: изменившиеся метки — три: `c6729d4c`, `07126d06` (Альфа-Банк) и `cc75e97f`
+  (Банк России, не «инФОМ» — заблуждение T7.120 исправлено); остальные 17 меток побайтово равны;
+* оценки и причины НЕ изменились вовсе (снимки равны); группировка изменилась ровно для одного
+  утверждения (`07126d06` — одиночная группа свернута на новый якорь alfabank.ru; `cc75e97f`
+  и `c6729d4c` — прежняя доменная группировка: собственные публикации родителя не создают,
+  якорь infom.org.ru больше не заводится), создана одна строка источника-якоря; каскад: один
+  снятый head, одна задача переоценки;
+* второй прогон идемпотентен (как в T7.101; заблуждение T7.120 требовало третьего прогона:
+  без якоря инФОМ дописывать на Infl_exp_26-09 нечего);
 * свёртка дублей значения (T7.99): пара `c6729d4c`/`136a0ca0` после прогона согласована
   (обе подписи «Опубликовано производителем»), пара `9266248e`/`e189c80d` остаётся
   несогласованной честно: у `e189c80d` (garant, пересказ без записанного указателя)
@@ -109,12 +107,14 @@ URL_NBJ = "https://nbj.ru/publs/obshchaya_inflyatsiya_po_itogam_2025_goda_/71790
 URL_ALFA_INTL = "https://internationalinvestment.biz/analytics/8583-alfa-bank-uhudshil-prognoz-po-jekonomike-rossii.html"
 URL_EVENT_32879 = "https://cbr.ru/press/event/?id=32879"
 
-#: T7.120 (часть 2): новые записи словаря (Альфа-Банк, инФОМ) — две улики, прежде не
-#: собранные, становятся строгими пересказами: прогноз Альфа-Банка на ретрансляционной
-#: странице и значение опроса инФОМ, опубликованное ЦБ
+#: T7.120a (ADR-0029 §24): строгим пересказом остаётся только законное расширение T7.120 —
+#: прогноз Альфа-Банка на ретрансляционной странице. Улика cc75e97f на странице события ЦБ
+#: (5422d75c) — собственная публикация семьи `cbr` (входит в EVIDENCE_SELF ниже); якорь
+#: infom.org.ru больше не создаётся
 WRITE_ACTION = "будет записано происхождение значения улики"
-EVIDENCE_NEW_WRITES = ("5422d75c", "5fab715e")  # улики cc75e97f (инФОМ) и 07126d06 (Альфа-Банк)
-NEW_ANCHOR_URIS = {"https://www.alfabank.ru/", "https://www.infom.org.ru/"}
+EVIDENCE_NEW_WRITES = ("5fab715e",)  # улика 07126d06 (Альфа-Банк)
+EVIDENCE_SELF_CBR_EVENT = ("5422d75c",)  # cc75e97f на странице события ЦБ — публикация семьи cbr
+NEW_ANCHOR_URIS = {"https://www.alfabank.ru/"}
 
 #: метки «было» на состоянии 817f2cc: утверждение → имя производителя из словаря
 #: T7.116 (часть б): `6d9a12ff` убран из таблицы — при T7.101–T7.115 он подписывался
@@ -128,13 +128,14 @@ WAS_PRODUCER: dict[str, str] = {
     "7cc2b578": "Росстат",
 }
 #: «стало» после переатрибуции: T7.101 — добавлялась ровно одна подпись (c6729d4c);
-#: T7.120 (часть 2) — три: прогноз Альфа-Банка на реле-странице и значение опроса инФОМ
-#: на странице ЦБ получили записи происхождения, их утверждения подписаны производителем
+#: с T7.120/T7.120a — три: прогноз Альфа-Банка на реле-странице (строгий пересказ) и
+#: cc75e97f на странице события ЦБ (собственная публикация семьи `cbr`, подпись «Банк
+#: России» — не «инФОМ»: заблуждение T7.120 исправлено склейкой семьи)
 BECAME_PRODUCER: dict[str, str] = {
     **WAS_PRODUCER,
     "c6729d4c": "Банк России",
     "07126d06": "Альфа-Банк",
-    "cc75e97f": "инФОМ",
+    "cc75e97f": "Банк России",
 }
 
 
@@ -506,10 +507,16 @@ async def test_twenty_stand_claims_label_table_was_becomes(
     def _rows_with(action: str) -> list[Any]:
         return [row for row in plan.rows if row.action == action]
 
+    # T7.120a (ADR-0029 §24): третья собственная публикация — cc75e97f на странице события ЦБ:
+    # страница стоит на home-хосте семьи cbr, называет Банк России и не может быть пересказом
+    # самой себя; отдельного якоря инФОМ больше нет (было T7.120: derivative→инФОМ)
     self_rows = _rows_with(SELF_ACTION)
-    assert len(self_rows) == 2, self_rows
-    assert {str(r.claim_id)[:8] for r in self_rows} == {"c6729d4c"}, self_rows
-    assert {r.canonical_uri for r in self_rows} == {URL_INFL_26_09, URL_CPD_2026_7}, self_rows
+    assert len(self_rows) == 3, self_rows
+    assert {(str(r.claim_id)[:8], r.canonical_uri) for r in self_rows} == {
+        ("c6729d4c", URL_INFL_26_09),
+        ("c6729d4c", URL_CPD_2026_7),
+        ("cc75e97f", URL_EVENT_32879),
+    }, self_rows
     assert all(r.was_status == NO_DECISION_YET and r.now_status == "self_primary" for r in self_rows), self_rows
     assert all(r.primary_name == "Банк России" for r in self_rows), self_rows
 
@@ -533,29 +540,30 @@ async def test_twenty_stand_claims_label_table_was_becomes(
     assert all(r.was_method == CURRENT_VALUE_METHOD for r in decided), decided
     assert {str(r.claim_id)[:8] for r in decided} == {"9266248e", "391c4388", "136a0ca0"}, decided
 
-    # T7.120 (часть 2): было — обе улики попадали в «не собрано» (16 строк); стало —
-    # производитель назван словарём, и план записывает им строгое происхождение
+    # строгое происхождение (T7.120, законно): только прогноз Альфа-Банка на реле;
+    # улица cc75e97f перешла из write_rows в self_rows (семья cbr, T7.120a)
     write_rows = _rows_with(WRITE_ACTION)
-    assert len(write_rows) == 2, write_rows
+    assert len(write_rows) == 1, write_rows
     assert {(str(r.claim_id)[:8], r.canonical_uri) for r in write_rows} == {
         ("07126d06", URL_ALFA_INTL),
-        ("cc75e97f", URL_EVENT_32879),
     }, write_rows
     assert all(r.now_status == "derivative" for r in write_rows), write_rows
 
     not_collected = _rows_with(NOT_COLLECTED_ACTION)
-    assert len(not_collected) == 33 - 2 - 2 - 5 - 8 - 2, [row.action for row in plan.rows]
+    assert len(not_collected) == 33 - 3 - 1 - 2 - 5 - 8, [row.action for row in plan.rows]
 
-    # ── apply: было (T7.101) — ровно две записи о собственной публикации, каскада нет;
-    # стало (T7.120) — четыре (две собственные + две строгие: Альфа-Банк, инФОМ) и
-    # каскад переоценки затронутых утверждений ──
+    # ── apply: четыре записи (три собственные публикации семьи cbr + строгий пересказ
+    # Альфа-Банка) и каскад переоценки только для затронутой группы Альфа-Банка ──
     report = await _run_window(scratch_url, store, dry_run=False)
     assert report.changed_evidence == 4, report.rows
-    assert len(report.changed_source_ids or ()) == 2, report.rows  # созданные якоря производителей
-    assert report.invalidated_heads == 3 and report.jobs_created == 3, report.rows
-    assert report.worker is not None and report.worker.completed == 3, report.worker
+    # изменённый источник — строка реле-страницы Альфа-Банка (у неё появился родитель-якорь);
+    # сам якорь alfabank.ru создаётся отдельно и в changed_source_ids не входит
+    assert len(report.changed_source_ids or ()) == 1, report.rows
+    # каскад задел и 136a0ca0: его улики опираются на ту же реле-страницу
+    assert report.invalidated_heads == 2 and report.jobs_created == 2, report.rows
+    assert report.worker is not None and report.worker.completed == 2, report.worker
 
-    # записи появились на двух уликах c6729d4c и на двух новых (инФОМ, Альфа-Банк);
+    # записи появились на трёх собственных публикациях cbr-семьи и на улике Альфа-Банка;
     # скоупы остальных 29 улики не изменились
     after_scopes = await _snapshot_scopes(engine)
     changed_scopes = [
@@ -564,10 +572,10 @@ async def test_twenty_stand_claims_label_table_was_becomes(
     assert sorted(x[0] for x in changed_scopes) == sorted(
         str(uuid.UUID(evidence[i]["evidence_id"]))
         for i in range(len(evidence))
-        if evidence[i]["evidence_id"][:8] in EVIDENCE_SELF + EVIDENCE_NEW_WRITES
+        if evidence[i]["evidence_id"][:8] in EVIDENCE_SELF + EVIDENCE_SELF_CBR_EVENT + EVIDENCE_NEW_WRITES
     ), changed_scopes
     for row in after_scopes:
-        if row[0][:8] in EVIDENCE_SELF:
+        if row[0][:8] in EVIDENCE_SELF + EVIDENCE_SELF_CBR_EVENT:
             scope = json.loads(row[1])
             rec = scope["value_self_publication"]
             assert rec["schema"] == "host-value-self-publication-v1", rec
@@ -576,16 +584,16 @@ async def test_twenty_stand_claims_label_table_was_becomes(
             assert "parent_source_id" not in rec, "первоисточник не может быть родителем самого себя"
             assert scope.get("value_attribution") is None, rec
 
-    # T7.120 (часть 2): новые записи происхождения — строгое сопряжение во фрагменте
-    # (value_and_primary_in_fragment), а не слабое окно публикации
+    # строгое сопряжение во фрагменте (value_and_primary_in_fragment) — у пересказа Альфа-Банка;
+    # T7.120a: записи «infom» больше нет: улица cc75e97f получила собственную публикацию семьи
     new_records = {
         row[0][:8]: json.loads(row[1])["value_attribution"]
         for row in after_scopes
         if row[0][:8] in EVIDENCE_NEW_WRITES
     }
     assert set(new_records) == set(EVIDENCE_NEW_WRITES), new_records
-    assert {rec["primary_key"] for rec in new_records.values()} == {"alfa", "infom"}, new_records
-    assert {rec["primary_name"] for rec in new_records.values()} == {"Альфа-Банк", "инФОМ"}, new_records
+    assert {rec["primary_key"] for rec in new_records.values()} == {"alfa"}, new_records
+    assert {rec["primary_name"] for rec in new_records.values()} == {"Альфа-Банк"}, new_records
     for rec in new_records.values():
         assert rec["pairing"] == "value_and_primary_in_fragment", rec
         assert rec["method"] == CURRENT_VALUE_METHOD, rec
@@ -598,55 +606,53 @@ async def test_twenty_stand_claims_label_table_was_becomes(
     assert now_labels["c6729d4c"]["label"] == PRODUCER_LABEL
     assert "Банк России" in now_labels["c6729d4c"]["hint"], now_labels["c6729d4c"]
     assert now_labels["c6729d4c"]["level"] == LEVEL_WEAK, "витрина не назначает уровень"
-    # T7.120 (часть 2): две дополнительные подписи названы производителем из записи
+    # две дополнительные подписи названы производителем из записи; cc75e97f — «Банк России»
+    # (собственная публикация семьи cbr), не «инФОМ»: имя опроса осталось в basis, производитель один
     assert "Альфа-Банк" in now_labels["07126d06"]["hint"], now_labels["07126d06"]
-    assert "инФОМ" in now_labels["cc75e97f"]["hint"], now_labels["cc75e97f"]
+    assert "Банк России" in now_labels["cc75e97f"]["hint"], now_labels["cc75e97f"]
     for prefix in WAS_PRODUCER:
         assert now_labels[prefix] == was_labels[prefix], prefix
     for prefix, label in now_labels.items():
         if prefix not in BECAME_PRODUCER:
             assert label["label"] == WEAK_LABEL, (prefix, label)
 
-    # ── стало (T7.120, часть 2): оценки не изменились вовсе; группировка изменилась
-    # ровно для трёх утверждений; в источниках созданы два якоря производителей; роли —
-    # тот же набор троек плюс строки новых снимков переоценки ──
+    # ── оценки не изменились вовсе; группировка изменилась ровно для одного утверждения
+    # (Альфа-Банк); в источниках создан один якорь производителя; роли — тот же набор троек
+    # плюс строки нового снимка переоценки ──
     assert await _snapshot_assessments(engine) == was_assessments
     now_groups = await _snapshot_groups(engine)
-    # три новых снимка переоценки: 2 (c6729d4c) + 1 (07126d06) + 2 (cc75e97f) строк участников
-    assert len(now_groups) == len(was_groups) + 5, (len(was_groups), len(now_groups))
+    # два новых снимка переоценки: 1 (07126d06) + 2 (136a0ca0 — его улики держатся за ту же
+    # реле-страницу) строк участников (было T7.120: пять — каскад задел c6729d4c и cc75e97f
+    # из-за якоря инФОМ в группе ЦБ)
+    assert len(now_groups) == len(was_groups) + 3, (len(was_groups), len(now_groups))
     now_kinds = {
         prefix: await _basis_kinds(engine, claim_ids[prefix])
         for prefix in ("07126d06", "cc75e97f", "c6729d4c")
     }
     # страница реле с прогнозом Альфа-Банка: была одиночной группой — свернута указателем
-    # на новый якорь alfabank.ru; страница события ЦБ: к домену ЦБ добавлен родитель-якорь
-    # infom.org.ru; группировка c6729d4c не изменилась (собственные публикации не свёртываются)
+    # на новый якорь alfabank.ru; группировки cc75e97f и c6729d4c не изменились: собственные
+    # публикации семьи cbr родителя не создают (было T7.120: к cc75e97f добавлялся родитель
+    # infom.org.ru)
     assert was_kinds["07126d06"] == {"single"} and now_kinds["07126d06"] == {"parent"}, was_kinds
-    assert was_kinds["cc75e97f"] == {"domain"} and now_kinds["cc75e97f"] == {"domain", "parent"}, was_kinds
+    assert was_kinds["cc75e97f"] == now_kinds["cc75e97f"] == {"domain"}, was_kinds
     assert was_kinds["c6729d4c"] == now_kinds["c6729d4c"] == {"domain"}, was_kinds
     now_roles = await _snapshot_roles(engine)
-    assert set(now_roles) == set(was_roles) and len(now_roles) == len(was_roles) + 5, (
+    assert set(now_roles) == set(was_roles) and len(now_roles) == len(was_roles) + 3, (
         len(was_roles),
         len(now_roles),
     )
     now_sources = await _snapshot_sources(engine)
     assert all(row in now_sources for row in was_sources), now_sources
     added_sources = [row for row in now_sources if row not in was_sources]
-    assert len(added_sources) == 2 and len(now_sources) == len(was_sources) + 2, added_sources
+    # единственный новый источник — якорь alfabank.ru (было T7.120: два, включая infom.org.ru)
+    assert len(added_sources) == 1 and len(now_sources) == len(was_sources) + 1, added_sources
     assert {await _source_uri(engine, row[0]) for row in added_sources} == NEW_ANCHOR_URIS, added_sources
 
-    # ── стало (T7.120): второй прогон добавляет одну запись: значение опроса инФОМ на
-    # странице ЦБ Infl_exp_26-09 сопрягается режимом ближайшего первоисточника только
-    # после того, как якорь инФОМ появился в первом прогоне; тот же прогон ставит
-    # указатель на строку страницы ──
+    # ── второй прогон идемпотентен (T7.101): дописывать на Infl_exp_26-09 нечего — заблуждение
+    # T7.120 дописывало одну запись только потому, что первый прогон заводил якорь инФОМ, а
+    # семейная склейка T7.120a его не создаёт (собственная публикация родителя не имеет) ──
     again = await _run_window(scratch_url, store, dry_run=False)
-    assert again.changed_evidence == 1, again.rows
-    assert len(again.changed_source_ids or ()) == 1, again.rows
-    again_written = [row for row in again.rows if row.action == "происхождение значения улики записано"]
-    assert [(str(r.claim_id)[:8], r.canonical_uri) for r in again_written] == [
-        ("cc75e97f", URL_INFL_26_09)
-    ], again.rows
-    assert await _source_uri(engine, str(next(iter(again.changed_source_ids)))) == URL_INFL_26_09, again.rows
+    assert again.changed_evidence == 0 and not again.changed_source_ids, again.rows
     again_self = [
         row
         for row in again.rows
@@ -659,11 +665,6 @@ async def test_twenty_stand_claims_label_table_was_becomes(
         row.was_status == "собственная публикация → Банк России (host-value-attribution-v6)"
         for row in again_self
     ), again_self
-
-    # только теперь прогон идемпотентен (было T7.101: ноль изменений уже со второго прогона):
-    # третий прогон не меняет ничего
-    third = await _run_window(scratch_url, store, dry_run=False)
-    assert third.changed_evidence == 0 and not third.changed_source_ids, third.rows
 
     # ── свёртка дублей значения (T7.99): согласованность пары после прогона ──
     statements = {row["claim"][:8]: (row["detail"]["claim_type"], row["detail"]["statement"]) for row in claims}

@@ -66,6 +66,7 @@ from apps.research_proxy.value_attribution import (
     SelfPublicationCandidate,
     ValueAttributionDecision,
     attribute_value_in_fragment,
+    record_pairing_gate_passes,
     self_publication_candidate,
 )
 from packages.artifacts.store import ArtifactStore, ArtifactStoreError
@@ -643,6 +644,10 @@ class _EvidencePlan:
     source_uri: str = ""
     #: метод прежней записи о собственной публикации (пусто — записи не было)
     recorded_self_method: str = ""
+    #: T7.120a (ADR-0029 §24): True — не записать решение, а СНЯТЬ прежнюю запись о происхождении
+    #: значения: она не проходит pairing-гейт текущего метода по своему основанию (прецедент
+    #: записи — снятие указателя T7.98; `decision` при этом хранит свежий отказ для строки плана)
+    removal: bool = False
 
 
 async def _read_pages(db: AsyncSession, since: datetime) -> dict[uuid.UUID, tuple[str, str]]:
@@ -754,6 +759,9 @@ async def _evidence_to_reevaluate(db: AsyncSession, source_id: uuid.UUID) -> lis
                         "  e.scope -> 'value_attribution' ->> 'primary_key' AS recorded_key, "
                         "  e.scope -> 'value_attribution' ->> 'method' AS recorded_method, "
                         "  e.scope -> 'value_attribution' ->> 'parent_source_id' AS recorded_parent, "
+                        # T7.120a: основание и pairing прежней записи нужны гейту снятия (ADR-0029 §24)
+                        "  e.scope -> 'value_attribution' ->> 'basis_fragment' AS recorded_basis, "
+                        "  e.scope -> 'value_attribution' ->> 'pairing' AS recorded_pairing, "
                         "  e.scope -> 'value_self_publication' ->> 'method' AS recorded_self_method, "
                         "  e.scope -> 'value_self_publication' ->> 'primary_name' AS recorded_self_name "
                         "FROM evidence e "
@@ -928,6 +936,51 @@ async def _plan_evidence_window(
                 known_claim_primaries=known,
             )
             if not decision.is_derivative:
+                # T7.120a (ADR-0029 §24, дефект приёмки T7.120, случай 83e7a1c8): прежняя запись
+                # обязана проходить pairing-гейт ТЕКУЩЕГО метода по СОБСТВЕННОМУ фрагменту
+                # основания. Не проходит — запись логически невозможна для нынешнего метода:
+                # значение утверждения в её основании отсутствует (стенд: «По данным Росстата,
+                # в декабре 2008 года число безработных выросло на четверть» при утверждении
+                # про 9,6). Такая запись СНИМАЕТСЯ — тем же путём записи и тем же каскадом §11.3,
+                # что снятие указателя T7.98 (тот же UPDATE строки улики под защитой
+                # FOR UPDATE: запись прежнего метода, не под коррекцией оператора), без нового
+                # типа аудита и без миграции.
+                # Записи, проходящие гейт, при отказе свежего метода
+                # по-прежнему сохраняются (правило T7.85 «знание не удаляется» не ослаблено:
+                # снимается только ложное знание).
+                if recorded_method and not record_pairing_gate_passes(
+                    claim_statement=statement,
+                    pairing=str(item["recorded_pairing"] or "") or None,
+                    basis_fragment=str(item["recorded_basis"] or ""),
+                ):
+                    rows.append(
+                        EvidenceAttributionRow(
+                            claim_id=claim_id,
+                            claim_statement=statement,
+                            canonical_uri=canonical_uri,
+                            was_status=was_status,
+                            now_status=decision.status,
+                            primary_name=recorded_name,
+                            action=(
+                                "будет снята: значение утверждения отсутствует "
+                                "во фрагменте основания прежней записи (T7.120a)"
+                            ),
+                            was_method=recorded_method,
+                        )
+                    )
+                    plan.append(
+                        _EvidencePlan(
+                            evidence_id=uuid.UUID(str(item["evidence_id"])),
+                            source_id=source_id,
+                            claim_id=uuid.UUID(str(item["claim_id"])),
+                            decision=decision,
+                            row_index=len(rows) - 1,
+                            recorded_key=str(item["recorded_key"] or ""),
+                            recorded_parent=str(item["recorded_parent"] or ""),
+                            removal=True,
+                        )
+                    )
+                    continue
                 # T7.101: `self_primary` — значение на прочитанной странице принадлежит её же
                 # хозяину. Запись о собственной публикации пишется только там, где записи о
                 # происхождении значения нет (она и не нужна: пересказа нет); улика с прежней
@@ -1077,6 +1130,11 @@ def _written_action(item: _EvidencePlan) -> str:
                 "обновлена до текущего"
             )
         return "собственная публикация производителя записана"
+    if item.removal:
+        return (
+            "снята: значение утверждения отсутствует во фрагменте основания прежней записи; "
+            "группы утверждения пересчитаны каскадом (T7.120a)"
+        )
     if not item.recorded_key:
         return "происхождение значения улики записано"
     if item.recorded_key == (item.decision.primary_key or ""):
@@ -1149,6 +1207,8 @@ async def reattribute_evidence_window(
 
     changed_evidence = 0
     changed_sources: set[uuid.UUID] = set()
+    # T7.120a: строки плана, чьё снятие не состоялось (параллельная правка/коррекция оператора)
+    removal_skipped: set[int] = set()
     # записи и каскад — одной транзакцией (инвариант audit+outbox §3)
     async with factory() as db, transaction(db):
         for item in plan:
@@ -1208,6 +1268,55 @@ async def reattribute_evidence_window(
                     },
                 )
                 changed_evidence += 1
+                continue
+            if item.removal:
+                # T7.120a (ADR-0029 §24): снятие прежней записи о происхождении значения,
+                # которая не проходит pairing-гейт текущего метода по своему основанию.
+                # Путь записи — тот же, что снятие указателя T7.98: строка улики берётся на
+                # блокировку только если запись в ней всё ещё прежнего метода (параллельное
+                # решение или операторская коррекция — снимание пропускается) и источник не под
+                # коррекцией оператора (ADR-0031). Снятие склеивало источники — каскад §11.3
+                # обязателен: `changed_sources` пополняется, группы пересчитываются.
+                guarded = (
+                    (
+                        await db.execute(
+                            text(
+                                "SELECT id FROM evidence WHERE id = :id AND source_id = :sid "
+                                "  AND jsonb_typeof(scope -> 'value_attribution') IS NOT NULL "
+                                "  AND COALESCE(scope -> 'value_attribution' ->> 'method', '') <> :method "
+                                "  AND NOT EXISTS (SELECT 1 FROM source_graph_corrections c "
+                                "      WHERE c.valid AND c.actor LIKE :prefix "
+                                "        AND (c.from_source_id = :sid OR c.to_source_id = :sid)) "
+                                "FOR UPDATE"
+                            ),
+                            {
+                                "id": item.evidence_id,
+                                "sid": item.source_id,
+                                "method": CURRENT_VALUE_METHOD_VERSION,
+                                "prefix": f"{OPERATOR_ACTOR_PREFIX}%",
+                            },
+                        )
+                    )
+                    .scalars()
+                    .first()
+                )
+                if guarded is None:
+                    removal_skipped.add(item.row_index)
+                    continue  # запись изменена параллельно или под коррекцией оператора — не трогаем
+                await db.execute(
+                    text(
+                        "UPDATE evidence SET scope = COALESCE(scope, '{}'::jsonb) - :key "
+                        "WHERE id = :id AND jsonb_typeof(scope -> 'value_attribution') IS NOT NULL "
+                        "  AND COALESCE(scope -> 'value_attribution' ->> 'method', '') <> :method"
+                    ),
+                    {
+                        "key": EVIDENCE_VALUE_ATTRIBUTION_KEY,
+                        "id": item.evidence_id,
+                        "method": CURRENT_VALUE_METHOD_VERSION,
+                    },
+                )
+                changed_evidence += 1
+                changed_sources.add(item.source_id)
                 continue
             spec = primary_source(item.decision.primary_key or "")
             if spec is None:
@@ -1300,6 +1409,8 @@ async def reattribute_evidence_window(
             action=(
                 row.action
                 if index not in written
+                else "запись изменена параллельно — снятие пропущено"
+                if index in removal_skipped
                 else _written_action(written[index])
             ),
             was_method=row.was_method,

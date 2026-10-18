@@ -52,6 +52,7 @@ from apps.research_proxy.source_attribution import (
     _OWN_ASSESSMENT,
     _TEMPLATES,
     ATTRIBUTION_WINDOW_CHARS,
+    BASIS_FRAGMENT_CHARS,
     MAX_SCAN_CHARS,
     OTHER_SOURCE_ACTOR_MARKERS,
     STATUS_AMBIGUOUS,
@@ -67,6 +68,8 @@ from apps.research_proxy.source_attribution import (
     _mask_primary_aliases,
     _mask_site_disclaimers,
     _relay_forecast_keys,
+    collapse_family_candidates,
+    family_home_hosts,
     is_home_host,
     named_primary_keys,
     normalize_scan_text,
@@ -248,7 +251,16 @@ from packages.memory.scope import (
 #: см. версию `host-source-attribution-v9`): обе версии поднимаются вместе, по правилам эпох
 #: (урок T7.110: любое изменение поведения детекторов поднимает обе версии). Решения v14
 #: отличаются от решений v13 → переатрибуция пересматривает записи эпохи v13.
-VALUE_ATTRIBUTION_METHOD_VERSION: Final = "host-value-attribution-v14"
+#: v15 (T7.120a, дефект приёмки T7.120, ADR-0029 §24): «семья» производителей в словаре
+#: (`family_key` у страничной записи): опрос инФОМ заказан и опубликован Банком России —
+#: один производитель. Кандидаты одной семьи схлопываются в корень, домашний хост проверяется
+#: по хостам всей семьи (страница cbr.ru с упоминанием опроса инФОМ — собственная публикация
+#: ЦБ). Заодно режим собственной публикации решает семью под именем корня. Остальные записи
+#: словаря не тронуты. Решения v15 отличаются от решений v14 → переатрибуция пересматривает
+#: записи эпохи v14 (в том числе ложную запись 83e7a1c8: при отказе свежего метода запись,
+#: не проходящую pairing-гейт по своему основанию, снимается — см. `record_pairing_gate_passes`
+#: и `apps/research_proxy/reattribution.py`).
+VALUE_ATTRIBUTION_METHOD_VERSION: Final = "host-value-attribution-v15"
 
 #: честный отказ этого детектора: первоисточник в основании назван, но значение там другое — не то,
 #: на котором стоит утверждение. Отличие от `no_value_attribution` (атрибуции нет вовсе) нужно,
@@ -1520,9 +1532,11 @@ def _publication_decision(
         attributed = _attributed_keys(window)
         if not attributed:
             continue
-        named = set(named_primary_keys(window))
+        # T7.120a (ADR-0029 §24): два алиаса ОДНОЙ семьи («инФОМ» и «Банк России») в одном
+        # окне — не разночтение двух первоисточников: окно называет одного производителя
+        named = collapse_family_candidates(dict.fromkeys(named_primary_keys(window), ""))
         if len(named) > 1:
-            # в одном окне с значением названы два разных первоисточника — разночтение
+            # в одном окне с значением названы два разных семейства первоисточников — разночтение
             ambiguity_basis = window
             continue
         regions_of_key: dict[str, list[tuple[int, int]]] = {}
@@ -1545,6 +1559,9 @@ def _publication_decision(
             claim_values=values,
             pairing=PAIRING_PUBLICATION_WINDOW,
         )
+    # T7.120a (ADR-0029 §24): кандидаты окон одной семьи — один кандидат под ключом корня
+    candidates_all = collapse_family_candidates(candidates_all)
+    candidates = collapse_family_candidates(candidates)
     if not candidates_all:
         return None
     if len(candidates_all) > 1:
@@ -1721,6 +1738,38 @@ def _pairing_maps(
     return attributed, matched
 
 
+def record_pairing_gate_passes(
+    *, claim_statement: str | None, pairing: str | None, basis_fragment: str
+) -> bool:
+    """T7.120a (ADR-0029 §24): проходит ли УЖЕ СОХРАНЕННАЯ запись о происхождении значения
+    гейт значения текущего метода по СОБСТВЕННОМУ основанию.
+
+    Гейт ровно тот же, что снимает пару в `_pairing_maps`: измеренное значение утверждения
+    обязано называться в фрагменте основания, а «голое» десятичное значение утверждения —
+    стоять в нём текстовой формой с гвардом одиночности (T7.120). Запись, которая не проходит
+    гейт по своему же фрагменту, логически невозможна для текущего метода — это ложное знание
+    прежней эпохи, и переатрибуция её снимает (тот же путь записи, что снятие указателя T7.98).
+
+    Честные границы проверки:
+    - режимы bibliography и упоминания известного производителя не обещают наличие значения
+      во фрагменте основания — гейт к ним не применяется (он про строгий режим и режим
+      публикации, где значение входит в pairing);
+    - основание, обрезанное по потолку `_basis` (BASIS_FRAGMENT_CHARS), не позволяет ДОКАЗАТЬ
+      отсутствие числа — запись сохраняется (fail-closed против удаления: «проверьте вручную»
+      дешевле, чем молча снятое знание)."""
+    if pairing not in (None, PAIRING_VALUE_AND_PRIMARY, PAIRING_PUBLICATION_WINDOW):
+        return True  # режимы 3–4: значение в основание не обещалось — снимать не за что
+    if len(basis_fragment) >= BASIS_FRAGMENT_CHARS:
+        return True  # основание обрезано: отсутствие числа не доказано — не удаляем
+    match_values = claim_match_values(claim_statement)
+    if not match_values:
+        bare_values = _claim_bare_values(claim_statement)
+        if not bare_values:
+            return True  # числового значения в утверждении нет — проверять нечего
+        return _single_values_found_standalone(basis_fragment, bare_values)
+    return bool(_measured_value_tokens(basis_fragment) & match_values)
+
+
 def attribute_value_in_fragment(
     *,
     canonical_uri: str | None,
@@ -1827,12 +1876,15 @@ def attribute_value_in_fragment(
             ValueAttributionDecision(status=STATUS_NO_VALUE_ATTRIBUTION, claim_values=values)
         )
 
-    # страница самого первоисточника не бывает его пересказом
+    # страница самого первоисточника не бывает его пересказом (T7.120a: вся семья — свой хост)
     candidates = {
         key: basis
         for key, basis in matched.items()
         if not is_home_host(canonical_uri, _home_hosts(key))
     }
+    # T7.120a (ADR-0029 §24): пары одной семьи — один кандидат под ключом корня: решение
+    # носит имя Банка России, а основание сохраняет формулировку опроса инФОМ
+    candidates = collapse_family_candidates(candidates)
     if not candidates:
         if not matched:
             # атрибуции в основании были, но все — про другие числа утверждения
@@ -1891,8 +1943,10 @@ def attribute_value_in_fragment(
 
 
 def _home_hosts(key: str) -> tuple[str, ...]:
-    spec = primary_source(key)
-    return () if spec is None else spec.home_hosts
+    """Домашние хосты записи СЕМЬИ производителя (T7.120a, ADR-0029 §24): страница на
+    домашнем хосте любой части семьи — страница производителя, а не его пересказ. Для записей
+    вне семей (`family_key` пуст) — ровно прежние хосты самой записи, ни на пункт не шире."""
+    return family_home_hosts(key)
 
 
 # ─── T7.101 (ADR-0029 дополнение, ADR-0035 §19): решение о собственной публикации ──────────────
@@ -1954,19 +2008,22 @@ def self_publication_candidate(
     _, matched = _pairing_maps(scanned, decision.claim_values, claim_match, claim_bare)
     if not matched:
         return None  # защита: `self_primary` без pairing не бывает, но и проверка не на слепке
+    # T7.120a (ADR-0029 §24): семья решается под именем корня — страница cbr.ru с упоминанием
+    # опроса инФОМ есть собственная публикация Банка России, а не «собственная публикация инФОМ»
+    families = collapse_family_candidates(matched)
     specs = [
         spec
-        for spec in (primary_source(key) for key in matched)
+        for spec in (primary_source(key) for key in families)
         if spec is not None and is_home_host(canonical_uri, spec.home_hosts)
     ]
-    if len(specs) != 1 or {spec.key for spec in specs} != set(matched):
+    if len(specs) != 1 or {spec.key for spec in specs} != set(families):
         return None  # запись — ровно об одном производителе, чей домашний хост мы читаем
     spec = specs[0]
-    veto = any(_third_actor_present(fragment) for fragment in matched.values())
+    veto = any(_third_actor_present(fragment) for fragment in families.values())
     return SelfPublicationCandidate(
         primary_key=spec.key,
         primary_name=spec.name,
-        basis_fragment=_basis(matched[spec.key]),
+        basis_fragment=_basis(families[spec.key]),
         actor_veto=veto,
     )
 

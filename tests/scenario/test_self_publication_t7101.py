@@ -54,7 +54,7 @@ pytestmark = [pytest.mark.scenario]
 
 SINCE_ISO = "2000-01-01T00:00:00+00:00"
 WEAK_LABEL = "Подтверждено слабо"
-CURRENT_VALUE_METHOD = "host-value-attribution-v14"
+CURRENT_VALUE_METHOD = "host-value-attribution-v15"
 SELF_SCHEMA = "host-value-self-publication-v1"
 
 FIXTURE_DIR = Path(__file__).parent.parent / "fixtures" / "t7101"

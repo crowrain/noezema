@@ -324,15 +324,16 @@ def test_new_sign_does_not_leak_into_the_strict_mode(
 # ─── 8: живые тексты стенда не сломаны (окно ЦБ и строгое решение СберCIB) ────────────────
 
 
-def test_cbr_window_live_texts_now_ambiguous_t7120() -> None:
-    """T7.120 (решение пользователя 2026-10-17, ADR-0029 дополнение): «инФОМ» — отдельный
-    производитель словаря. Живые тексты Forbes и Коммерсанта называют в окне публикации и
-    «инФОМ», и Банк России («опрос, проводимый „инФОМ“ по заказу Банка России») — два
-    названных первоисточника. Прежнее решение (derivative→cbr окном публикации) заменено
-    честным разночтением: окно не выбирает производителя, приписывания нет."""
+def test_cbr_window_positives_on_live_texts_survive() -> None:
+    """Живые тексты Forbes и Коммерсанта («опрос, проводимый „инФОМ“ по заказу Банка России»)
+    решаются окном публикации как пересказ ЦБ.
+
+    Заблуждение T7.120 (982ffc5) давало по ним ambiguous_primaries («инФОМ» — отдельный
+    производитель); T7.120a (ADR-0029 §24): инФОМ и Банк России — одна семья `cbr`,
+    решение прежнее (derivative→cbr), контроль снят параметром в t785b."""
     for name in ("forbes_552221", "kommersant_8294535"):
         decision = _decide(_text(name), STATEMENT_145, STAND_URI[name])
-        assert (decision.status, decision.primary_key) == ("ambiguous_primaries", None), name
+        assert (decision.status, decision.primary_key) == ("derivative", "cbr"), name
         assert decision.pairing == PAIRING_PUBLICATION_WINDOW, name
 
 

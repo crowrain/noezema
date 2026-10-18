@@ -111,23 +111,20 @@ def test_two_named_primaries_stay_ambiguous() -> None:
     assert decision.pairing == PAIRING_PUBLICATION_WINDOW, decision
 
 
-def test_kommersant_form_indicator_noun_two_named_primaries_t7120() -> None:
+def test_kommersant_form_indicator_noun_stays_derivative() -> None:
     """(6) форма Коммерсанта: «Оценка текущих темпов роста цен … осталась на уровне 14,5%» —
-    существительное «оценка» здесь имя показателя, а не чья-то оценка.
+    существительное «оценка» здесь имя показателя, а не чья-то оценка: приписывание ЦБ остаётся.
 
-    T7.120 (решение пользователя 2026-10-17, ADR-0029 дополнение): «инФОМ» — отдельный
-    производитель словаря, и в окне публикации названы двое («„инФОМ“ по заказу Банка
-    России») — решение не принимается вовсе. Было: derivative→cbr (окно публикации).
-    Стало: ambiguous_primaries с основой разночтения — та же консервативная ветка, что
-    случай (5) этого файла; ослабления вето не произошло: ложного приписывания нет."""
+    Заблуждение T7.120 (982ffc5) временно давало по этой форме ambiguous_primaries: «инФОМ»
+    считался вторым названным первоисточником. T7.120a (ADR-0029 §24): «инФОМ» по заказу
+    Банка России — одна семья `cbr`, двух первоисточников в окне нет; решение прежнее."""
     decision = _decide(
         "Об этом следует из опубликованных 17 декабря данных опроса, проводимого «инФОМ» "
         "по заказу Банка России. Оценка текущих темпов роста цен при этом осталась на уровне 14,5%.",
         "Наблюдаемая населением годовая инфляция в декабре 2025 года составила 14,5%.",
     )
-    assert not decision.is_derivative, decision
-    assert decision.primary_key is None, decision
-    assert decision.status == "ambiguous_primaries", decision
+    assert decision.is_derivative, decision
+    assert decision.primary_key == "cbr", decision.basis_fragment
     assert decision.pairing == PAIRING_PUBLICATION_WINDOW, decision
 
 
@@ -229,4 +226,4 @@ def test_method_version_is_v5_after_the_veto_fixes() -> None:
     T7.85c — на v5 (окно публикации только для русского текста и латинское имя собственного вне
     словаря), T7.98 — на v6 (relay в строгом режиме; окно публикации не тронуто).
     Переатрибуция по этому номеру пересматривает записи эпох v2, v3, v4 и v5."""
-    assert VALUE_ATTRIBUTION_METHOD_VERSION == "host-value-attribution-v14"
+    assert VALUE_ATTRIBUTION_METHOD_VERSION == "host-value-attribution-v15"

@@ -100,10 +100,18 @@ def test_another_author_inside_the_publication_window_is_not_retelling(
 @pytest.mark.parametrize(
     ("text", "claim", "expected_key", "expected_pairing"),
     [
-        # форма Коммерсанта с «инФОМ» из прежнего списка снята (T7.120: «инФОМ» — отдельный
-        # производитель словаря, в окне названы двое) — её новое решение пиняет тест
-        # `test_infom_and_cbr_in_one_window_is_ambiguous_t7120` ниже этого параметризованного
-        # теста (было: cbr через окно публикации; стало: честное разночтение)
+        # форма Коммерсанта: «Оценка … осталась на уровне» — имя показателя, а не чужая оценка;
+        # «инФОМ» стоит ВНУТРИ фразы атрибуции (до конца зоны) → не признак.
+        # T7.120a (ADR-0029 §24): форма возвращается параметром после заблуждения T7.120
+        # (инФОМ был отдельным производителем); решение пиняет и
+        # `test_infom_and_cbr_in_one_window_is_one_producer_t7120a` ниже
+        (
+            "Об этом следует из опубликованных 17 декабря данных опроса, проводимого «инФОМ» "
+            "по заказу Банка России. Оценка текущих темпов роста цен при этом осталась на уровне 14,5%.",
+            "Наблюдаемая населением годовая инфляция в декабре 2025 года составила 14,5%.",
+            "cbr",
+            PAIRING_PUBLICATION_WINDOW,
+        ),
         # релиз Росстата: ИПЦ — имя показателя из белого списка, вето по нему быть не может
         (
             "По данным опубликованного Росстатом релиза, ИПЦ вырос на 5,59%.",
@@ -163,21 +171,19 @@ def test_retellings_of_the_named_primary_survive(
     assert decision.pairing == expected_pairing, decision
 
 
-def test_infom_and_cbr_in_one_window_is_ambiguous_t7120() -> None:
-    """T7.120 (решение пользователя 2026-10-17, ADR-0029 дополнение): «инФОМ» — отдельный
-    производитель словаря, запись с ним не склеивается с Банком России. Та же форма
-    Коммерсанта, что раньше давала derivative→cbr окном публикации: в окне названы двое
-    («„инФОМ“ по заказу Банка России») — окно публикации не выбирает производителя и
-    решение не принимается вовсе. Было: derivative→cbr (окно публикации). Стало:
-    ambiguous_primaries; приписывания значения ЦБ нет ни в одном режиме."""
+def test_infom_and_cbr_in_one_window_is_one_producer_t7120a() -> None:
+    """T7.120a (ADR-0029 §24): инФОМ и Банк России — один производитель (семья `cbr`):
+    опрос инФОМ заказан и опубликован Банком России. Та же форма Коммерсанта, по которой
+    заблуждение T7.120 (982ffc5) давало ambiguous_primaries («в окне названы двое»):
+    семейная склейка сворачивает обоих в одного первоисточника — окно публикации решает
+    derivative→cbr, как на `11014ee`. Приписывание значения ЦБ есть, ложного разночтения нет."""
     decision = _decide(
         "Об этом следует из опубликованных 17 декабря данных опроса, проводимого «инФОМ» "
         "по заказу Банка России. Оценка текущих темпов роста цен при этом осталась на уровне 14,5%.",
         "Наблюдаемая населением годовая инфляция в декабре 2025 года составила 14,5%.",
     )
-    assert not decision.is_derivative, decision
-    assert decision.primary_key is None, decision
-    assert decision.status == "ambiguous_primaries", decision
+    assert decision.is_derivative, decision
+    assert decision.primary_key == "cbr", decision
     assert decision.pairing == PAIRING_PUBLICATION_WINDOW, decision
 
 
@@ -325,4 +331,4 @@ def test_method_version_is_v5_after_t785c() -> None:
     (tests/scenario/test_reattribute_stale_records.py). T7.98 поднял номер дальше (v6, relay в
     строгом режиме) — предикат тот же, окно публикации по-прежнему не тронуто."""
 
-    assert VALUE_ATTRIBUTION_METHOD_VERSION == "host-value-attribution-v14"
+    assert VALUE_ATTRIBUTION_METHOD_VERSION == "host-value-attribution-v15"

@@ -129,9 +129,9 @@ def test_page_detector_on_finmarket_is_unchanged() -> None:
 
 
 def test_method_versions_pinned_after_t7113() -> None:
-    assert VALUE_ATTRIBUTION_METHOD_VERSION == "host-value-attribution-v14"
+    assert VALUE_ATTRIBUTION_METHOD_VERSION == "host-value-attribution-v15"
     # часть (в) изменила общий словарь плашек и шаблон «отчитал(ось)», но ни одно закреплённое
     # и фикстурное решение детектора страниц не изменилось (замер свипа — STATUS T7.113):
     # номер метода страниц остаётся v8
-    assert ATTRIBUTION_METHOD_VERSION == "host-source-attribution-v9"
+    assert ATTRIBUTION_METHOD_VERSION == "host-source-attribution-v10"
     assert OWN_ASSESSMENT_PROXIMITY_CHARS == 400

@@ -142,11 +142,10 @@ def test_page_decisions_on_stand_texts() -> None:
         # оно стоит в росстатовском фрагменте строгого режима.
         "expert_5-59": ("ambiguous_primaries", None),
         # «следует из опроса … опубликованного ЦБ» + «ЦБ сообщил»: страница пересказ ЦБ.
-        # T7.120 (решение пользователя 2026-10-17): «инФОМ» — отдельный производитель в
-        # словаре, назван на странице рядом с Банком России («опрос, проводимый „инФОМ“
-        # по заказу Банка России») — два первоисточника-кандидата вместо прежнего
-        # (derivative, cbr): честный отказ по правилу разночтения (ADR-0029 дополнение)
-        "forbes_552221": ("ambiguous_primaries", None),
+        # T7.120 (982ffc5) временно сделал «инФОМ» отдельным производителем без склейки и
+        # получил ambiguous_primaries; T7.120a (ADR-0029 §24): инФОМ — часть семьи `cbr`
+        # (опрос заказан и опубликован Банком России), склейка возвращает решение (derivative, cbr)
+        "forbes_552221": ("derivative", "cbr"),
         "garant_1963171": ("no_value_attribution", None),
         # две атрибуции рядом (Росстат и консенсус-прогноз «Интерфакса») → честный отказ
         "interfax_1068021_a": ("ambiguous_primaries", None),
@@ -165,7 +164,7 @@ def test_page_decisions_on_stand_texts() -> None:
     for name, (status, primary) in expected_page.items():
         decision = detect_source_attribution(canonical_uri=STAND_URI[name], text=_text(name))
         assert (decision.status, decision.primary_key) == (status, primary), name
-    assert ATTRIBUTION_METHOD_VERSION == "host-source-attribution-v9"
+    assert ATTRIBUTION_METHOD_VERSION == "host-source-attribution-v10"
 
 
 @pytest.mark.parametrize(
@@ -188,25 +187,23 @@ def test_page_decisions_on_stand_texts() -> None:
         ("garant_1963171", STATEMENT_559, "no_value_attribution", None, PAIRING_VALUE_AND_PRIMARY),
         # nbj.ru: собственная оценка НБС («по нашим расчётам») → не пересказ вовсе
         ("nbj_71790", STATEMENT_559, "no_value_attribution", None, PAIRING_VALUE_AND_PRIMARY),
-        # ── 14,5: опрос инФОМ опубликован Банком России. T7.120 (решение пользователя
-        # 2026-10-17, ADR-0029 дополнение): «инФОМ» — отдельный производитель словаря;
-        # в окне публикации названы и «инФОМ», и «Банк России» — разночтение двух
-        # первоисточников. Прежнее решение (derivative, cbr, окно публикации) заменяется
-        # честным отказом ambiguous_primaries: окно не выбирает производителя, когда их
-        # названо двое (тот же исход, что «two named primaries stay ambiguous» T7.85a).
-        # Было: пересказ ЦБ окном публикации. Стало: отказ с явной основой разночтения.
+        # ── 14,5: опрос инФОМ опубликован Банком России → пересказ ЦБ (окно публикации).
+        # Заблуждение T7.120 (982ffc5): «инФОМ» считался отдельным производителем без склейки
+        # с ЦБ, и окно давало честный отказ ambiguous_primaries. T7.120a (ADR-0029 §24):
+        # инФОМ и Банк России — один производитель (семья `cbr`), решение прежнее: derivative→cbr
+        # окном публикации (тот же исход, что на `11014ee`).
         (
             "forbes_552221",
             STATEMENT_145,
-            "ambiguous_primaries",
-            None,
+            "derivative",
+            "cbr",
             PAIRING_PUBLICATION_WINDOW,
         ),
         (
             "kommersant_8294535",
             STATEMENT_145,
-            "ambiguous_primaries",
-            None,
+            "derivative",
+            "cbr",
             PAIRING_PUBLICATION_WINDOW,
         ),
         # отрицательная проверка: страница САМОГО ЦБ — не пересказ самого себя
@@ -229,7 +226,7 @@ def test_value_decisions_on_stand_texts(
     )
     assert (decision.status, decision.primary_key) == (status, primary), (name, statement[:40])
     assert decision.pairing == pairing, (name, statement[:40])
-    assert VALUE_ATTRIBUTION_METHOD_VERSION == "host-value-attribution-v14"
+    assert VALUE_ATTRIBUTION_METHOD_VERSION == "host-value-attribution-v15"
 
 
 def test_publication_window_never_overrides_a_refusal_of_its_own_kind() -> None:

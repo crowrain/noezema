@@ -7,7 +7,9 @@ the curator», ADR-0029 дополнение).
 1. Десять новых записей `PRIMARY_SOURCES` (superjob, hh, sbercib, vtb, alfa, gpb, psb,
    infom, cmakp, sberindex) самосогласованы: домашний хост совпадает с домашним URI,
    имя матчит собственного алиаса, страница производителя называет себя self_primary,
-   чужая страница с шаблоном атрибуции — derivative на правильный якорь.
+   чужая страница с шаблоном атрибуции — derivative на правильный якорь. С T7.120a
+   (ADR-0029 §24) «правильный якорь» для инФОМ — корень его семьи `cbr` (опрос заказан и
+   опубликован Банком России), остальные девять записей вне семей.
 2. Короткие имена матчены только отдельными словами с границами: «ВТБ24» и «ВТБР» —
    другие имена (алиас не попадает); «ВТБ Мои Инвестиции» и «ВТБ Капитал» — тот же ключ;
    голое «Сбер»/«Сбербанк» не приписывается SberCIB («Сбер CIB», «Сбербанк CIB» — приписывается).
@@ -74,12 +76,12 @@ def _sentence(name: str) -> str:
     return f"Как сообщает {name}, инфляция в России ускорилась до 3,5%."
 
 
-# ─── версия метода: решения v9/v14 отличаются от v8/v13 (обе версии поднимаются вместе) ──
+# ─── версия метода: решения v10/v15 отличаются от v9/v14 (T7.120a поднимает обе метки) ──
 
 
 def test_method_versions_bumped_together() -> None:
-    assert ATTRIBUTION_METHOD_VERSION == "host-source-attribution-v9"
-    assert VALUE_ATTRIBUTION_METHOD_VERSION == "host-value-attribution-v14"
+    assert ATTRIBUTION_METHOD_VERSION == "host-source-attribution-v10"
+    assert VALUE_ATTRIBUTION_METHOD_VERSION == "host-value-attribution-v15"
 
 
 # ─── 1: самосогласованность десяти новых записей (t7) ───────────────────────────────────
@@ -104,12 +106,15 @@ def test_new_entries_are_named_primaries_on_foreign_pages(key: str) -> None:
     spec = primary_source(key)
     assert spec is not None
     sentence = _sentence(spec.name)
+    # T7.120a (ADR-0029 §24): якорь решения — корень семьи записи (для `infom` это `cbr`),
+    # остальные записи вне семей — свой собственный ключ
+    root = spec.family_key or key
     page = detect_source_attribution(canonical_uri=NEWS_URI, text=sentence)
-    assert (page.status, page.primary_key) == ("derivative", key), (key, page.status)
+    assert (page.status, page.primary_key) == ("derivative", root), (key, page.status)
     # основание — фрагмент с именем (для `hh.ru` — усечённый фрагментатором алиас «hh»)
     assert page.basis_fragment and spec.name.split(".", 1)[0] in page.basis_fragment, key
     value = _decide(sentence, "Инфляция в России в 2026 году ускорилась до 3,5%.")
-    assert (value.status, value.primary_key) == ("derivative", key), (key, value.status)
+    assert (value.status, value.primary_key) == ("derivative", root), (key, value.status)
     assert value.pairing == PAIRING_VALUE_AND_PRIMARY, key
 
 
@@ -119,10 +124,13 @@ def test_registry_home_uris_are_distinct_from_official_anchors() -> None:
     old = {s.home_uri for s in PRIMARY_SOURCES if s.key not in NEW_KEYS}
     new = {primary_source(k).home_uri for k in NEW_KEYS if primary_source(k)}
     assert not (old & new), old & new
-    # инФОМ — отдельный производитель: его якорь ≠ ЦБ и ≠ любой прежний (решение пользователя)
+    # инФОМ сохраняет собственный домашний URI (реестр его не «склеивает» с ЦБ на уровне
+    # записей), но T7.120a (ADR-0029 §24) состоит в семье `cbr`: отдельный URI ≠ отдельный
+    # производитель — решения по инФОМ сворачиваются к корню семьи
     infom = primary_source("infom")
     cbr = primary_source("cbr")
     assert infom.home_uri != cbr.home_uri
+    assert infom.family_key == "cbr", "семейная склейка возвращена после заблуждения T7.120"
 
 
 # ─── 2: границы коротких имён (t4) ───────────────────────────────────────────────────────
@@ -194,7 +202,7 @@ def test_case2_bare_value_must_stand_in_the_same_fragment() -> None:
 
     Было (v13): derivative→Росстат, basis «По данным Росстата, в декабре 2008 года число
     безработных выросло на четверть» — значение 9,6 в том фрагменте отсутствовало.
-    Стало (v14): честный отказ `value_not_attributed` — записи о производителе нет;
+    Стало (v15): честный отказ `value_not_attributed` — записи о производителе нет;
     запись не ставится ни Росстату, ни hh.ru (у hh.ru нет ни шаблона, ни relay-посылки)."""
     decision = _decide(CASE2_TEXT, CASE2_CLAIM, "https://hr-ratings.example.ru/hh-index")
     assert decision.status == "value_not_attributed", decision
@@ -359,7 +367,7 @@ def test_rambler_retelling_is_attributed_to_superjob() -> None:
 def test_one_group_anchor_page_retelling_and_parent_record() -> None:
     """Чистая сборка графа (тот же вход, что T7.117): якорь SuperJob, страница SuperJob
     (её страничная запись ведёт к ЦБ — прежний residual), Rambler (запись значения ведёт
-    к якорю SuperJob — новое решение v9). Все четверо — одна группа: доменное склеивание
+    к якорю SuperJob — решение текущего метода v10). Все четверо — одна группа: доменное склеивание
     якоря со страницей и связи по записям значения. Основания групп названы."""
     anchor = GraphNode(source_id=uuid.uuid4(), canonical_uri="https://www.superjob.ru/",
                        content_hash="h-anchor", pointer_parent=None)

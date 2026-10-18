@@ -190,7 +190,7 @@ async def test_corrupted_page_text_is_re_read_from_the_original_artifact(
     after = await _evidence_row(scratch_url)
     record = dict(after["origin"])
     assert record["primary_key"] == "rosstat" and record["primary_name"] == "Росстат"
-    assert record["method"] == "host-value-attribution-v14"
+    assert record["method"] == "host-value-attribution-v15"
     assert record["pairing"] == "value_and_primary_in_fragment"
     assert "зафиксировал" in record["basis_fragment"].lower()  # шаблон а3 прочитан живым текстом
     assert "\ufffd" not in record["basis_fragment"]

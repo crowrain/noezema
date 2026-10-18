@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Final
 from urllib.parse import urlsplit
@@ -88,7 +89,14 @@ from packages.domain.sanitization import mask_nul
 #: публикации и вето третьего актора собственной публикации этим не тронуты: неназванный
 #: актор («аналитики Сбербанка») остаётся действующим лицом. Решения v9 отличаются от
 #: решений v8 → переатрибуция пересматривает страницы эпохи v8.
-ATTRIBUTION_METHOD_VERSION: Final = "host-source-attribution-v9"
+#: v10 (T7.120a, дефект приёмки T7.120, ADR-0029 §24): в словаре появилось поле `family_key`
+#: — «семья» производителей: опрос инФОМ заказан и опубликован Банком России, это один
+#: производитель. Кандидаты одной семьи склейки схлопываются в корень (`family_key="cbr"` у
+#: infom): фрагмент, называющий и «инФОМ», и «Банк России», — не разночтение двух
+#: первоисточников, а страница ЦБ со ссылкой на свой опрос — собственная публикация, не
+#: пересказ инФОМ. Остальные записи словаря не тронуты (family_key пуст). Решения v10
+#: отличаются от решений v9 → переатрибуция пересматривает страницы эпохи v9.
+ATTRIBUTION_METHOD_VERSION: Final = "host-source-attribution-v10"
 
 #: статусы решения. `derivative` — единственный, при котором хост ставит указатель;
 #: остальные четыре означают «не помечаем» и записываются в аудит как честный отказ.
@@ -151,6 +159,12 @@ class PrimarySource:
     #: domain "gov.ru", и по нему Росстат, Минфин и ФНС стали бы «одним сайтом»)
     home_hosts: tuple[str, ...]
     alias_patterns: tuple[str, ...]
+    #: T7.120a (ADR-0029 §24): ключ корня «семьи» производителей — опрос, заказанный и
+    #: опубликованный другим производителем, публикуется под именем корня: запись-член семьи
+    #: не отдельный центр независимости, её решения (ключ, родитель, подпись) строятся на
+    #: корне. Пусто — запись сама является корнем семьи. Цепочек нет: корень обязан быть
+    #: без `family_key` (проверяет тест самосогласованности словаря `test_registry_*`).
+    family_key: str | None = None
 
 
 #: минимальный расширяемый словарь первоисточников. Новая запись = один элемент кортежа;
@@ -328,10 +342,13 @@ PRIMARY_SOURCES: Final[tuple[PrimarySource, ...]] = (
             r"psbank\.ru",
         ),
     ),
-    #: инФОМ — отдельный производитель опросов, без склейки с Банком России (решение
-    #: пользователя 2026-10-17): фрагмент, называющий и «инФОМ», и «Банк России», даёт
-    #: два алиаса — то же разночтение, что решалось отказом всегда (ADR-0029 «Риски»);
-    #: алиас не матчит «информация»: «инфом» ≠ «инфор»
+    #: инФОМ — опросы, заказанные и опубликованные Банком России: один производитель с ЦБ
+    #: (T7.120a, ADR-0029 §24; отменяет решение пользователя 2026-10-17 о «без склейки»,
+    #: найденное дефектом при приёмке T7.120). Запись остаётся в словаре — её алиас узнаёт
+    #: пересказ опроса, — но решение принадлежит корню семьи `cbr`: одновременно названные
+    #: «инФОМ» и «Банк России» — не разночтение двух первоисточников, страница cbr.ru —
+    #: не пересказ инФОМ, а собственная публикация ЦБ. Алиас не матчит «информация»:
+    #: «инфом» ≠ «инфор»
     PrimarySource(
         key="infom",
         name="инФОМ",
@@ -341,6 +358,7 @@ PRIMARY_SOURCES: Final[tuple[PrimarySource, ...]] = (
             r"\bинфом[а-яё]*",
             r"инфом\.org\.ru",
         ),
+        family_key="cbr",
     ),
     #: ЦМАКП — отдельный производитель прогнозов (решение пользователя 2026-10-17,
     #: отменяющее пример T7.85b «ЦМАКП остаётся вне словаря»); домашний хост forecast.ru
@@ -827,6 +845,52 @@ def is_home_host(uri: str | None, home_hosts: tuple[str, ...]) -> bool:
     return any(host == home or host.endswith(f".{home}") for home in home_hosts)
 
 
+def family_primary_key(key: str) -> str:
+    """Ключ корня семьи производителей (T7.120a, ADR-0029 §24): член семьи решается под
+    именем корня, корень решается под своим. Ключ вне словаря — сам себе корень.
+    Одновременно это и защита от цепочек: тест самосогласованности словаря запрещает
+    семью с семейным корнем, а цикл здесь просто не зацикливается."""
+    root = key
+    seen: set[str] = set()
+    while root not in seen:
+        seen.add(root)
+        entry = _ALIASES.get(root)
+        if entry is None or entry[0].family_key is None or entry[0].family_key == root:
+            return root
+        root = entry[0].family_key
+    return root
+
+
+def family_home_hosts(key: str) -> tuple[str, ...]:
+    """Домашние хосты всей семьи: хосты самой записи плюс хосты корня её семьи. Член семьи
+    на домашнем хосте ANY части семьи — страница производителя, а не его пересказ (T7.120a):
+    страница cbr.ru, называющая опрос инФОМ, есть собственная публикация Банка России."""
+    hosts: list[str] = []
+    for member in (key, family_primary_key(key)):
+        entry = _ALIASES.get(member)
+        if entry is None:
+            continue
+        for home in entry[0].home_hosts:
+            if home not in hosts:
+                hosts.append(home)
+    return tuple(hosts)
+
+
+def collapse_family_candidates(candidates: Mapping[str, str]) -> dict[str, str]:
+    """Кандидаты одной семьи склейки — один кандидат под ключом корня (T7.120a, ADR-0029 §24).
+    «инФОМ» и «Банк России» в одном окне атрибуции — не разночтение двух первоисточников:
+    опрос заказан и опубликован Банком России. Если корень назван прямо, основанием решения
+    становится его собственная формулировка; если назван только член семьи — сохраняется
+    формулировка члена (именно она привязывает значение к опросу), а решение носит имя корня."""
+    merged: dict[str, str] = {}
+    for key, basis in candidates.items():
+        merged.setdefault(family_primary_key(key), basis)
+    for key, basis in candidates.items():
+        if family_primary_key(key) == key:
+            merged[key] = basis  # корень назван прямо — его основание приоритетно
+    return merged
+
+
 def _fragments(text: str) -> list[str]:
     """Фрагменты сканируемого текста. Разделители с окончанием предложения (или пустая
     строка) закрывают фрагмент; одиночный перевод строки склеивает соседние куски —
@@ -928,12 +992,16 @@ def detect_source_attribution(*, canonical_uri: str | None, text: str | None) ->
     if not matches:
         return AttributionDecision(status=STATUS_NO_VALUE_ATTRIBUTION)
 
-    # страница не может быть пересказом самой себя
+    # страница не может быть пересказом самой себя (T7.120a: вся семья производителей —
+    # «свой» хост: страница cbr.ru с упоминанием опроса инФОМ — собственная публикация ЦБ)
     candidates = {
         key: basis
         for key, basis in matches.items()
-        if not is_home_host(canonical_uri, _ALIASES[key][0].home_hosts)
+        if not is_home_host(canonical_uri, family_home_hosts(key))
     }
+    # T7.120a (ADR-0029 §24): кандидаты одной семьи — один кандидат под ключом корня:
+    # «инФОМ» и «Банк России» в одном фрагменте — не разночтение двух первоисточников
+    candidates = collapse_family_candidates(candidates)
     if not candidates:
         return AttributionDecision(status=STATUS_SELF_PRIMARY)
 
