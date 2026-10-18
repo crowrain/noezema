@@ -48,6 +48,14 @@ finmarket с одним «2,2%» проходила гейт эпохи T7.108a 
 Одиночные значения claim'а читает прежний `claim_values_found_in_texts` — их поведение не
 изменено ни на пункт; форма причины снятия не изменена.
 
+Дополнение T7.123 (часть 2): когда измеренного профиля у утверждения нет вовсе, гейт
+использует «голые» десятичные числа T7.120 (`_claim_bare_values`) — тот же профиль, что у
+pairing-фильтров атрибуции; утверждение без измеренного значения остаётся вне гейта только
+если у него нет и голого числа. Связи перепроверок (явных и обращённых гейтом дублей)
+проверяются наравне со связями новых claims: освобождения для `existing_claim_id` в этом
+гейте не было и нет (стенд 64837cb5/claim[3]: «9,6» не измеренное значение, гейт молчал,
+связь к чужой странице прошла).
+
 Модуль чистый: никаких БД и LLM — только разбор строк и дайджесты (формы записей совпадают
 с дайджестом T7.84: те же `_claim_entry` / `_link_entry` из `rejected_proposal`, чтобы
 «digest операции» в записи отказа был тем же снимком операции, что видит оператор в отказе
@@ -63,6 +71,7 @@ from typing import TYPE_CHECKING
 
 from apps.orchestrator.rejected_proposal import _claim_entry, _link_entry
 from apps.research_proxy.value_attribution import (
+    _claim_bare_values,  # T7.123: тот же «голый» профиль значения, что у pairing-фильтров T7.120
     claim_match_values,
     claim_range_tokens,
     claim_ranges_found_in_texts,
@@ -182,6 +191,7 @@ def links_without_claim_value(
     proposal: CuratorProposal,
     dropped: dict[int, str],
     link_texts: Mapping[int, tuple[str | None, str | None] | None],
+    statement_overrides: Mapping[int, str] | None = None,
 ) -> tuple[dict[int, str], dict[int, str]]:
     """Связи без значения утверждения и операции, у которых сняты все связи.
 
@@ -191,6 +201,15 @@ def links_without_claim_value(
     Связи уже снятых операций не проверяются и не снимаются повторно: их описывает запись
     операции. Функция чистая и вызывается ДО предпроверки правил и гейта дублей: они обязаны
     видеть отфильтрованные связи (ADR-0034 §10).
+
+    Дополнение T7.123 (часть 2): профиль значения утверждения, как у pairing-фильтров
+    T7.120, — измеренные значения, а когда их нет вовсе — «голые» десятичные числа
+    (`_claim_bare_values`: число с разделителем без единицы; целые числа и годы не собираются).
+    Стенд 64837cb5/claim[3] («hh-индекс … составил 9,6»): измеренного профиля нет, гейт молчал,
+    и supports-связь к странице про ключевую ставку (где 9,6 нет) осталась. Смешанный профиль
+    (есть измеренное значение) проверяется ровно как прежде: голые числа к нему не добавляются.
+    Перепроверка (явная и обращённая) проверяется формулировкой цели (`statement_overrides`):
+    собственная строка операции — пересказ (audit-only, ADR-0033).
     """
     removed: dict[int, str] = {}
     claims_count = len(proposal.claims)
@@ -203,18 +222,25 @@ def links_without_claim_value(
         texts = link_texts.get(k)
         if texts is None:
             continue  # улика не `source_assertion` (или вне диапазона): гейт молчит
-        values = frozenset(claim_value_numbers(proposal.claims[claim_index].statement))
-        if not values:
-            continue  # утверждение без измеренного значения не проверяется
+        statement = str(proposal.claims[claim_index].statement or "").strip()
+        if proposal.claims[claim_index].existing_claim_id is not None and statement_overrides:
+            # T7.123 (часть 2): предмет перепроверки — формулировка ЦЕЛИ (ADR-0033:
+            # собственная строка операции есть пересказ, audit-only), профиль значения берётся
+            # из неё; при отсутствии цели откатываемся на собственную строку
+            statement = str(statement_overrides.get(claim_index) or "").strip() or statement
+        values = frozenset(claim_value_numbers(statement))
+        match_values = claim_match_values(statement)
+        bare = frozenset() if match_values else _claim_bare_values(statement)
+        if not values and not match_values and not bare:
+            continue  # утверждение без числового профиля не проверяется (T7.108, T7.120)
         # T7.113 (часть 2): диапазоны утверждения подтверждают связь только целиком (один
         # диапазон как значение либо оба конца отдельными числами); одиночные значения —
         # прежний читатель текстовых форм T7.108a, его поведение не изменено
-        match_values = claim_match_values(proposal.claims[claim_index].statement)
         ranges = claim_range_tokens(match_values)
-        singles = match_values - ranges
+        singles = (match_values - ranges) | bare
         if claim_values_found_in_texts(values=singles, texts=texts):
             continue
-        if claim_ranges_found_in_texts(ranges=ranges, texts=texts):
+        if ranges and claim_ranges_found_in_texts(ranges=ranges, texts=texts):
             continue
         removed[k] = (
             f"evidence_link[{k}]: evidence {link.evidence_index} "

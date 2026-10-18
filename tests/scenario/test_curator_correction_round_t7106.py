@@ -339,12 +339,18 @@ async def test_fixture_off_by_one_link_replay_gets_one_correction_round(
     # claim'а; обзоры «Веер» без 2,3 — у июльского; список газеты без цифр — у claim'а про
     # динамику). Связь без значения снимается с названной причиной; claim, у которого не
     # осталось ни одной связи, снимается как операция (механизм T7.105) — отказ частичный,
-    # раунд исправления при этом НЕ запускается (снят не весь ответ)
+    # раунд исправления при этом НЕ запускается (снят не весь ответ).
+    # Дополнение T7.123 (часть 2): у claim'а «10,3 резюме на одну вакансию» нет измеренного
+    # профиля, но есть ГОЛОЕ десятичное значение (тот же профиль, что у pairing-фильтров
+    # T7.120) — прежняя молчавшая проверка снимает обе его связи (ни «Тарменика», ни
+    # «Трудовики» не называют 10,3): было applied=2, стало applied=1. Это и есть закрытая
+    # дыра к1 («9,6» без единицы измерения проходила гейт незамеченной).
     payload = claim_events[0]
     assert len(payload["claims"]) == 4
-    assert payload["claims_proposed"] == 4 and payload["claims_applied"] == 2
+    assert payload["claims_proposed"] == 4 and payload["claims_applied"] == 1
     assert [entry["reason"] for entry in payload["rejected_operations"]] == [
         "claim[1]: no linked evidence contains the claim value",
+        "claim[2]: no linked evidence contains the claim value",
         "claim[3]: no linked evidence contains the claim value",
     ]
     # связь, снятая у Оставшейся операции, названа записью связи; связи снятых операций
@@ -359,11 +365,10 @@ async def test_fixture_off_by_one_link_replay_gets_one_correction_round(
         }
     ]
 
-    # записаны утверждения, чьи улики несут значение: август (служба занятости) и
-    # конкуренция «Веер» (утверждение без измеренного значения гейтом не проверяется)
-    assert await _db_statements(scratch_url) == sorted(
-        _CLAIMS_FIXTURE[i]["statement"] for i in (0, 2)
-    )
+    # записано утверждение, чья улика несёт значение: август (служба занятости);
+    # конкуренция «Веер» снимается с T7.123 — её голое значение 10,3 не названо ни одной
+    # из двух связанных страниц
+    assert await _db_statements(scratch_url) == [_CLAIMS_FIXTURE[0]["statement"]]
 
     # оба обращения к куратору — фазовые записи consolidating (шаговый бюджет исследователя
     # раунд НЕ расходует: второй вызов живёт в фазе consolidating)
@@ -421,7 +426,15 @@ async def test_second_answer_still_rejected_yields_single_final_rejection(
 
 # ── т3: каждый из четырёх целых гейтов получает ровно один раунд ──────────────────────
 
-_SHORT_URLS = ["http://tarstat.example/labour-aug", "http://tarmenika.example/jobmarket"]
+# T7.123 (часть 2): третья короткая страница — «Веер» со значением 10,3. Гейт значения
+# теперь видит и «голые» десятичные значения (дыра к1), поэтому исправленный ответ gate2
+# обязан связать утверждение со страницей, где 10,3 названо: прежде утверждение без
+# измеренного значения проходило гейт незамеченным.
+_SHORT_URLS = [
+    "http://tarstat.example/labour-aug",
+    "http://tarmenika.example/jobmarket",
+    "http://veer.example/competition",
+]
 
 
 def _short_script(*answers: dict[str, Any]) -> list[dict[str, Any]]:
@@ -446,8 +459,11 @@ async def test_gate2_unresolved_reverify_reference_gets_one_round(
         [{"statement": statement, "claim_type": "external_fact", "existing_claim_id": str(uuid.uuid4())}],
         _links((0, 0), (1, 0)),
     )
+    # было (до T7.123): тот же ответ без ссылки — утверждение без измеренного значения гейт
+    # значения не проверял вовсе. стало: голое значение 10,3 проверяется, и исправленный
+    # ответ обязан вести связь к странице, где 10,3 названо («Веер», evidence 2)
     fixed = _curator_answer(
-        [{"statement": statement, "claim_type": "external_fact"}], _links((0, 0), (1, 0))
+        [{"statement": statement, "claim_type": "external_fact"}], _links((2, 0))
     )
     outcome = await _run(
         scratch_url,

@@ -54,6 +54,14 @@
      новых нормализующих словарей нет; направление правки консервативно: молчание
      гейта не создаёт неоправданных отказов.
 
+Дополнение T7.123 (часть 2, ADR-0038 §2): гейт проверяет КАЖДУЮ новую связь операции —
+в том числе операции-перепроверки (явные `existing_claim_id` в ответе модели и обращённые
+гейтом дублей T7.83): освобождение «перепроверку ведёт якорь» дало дыру на стенде
+64837cb5/claim[0] (переформулированный дубль прошёл гейт значения в связь и не был
+проверен гейтом периода). Проверка идёт по связям: неподтверждённая связь снимается
+(строка `evidence_link[<k>]…`), операция живёт, пока осталась хотя бы одна подтверждённая
+связь, и иначе снимается прежней строкой причины. Строки отказов операций не изменены.
+
 Функции чистые: ни БД, ни LLM (та же дисциплина, что у apps/orchestrator/curator_rejections.py).
 Якоря значения здесь ЛОКАЛИЗУЮТ место значения в тексте; подтверждением связи владеет
 гейт T7.108 — якорный поиск может быть шире подтверждающего и ничего не подтверждает.
@@ -854,43 +862,113 @@ def _reject_doc_date(labels: Sequence[str]) -> str:
     )
 
 
-def claim_period_rejections(
+# ── T7.123 (часть 2, ADR-0038 дополнение): гейт на каждую новую связь ───────────────
+#
+# Прежнее освобождение «перепроверки (`existing_claim_id`) не проверяются» оказалось
+# дефектом (стенд 64837cb5/claim[0]): переформулированная дублем операция снималась
+# гейтом значения в связь, обращалась гейтом дублей в перепроверку — и гейт периода
+# молчал, хотя порочащей была именно её новая страница. С T7.123:
+#  - проверяются И явные (`existing_claim_id` в ответе модели), И гейтом обращённые
+#    перепроверки — как новые claims (стендовый к2 «в октябре 2026 … 2,2%»);
+#  - значение/период берутся из формулировки самой операции; явная перепроверка без
+#    собственной формулировки наследует формулировку цели (`statement_overrides`);
+#  - проверка идёт ПО СВЯЗЯМ: связь снимается, если её страница (фрагмент улики или
+#    сохранённый полный текст) не подтверждает названный период рядом со значением или
+#    не содержит названной даты документа; операция живёт без снятой связи, пока
+#    осталась хотя бы одна подтверждённая связь, и снимается с прежними строками
+#    причин (`_reject_period`/`_reject_doc_date`/`_reject_forecast_date` не менялись);
+#  - связь, в тексте которой нет измеренного значения утверждения, гейтом периода НЕ
+#    проверяется: её юрисдикция — гейт значения T7.108 (тот же `usable`-предикат);
+#    утверждение без измеренного значения остаётся вне гейта периода (ADR-0038 §2).
+# Строки отказов операций байт-в-байт прежние; добавлены строки снятия связей
+# (`evidence_link[<k>]: …`) того же формата, что у гейта значения T7.108.
+
+
+@dataclass(frozen=True)
+class PeriodGateDecision:
+    """Итог гейта периода: снятые связи (индекс `evidence_link` -> причина) и снятые
+    операции (индекс claim -> строка причины прежнего формата)."""
+
+    link_rejections: dict[int, str]
+    claim_rejections: dict[int, str]
+
+
+def _scan_texts(raw_texts: Sequence[str]) -> list[str]:
+    return [normalize_scan_text(text)[:MAX_SCAN_CHARS] for text in raw_texts if text]
+
+
+def _usable_pairs(
+    scanned_texts: Sequence[str], statement: str
+) -> list[tuple[str, list[tuple[int, int]], list[tuple[int, int]]]]:
+    """(текст, окна значения, фрагменты значения) для текстов, где значение утверждения стоит.
+
+    Тексты, где измеренного значения утверждения нет, период не подтверждают; утверждение
+    вовсе без измеренного значения — вне гейта периода (T7.108, ADR-0038 §2).
+    """
+    pairs: list[tuple[str, list[tuple[int, int]], list[tuple[int, int]]]] = []
+    for scanned in scanned_texts:
+        windows = _windows(scanned, statement)
+        if windows:
+            pairs.append((scanned, windows, _value_fragments(scanned, statement)))
+    return pairs
+
+
+def _link_reject_period(link_index: int, evidence_index: int, claim_index: int, labels: Sequence[str]) -> str:
+    quoted = "», «".join(labels)
+    return (
+        f"evidence_link[{link_index}]: evidence {evidence_index} does not confirm "
+        f"the period of claim {claim_index}: «{quoted}»"
+    )
+
+
+def _link_reject_doc_date(link_index: int, evidence_index: int, claim_index: int, labels: Sequence[str]) -> str:
+    quoted = "», «".join(labels)
+    return (
+        f"evidence_link[{link_index}]: evidence {evidence_index} does not contain "
+        f"the document date of claim {claim_index}: «{quoted}»"
+    )
+
+
+def claim_period_rejections_by_links(
     *,
     claims: Sequence[ClaimProposal],
-    texts_by_claim: Mapping[int, Sequence[str]],
+    texts_by_link: Mapping[int, Sequence[str]],
+    links_by_claim: Mapping[int, Sequence[int]],
+    evidence_index_by_link: Mapping[int, int],
     already_dropped: Collection[int],
-) -> dict[int, str]:
-    """Индекс операции -> именованная причина снятия гейтами периода/даты прогноза/даты документа.
+    statement_overrides: Mapping[int, str] | None = None,
+) -> PeriodGateDecision:
+    """Гейт периода/даты прогноза/даты документа по каждой новой связи операции (T7.123).
 
-    `texts_by_claim` — тексты оставшихся `supports`-связей `source_assertion`
-    операции (фрагмент улики и сохранённый полный текст страницы). Снятые ранее
-    операции и перепроверки не проверяются (у снятой уже есть причина; перепроверку
-    ведёт якорь). Причина снятия одна: сначала называется пропущенная дата прогноза,
-    затем периоды, которых нет рядом со значением, затем названная, но отсутствующая
-    на странице дата документа (T7.121a д3). Формулировка без явного периода
-    и без маркера прогноза молчит (ADR-0038 §2–§3, §8).
+    `texts_by_link` — тексты связи (фрагмент улики и сохранённый полный текст страницы),
+    `links_by_claim` — индексы оставшихся `supports`-связей `source_assertion` операции,
+    `evidence_index_by_link` — индекс улики для именованной причины снятия связи.
+    Снятые ранее операции не проверяются; перепроверки (явные и обращённые) проверяются
+    наравне с новыми claims. Явная перепроверка без собственной формулировки берёт её из
+    `statement_overrides`. Связь снимается, когда её собственный текст не подтверждает
+    названный период рядом со значением (или названную дату документа — она проверяется на
+    СТРАНИЦЕ ЦЕЛИКОМ, T7.121a д3); операция снимается, когда ни одна связь не подтвердила
+    период (прежние строки причин: сначала пропущенная дата прогноза, затем периоды, затем
+    дата документа). Формулировка без явного периода и без маркера прогноза молчит
+    (ADR-0038 §2–§3, §8).
     """
-    rejections: dict[int, str] = {}
+    link_rejections: dict[int, str] = {}
+    claim_rejections: dict[int, str] = {}
     for index, claim in enumerate(claims):
-        if index in already_dropped or claim.existing_claim_id is not None:
+        if index in already_dropped:
             continue
         if str(claim.claim_type.value) not in GATED_CLAIM_TYPES:
             continue
-        statement = str(claim.statement or "")
+        statement = str(claim.statement or "").strip()
+        if claim.existing_claim_id is not None and statement_overrides:
+            # T7.123 (часть 2): предмет перепроверки — формулировка ЦЕЛИ (ADR-0033:
+            # собственная строка операции есть пересказ, audit-only); при отсутствии цели
+            # откатываемся на собственную строку
+            statement = str(statement_overrides.get(index) or "").strip() or statement
         if not statement:
             continue
         tokens = statement_period_tokens(statement)
         lowered = statement.lower()
-        texts = [
-            normalize_scan_text(text)[:MAX_SCAN_CHARS] for text in texts_by_claim.get(index, ()) if text
-        ]
-        # тексты, где измеренного значения утверждения нет, период не подтверждают;
-        # утверждение вовсе без измеренного значения — вне гейта периода (T7.108)
-        usable: list[tuple[str, list[tuple[int, int]], list[tuple[int, int]]]] = []
-        for scanned in texts:
-            windows = _windows(scanned, statement)
-            if windows:
-                usable.append((scanned, windows, _value_fragments(scanned, statement)))
         problems: list[str] = []
         if (
             has_forecast_marker(statement)
@@ -898,26 +976,88 @@ def claim_period_rejections(
             and not any(token.is_forecast_date_capable for token in tokens)
         ):
             problems.append(_reject_forecast_date())
+
+        all_scanned: list[str] = []
+        all_usable: list[tuple[str, list[tuple[int, int]], list[tuple[int, int]]]] = []
+        for link_index in links_by_claim.get(index, ()):
+            texts = _scan_texts(texts_by_link.get(link_index, ()))
+            if not texts:
+                continue
+            usable = _usable_pairs(texts, statement)
+            period_missing = [
+                token.label
+                for token in tokens
+                if usable
+                and not token.doc_date
+                and not any(
+                    _period_token_found(token, scanned, windows, fragments)
+                    for scanned, windows, fragments in usable
+                )
+            ]
+            doc_missing = [
+                token.label
+                for token in tokens
+                if token.doc_date and not any(_doc_date_found(token, scanned) for scanned in texts)
+            ]
+            if period_missing or doc_missing:
+                evidence_index = evidence_index_by_link.get(link_index, -1)
+                parts: list[str] = []
+                if period_missing:
+                    parts.append(_link_reject_period(link_index, evidence_index, index, period_missing[:3]))
+                if doc_missing:
+                    parts.append(_link_reject_doc_date(link_index, evidence_index, index, doc_missing[:3]))
+                link_rejections[link_index] = "; ".join(parts)
+            all_scanned.extend(texts)
+            all_usable.extend(usable)
+
         missing = [
             token.label
             for token in tokens
-            if usable
+            if all_usable
             and not token.doc_date
             and not any(
                 _period_token_found(token, scanned, windows, fragments)
-                for scanned, windows, fragments in usable
+                for scanned, windows, fragments in all_usable
             )
+        ]
+        doc_missing_claim = [
+            token.label
+            for token in tokens
+            if token.doc_date
+            and all_scanned
+            and not any(_doc_date_found(token, scanned) for scanned in all_scanned)
         ]
         if missing:
             problems.append(_reject_period(missing[:3]))
-        doc_missing = [
-            token.label
-            for token in tokens
-            if token.doc_date and texts and not any(_doc_date_found(token, scanned) for scanned in texts)
-        ]
-        if doc_missing:
-            problems.append(_reject_doc_date(doc_missing[:3]))
+        if doc_missing_claim:
+            problems.append(_reject_doc_date(doc_missing_claim[:3]))
         if problems:
             # та же форма строки журнала снятых операций, что у гейта значения и as_of (T7.105)
-            rejections[index] = f"claim[{index}]: " + "; ".join(problems)
-    return rejections
+            claim_rejections[index] = f"claim[{index}]: " + "; ".join(problems)
+    return PeriodGateDecision(link_rejections=link_rejections, claim_rejections=claim_rejections)
+
+
+def claim_period_rejections(
+    *,
+    claims: Sequence[ClaimProposal],
+    texts_by_claim: Mapping[int, Sequence[str]],
+    already_dropped: Collection[int],
+) -> dict[int, str]:
+    """Индекс операции -> именованная причина снятия (прежний API T7.121): пооперационный
+    взгляд, где все тексты операции считаются одной связью.
+
+    Оркестратор вызывает `claim_period_rejections_by_links` (T7.123 — проверка по каждой
+    связи). Причина снятия операции одна: сначала называется пропущенная дата прогноза,
+    затем периоды, которых нет рядом со значением ни в одном тексте, затем названная, но
+    отсутствующая на страницах дата документа (T7.121a д3). Формулировка без явного
+    периода и без маркера прогноза молчит (ADR-0038 §2–§3, §8); снятые ранее операции не
+    проверяются; перепроверки проверяются наравне с новыми claims (T7.123).
+    """
+    decision = claim_period_rejections_by_links(
+        claims=claims,
+        texts_by_link=dict(texts_by_claim),
+        links_by_claim={index: (index,) for index in range(len(claims))},
+        evidence_index_by_link=dict.fromkeys(range(len(claims)), 0),
+        already_dropped=already_dropped,
+    )
+    return decision.claim_rejections

@@ -144,8 +144,14 @@ def test_valueless_claim_and_other_types_are_outside_the_gate() -> None:
     assert _check(C1_CREATED, [FINMARKET], claim_type="local_observation") == {}
 
 
-def test_reverify_and_already_dropped_operations_are_skipped() -> None:
-    assert _check(C1_CREATED, [FINMARKET], existing_claim_id="136a0ca0-0000-0000-0000-000000000000") == {}
+def test_reverify_is_checked_and_already_dropped_operations_are_skipped() -> None:
+    # было (T7.121): перепроверки не проверялись («перепроверку ведёт якорь»);
+    # стало (T7.123, ADR-0038 §2): освобождение — дыра стенда 64837cb5/claim[0]
+    # (обращённый дубль прошёл гейт значения в порочащую связь, период не проверился):
+    # перепроверка проверяется наравне с новым claim'ом — та же строка причины.
+    reasons = _check(C1_CREATED, [FINMARKET], existing_claim_id="136a0ca0-0000-0000-0000-000000000000")
+    assert list(reasons) == [0] and "октябре 2026" in reasons[0]
+    # снятая ранее операция по-прежнему не проверяется: у неё уже есть причина
     assert _check(C1_CREATED, [FINMARKET], already_dropped=frozenset({0})) == {}
 
 

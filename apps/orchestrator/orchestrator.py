@@ -40,7 +40,7 @@ from apps.orchestrator.curator_correction import (
     CorrectionOverLimit,
     build_correction_section,
 )
-from apps.orchestrator.curator_period_gate import claim_period_rejections
+from apps.orchestrator.curator_period_gate import claim_period_rejections_by_links
 from apps.orchestrator.curator_rejections import (
     claim_index_from_line,
     links_without_claim_value,
@@ -3382,6 +3382,11 @@ class Orchestrator:
         from packages.memory.service import resolve_claim_reference
 
         reverify_anchor_types: dict[int, str] = {}
+        # T7.123 (часть 2): формулировка якоря перепроверки — резервный профиль значения/
+        # периода для явной перепроверки без собственной формулировки (гейты ведут операцию
+        # формулировкой цели; у перепроверок, обращённых гейтом дублей, своя формулировка
+        # есть всегда и берётся из неё).
+        reverify_anchor_statements: dict[int, str] = {}
         claims_for_validation = [c.model_dump(mode="json") for c in proposal.claims]
         reverify_drops = 0
         reverify_summary = ""
@@ -3412,7 +3417,7 @@ class Orchestrator:
                     (
                         await db.execute(
                             text(
-                                "SELECT c.claim_type FROM claims c "
+                                "SELECT c.claim_type, c.statement FROM claims c "
                                 "WHERE c.id = :id AND EXISTS (SELECT 1 "
                                 "FROM claim_assessment_heads h "
                                 "WHERE h.claim_id = c.id "
@@ -3436,6 +3441,7 @@ class Orchestrator:
                     )
                     continue
                 reverify_anchor_types[i] = str(anchor_type[0])
+                reverify_anchor_statements[i] = str(anchor_type[1])
                 claims_for_validation[i]["claim_type"] = str(anchor_type[0])
 
         if proposal.claims and reverify_drops and len(dropped) == len(proposal.claims):
@@ -3477,15 +3483,15 @@ class Orchestrator:
             proposal=proposal,
             dropped=dropped,
             link_texts=link_value_texts,
+            # T7.123 (часть 2): явная перепроверка без собственной формулировки проверяется
+            # формулировкой цели
+            statement_overrides=reverify_anchor_statements,
         )
         # гейт заполняет только ещё не снятые операции: причины сняты ранее — первые (T7.105)
         dropped.update(value_claim_drops)
         rejected_links_all = rejected_link_entries(proposal=proposal, removed_links=removed_links)
-        # связи снятых этим гейтом операций названы их записями отказа (`rejected_operations`):
-        # отдельной записью связи не дублируются — остаётся пометка только за активные операции
-        rejected_links_active = [
-            entry for entry in rejected_links_all if int(entry["claim_index"]) not in value_claim_drops
-        ]
+        # журнал активных снятых связей считается после гейта периода (T7.123): там связи
+        # дополняются связями, снятыми гейтом периода, и покрываются записями снятых операций
         if value_claim_drops and proposal.claims and len(dropped) == len(proposal.claims):
             # все операции сняты из-за связей без значения — отказ предложения целиком
             # (тот же event, аддитивный `curator_reject_kind`; связи названы полностью:
@@ -3555,6 +3561,9 @@ class Orchestrator:
         # Исходное предложение в аудит не переписывается: staged-копия отдельна.
         value_duplicates: list[JsonDict] = []
         staged_claims = list(proposal.claims)
+        # T7.123 (часть 2): формулировки якорей обращённых перепроверок (заполняется
+        # гейтом дублей; пуст, если конверсий не было)
+        converted_statements: dict[int, str] = {}
         pack_claim_ids = _pack_claim_ids(knowledge)
         if pack_claim_ids and proposal.claims:
             id_params = {f"vd{i}": cid for i, cid in enumerate(pack_claim_ids)}
@@ -3640,12 +3649,17 @@ class Orchestrator:
                     key=lambda entry: int(str(entry["claim_index"])),
                 )
                 candidate_types = {str(row["id"]): str(row["claim_type"]) for row in candidate_rows}
+                candidate_statements = {str(row["id"]): str(row["statement"]) for row in candidate_rows}
                 for entry in value_duplicates:
                     if entry["action"] == "reverified" and entry["target"]:
                         claim_i = int(entry["claim_index"])
                         staged_claims[claim_i] = proposal.claims[claim_i].model_copy(
                             update={"existing_claim_id": str(entry["target"])}
                         )
+                        # T7.123 (часть 2): формулировка якоря — резервный профиль гейтов для
+                        # обращённой перепроверки (своя формулировка у неё есть, override
+                        # сработает только если она пустая)
+                        converted_statements[claim_i] = candidate_statements.get(str(entry["target"]), "")
                         # оценка перепроверки считается по типу ЯКОРЯ (T7.34/ADR-0018), и предпроверка
                         # правил обязана видеть именно он: при релейбеле тип второго прохода модели
                         # другой, и проверка по нему отвергла бы законную перепроверку.
@@ -3673,9 +3687,15 @@ class Orchestrator:
         # отличную от целевого периода — или писать «дата прогноза на странице не указана».
         # Формулировка без периода и без маркера молчит: гейт
         # требует только названное. Гейт стоит ПОСЛЕ того, как гейт дублей определил вид
-        # операции (перепроверку ведёт якорь, а не её формулировка), и ПОСЛЕ гейта значения
-        # (тексты берутся из оставшихся `supports`-связей) — причины снятых операций уже
-        # записаны, и в проверке as_of ниже они отфильтрованы тем же фильтром T7.105.
+        # операции, и ПОСЛЕ гейта значения (тексты берутся из оставшихся `supports`-связей) —
+        # причины снятых операций уже записаны, и в проверке as_of ниже они отфильтрованы
+        # тем же фильтром T7.105. Дополнение T7.123 (часть 2, ADR-0038 §2): освобождения
+        # «перепроверку ведёт якорь» больше нет — проверяются и явные, и обращённые
+        # перепроверки; проверка идёт ПО КАЖДОЙ связи: неподтверждённая связь снимается
+        # (строка `evidence_link[<k>]…` в `removed_links`, журнал `rejected_links`), операция
+        # снимается только когда не осталось ни одной подтверждённой связи (прежняя строка
+        # причины). Явная перепроверка без собственной формулировки ведётся формулировкой
+        # цели (`statement_overrides`).
         # T7.121a (часть д5): гейты включаются конфигурацией — необязательный ключ
         # `session_limits.curator_record_gates` (config-v28 = true); отсутствие ключа =
         # гейт периода/даты прогноза/даты документа молчит, поведение payload'ов до v28
@@ -3683,23 +3703,50 @@ class Orchestrator:
         # (T7.83, T7.121 часть 4) от этого ключа НЕ зависят.
         curator_gates_on = snapshot.session_limits.get("curator_record_gates") is True
         period_drops: dict[int, str] = {}
+        period_link_drops: dict[int, str] = {}
         if curator_gates_on:
-            period_texts_by_claim: dict[int, list[str]] = {}
+            period_texts_by_link: dict[int, list[str]] = {}
+            period_links_by_claim: dict[int, list[int]] = {}
+            period_evidence_index: dict[int, int] = {}
             for k_link, link in enumerate(proposal.evidence_links):
                 if k_link in removed_links or link.relation.value != "supports":
                     continue  # опровержения и снятые связи — вне гейта (та же граница, что у T7.108)
                 texts = link_value_texts.get(k_link)
                 if texts is None:
                     continue  # улики не `source_assertion` — вне гейта
-                period_texts_by_claim.setdefault(link.claim_index, []).extend(
-                    text for text in texts if text
-                )
-            period_drops = claim_period_rejections(
+                period_texts_by_link[k_link] = [text for text in texts if text]
+                period_links_by_claim.setdefault(link.claim_index, []).append(k_link)
+                period_evidence_index[k_link] = link.evidence_index
+            period_decision = claim_period_rejections_by_links(
                 claims=staged_claims,
-                texts_by_claim=period_texts_by_claim,
+                texts_by_link=period_texts_by_link,
+                links_by_claim=period_links_by_claim,
+                evidence_index_by_link=period_evidence_index,
                 already_dropped=dropped,
+                statement_overrides={**reverify_anchor_statements, **converted_statements},
             )
+            period_drops = period_decision.claim_rejections
+            # связи снятых этим гейтом операций названы их записями отказа (`rejected_operations`):
+            # отдельной записью связи не дублируются (та же дисциплина, что у гейта значения)
+            period_link_drops = {
+                k: reason
+                for k, reason in period_decision.link_rejections.items()
+                if 0 <= k < len(proposal.evidence_links)
+                and proposal.evidence_links[k].claim_index not in period_drops
+            }
         dropped.update(period_drops)
+        if period_link_drops:
+            # снятые гейтом периода связи не пишутся в staging и не видны движку правил ниже
+            removed_links = {**removed_links, **period_link_drops}
+            rejected_links_all = rejected_link_entries(proposal=proposal, removed_links=removed_links)
+        # журнал активных снятых связей: связи снятых операций (гейта значения ИЛИ периода)
+        # названы их записями отказа — отдельной записью связи не дублируются
+        rejected_links_active = [
+            entry
+            for entry in rejected_links_all
+            if int(entry["claim_index"]) not in value_claim_drops
+            and int(entry["claim_index"]) not in period_drops
+        ]
         if period_drops and proposal.claims and len(dropped) == len(proposal.claims):
             # Сняты ВСЕ операции — отказ предложения целиком (тот же event, аддитивный
             # `curator_reject_kind` = "claim_period_not_near_value") -> вариант C догоняет
