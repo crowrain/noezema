@@ -18,6 +18,16 @@ verifies every referenced hash:
 A passed drill stamps ``verified_at`` on the manifest and records the
 audit (``backup_restore_drill``) in the same transaction. A failed
 drill stamps nothing and records the problems in the audit payload.
+
+Clock (T7.46b): the drill runs on the INJECTED clock — ``now`` (or the
+host clock when None). ``retention_until`` is host-stamped by
+``create_backup`` (the same injected-clock convention), so the
+retention window is evaluated on that clock: selection, the
+``verified_at`` stamp and the drill are ONE operation with ONE clock.
+(Evaluating retention on the DB ``now()`` while stamping ``verified_at``
+with the injected clock made the drill's answer depend on the wall
+clock at run time — a time bomb: the same manifest was retained at
+backup time and expired at drill time.)
 """
 
 from __future__ import annotations
@@ -73,17 +83,20 @@ def admission_problems(admission: dict[str, Any]) -> str:
 
 
 async def _pick_retained_backup(
-    db: AsyncSession, rng: random.Random
+    db: AsyncSession, rng: random.Random, now: datetime
 ) -> ORMBackupManifest:
-    """A random backup point inside the retention window."""
+    """A random backup point inside the retention window, evaluated on
+    the drill's clock (T7.46b — the same clock that stamps
+    ``verified_at``; the DB ``now()`` ignored the injected clock)."""
     rows = (
         (
             await db.execute(
                 text(
                     "SELECT id FROM backup_manifests "
-                    "WHERE (retention_until IS NULL OR retention_until > now()) "
+                    "WHERE (retention_until IS NULL OR retention_until > :drill_now) "
                     "ORDER BY created_at, id"
-                )
+                ),
+                {"drill_now": now},
             )
         )
         .all()
@@ -293,7 +306,11 @@ async def run_restore_drill(
     """
     base = Path(base_dir)
     roll = rng or random.Random()
-    manifest = await _pick_retained_backup(db, roll)
+    # T7.46b: ONE clock for the whole drill — selection, the verified_at
+    # stamp, the audit. The production CLI passes no ``now``: the host
+    # clock (datetime.now(UTC)) is used, the real-time semantics kept.
+    moment = now or datetime.now(UTC)
+    manifest = await _pick_retained_backup(db, roll, moment)
     problems: list[str] = []
 
     # 1. the artifact inventory + every referenced hash
@@ -333,7 +350,7 @@ async def run_restore_drill(
     )
 
     if drill.outcome == "passed":
-        manifest.verified_at = now or datetime.now(UTC)
+        manifest.verified_at = moment
     await AuditService(db).record(
         AuditEventType.BACKUP_RESTORE_DRILL,
         payload={

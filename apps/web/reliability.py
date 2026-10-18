@@ -1,0 +1,435 @@
+"""Представление надёжности ответа (T7.64, ADR-0026).
+
+Чистая презентационная функция: она НЕ оценивает знание. Grade и
+epistemic_status производит rules engine (`packages/memory/rules_engine.py`,
+ARCHITECTURE §3.7, §8.7); здесь уже вычисленные значения переводятся в
+понятную шкалу «насколько можно верить» и в человеческую фразу «как
+проверено». Никаких обращений к базе и к модели: только переданные поля.
+
+Шкала (проект упрощения интерфейса, решение пользователя):
+
+* проверено — вывод принят правилами (статус supported);
+* подтверждено слабо — предположение с частичными подтверждениями;
+* не проверено — подтверждений или оценки нет;
+* спорно — есть неподтверждённое возражение;
+* опровергнуто — вывод опровергнут;
+* отложено — оценку не удалось корректно завершить.
+
+Если данных не хватает, функция честно сообщает об этом вместо того, чтобы
+изображать проверку (проект упрощения интерфейса, раздел про профиль без
+сети).
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from collections.abc import Iterable, Mapping
+from typing import Any, Final
+
+from apps.web.labels import MAX_HINT_CHARS
+
+LEVEL_VERIFIED: Final = "verified"
+LEVEL_WEAK: Final = "weak"
+LEVEL_UNVERIFIED: Final = "unverified"
+LEVEL_DISPUTED: Final = "disputed"
+LEVEL_REFUTED: Final = "refuted"
+LEVEL_DEFERRED: Final = "deferred"
+
+RELIABILITY_LEVELS: Final[tuple[str, ...]] = (
+    LEVEL_VERIFIED,
+    LEVEL_WEAK,
+    LEVEL_UNVERIFIED,
+    LEVEL_DISPUTED,
+    LEVEL_REFUTED,
+    LEVEL_DEFERRED,
+)
+
+_LEVEL_LABEL: Final[dict[str, str]] = {
+    LEVEL_VERIFIED: "Проверено",
+    LEVEL_WEAK: "Подтверждено слабо",
+    LEVEL_UNVERIFIED: "Не проверено",
+    LEVEL_DISPUTED: "Спорно",
+    LEVEL_REFUTED: "Опровергнуто",
+    LEVEL_DEFERRED: "Отложено",
+}
+
+#: Цвет — логический токен страницы (конкретные оттенки выбирает CSS этапа T7.65).
+_LEVEL_COLOR: Final[dict[str, str]] = {
+    LEVEL_VERIFIED: "green",
+    LEVEL_WEAK: "yellow",
+    LEVEL_UNVERIFIED: "gray",
+    LEVEL_DISPUTED: "orange",
+    LEVEL_REFUTED: "red",
+    LEVEL_DEFERRED: "gray",
+}
+
+_LEVEL_HINT: Final[dict[str, str]] = {
+    LEVEL_DISPUTED: "Есть возражение, которое ещё не разобрано: на такой вывод опираться нельзя.",
+    LEVEL_REFUTED: "Противоречащие доказательства перевесили: вывод признан ошибочным.",
+    LEVEL_DEFERRED: "Оценку отложили: для этого типа утверждений не хватает обязательных данных.",
+}
+
+#: Запасные пороги `supported` по типам утверждений. Зеркалят правила
+#: ARCHITECTURE §8.7 и payload действующего снимка правил; тест сверяет их с
+#: `docs/eval/config-v13-payload.json`, чтобы презентация не разъезжалась с
+#: правилами. Если вызывающий код передал порог из снапшота, используется он.
+TYPE_MIN_GRADE: Final[dict[str, str]] = {
+    "local_observation": "E2",
+    "computed_result": "E2",
+    "self_model": "E2",
+    "empirical_conjecture": "E3",
+    "procedural": "E3",
+    "external_fact": "E3",
+    "temporal_fact": "E3",
+    "formal_theorem": "E4",
+}
+
+#: Чего не хватает по типу утверждения (формулировка строго из правил §8.7).
+TYPE_REQUIREMENT: Final[dict[str, str]] = {
+    "local_observation": "нужно подтверждение наблюдением в зафиксированных условиях (уровень E2)",
+    "computed_result": "нужно подтверждение вычислением в зафиксированных условиях (уровень E2)",
+    "self_model": "нужно измеряемое наблюдение о самом узле (уровень E2)",
+    "empirical_conjecture": "нужны минимум два эксперимента в независимо полученных условиях (уровень E3)",
+    "procedural": "нужны минимум две успешные повторения независимо полученным путём (уровень E3)",
+    "external_fact": "нужно минимум два независимых источника (уровень E3)",
+    "temporal_fact": "нужны два независимых источника (уровень E3) и ясная привязка ко времени",
+    "formal_theorem": "нужно формальное доказательство (уровень E4)",
+}
+
+#: Уровни, при которых предположение показывается жёлтым («частично подтверждено»).
+_WEAK_GRADES: Final[frozenset[str]] = frozenset({"E1", "E2"})
+
+# ─── случай «кластер вокруг производителя» (ADR-0035 вариант A, T7.87; T7.100 — §18) ───
+#
+# Когда действующая оценка объяснена нехваткой подтверждений (записанная причина —
+# `insufficient_independence` или, с T7.100, `insufficient_evidence`), а факты графа этой же
+# оценки сводят все подтверждения к одному производителю (`apps.web.producer_view`),
+# витрина называет это публикацией производителя, а не «предположением» в том же
+# смысле, что непроверенная городская легенда (ADR-0035 §5 п.2). Уровень оценки,
+# grade и пороги при этом НЕ меняются: остаётся `weak`, поэтому и цвет остаётся
+# жёлтым — тот же токен, что у «Подтверждено слабо». Зелёный зарезервирован за
+# уровнем `verified` («Проверено»), серый означает «данных оценки нет»: окрасить
+# публикацию производителя зелёным — значит прочитать её как проверенную, что
+# запрещено ADR-0035 §5 п.1 и AGENTS §7 (T7.65).
+PRODUCER_LABEL: Final = "Опубликовано производителем"  # 27 знаков
+
+#: Имя производителя в подписи — только человеческое и только из словаря атрибуции:
+# буквы, пробел, дефис и косая черта; всё остальное (цифры, скобки, коды) наружу не
+# выводится — при сомнительном имени подпись остаётся без него.
+_PRODUCER_NAME: Final = re.compile(r"^[А-Яа-яЁё][А-Яа-яЁё \-/]{1,59}$")
+
+#: Запасная подсказка, когда имя вписать нельзя (длиннее потолка или не читается).
+_PRODUCER_HINT_NO_NAME: Final = (
+    "Производитель опубликовал это значение: все подтверждения этой оценки — один кластер. "
+    "Независимых измерений нет — истинность не проверена."
+)
+
+#: Подсказка единственной улики (T7.100, ADR-0035 §18): подтверждение ровно одно —
+#: публикация производителя. «Один кластер» здесь было бы преувеличением: кластер
+# предполагает несколько подтверждений, а их ровно одно (записано правилом).
+_PRODUCER_HINT_SINGLE: Final = (
+    "Производитель ({name}) опубликовал это значение: одна публикация, "
+    "независимых измерений нет — истинность не проверена."
+)
+_PRODUCER_HINT_NO_NAME_SINGLE: Final = (
+    "Производитель опубликовал это значение: одна публикация, "
+    "независимых измерений нет — истинность не проверена."
+)
+
+
+def _producer_hint(name: str, supports: int | None) -> str:
+    """Подсказка случая «кластер вокруг производителя» (ADR-0035 §6.1/§6.2, §18).
+
+    Дословно повторяется только то, что действительно следует из данных: имя
+    производителя — из записанной атрибуции, «один кластер» — из ровно одной
+    записанной группы независимости этой оценки, «одна публикация» — из ровно одной
+    подтверждающей улики этой оценки (T7.100). Никаких «сообщений ЦБ» и прочих
+    деталей, которых в строках оценки нет (запрет выдумки, ADR-0035 §6).
+    """
+    if supports == 1:
+        single = _PRODUCER_HINT_SINGLE.format(name=name)
+        return single if len(single) <= MAX_HINT_CHARS else _PRODUCER_HINT_NO_NAME_SINGLE
+    named = (
+        f"Производитель ({name}) опубликовал это значение: все подтверждения этой оценки "
+        "— один кластер. Независимых измерений нет — истинность не проверена."
+    )
+    if len(named) <= MAX_HINT_CHARS:
+        return named
+    short = (
+        f"Производитель ({name}) опубликовал это значение; независимых измерений нет "
+        "— истинность не проверена."
+    )
+    return short if len(short) <= MAX_HINT_CHARS else _PRODUCER_HINT_NO_NAME
+
+
+def _producer_badge(name: object, supports: int | None) -> dict[str, str]:
+    """Бейдж «опубликовано производителем»: уровень `weak` и цвет сохранены, подписи другие."""
+    label = str(name).strip() if isinstance(name, str) else ""
+    if _PRODUCER_NAME.match(label):
+        hint = _producer_hint(label, supports)
+    elif supports == 1:
+        hint = _PRODUCER_HINT_NO_NAME_SINGLE
+    else:
+        hint = _PRODUCER_HINT_NO_NAME
+    return {
+        "level": LEVEL_WEAK,
+        "label": PRODUCER_LABEL,
+        "hint": hint,
+        "color": _LEVEL_COLOR[LEVEL_WEAK],
+    }
+
+
+_HEAD_STATE_HINT: Final[dict[str, str]] = {
+    "none": "Оценки нет: подтверждений по действующим правилам не зафиксировано.",
+    "pending": "Новая оценка подготовлена, но действующей ещё не стала — опираться на неё нельзя.",
+    "invalid": "Прежняя оценка потеряла силу: нужна перепроверка утверждения.",
+}
+
+NO_DETAILS: Final = "подробности проверки недоступны"
+
+
+def reliability(
+    claim_type: str | None,
+    epistemic_status: str | None,
+    effective_grade: str | None,
+    *,
+    head_state: str | None = None,
+    min_grade_for_supported: str | None = None,
+    single_producer: str | None = None,
+    producer_supports: int | None = None,
+) -> dict[str, str]:
+    """{"level","label","hint","color"} по уже вычисленной оценке.
+
+    `effective_grade` и `epistemic_status` берутся из действующей оценки
+    (head current); для pending/invalid/none они NULL — и ответ честно
+    показывает «не проверено» с объяснением, а не выдумывает уровень.
+    Порог типа берётся из переданного снапшота правил, иначе из запасной
+    таблицы этого модуля.
+
+    `single_producer` (T7.87, ADR-0035 вариант A) — имя производителя, которое
+    `apps.web.producer_view` вывел из уже записанных фактов этой же оценки (одна группа
+    независимости и все указатели сводятся к одному производителю). Оно меняет ТОЛЬКО
+    подписи случая «hypothesis + слабый уровень»: уровень остаётся `weak`, grade и пороги
+    никто не пересматривает. Для `supported` (`Проверено`) и для спорно/опровергнуто/
+    отложено имя не участвует: там бейдж уже назван другим исходом оценки.
+
+    `producer_supports` (T7.100, ADR-0035 §18) — число подтверждающих улик этой же оценки
+    (считает `producer_view` из тех же записанных строк): 1 — единственная улика, подсказка
+    говорит «одна публикация»; None — число не передано, подсказка прежняя общая форма.
+    """
+    grade = effective_grade if isinstance(effective_grade, str) and effective_grade else None
+    status = epistemic_status if isinstance(epistemic_status, str) and epistemic_status else None
+
+    if head_state in _HEAD_STATE_HINT:
+        return _build(LEVEL_UNVERIFIED, _HEAD_STATE_HINT[str(head_state)])
+
+    if status == "supported":
+        hint = (
+            f"Вывод принят правилами оценки: уровень подтверждения {grade}."
+            if grade is not None
+            else "Вывод принят правилами оценки."
+        )
+        return _build(LEVEL_VERIFIED, hint)
+
+    if status in (LEVEL_DISPUTED, LEVEL_REFUTED, LEVEL_DEFERRED):
+        return _build(status, _LEVEL_HINT[status])
+
+    if status == "hypothesis":
+        if grade is None or grade == "E0":
+            return _build(
+                LEVEL_UNVERIFIED,
+                "Пригодных для оценки подтверждений пока нет: уровень подтверждения E0.",
+            )
+        if grade in _WEAK_GRADES:
+            if single_producer:
+                return _producer_badge(single_producer, producer_supports)
+            key = str(claim_type or "")
+            threshold = min_grade_for_supported or TYPE_MIN_GRADE.get(key, "")
+            requirement = TYPE_REQUIREMENT.get(key) or (
+                "подтверждений по правилам этого типа не хватает"
+            )
+            missing_by_grade = ""
+            if threshold and _grade_rank(grade) < _grade_rank(threshold):
+                missing_by_grade = f" Сейчас уровень {grade} ниже порога {threshold}."
+            return _build(LEVEL_WEAK, f"Пока это предположение: {requirement}.{missing_by_grade}")
+        # Подозрительная запись: уровень выше, чем rules-v2 даёт предположению.
+        return _build(
+            LEVEL_UNVERIFIED,
+            "Запись об уровне не согласуется с правилами оценки: утверждению нужна переоценка.",
+        )
+
+    return _build(LEVEL_UNVERIFIED, NO_DETAILS)
+
+
+def _build(level: str, hint: str) -> dict[str, str]:
+    return {
+        "level": level,
+        "label": _LEVEL_LABEL[level],
+        "hint": hint,
+        "color": _LEVEL_COLOR[level],
+    }
+
+
+def _grade_rank(grade: str) -> int:
+    order = ("E0", "E1", "E2", "E3", "E4")
+    return order.index(grade) if grade in order else -1
+
+
+# ─── «как проверено» ──────────────────────────────────────────────────────
+
+_KIND_PHRASE: Final[dict[str, str]] = {
+    "computation": "выполнено вычисление",
+    "experiment_run": "проведён опыт",
+    "formal_check": "вывод проверен формально",
+    "local_observation": "получено наблюдение на узле",
+    "quote_integrity": "цитата сверена с источником",
+    "source_assertion": "использовано утверждение источника",
+}
+
+
+def describe_verification(
+    evidence_rows: Iterable[Mapping[str, Any]] | None,
+    *,
+    source_groups: Iterable[Mapping[str, Any]] | None = None,
+    environment_groups: Iterable[Mapping[str, Any]] | None = None,
+) -> list[str]:
+    """Короткие честные фразы «как проверено» из переданных полей доказательств.
+
+    `evidence_rows` — строки доказательств (relation, evidence_kind, ссылка на
+    источник и/или артефакт). None означает «данных не передали»: возвращается
+    одна честная фраза, а не правдоподобная проверка. Ничего сверх переданного
+    не утверждается: изоляция среды, независимость источников и факт сверки
+    упоминаются только когда соответствующее поле действительно есть.
+    """
+    if evidence_rows is None:
+        return [NO_DETAILS]
+
+    rows = [row for row in evidence_rows if isinstance(row, Mapping)]
+    if not rows:
+        return ["подтверждений нет: ни одного свидетельства не зафиксировано"]
+
+    supports = [row for row in rows if row.get("relation") == "supports"]
+    counters = [row for row in rows if row.get("relation") == "counters"]
+    phrases: list[str] = []
+
+    kinds: dict[str, int] = {}
+    for row in supports:
+        kind = row.get("evidence_kind")
+        if isinstance(kind, str) and kind in _KIND_PHRASE:
+            kinds[kind] = kinds.get(kind, 0) + 1
+
+    for kind in sorted(kinds):
+        phrase = f"{_KIND_PHRASE[kind]}: {kinds[kind]}"
+        if kind == "computation" and any(
+            row.get("evidence_kind") == kind and _has_artifact(row) for row in supports
+        ):
+            phrase += ", артефакт результата сохранён"
+        phrases.append(phrase)
+
+    source_refs = {_source_ref(row) for row in supports if _source_ref(row) is not None}
+    if len(source_refs) > 1:
+        phrases.append(f"источников прочитано: {len(source_refs)}")
+    elif len(source_refs) == 1:
+        phrases.append("использован один источник")
+
+    # T7.75 (ADR-0029 B): часть прочитанного может пересказывать один первоисточник — это видно
+    # по указателю происхождения источника. T7.78: то же самое решает запись об улике, когда
+    # страница неоднозначна и страничный указатель не поставлен. Фраза честная: она не утверждает,
+    # что независимость есть или её нет, она называет найденное (сколько прочитанных источников
+    # хоть в чём-то пересказывают первоисточник), ничего сверх переданных полей не выдумывая.
+    retold = {
+        _source_ref(row)
+        for row in supports
+        if _source_ref(row) is not None
+        and (_parent_ref(row) is not None or _value_attribution_ref(row) is not None)
+    }
+    if retold:
+        phrases.append(f"часть прочитанного — пересказ первоисточника: {len(retold)}")
+
+    groups = _distinct_groups(source_groups)
+    if groups >= 2:
+        phrases.append(f"источники разнесены по {groups} независимым группам")
+
+    env_groups = _distinct_groups(environment_groups)
+    if env_groups >= 2:
+        phrases.append(f"повторения получены независимо: {env_groups} групп условий")
+
+    if counters:
+        phrases.append(f"есть возражения: {len(counters)}")
+
+    if not phrases:
+        return [NO_DETAILS]
+    return phrases
+
+
+def _has_artifact(row: Mapping[str, Any]) -> bool:
+    artifact = row.get("artifact")
+    return bool(artifact) or bool(row.get("artifact_sha256")) or bool(row.get("observation_artifact_id"))
+
+
+def _source_ref(row: Mapping[str, Any]) -> str | None:
+    source = row.get("source")
+    if isinstance(source, Mapping):
+        for key in ("canonical_uri", "id", "content_hash"):
+            value = source.get(key)
+            if value:
+                return str(value)
+    for key in ("source_uri", "source_id", "canonical_uri"):
+        value = row.get(key)
+        if value:
+            return str(value)
+    return None
+
+
+def _parent_ref(row: Mapping[str, Any]) -> str | None:
+    """Указатель происхождения прочитанного источника (T7.75): страница пересказывает первоисточник.
+
+    Форма строки зависит от экрана: в provenance инженера это вложенный `parent`, в карточке
+    ответа — плоские колонки запроса доказательств.
+    """
+    parent = row.get("parent")
+    if isinstance(parent, Mapping):
+        for key in ("canonical_uri", "id"):
+            value = parent.get(key)
+            if value:
+                return str(value)
+    for key in ("parent_uri", "parent_source_id"):
+        value = row.get(key)
+        if value:
+            return str(value)
+    return None
+
+
+def _value_attribution_ref(row: Mapping[str, Any]) -> str | None:
+    """Запись об улике (T7.78): этот фрагмент пересказывает первоисточник, даже если сама
+    страница не помечена. Форма та же, что хранит `evidence.scope` (`packages/memory/scope.py`);
+    JSONB приходит то словарём, то строкой — разбираем оба варианта, при битой форме отказа нет.
+    """
+    scope = row.get("scope")
+    if isinstance(scope, str):
+        try:
+            scope = json.loads(scope)
+        except ValueError:
+            return None
+    if not isinstance(scope, Mapping):
+        return None
+    record = scope.get("value_attribution")
+    if not isinstance(record, Mapping):
+        return None
+    for key in ("primary_uri", "primary_name", "parent_source_id"):
+        value = record.get(key)
+        if value:
+            return str(value)
+    return None
+
+
+def _distinct_groups(rows: Iterable[Mapping[str, Any]] | None) -> int:
+    if rows is None:
+        return 0
+    groups = {
+        row.get("group_id")
+        for row in rows
+        if isinstance(row, Mapping) and row.get("group_id") is not None
+    }
+    return len(groups)

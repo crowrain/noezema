@@ -1,89 +1,93 @@
 # NOEZEMA
 
-**Local-first autonomous thinker** — система, которая периодически пробуждается, выбирает неизвестный ей вопрос, исследует его, проверяет выводы с доказательствами и сохраняет знания для следующей сессии и человека-наблюдателя.
+**Local-first autonomous thinker** — автономный локальный «мыслитель»: периодически
+пробуждается, выбирает вопрос из очереди, исследует его инструментами, готовит утверждения с
+уликами, а хост проверяет каждое утверждение перед записью. Знание переживает сессию: следующая
+сессия и человек-наблюдатель видят записанное, оценённое и объяснённое.
 
-| Параметр | Значение |
-|----------|----------|
-| Статус | Архитектурный draft v0.25 |
-| Язык | Python |
-| Бэкенд | Локальная LLM (OpenAI-compatible API) |
-| База данных | PostgreSQL 15+ |
-| Сэндбокс | Rootless Podman / Docker |
-| Веб-интерфейс | FastAPI + HTMX + SSE |
+Содержание: [что это](#что-это) · [статус](#статус) · [как устроена сессия](#как-устроена-сессия) ·
+[оценка знания](#оценка-знания) · [производители и группы независимости](#производители-и-группы-независимости) ·
+[переоценка](#переоценка) · [веб-интерфейс](#веб-интерфейс) · [хостовые команды](#хостовые-команды) ·
+[конфигурации](#конфигурации) · [качество](#качество) · [разработка](#разработка) ·
+[карта документации](#карта-документации) · [не сделано / дальше](#не-сделано--дальше)
 
----
+## Что это
 
-## Идея
+Один узел, одна база PostgreSQL, локальная LLM (OpenAI-compatible API), ничего внешнего по
+умолчанию. Модель не меняет знание напрямую: только через staging-операции сессии
+(утверждение / улика / вопрос / идентификатор), финальный коммит — огороженная транзакция с
+проверкой аренды и ревизий. Оценка знания — детерминированный rules engine, не модель.
+Архитектурная спецификация — [ARCHITECTURE.md](ARCHITECTURE.md) v0.25 (исходный проект); все
+осознанные отклонения задокументированы ADR (индекс: [docs/adr/README.md](docs/adr/README.md)).
 
-NOEZEMA — автономный локальный мыслитель. Каждая сессия:
+## Статус
 
-1. **Пробуждение** — система определяет, что условия выполнены (GPU, диск, нет активной сессии)
-2. **Выбор вопроса** — Curiosity Engine ранжирует кандидатов по новизне, проверяемости, связи с интересами (в MVP — FIFO Question Selector, ранжирование появляется на этапе 4)
-3. **Исследование** — LLM выполняет типизированные действия внутри изолированного sandbox
-4. **Верификация** — правила доказательств (E0–E4) оценивают каждый claim по набору evidence
-5. **Консолидация** — Curator предлагает изменения; Memory Service валидирует staging
-6. **Атомарный commit** — результат фиксируется одной транзакцией; при сбое — reconciliation
+- Вехи M0–M7 закрыты; теги `noezema-m1…noezema-m7` и `noezema-mvp` в истории.
+- Последние задачи: T7.121 и T7.121a (2026-10-18, гейты честности кураторских записей,
+  [ADR-0038](docs/adr/0038-curator-record-honesty-period-forecast-and-mutual-duplicates.md)); активная история — от T7.106 в
+  [docs/STATUS.md](docs/STATUS.md).
+- Полная проверка ([AGENTS.md §6](AGENTS.md#6-окружение-и-команды)) на HEAD этой ветки:
+  ruff — чисто; mypy strict — «Success: no issues found in 161 source files»;
+  pytest `-n auto -m "not timing"` — **3085 passed, 12 skipped**; отдельный последовательный
+  прогон `-m timing` — **4 passed**.
+- Конфигурации config-v26, config-v27, config-v28 выпущены payload'ами и не активированы нигде:
+  активация — решение менеджера (см. [конфигурации](#конфигурации)).
 
-Мыслитель свободен выбирать темы, развивать идентичность и организовывать рабочее пространство. Границы безопасности, планировщик и журнал событий находятся вне его контроля.
+## Как устроена сессия
 
-## Ключевые отличия
+**Вопрос.** Очередь FIFO с приоритетом; приём — `noezemactl ask "<текст>" [--priority N]` или
+`POST /api/v1/questions` (заголовок `X-Admin-Token`); вид очереди — открытый
+`GET /api/v1/questions` ([ADR-0024](docs/adr/0024-operator-question-intake.md)).
 
-Относительно ранних экспериментов с автономным AI на сервере с персистентной памятью:
+**Пробуждение.** Плановый тик (таймер юнита на dev-стенде — только по явному включению; сессии
+запускает оператор) или ручной `wake-tick`. На узле одновременно живёт ровно одна сессия —
+advisory lock ([ADR-0025](docs/adr/0025-node-session-advisory-lock.md)); состояние
+узла (пауза после серии отказов, остаточный маркер) читается из БД при каждой команде.
 
-- ✅ Управляющий контур отделён от среды мыслителя
-- ✅ Модель не исполняет команды непосредственно на хосте
-- ✅ Действия передаются через типизированный протокол с capability-профилями
-- ✅ Знания отделены от субъективных воспоминаний
-- ✅ Каждое утверждение связано с доказательствами и статусом проверки
-- ✅ История событий неизменяема
-- ✅ Локальная LLM — штатный режим, а не дополнительный
-- ✅ Наблюдаемость через веб-интерфейс, включая read-only host recovery при остановленном runtime
+**Исследование.** Избранный вопрос попадает в контекст исследователя; шаг — вызов инструмента из
+профиля доступа. Действующие инструменты (профиль curated, config-v28): `web.search`
+(только текст запроса ≤500 знаков), `research.fetch` (чтение страницы через research proxy с
+артефактом), `memory.search` (локальный индекс знания), `python.execute`, `shell.execute`,
+`workspace.read/list/write`. Исполнитель `python.execute`/`shell.execute` —
+одноразовый контейнер на сессию: сеть none, cap-drop ALL, non-root, read-only rootfs
+([ADR-0023](docs/adr/0023-tool-executor-switch.md)); режим выбирается
+`NOEZEMA_TOOL_EXECUTOR` (дефолт — dev-подставка stub). Хиты поиска знанием не становятся:
+знание даёт только прочитанная страница `research.fetch`
+([ADR-0028](docs/adr/0028-model-search-tool-web-search-and-snapshot-config-v14.md)).
 
-### Гарантии восстановления
+**Гейты исследователя (хостовые, до исполнения шага).** Повтор поиска без нового содержательного
+слова отклоняется по равенству основ слов
+([ADR-0036](docs/adr/0036-explorer-step-hygiene.md)); хосты, неоднократно недоступные для чтения
+за последнюю неделю, называются сессии в секции контекста «Недавно недоступны», а 401/403/429
+закрыт хост для чтения до конца сессии.
 
-Отдельно от концептуальных отличий — свойства, которые обычно всплывают уже в эксплуатации:
+**Потолок шагов и подсказки.** Общий потолок шагов исследователя — 16; для вопросов вида
+«официальная цифра + независимые оценки» — 20 (ключ `session_limits` в снапшоте) и короткая
+секция-подсказка «Независимые источники по теме…» из каталога `session_limits.research_hints` —
+подсказка, не белый список ([ADR-0037](docs/adr/0037-official-independent-step-cap-and-independent-hints.md)).
 
-- Потерянный ответ на `COMMIT` разрешается fenced row-lock reconciliation, а не догадкой по сетевому ответу
-- Durable worker и barrier recovery: ни один poison job, ни падение между батчами не теряют прогресс и не парализуют систему
-- Транзиентная недоступность БД восстанавливается сама; человек нужен только для несогласованных записей
-- Knowledge и dependency graph защищены revision vector и единым частичным lock order
-- В MVP rules/config меняется offline внутри systemd-owned maintenance scope: target membership проверяется через `PartOf/ConsistsOf`, current state и immutable host events журналируются fsync-safe, а pointer+questions публикуются одной транзакцией; fenced online activation появляется в 3b
-- Классифицированный DB outage остаётся в durable `retry_wait` и не расходует systemd crash budget; неклассифицированный crash-loop виден как auto-recovering `resume_degraded`, permanent inconsistency — как operator-required `resume_blocked`
-- Единственный fsync-safe active head отделяет незавершённый host transition от retained history; boot reconciliation восстанавливает один orphan и блокирует runtime при множественных unresolved records
-- Recovery policy берётся только из versioned root-owned host files, hash-ируется и материализуется в transition; её смена имеет отдельный fsync-safe active head и terminal `effective_hash`, а DB snapshot не может неявно изменить backoff
-- Single-node schema v1 фиксирует recovery jitter в `0`; retry и unit-state timers имеют явные `AccuracySec=1s`, отключённый systemd jitter и измеряемую lateness
+**Куратор и хостовые гейты записи.** Куратор готовит утверждения (claims) с привязкой к уликам;
+хост проверяет каждую операцию до записи. Условие «значение на странице»: `supports`-связь живёт
+только если измеренное значение утверждения названо целым токеном в фрагменте улики или на
+странице целиком (T7.108, безусловный). Склейка дублей по значению и mutual-кластер взаимных
+дублей — безусловны ([ADR-0033](docs/adr/0033-value-duplicate-honest-merge.md)); якорь склейки —
+ранейшая запись. Порядок проверки `as_of` опоры после вида операции
+([ADR-0034](docs/adr/0034-per-operation-vs-whole-proposal-curator-rejection.md)). Гейты честности формулировок —
+период рядом со значением, дата прогноза на странице, дата документа — включаются только ключом
+`session_limits.curator_record_gates` в снапшоте (появился в config-v28; без него прежние payload'ы
+ведут себя как раньше) ([ADR-0038](docs/adr/0038-curator-record-honesty-period-forecast-and-mutual-duplicates.md)). Отказ —
+именованная причина и ровно один раунд исправления: частичный отказ — снимается одна операция,
+полный — всё предложение целиком (ADR-0034 §9). Честный итог без новых утверждений — пустые `claims` с заполненным
+`relied_claim_ids` (вывод опирается на уже записанное знание и это называет).
 
-## Архитектура
+**Финал.** Проверка связности, огороженный коммит одной транзакцией (fencing-предикат по аренде
+и ревизиям), audit + outbox в той же транзакции; лента сессии видна в вебе (operational timeline
+из audit events, не из нарратива модели).
 
-```
-┌─────────────────────────────────────────────────┐
-│           Доверенный контур (Linux VM)           │
-│                                                  │
-│  Supervisor → Orchestrator → Curiosity Engine    │
-│                  → Context Builder               │
-│                  → LLM Gateway → Локальная LLM   │
-│                  → Policy Engine                 │
-│                  → Tool Broker → Sandbox         │
-│                  → Memory Service                │
-│                                                  │
-│  PostgreSQL (domain + audit + outbox)            │
-│  Content-addressed Artifact Store                │
-│  Research Proxy (контролируемый egress)          │
-│  Query API / Command API → Веб-модуль            │
-└─────────────────────────────────────────────────┘
-         ↕
-┌─────────────────────────────────────────────────┐
-│       Sandbox (одноразовый, COW overlay)         │
-│  /workspace (base snapshot + overlay)            │
-│  Ограниченный shell / Python                     │
-└─────────────────────────────────────────────────┘
-```
+## Оценка знания
 
-Подробнее: [ARCHITECTURE.md](ARCHITECTURE.md)
-
-## Модель доказательств
-
-Каждое значимое утверждение проходит оценку по уровням:
+Каждое утверждение получает grade — вычисляет его версионируемый rules engine, не LLM и не
+верификатор:
 
 | Grade | Статус | Требование |
 |-------|--------|------------|
@@ -93,216 +97,138 @@ NOEZEMA — автономный локальный мыслитель. Кажд
 | E3 | `independently_corroborated` | Независимые источники или репликация |
 | E4 | `formally_verified` | Формальная верификация или многократная репликация |
 
-Grade вычисляет версионируемый rules engine — не LLM, не verifier. Claim assessment строится по evidence set, claim type rules, independence groups и scope.
+Тип утверждения задаёт минимум для статуса `supported` (правила в снапшоте, `claim_type_rules`):
 
-### Типы утверждений (v1)
+| Тип | Минимум grade | Минимум групп независимости |
+|-----|---------------|-----------------------------|
+| `local_observation` | E2 | 1 |
+| `computed_result` | E2 | 1 |
+| `self_model` | E2 | 1 |
+| `procedural` | E3 | 2 |
+| `external_fact` | E3 | 2 |
+| `temporal_fact` | E3 | 2 |
+| `empirical_conjecture` | E3 | 2 |
+| `formal_theorem` | E4 | 1 |
 
-| Тип | Минимальный grade для `supported` |
-|-----|----------------------------------|
-| `local_observation` | E2 |
-| `computed_result` | E2 |
-| `formal_theorem` | E4 |
-| `empirical_conjecture` | E3 (≥2 независимых экспериментов) |
-| `procedural` | E3 (≥2 успешных репликаций) |
-| `external_fact` | E3 (≥2 независимых источника) |
-| `temporal_fact` | E3 + временной scope |
-| `self_model` | E2 |
+Дублирующая улика grade не повышает; опровержение переводит утверждение в disputed (≤E1).
 
-## Безопасность
+## Производители и группы независимости
 
-**Модель нарушителя:** внешняя страница, сообщение человека, LLM, код в sandbox и артефакты прошлых сессий считаются недоверенными.
+Знание различает **первоисточник** (актор, опубликовавший цифру) и **пересказ** (страница,
+передавшая чужое значение). Реестр первоисточников — `PRIMARY_SOURCES` в
+`apps/research_proxy/source_attribution.py`; значение привязывается к производителю
+(`host-source-attribution-v10`, `host-value-attribution-v15`, режим pairing
+`bibliography_known_producer`). Пересказ одного производителя не даёт второй группе независимости
+([ADR-0029](docs/adr/0029-source-independence-primary-vs-derivative-publication.md)); две независимые группы — два
+разных производителя или независимый метод. На витрине карточка показывает, кто источник:
+подпись «Опубликовано производителем» с причиной оценки и подраздел «Независимые оценки»
+([ADR-0035](docs/adr/0035-official-figure-publication-vs-truthfulness.md)). Оценку третьей стороны (индекс,
+рейтинг, опрос) куратор несёт как `external_fact` с уликой чтения — собственная гипотеза остаётся
+`empirical_conjecture`.
 
-Защита слоями:
+## Переоценка
 
-- **Изоляция** — одноразовый rootless-контейнер, read-only rootfs, no network, cap-drop ALL
-- **Capability security** — права задаются профилем, содержание контекста их не расширяет
-- **Provenance** — каждый chunk имеет origin, hash, transform chain и trust class
-- **Evidence rules** — grade вычисляется детерминированно, не моделью
-- **Наблюдаемость** — operational timeline из audit events, не из нарратива модели
-- **Операторское подтверждение** — для действий с внешним эффектом
+Изменение дерева источников (перепривязка производителя, спор утверждения) каскадно помечает
+затронутые утверждения к переоценке: `apply_source_graph_change` + фоновый
+`reassessment-tick`; спор утверждения оператором — `claim-dispute` / `claim-dispute-cancel` с
+именованными аргументами (первоисточник, пересказ, причина).
 
-### Режимы доступа к интернету
+## Веб-интерфейс
 
-| Режим | Поиск | Egress |
-|-------|-------|--------|
-| **Sealed** | Локальный индекс | Нет |
-| **Curated** | SearXNG через Research Proxy | Контролируемый |
-| **Open Lab** | Внешний API | Разрешённые домены |
+FastAPI, серверные страницы + JSON API (`/api/v1/...`), без фронтенд-фреймворка. Страницы:
+главная (приём вопроса и лента), инженерная, карточка ответа, карточка сессии (ход сессии),
+база знания, карточка утверждения (улики, независимость, спор), диагностика, метрики,
+оценка (evaluation). Лента хода сессии доступна и как SSE
+(`GET /api/v1/sessions/{id}/timeline/sse`) — единственный SSE-эндпоинт.
 
-## Стек
+Запуск: `python -m apps.web.main` (или `uvicorn apps.web.main:app`). Дефолтный bind —
+`127.0.0.1:8321` (`NOEZEMA_WEB_HOST`/`NOEZEMA_WEB_PORT`); bind вне loopback при пустом
+`NOEZEMA_ADMIN_TOKEN` — отказ запуска с кодом 78 (fail-closed).
 
-| Компонент | Технология |
-|-----------|-----------|
-| Язык | Python 3.11+ |
-| Веб-фреймворк | FastAPI + Pydantic |
-| База данных | PostgreSQL 15+ (опционально pgvector) |
-| ORM / миграции | SQLAlchemy + Alembic |
-| Веб-UI | HTMX + Server-Sent Events |
-| Сэндбокс | Rootless Podman или Docker |
-| Оркестрация | systemd 249+ |
-| LLM-бэкенд | llama.cpp / Ollama / vLLM |
-| Тесты | pytest (unit, scenario, security, model_compatibility) |
+## Хостовые команды
 
-### Требования к железу (ориентир)
+Хостовый CLI — `noezemactl` (`python -m hostctl.cli`), всего 23 команды. Основные:
 
-Модель класса **30B в Q4** — ~24 GB VRAM, 64 GB RAM.
+| Команда | Что делает |
+|---------|------------|
+| `ask "<текст>" [--priority N]` | приём вопроса оператором в очередь |
+| `wake-tick`, `reconcile-tick`, `reassessment-tick` | плановые работы: пробуждение, сверка незавершённых коммитов, переоценка |
+| `activate-online --payload F --reason R [--drain-wait-seconds N]` | активация конфигурации из payload-файла (решение менеджера) |
+| `claim-dispute --claim ID --primary … --retelling … --reason R` | спор утверждения: первоисточник vs пересказ |
+| `claim-dispute-cancel --claim ID --reason R` | снятие спора |
+| `research-reattribute --since … [--dry-run]` | перепривязка производителей по журналу поиска (каскад переоценки) |
+| `independence-preview [--apply]` | предпросмотр групп независимости витрины |
+| `honesty-report --since … [--questions ids] [--baseline F] [--json OUT]` | отчёт честности витрины (флаги Ф1–Ф3) |
+| `resume-runtime`, `offline-rules`, `show-policy`, `backup`, `gc` … | хостовый контур: пауза/снятие паузы узла, правила, снимок состояния, резервные копии, сборка мусора |
 
-## Структура репозитория
+Полный список: `python -m hostctl.cli --help`.
 
-```
-noezema/
-├── apps/
-│   ├── orchestrator/        # Машина состояний сессий
-│   ├── web/                 # FastAPI: Query API + Command API + UI
-│   └── research_proxy/      # Контролируемый egress
-├── packages/
-│   ├── domain/              # Доменные модели, схемы, constraints
-│   ├── llm_gateway/         # OpenAI-compatible API, fingerprint
-│   ├── cognition/           # Curiosity Engine, Context Builder
-│   ├── memory/              # Claims, evidence, assessments, rules
-│   ├── policy/              # Capability checks, profiles
-│   ├── tool_broker/         # Типизированные инструменты, retry
-│   └── observability/       # Метрики, audit, outbox
-├── sandbox/
-│   ├── Containerfile        # Базовый образ sandbox
-│   └── policy/              # Security profiles
-├── prompts/
-│   ├── identity.md          # Документ идентичности
-│   ├── explorer.md          # Промпт исследователя (MVP)
-│   ├── curator.md           # Промпт куратора (MVP)
-│   └── verifier.md          # Промпт верификатора (этап 4)
-├── docs/adr/                # Архитектурные решения
-├── migrations/              # Alembic миграции
-├── infra/
-│   ├── compose.yaml         # Локальная разработка
-│   └── systemd/             # Production supervisor + host-recovery.defaults.toml
-└── tests/
-    ├── scenarios/           # Сценарные тесты сессий
-    ├── security/            # Invariant и failpoint-тесты
-    └── model_compatibility/  # Compatibility suite для LLM
-```
+## Конфигурации
 
-## Этапы реализации
+Конфигурация живёт только в снапшоте (`runtime_config_heads` → `config_snapshots`, fail-closed);
+payload-файлы — в `docs/eval/`. Канал текущей цепочки (полностью — AGENTS.md §6):
 
-| Этап | Что | Gate |
-|------|-----|------|
-| **1. Контракты и LLM** | Enums, schemas, host-generated IDs, LLM Gateway, FIFO Selector, minimal explorer/curator | Sealed-путь question → evidence → assessment → commit |
-| **2. Изоляция и commit** | Sandbox, capability policy, Tool Broker, COW/staging, revision vector, fenced reconciliation | Unknown COMMIT reconciled, живой finalizer не принят за rollback |
-| **3a. Память и доказательства** | Claims/evidence, versioned assessment heads, systemd-owned offline rules change с verification seal, отдельные active heads для transition/policy change, root-owned recovery policy и точные durable retry timers, conservative source grouping | Старый либо полный новый pointer+questions; по одной unresolved host operation, DB outage — `retry_wait`, crash-loop — `resume_degraded`, inconsistency/policy error — `resume_blocked`, ни один start не обходит admission |
-| **3b. Зависимости и переоценка** | Closure manifests, resumable barriers, reassessment worker, fenced online rules activation, full grouping, resolutions | Invalid ancestor блокирует downstream; stale activator/repair не меняет effective config |
-| **4. Расширенный познавательный цикл** | Curiosity ranking, planning, specialized verifier/curator, защита от повторений | Verifier не назначает grade |
-| **5. Research Proxy** | SSRF-safe fetch/search, provenance, injection tests | Внешний текст не меняет capabilities |
-| **6. Веб-модуль** | MVP: status/timeline/messages/controls и read-only degraded host status; затем knowledge graph и diagnostics | Без system-bus access; stale snapshot или любой unresolved host transition/policy change fail-closed закрывает Command API |
-| **7. Эксплуатация** | Backup/PITR, GC, security regression, 50–100 сессий | §22.1 → frozen evaluation → §22.2 full acceptance |
+| Конфигурация | Что меняет |
+|--------------|------------|
+| config-v26 (T7.111) | пин `explorer-v11`: гигиена шагов исследователя (читать найденное после поиска; хосты из «Недавно недоступны»; к ведомству — сразу к документу с числами). Canonical `3d93df81…` |
+| config-v27 (T7.119, T7.119a) | потолок шагов 20 для вопросов «официальные + независимые», каталог-подсказка `research_hints`, удлинение дедлайнов фазы/сессии. Canonical `9d9ebba4…` |
+| config-v28 (T7.121, T7.121a) | пин `curator-v16` (правила 15–17: дата прогноза, одиночная операция дубля, честный итог из опоры) + ключ `curator_record_gates: true` (гейты периода/даты). Canonical `8db816ee…` |
 
-MVP — этапы 1, 2, 3a + минимальный web slice: status, SSE timeline, messages, controls и degraded host recovery view. Он уже выполняет полный минимальный познавательный путь с локальной LLM. Этап 3b начинается после серии реальных сессий: пороги очереди и SLO выводятся из измеренной нагрузки.
+Дефолт bootstrap'а dev-стенда — config-v20 (canonical `2b065470…`). Активация новых конфигураций
+и откат (payload предыдущей конфигурации) — решение менеджера, команда `activate-online` с
+`--drain-wait-seconds`; порядок развёртывания и отката —
+[deploy/dev-stand/README.md](deploy/dev-stand/README.md).
 
-## Не-цели первой версии
+## Качество
 
-- Доказательство сознания или субъективного опыта
-- Неограниченный доступ к хостовой системе
-- Выполнение произвольных действий от имени владельца
-- Multi-agent orchestration ради сложности
-- Дообучение основной LLM во время работы
-- Публичное раскрытие скрытой chain of thought
+- Контрольный набор вопросов — [docs/eval/control-set-v1.jsonl](docs/eval/control-set-v1.jsonl)
+  (5 вопросов c1–c5 с ожидаемыми ответами; описание и флаги честности —
+  [docs/eval/CONTROL-SET.md](docs/eval/CONTROL-SET.md)); прогоняется через `eval-run` на стенде,
+  наблюдения снимает `honesty-report`.
+- Результаты прогонов (подлинные записи) — в `docs/eval/`; состояние матрицы EVAL-замеров — §22.2
+  в [docs/STATUS.md](docs/STATUS.md): sealed-замеры EVAL-1/EVAL-2 провалины, EVAL-3d (curated) —
+  недостаточно выборок; это открытые замеры, не скрытые дефекты.
+- Модель нарушителя: внешняя страница, сообщение человека, LLM, код в sandbox и артефакты прошлых
+  сессий считаются недоверенными; защита — изоляция контейнера, capability-права из профиля,
+  provenance каждой улики, детерминированные правила оценки, наблюдаемость из audit events.
 
-## Статус
+Режимы доступа к интернету:
 
-🚀 **MVP v0.1 (2026-08)** — полный познавательный цикл: вопрос → исследование (LLM + инструменты) → claim → оценка → commit. 57 тестов. Docker Compose.
+| Режим | web.search | Egress |
+|-------|-----------|--------|
+| Sealed | не выдан (есть `memory.search`) | нет |
+| Curated | SearXNG на localhost через research proxy | контролируемый (whitelist+allowlist снапшота) |
+| Open Lab | инструмент выдан, но upstream в текущем коде не вызывается (`modes.py` принудительно `searxng_url=None`); наблюдение обязано честно это говорить | — |
 
-**Что работает:**
-- SQLAlchemy ORM (16 таблиц) + Alembic миграции
-- DB-backed orchestrator с explorer loop (LLM proposes → tool executes → DB persists)
-- Curator LLM с Pydantic schemas и rules engine
-- Tool Broker: bash, python, web_fetch, search (реальное исполнение)
-- Web API (8 эндпоинтов) + Web UI (SPA на `/ui`)
-- RQ Worker (Redis-backed с graceful degradation)
-- Docker Compose (6 сервисов: postgres, redis, web, worker, orchestrator, alembic)
-- GitHub Actions CI
+## Разработка
 
-**Как запустить:** [Quick Start](#quick-start)
+- Python 3.11+, FastAPI + Pydantic, SQLAlchemy + Alembic, PostgreSQL 15+ (asyncpg), пакетный
+  менеджер и venv — uv; тесты — pytest + pytest-xdist (`-n auto`), линт — ruff, типы — mypy
+  strict. Очередей и кэша нет (Redis/RQ удалены из проекта, ADR-0003); контейнер — Docker.
+- Тестовая инфраструктура: контейнер PostgreSQL `noezema-test-db` (127.0.0.1:54329) и образ
+  `noezema-sandbox:test`; dev-контур — `infra/compose.dev.yaml` (БД + fake LLM).
+- Полная проверка перед каждым коммитом ([AGENTS.md §6](AGENTS.md#6-окружение-и-команды)):
+  ruff, mypy strict, наличие sandbox-образа, pytest `not timing` + отдельный `timing`.
+- Ветки и ритуал: ветка разработки `impl/from-scratch`, правила — [AGENTS.md](AGENTS.md).
 
-[Полная спецификация](ARCHITECTURE.md) описывает 22 раздела.
+## Карта документации
 
----
+| Файл | Что это |
+|------|---------|
+| [ARCHITECTURE.md](ARCHITECTURE.md) | исходная спецификация v0.25 (заморожена; расхождения — через ADR) |
+| [docs/adr/README.md](docs/adr/README.md) | индекс ADR 0001–0038 со статусами |
+| [docs/PLAN_FROM_SCRATCH.md](docs/PLAN_FROM_SCRATCH.md) | план вех M0–M7 и задач |
+| [docs/STATUS.md](docs/STATUS.md) | текущее состояние: вехи, матрицы §22.1/§22.2, активная история T7.106+, индекс перенесённого |
+| [docs/STATUS-archive.md](docs/STATUS-archive.md) | закрытые разделы истории побайтово (M0–M6, T7.1–T7.105), оглавление с якорями |
+| [docs/eval/](docs/eval/) | payload-файлы конфигураций, control set, отчёты прогонов и замеров модели |
+| [deploy/dev-stand/README.md](deploy/dev-stand/README.md) | развёртывание dev-стенда: bootstrap, юниты, сессии, активация/откат конфигураций |
 
-## Quick Start
+## Не сделано / дальше
 
-### Требования
+Кратко; полный список открытого — в [docs/STATUS.md](docs/STATUS.md):
 
-- Python 3.11+
-- Docker + Docker Compose
-- Локальная LLM с OpenAI-compatible API (llama.cpp, Ollama, vLLM)
-
-### 1. Клонировать и настроить окружение
-
-```bash
-git clone https://github.com/crowrain/noezema.git
-cd noezema
-cp .env.example .env
-# Отредактируйте .env — минимум LLM_API_BASE и LLM_MODEL
-```
-
-### 2. Поднять стек
-
-```bash
-docker compose -f infra/compose.yaml up -d
-```
-
-Это запустит:
-- **PostgreSQL** (`:5432`) — основная БД
-- **Redis** (`:6379`) — очередь задач RQ
-- **Web API** (`:8000`) — FastAPI + SPA на `/ui`
-- **Worker** — RQ worker для фоновых задач
-- **Orchestrator** — познавательный цикл (запускает сессии)
-- **Alembic** — автозапуск миграций
-
-### 3. Проверить
-
-```bash
-curl http://localhost:8000/
-# {"status":"ok","version":"0.1.0"}
-```
-
-Откройте **Web UI**: http://localhost:8000/ui
-
-### 4. Создать вопрос и запустить сессию
-
-```bash
-curl -X POST http://localhost:8000/api/v1/questions \
-  -H "Content-Type: application/json" \
-  -d '{"statement":"What is the current price of Bitcoin?"}'
-```
-
-Orchestrator подхватит вопрос и начнёт исследование. Прогресс виден в Web UI.
-
-### 5. Локальная разработка (без Docker)
-
-```bash
-# Установить uv
-pip install uv
-
-# Создать виртуалку и зависимости
-uv venv
-uv pip install -e '.[dev]'
-
-# Настроить переменные
-cp .env.example .env
-source .env
-
-# Запустить миграции
-alembic upgrade head
-
-# Запустить Web API
-uvicorn apps.web.app:create_app --factory --port 8000
-
-# Запустить Worker (в другом терминале)
-python -m apps.rq.worker
-
-# Тесты
-pytest tests/ -v
-```
-
-## License
-
-[Apache 2.0](LICENSE)
+- Активация config-v21…config-v28 нигде не выполнена (и активация, и откат — решение менеджера).
+- Регулярные реальные сессии на dev-стенде с замерами нагрузки (прогон control set и
+  `honesty-report` на живой модели) — за оператором.
+- EVAL-матрица не закрыта: sealed-замеры провален, EVAL-3d требует продолжения выборки (§22.2).
+- Старт M4 по плану возможен только после серии реальных MVP-сессий и по решению пользователя.

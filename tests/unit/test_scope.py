@@ -11,8 +11,14 @@ from __future__ import annotations
 
 from datetime import UTC, date, datetime, timedelta, timezone
 
+import pytest
+
+from packages.domain.models.enums import ClaimDateAnchor
 from packages.memory.scope import (
+    DATE_ANCHOR_KEY,
     SCOPE_SCHEMA,
+    anchor_from_scope,
+    derive_claim_as_of,
     derive_claim_scope,
     derive_evidence_scope,
     extract_question_urls,
@@ -126,6 +132,75 @@ def test_extract_question_urls() -> None:
     assert extract_question_urls("без ссылок") == ()
 
 
+# ── URL extraction: parenthesis-balanced URLs (T7.57) ──────────────────
+
+#: the Go source as the smoke corpus names it (question-set-smoke.jsonl,
+#: byte-identical — the case SMOKE-V14 §4.3 turned fatal: the old extractor
+#: cut it at the first «)», the coverage gate then demanded an unfetchable
+#: truncated URL and the Go question lost its claim)
+GO_QUESTION = (
+    "Какой номер носит последняя стабильная версия Go на текущую дату? "
+    "Установи это утверждение строго по этим двум источникам: "
+    "https://go.dev/dl/ и https://ru.wikipedia.org/wiki/Go_(язык_программирования)"
+)
+GO_WIKI = "https://ru.wikipedia.org/wiki/Go_(язык_программирования)"
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        # the corpus case: a Wikipedia-style title with parentheses at the
+        # end of the question is extracted WHOLE (T7.57)
+        pytest.param(GO_QUESTION, ("https://go.dev/dl/", GO_WIKI), id="go-corpus-question"),
+        # the same URL wrapped in the sentence's own parentheses: exactly one
+        # balanced copy — the enclosing «)» never rides into the URL
+        pytest.param(f"Источники: ({GO_WIKI}) и другие.", (GO_WIKI,), id="enclosed-wiki-url"),
+        # enclosing parentheses without inner ones («(см. url)»)
+        pytest.param("см. (https://a.example/x)", ("https://a.example/x",), id="enclosed-plain"),
+        # markdown link syntax: the closing paren belongs to the text
+        pytest.param("[текст](https://a.example/x)", ("https://a.example/x",), id="markdown-link"),
+        # trailing punctuation AFTER a balanced closer is stripped as before
+        pytest.param(f"источник — {GO_WIKI}.", (GO_WIKI,), id="dot-after-closer"),
+        pytest.param(f"{GO_WIKI}, дата из него", (GO_WIKI,), id="comma-after-closer"),
+        # several URLs in one text (the question-set-v3/v4 Rust/R pair)
+        pytest.param(
+            "Сравните https://ru.wikipedia.org/wiki/Rust_(язык_программирования) и "
+            "https://ru.wikipedia.org/wiki/R_(язык_программирования).",
+            (
+                "https://ru.wikipedia.org/wiki/Rust_(язык_программирования)",
+                "https://ru.wikipedia.org/wiki/R_(язык_программирования)",
+            ),
+            id="two-wiki-urls",
+        ),
+        # query + fragment with a balanced title stay intact
+        pytest.param(
+            f"ссылка {GO_WIKI}?action=raw#section.",
+            (f"{GO_WIKI}?action=raw#section",),
+            id="query-and-fragment",
+        ),
+        # nesting beyond one level — the balance counter is general, not a
+        # single-pair special case
+        pytest.param(
+            "см. https://x.example/a(b(c)d)e далее", ("https://x.example/a(b(c)d)e",), id="nested-parens"
+        ),
+        # regression (must stay byte-identical to the old extraction): the
+        # v2 corpus shape — two URLs wrapped in one «(…)», the closer and the
+        # comma after it never ride into either URL
+        pytest.param(
+            "Сколько, согласно этим двум страницам (https://un.org/en/about-us и "
+            "https://ru.wikipedia.org/wiki/Список_государств_—_членов_ООН), государств-членов "
+            "в ООН на текущую дату?",
+            ("https://un.org/en/about-us", "https://ru.wikipedia.org/wiki/Список_государств_—_членов_ООН"),
+            id="v2-enclosed-pair",
+        ),
+        # no URL at all
+        pytest.param("вопрос без ссылок", (), id="no-url"),
+    ],
+)
+def test_extract_question_urls_balanced_parentheses(text: str, expected: tuple[str, ...]) -> None:
+    assert extract_question_urls(text) == expected
+
+
 # ── claim scope derivation ─────────────────────────────────────────────
 
 
@@ -207,6 +282,169 @@ def test_derive_claim_scope_naive_as_of_treated_as_utc() -> None:
         as_of=datetime(2026, 9, 17, 5, 0),  # naive
     )
     assert scope["as_of"] == "2026-09-17"
+
+
+# ── T7.30 (ADR-0016): the claim row's reference datetime ───────────────
+
+
+def test_derive_claim_as_of_explicit_date_wins() -> None:
+    # priority 1: the explicit question date beats BOTH the model's
+    # typed as_of and the session date; the ANCHOR is explicit (T7.32,
+    # ADR-0017: a claim about a fixed point — no reverify deadline)
+    ref = derive_claim_as_of(
+        question="По состоянию на 15 апреля 2026 года: сколько стран в ЕС?",
+        as_of=datetime(2026, 8, 13, 12, 0, tzinfo=UTC),
+        session_date=date(2026, 9, 22),
+    )
+    assert ref.as_of == datetime(2026, 4, 15, tzinfo=UTC)
+    assert ref.anchor is ClaimDateAnchor.EXPLICIT
+
+
+def test_derive_claim_as_of_relative_form_uses_session_date() -> None:
+    # priority 2: a relative form anchors on the SESSION's date on the
+    # host's clock (midnight UTC) — the model's typed as_of (in the
+    # future OR the past) does not shift it; the ANCHOR is relative
+    # (T7.32, ADR-0017: a claim about the present — the only claim
+    # class that gets a reverify deadline)
+    session_date = date(2026, 9, 22)
+    for model_as_of in (
+        datetime(2026, 9, 23, 12, 0, tzinfo=UTC),  # tomorrow
+        datetime(2026, 6, 15, 0, 0, tzinfo=UTC),  # the EVAL-4d artifact
+    ):
+        ref = derive_claim_as_of(
+            question="Какова ключевая ставка Банка России на текущую дату?",
+            as_of=model_as_of,
+            session_date=session_date,
+        )
+        assert ref.as_of == datetime(2026, 9, 22, tzinfo=UTC)
+        assert ref.anchor is ClaimDateAnchor.RELATIVE
+
+
+def test_derive_claim_as_of_relative_form_without_session_date_falls_back() -> None:
+    # fail-closed: a relative form with NO session date available
+    # (session_date=None) has no host anchor — the model's typed as_of
+    # stands (the same fallback the scope has since T7.18); the branch
+    # that PRODUCED the value is the model fallback, so the ANCHOR is
+    # none (T7.32, ADR-0017: no deadline — never a deadline computed
+    # from a value the branch does not own)
+    ref = derive_claim_as_of(
+        question="Какова ключевая ставка Банка России на текущую дату?",
+        as_of=datetime(2026, 6, 15, tzinfo=UTC),
+        session_date=None,
+    )
+    assert ref.as_of == datetime(2026, 6, 15, tzinfo=UTC)
+    assert ref.anchor is ClaimDateAnchor.NONE
+
+
+def test_derive_claim_as_of_dateless_question_keeps_model_as_of() -> None:
+    # priority 3: a question with NO date anchor (neither explicit nor
+    # relative) keeps the model's typed as_of — the Sputnik-1 / release
+    # event date (ADR-0016, fallback unchanged from T7.17/T7.18); the
+    # ANCHOR is none (T7.32, ADR-0017: a fixed point — no reverify
+    # deadline, the "forever overdue" class is gone)
+    ref = derive_claim_as_of(
+        question="Когда был запущен Спутник-1?",
+        as_of=datetime(1957, 10, 4, 19, 28, 34, tzinfo=UTC),
+        session_date=date(2026, 9, 22),
+    )
+    assert ref.as_of == datetime(1957, 10, 4, 19, 28, 34, tzinfo=UTC)
+    assert ref.anchor is ClaimDateAnchor.NONE
+    # naive model as_of is treated as UTC
+    ref_naive = derive_claim_as_of(
+        question="Когда был запущен Спутник-1?",
+        as_of=datetime(1957, 10, 4, 19, 28, 34),
+        session_date=date(2026, 9, 22),
+    )
+    assert ref_naive.as_of == datetime(1957, 10, 4, 19, 28, 34, tzinfo=UTC)
+    assert ref_naive.anchor is ClaimDateAnchor.NONE
+
+
+def test_derive_claim_as_of_no_question_no_as_of_is_none() -> None:
+    # no question at all (no anchor to derive from) and no model
+    # as_of: the reference datetime is None and the ANCHOR is none
+    ref = derive_claim_as_of(question=None, as_of=None, session_date=date(2026, 9, 22))
+    assert ref.as_of is None
+    assert ref.anchor is ClaimDateAnchor.NONE
+
+
+def test_derive_claim_scope_date_is_the_reference_datetime_date_part() -> None:
+    # one function, one source of truth (T7.30): the claim scope's
+    # reference date is the DATE part of derive_claim_as_of — for all
+    # three priorities, explicit / relative / dateless fallback
+    model = datetime(2026, 6, 15, tzinfo=UTC)
+    session_date = date(2026, 9, 22)
+    for question in (
+        "По состоянию на 15 апреля 2026 года: сколько стран в ЕС?",
+        "Какова ключевая ставка Банка России на текущую дату?",
+        "Когда был запущен Спутник-1?",
+    ):
+        ref = derive_claim_as_of(
+            question=question, as_of=model, session_date=session_date
+        )
+        scope = derive_claim_scope(
+            question=question, as_of=model, session_date=session_date
+        )
+        assert scope["as_of"] == ref.as_of.date().isoformat()
+
+
+def test_derive_claim_scope_carries_the_date_anchor() -> None:
+    # T7.32 (ADR-0017): the claim scope persists the ANCHOR of the
+    # branch of derive_claim_as_of (date_anchor) — the write paths
+    # (commit, reassessment) derive the reverify deadline from it.
+    # One function, one source of truth: the scope's anchor is the
+    # same value the direct call returns — no re-derivation.
+    model = datetime(2026, 6, 15, tzinfo=UTC)
+    session_date = date(2026, 9, 22)
+    cases = (
+        (
+            "По состоянию на 15 апреля 2026 года: сколько стран в ЕС?",
+            ClaimDateAnchor.EXPLICIT,
+        ),
+        ("Какова ключевая ставка Банка России на текущую дату?", ClaimDateAnchor.RELATIVE),
+        ("Когда был запущен Спутник-1?", ClaimDateAnchor.NONE),
+    )
+    for question, expected_anchor in cases:
+        ref = derive_claim_as_of(
+            question=question, as_of=model, session_date=session_date
+        )
+        scope = derive_claim_scope(
+            question=question, as_of=model, session_date=session_date
+        )
+        assert ref.anchor is expected_anchor
+        assert scope[DATE_ANCHOR_KEY] == expected_anchor.value
+
+
+def test_anchor_from_scope_reads_stored_anchor() -> None:
+    # T7.32 (ADR-0017): the persistence seam — a stored host scope
+    # carries the anchor verbatim
+    for anchor in ClaimDateAnchor:
+        scope = derive_claim_scope(
+            question="Какова ключевая ставка Банка России на текущую дату?",
+            as_of=datetime(2026, 6, 15, tzinfo=UTC),
+            session_date=date(2026, 9, 22),
+        )
+        scope[DATE_ANCHOR_KEY] = anchor.value
+        assert anchor_from_scope(scope) is anchor
+    # a scope with a GARBAGE value is not trusted — the conservative
+    # default applies (a deadline is kept, never "valid forever" on
+    # the strength of bad data)
+    assert anchor_from_scope({"date_anchor": "garbage"}) is ClaimDateAnchor.RELATIVE
+
+
+def test_anchor_from_scope_legacy_scope_defaults_to_relative() -> None:
+    # T7.32 (ADR-0017): a LEGACY scope (pre-ADR-0017, no date_anchor
+    # key — including the empty scope of a claim with no stored
+    # assessment) is treated as relative — the conservative default:
+    # the deadline is kept/refreshed rather than the claim declared
+    # valid forever on missing data
+    assert anchor_from_scope({}) is ClaimDateAnchor.RELATIVE
+    assert anchor_from_scope({"x": 1}) is ClaimDateAnchor.RELATIVE
+    assert (
+        anchor_from_scope(
+            {"scope_schema": "host-scope-v1", "as_of": "2026-01-01", "source_domains": []}
+        )
+        is ClaimDateAnchor.RELATIVE
+    )
 
 
 # ── evidence scope derivation ──────────────────────────────────────────

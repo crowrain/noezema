@@ -11,6 +11,7 @@ import json
 import sys
 import uuid
 from pathlib import Path
+from typing import Any
 
 import click
 
@@ -223,7 +224,10 @@ def wake_tick(node_owner: str | None, data_root: str | None) -> None:
         sys.exit(EXIT_USAGE_ERROR)
 
     from apps.orchestrator.main import build_orchestrator
+    from apps.orchestrator.node_guard import NodeSessionGuard, NodeSessionGuardError
     from apps.orchestrator.scheduler import (
+        REASON_SESSION_IN_PROGRESS,
+        WORKSPACE_SUBDIR,
         ReassessmentAdmissionError,
         RepairAdmissionError,
         WakeScheduleError,
@@ -231,7 +235,14 @@ def wake_tick(node_owner: str | None, data_root: str | None) -> None:
         data_root_from_env,
         node_owner_from_env,
     )
+    from apps.orchestrator.tool_executors import (
+        SANDBOX_MODE,
+        ToolExecutorConfigError,
+        ToolExecutorUnavailableError,
+        tool_executor_mode_from_env,
+    )
     from packages.domain.services.config import ConfigError
+    from packages.memory.activation import ActivationInFlightError
 
     owner = node_owner or node_owner_from_env()
     root = Path(data_root) if data_root else data_root_from_env()
@@ -260,34 +271,84 @@ def wake_tick(node_owner: str | None, data_root: str | None) -> None:
             click.echo(f"wake-tick: {decision.action} ({decision.reason})")
             return 0
 
-        async with factory() as db, db.begin():
-            await db.execute(
-                text(
-                    "INSERT INTO system_constants (key, value) VALUES ('node_state', :v) "
-                    "ON CONFLICT (key) DO UPDATE SET value = :v"
-                ),
-                {"v": "session_running"},
-            )
-
-        orchestrator, gateway = build_orchestrator(factory, root / "workspace")
+        # T7.61(а) (§5.2.1): an admitted wake is NOT a free session lane. `decide` only sees COMMITTED
+        # rows, and another entry point (the web's «wake now») keeps its session row uncommitted until
+        # COMMITTING — that is exactly how the stand started two sessions 36 s apart on one node. The
+        # node's advisory lock is taken between the admission decision and the marker write and held for
+        # the whole session; it is given back in the finally below on every path (normal finish, an
+        # exception inside the session, the activation-rejected skip, a fail-closed exit) — and by
+        # PostgreSQL itself if this unit is killed mid-session.
+        guard = NodeSessionGuard(engine, owner)
         try:
-            outcome = await orchestrator.run_session()
-        except Exception as exc:
-            # Infra failure around the session; the session row is left to the
-            # reconciler, and the failure counts for the backoff.
-            final_state = "failed"
-            click.echo(f"wake-tick: session error ({type(exc).__name__}: {exc})", err=True)
-        else:
-            final_state = outcome.final_state.value
-        finally:
-            await gateway.close()
+            lane_free = await guard.acquire()
+        except NodeSessionGuardError as exc:
+            # Exclusivity cannot even be checked: no session (§3 «Host-контур — fail-closed»).
+            click.echo(f"wake-tick: fail-closed ({exc})", err=True)
+            return 78
+        if not lane_free:
+            async with factory() as db:
+                await WakeScheduler(db, node_owner=owner, data_root=root).record_guard_skip(
+                    source="scheduled", lock_name=guard.name
+                )
+            click.echo(f"wake-tick: skip ({REASON_SESSION_IN_PROGRESS})")
+            return 0
 
-        async with factory() as db:
-            node_state = await WakeScheduler(db, node_owner=owner, data_root=root).record_session_result(
-                final_state=final_state, now=datetime.now(UTC)
-            )
-        click.echo(f"wake-tick: session -> {final_state} (node_state={node_state})")
-        return 0 if final_state in ("succeeded", "succeeded_partial") else 1
+        try:
+            # T7.58 (ADR-0023): the tool executor is resolved at build time
+            # (NOEZEMA_TOOL_EXECUTOR). Sandbox mode refuses to start a session when
+            # the engine/image is unusable — that refusal happens BEFORE the node is
+            # marked session_running and before any tool runs, so it leaves no wedged
+            # node state and never falls back to the unisolated dev stub.
+            try:
+                executor_mode = tool_executor_mode_from_env()
+                orchestrator, gateway = build_orchestrator(factory, root / WORKSPACE_SUBDIR)
+            except (ToolExecutorConfigError, ToolExecutorUnavailableError) as exc:
+                click.echo(f"wake-tick: tool executor fail-closed ({exc})", err=True)
+                return 78
+            if executor_mode == SANDBOX_MODE:
+                # process-log label only: no new audit/fingerprint fields (T7.58, ADR-0023)
+                click.echo("wake-tick: tool executor=sandbox (one container per session)")
+
+            async with factory() as db, db.begin():
+                await db.execute(
+                    text(
+                        "INSERT INTO system_constants (key, value) VALUES ('node_state', :v) "
+                        "ON CONFLICT (key) DO UPDATE SET value = :v"
+                    ),
+                    {"v": "session_running"},
+                )
+
+            try:
+                outcome = await orchestrator.run_session()
+            except ActivationInFlightError as exc:
+                # T7.26 (ADR-0013): the wake was granted on a stale read and a
+                # drain was published before the admission — the session did
+                # NOT start (no session row, no admission record). This is a
+                # SKIP, not a failure: no record_session_result (the drain
+                # must not accumulate consecutive_failures and auto-pause the
+                # node); the next tick's admission sees the slot and skips.
+                await gateway.close()
+                click.echo(f"wake-tick: admission rejected ({exc}); waiting for the next tick")
+                return 0
+            except Exception as exc:
+                # Infra failure around the session; the session row is left to the
+                # reconciler, and the failure counts for the backoff.
+                final_state = "failed"
+                click.echo(f"wake-tick: session error ({type(exc).__name__}: {exc})", err=True)
+            else:
+                final_state = outcome.final_state.value
+            finally:
+                await gateway.close()
+
+            async with factory() as db:
+                node_state = await WakeScheduler(
+                    db, node_owner=owner, data_root=root
+                ).record_session_result(final_state=final_state, now=datetime.now(UTC))
+            click.echo(f"wake-tick: session -> {final_state} (node_state={node_state})")
+            return 0 if final_state in ("succeeded", "succeeded_partial") else 1
+        finally:
+            # The lane is released AFTER the outcome accounting (§5.2.1 backoff), never before it.
+            await guard.release()
 
     async def _run() -> int:
         try:
@@ -353,19 +414,532 @@ def reassessment_tick(batch_size: int, lease_seconds: int) -> None:
     sys.exit(code)
 
 
+@main.command("independence-preview")
+@click.option(
+    "--apply",
+    is_flag=True,
+    default=False,
+    help="Применить: существующий каскад §11.3 (головы в pending + задачи переоценки) "
+    "и один рабочий батч; повторный предпросмотр после обработки.",
+)
+def independence_preview(apply: bool) -> None:
+    """Предпросмотр смены групп независимости (T7.117 часть б, ADR-0029 §22).
+
+    Read-only по умолчанию: для каждого утверждения с действующей головой
+    effective-снапшота сравнивает записанные группы независимости и оценку с тем, что
+    дадут чистые группировщик и правила при новом приоритете «запись значения выше
+    страничного указателя». Ничего не пишет. --apply применяет перечисленное существующим
+    каскадом `apply_source_graph_change` (тот же путь, что у переатрибуции), затем
+    выполняет один рабочий батч и повторяет предпросмотр: он обязан стать пустым.
+    """
+    import asyncio
+    import os
+
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    url = os.environ.get("NOEZEMA_DATABASE_URL", "")
+    if not url:
+        click.echo("NOEZEMA_DATABASE_URL is not set", err=True)
+        sys.exit(EXIT_USAGE_ERROR)
+
+    from packages.domain.db.uow import transaction
+    from packages.domain.services.audit import AuditService
+    from packages.memory.independence_preview import (
+        IndependencePreviewError,
+        IndependencePreviewRow,
+        apply_independence_preview,
+        preview_independence_changes,
+    )
+    from packages.memory.reassessment import run_reassessment_batch
+
+    engine = create_async_engine(url)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    def _fmt_partition(partition: tuple[tuple[str, ...], ...]) -> str:
+        if not partition:
+            return "нет источных улик"
+        return " | ".join("«" + ", ".join(items) + "»" for items in partition)
+
+    def _print_row(row: IndependencePreviewRow) -> None:
+        statement = " ".join(row.statement.split())
+        if len(statement) > 90:
+            statement = statement[:89] + "…"
+        click.echo(f"утверждение {str(row.claim_id)[:8]} · {row.claim_type}")
+        click.echo(f"    утверждение: {statement}")
+        if row.groups_changed:
+            click.echo(f"    группы было ({len(row.old_groups)}): {_fmt_partition(row.old_groups)}")
+            click.echo(f"    группы стало ({len(row.new_groups)}): {_fmt_partition(row.new_groups)}")
+        else:
+            click.echo("    группы не изменились")
+        for switch in row.parent_switches:
+            was = switch.pointer_parent_uri or "нет родителя по строке"
+            click.echo(
+                f"    улика {switch.evidence_uri}: родитель по указателю «{was}» → "
+                f"по записи «{switch.record_parent_uri}»"
+            )
+        if row.evaluation_computed:
+            click.echo(
+                f"    оценка было: {row.persisted_grade} {row.persisted_status} "
+                f"({row.persisted_confidence:.2f}) → стало: {row.new_grade} {row.new_status} "
+                f"({(row.new_confidence or 0.0):.2f})"
+            )
+        else:
+            click.echo(
+                f"    оценка было: {row.persisted_grade} {row.persisted_status} "
+                f"({row.persisted_confidence:.2f}); {row.evaluation_note or ''}"
+            )
+
+    def _print_totals(report: Any) -> None:
+        click.echo(
+            f"итог: утверждений с изменением групп: {report.groups_changed_count}; "
+            f"с изменением оценки: {report.assessment_changed_count}; "
+            f"проверено утверждений: {report.claims_checked}"
+        )
+
+    async def _run() -> int:
+        try:
+            async with factory() as db:
+                report = await preview_independence_changes(db)
+            snap = str(report.config_snapshot_id)[:8] if report.config_snapshot_id else "—"
+            click.echo(
+                f"independence-preview: только чтение (снимок правил {snap}); "
+                f"утверждений с изменениями: {len(report.rows)}"
+            )
+            for row in report.rows:
+                _print_row(row)
+            if not report.rows:
+                click.echo(
+                    "(изменений нет: записанные группы и оценки совпадают с пересчётом по новому правилу)"
+                )
+            _print_totals(report)
+
+            if not apply:
+                return 0
+            if not report.rows:
+                click.echo("(применять нечего: предпросмотр пуст)")
+                return 0
+            async with factory() as db, transaction(db):
+                cascade = await apply_independence_preview(db, AuditService(db), rows=report.rows)
+            click.echo(
+                f"каскад §11.3: затронуто утверждений: {cascade.affected_claims}; "
+                f"снятых голов: {cascade.invalidated}; задач переоценки создано: {cascade.jobs_created}"
+            )
+            if cascade.jobs_created:
+                async with factory() as db:
+                    outcome = await run_reassessment_batch(db)
+                click.echo(
+                    f"рабочий переоценки: processed={outcome.processed} completed={outcome.completed} "
+                    f"retried={outcome.retried} blocked={outcome.blocked} deferred={outcome.deferred}"
+                )
+            async with factory() as db:
+                after = await preview_independence_changes(db)
+            if after.rows:
+                click.echo(f"повторный предпросмотр после обработки: {len(after.rows)} изменений")
+                for row in after.rows:
+                    _print_row(row)
+            else:
+                click.echo(
+                    "повторный предпросмотр после обработки: пусто (оценки перестроены по новому правилу)"
+                )
+            return 0
+        except IndependencePreviewError as exc:
+            click.echo(f"independence-preview: отказ — {exc}", err=True)
+            return 2
+        finally:
+            # пул закрываем в том же event loop, где были соединения (ловушка CliRunner-тестов)
+            await engine.dispose()
+
+    sys.exit(asyncio.run(_run()))
+
+
+@main.command("research-reattribute")
+@click.option(
+    "--since",
+    required=True,
+    help="Начало окна журнала в ISO (например 2026-10-07T14:30:00+00:00 или …Z).",
+)
+@click.option("--dry-run", is_flag=True, default=False, help="Только план: ничего не пишет.")
+@click.option(
+    "--evidence-level",
+    is_flag=True,
+    default=False,
+    help=(
+        "T7.78: решать производность для каждого доказательства (утверждение + источник), "
+        "а не для всей страницы."
+    ),
+)
+def research_reattribute(since: str, dry_run: bool, evidence_level: bool) -> None:
+    """Переатрибуция происхождения прочитанного (T7.77 — страница, T7.78 — доказательство).
+
+    По умолчанию (`--evidence-level` не задан): пересматриваются решения ПРЕЖНЕЙ версии страничного
+    детектора — с T7.85 это любое решение, записанное методом, который уже не текущий (v1 из T7.77
+    и v2 из T7.78), а не одна «битая» v1. Просматриваются события `research_fetch_completed` окна
+    (последний снимок на источник), сохранённый нормализованный текст перечитывается и решение
+    принимается заново текущим детектором. Указатель производности проставляется тем же кодом, что
+    и при fetch (`apps/research_proxy/derivative_pointer.py`), только ещё не размеченным строкам
+    источников: существующий указатель не перешагивается никогда.
+
+    С `--evidence-level`: производится поуровневая атрибуция (T7.78, ADR-0029). Для каждого
+    доказательства окна (утверждение + прочитанный источник) детектор значения смотрит в
+    сохранённом тексте страницы ту атрибуцию, которая касается ЧИСЛА утверждения, и записывает на
+    улике «этот фрагмент — пересказ такого-то первоисточника» (`evidence.scope.value_attribution`).
+    С T7.85 перечитываются и улики, решение по которым записано ПРЕЖНЕЙ версией метода значений:
+    строка отчёта показывает «было: derivative → Росстат (host-value-attribution-v1)». Если свежий
+    метод отказался решать, прежняя запись сохраняется и строка честно это называет — знание не
+    удаляется. Строки источников не размечаются: страница остаётся независимой для значений,
+    которые её собственная оценка. Искомый первоисточник разрешается тем же механизмом, что и при
+    fetch (прочитанная публикация либо якорь объявленного первоисточника); при том же первоисточнике
+    уже существующий родитель улики сохраняется, а не подменяется свежим якорем.
+
+    Источники и улики, которых касается действующая коррекция оператора (`source_graph_corrections`,
+    ADR-0031), в обоих режимах выводятся отдельной строкой «под коррекцией оператора — не трогаем»
+    и не изменяются: автоматический прогон не отменяет решение оператора молча.
+
+    В обоих режимах пересчёт оценок — существующим механизмом: каскад §11.3
+    (`apply_source_graph_change`, тип журнала `source_graph_changed`) и рабочий переоценки.
+    Идемпотентно: повторный запуск ничего не меняет. Новых типов событий, миграций и правок
+    правил нет.
+
+    exit 0  -> прогон завершён (dry-run или запись)
+    exit 2  -> NOEZEMA_DATABASE_URL не задан, --since не ISO, каталог артефактов недоступен
+    """
+    import asyncio
+    import os
+
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    url = os.environ.get("NOEZEMA_DATABASE_URL", "")
+    if not url:
+        click.echo("NOEZEMA_DATABASE_URL is not set", err=True)
+        sys.exit(EXIT_USAGE_ERROR)
+
+    from apps.orchestrator.scheduler import artifacts_root_from_env
+    from apps.research_proxy.reattribution import (
+        ReattributionError,
+        parse_since,
+        reattribute_evidence_window,
+        reattribute_window,
+    )
+    from packages.artifacts.store import FilesystemArtifactStore
+
+    try:
+        since_ts = parse_since(since)
+    except ReattributionError as exc:
+        click.echo(str(exc), err=True)
+        sys.exit(EXIT_USAGE_ERROR)
+
+    try:
+        store = FilesystemArtifactStore(artifacts_root_from_env())
+    except OSError as exc:
+        click.echo(f"каталог артефактов недоступен ({artifacts_root_from_env()}): {exc}", err=True)
+        sys.exit(EXIT_USAGE_ERROR)
+
+    engine = create_async_engine(url)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    def _print_report(report: Any) -> None:
+        """Отчёт команды: две формы (страница / доказательство) одного пересчёта."""
+        click.echo(f"research-reattribute: окно с {report.since}{' (только план)' if report.dry_run else ''}")
+        for row in report.rows:
+            became = row.now_status + (f" → {row.primary_name}" if row.primary_name else "")
+            if evidence_level:
+                statement = " ".join(row.claim_statement.split())
+                if len(statement) > 90:
+                    statement = statement[:89] + "…"
+                head = f"утверждение {row.claim_id[:8]} · {row.canonical_uri}"
+                click.echo(head)
+                click.echo(f"    утверждение: {statement}")
+                click.echo(f"    было: {row.was_status}  стало: {became}  [{row.action}]")
+            else:
+                was = row.was_status + (f" ({row.was_method})" if row.was_method else "")
+                click.echo(f"{row.canonical_uri}\n    было: {was}  стало: {became}  [{row.action}]")
+        if not report.rows:
+            click.echo("(в окне нечего переатрибуцировать)")
+        if evidence_level:
+            click.echo(
+                f"доказательств с новым решением: {report.changed_evidence}; "
+                f"изменено источников: {len(report.changed_source_ids)}; "
+                f"затронуто утверждений: {report.affected_claims}; "
+                f"снятых голов: {report.invalidated_heads}; задач переоценки создано: {report.jobs_created}"
+            )
+        else:
+            click.echo(
+                f"изменено источников: {len(report.changed_source_ids)}; "
+                f"затронуто утверждений: {report.affected_claims}; "
+                f"снятых голов: {report.invalidated_heads}; задач переоценки создано: {report.jobs_created}"
+            )
+        if report.worker is not None:
+            outcome = report.worker
+            click.echo(
+                f"рабочий переоценки: processed={outcome.processed} completed={outcome.completed} "
+                f"retried={outcome.retried} blocked={outcome.blocked} deferred={outcome.deferred}"
+            )
+
+    async def _run() -> int:
+        report: Any  # две формы отчёта: ReattributionReport (страница) / EvidenceReattributionReport
+        try:
+            if evidence_level:
+                report = await reattribute_evidence_window(
+                    factory, store, since=since_ts, dry_run=dry_run
+                )
+            else:
+                report = await reattribute_window(factory, store, since=since_ts, dry_run=dry_run)
+        finally:
+            # пул закрываем в том же event loop, где были соединения (ловушка CliRunner-тестов)
+            await engine.dispose()
+        _print_report(report)
+        return 0
+
+    sys.exit(asyncio.run(_run()))
+
+
+@main.command("honesty-report")
+@click.option(
+    "--since",
+    default=None,
+    metavar="ISO",
+    help="Начало окна в ISO (например 2026-10-14T00:00:00+00:00 или 2026-10-14): берутся вопросы, "
+    "у которых есть сессии, начатые не раньше.",
+)
+@click.option(
+    "--questions",
+    default=None,
+    metavar="id,id,...",
+    help="Явный список id вопросов через запятую.",
+)
+@click.option(
+    "--control-tag",
+    default=None,
+    metavar="TAG",
+    help="Метка контрольного прогона: берутся только вопросы, чей текст заканчивается на "
+    "' (контроль TAG)'.",
+)
+@click.option("--json", "json_path", default=None, metavar="ФАЙЛ", help="Записать JSON отчёта в этот файл.")
+@click.option(
+    "--baseline",
+    "baseline_path",
+    default=None,
+    metavar="ФАЙЛ",
+    help="Прежний JSON-отчёт той же схемы: к выводу добавляется сравнение итогов «было → стало».",
+)
+def honesty_report_cmd(
+    since: str | None,
+    questions: str | None,
+    control_tag: str | None,
+    json_path: str | None,
+    baseline_path: str | None,
+) -> None:
+    """Отчёт честности по уже записанным фактам (T7.118; ТОЛЬКО ЧТЕНИЕ).
+
+    Читает записанное и ничего не пишет: модуль `packages.memory.honesty_report` не содержит ни
+    одного INSERT/UPDATE/DELETE, не создаёт audit-событий и не меняет оценки, группы независимости
+    или карточку ответа. Показывает: какие вопросы взяты, ответ есть или не записан, сессии
+    (состояние, причина завершения, длительность, вызовы модели и токены), утверждения по отноше-
+    нию к сессиям (созданные / переиспользованные / перепроверенные / опертые) с действующей
+    оценкой активного снимка правил (E-уровень, статус, причины из ленты, подпись о производителе),
+    состав групп независимости для E2+ (источник → родитель по записи значения или страничный
+    указатель) и шаги исследователя из ленты событий (поиски и их доли, поиски без последующего
+    чтения, чтения и отказы по хостам, повторные заходы, отказы ворот).
+
+    Флаги Ф1–Ф3 — эвристики отчёта («требует ручной проверки»), а не вердикты оценки: их границы
+    и ограничения описаны в шапке модуля. Ровно один критерий отбора обязателен.
+
+    exit 0  -> отчёт собран
+    exit 2  -> NOEZEMA_DATABASE_URL не задан, критерий отбора не задан или испорчен, потолки
+              отбора превышены
+    exit 1  -> baseline-файл не читается или его схема не совпадает со схемой отчёта
+    """
+    import asyncio
+    import os
+
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from packages.memory.honesty_report import (
+        HonestyReportError,
+        collect_honesty_report,
+        load_baseline,
+        parse_since,
+        render_markdown,
+    )
+
+    url = os.environ.get("NOEZEMA_DATABASE_URL", "")
+    if not url:
+        click.echo("NOEZEMA_DATABASE_URL is not set", err=True)
+        sys.exit(EXIT_USAGE_ERROR)
+
+    question_ids: list[uuid.UUID] = []
+    if questions:
+        for raw in questions.split(","):
+            token = raw.strip()
+            if not token:
+                continue
+            try:
+                question_ids.append(uuid.UUID(token))
+            except ValueError:
+                click.echo(f"--questions: '{token}' — не uuid вопроса", err=True)
+                sys.exit(EXIT_USAGE_ERROR)
+    if since is None and not question_ids and control_tag is None:
+        click.echo("нужен хотя бы один критерий отбора: --since, --questions или --control-tag", err=True)
+        sys.exit(EXIT_USAGE_ERROR)
+
+    try:
+        since_ts = parse_since(since) if since is not None else None
+    except HonestyReportError as exc:
+        click.echo(f"honesty-report: {exc}", err=True)
+        sys.exit(EXIT_USAGE_ERROR)
+
+    baseline_doc: dict[str, Any] | None = None
+    if baseline_path is not None:
+        try:
+            baseline_doc = dict(load_baseline(baseline_path))
+        except HonestyReportError as exc:
+            click.echo(f"honesty-report: {exc}", err=True)
+            sys.exit(1)
+
+    engine = create_async_engine(url)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    async def _run() -> int:
+        try:
+            async with factory() as db:
+                report = await collect_honesty_report(
+                    db, since=since_ts, question_ids=question_ids, control_tag=control_tag
+                )
+        except HonestyReportError as exc:
+            click.echo(f"honesty-report: {exc}", err=True)
+            return EXIT_USAGE_ERROR
+        finally:
+            # пул закрываем в том же event loop, где были соединения (ловушка CliRunner-тестов)
+            await engine.dispose()
+        if json_path is not None:
+            try:
+                Path(json_path).write_text(
+                    json.dumps(report.to_dict(), ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+                )
+            except OSError as exc:
+                click.echo(f"honesty-report: JSON-файл не записан ({json_path}): {exc}", err=True)
+                return EXIT_USAGE_ERROR
+        click.echo(render_markdown(report, baseline_doc))
+        return 0
+
+    sys.exit(asyncio.run(_run()))
+
+
+@main.command("reconcile-tick")
+@click.option(
+    "--max-probes", default=5, show_default=True, help="Probes per stuck session (fresh connection each)."
+)
+@click.option(
+    "--lock-timeout-ms", default=2000, show_default=True, help="Row-lock timeout per probe."
+)
+def reconcile_tick(max_probes: int, lock_timeout_ms: int) -> None:
+    """Run one reconciliation tick (T2.20, T7.24, §5.2.2).
+
+    Finds sessions stuck at the commit boundary (committing /
+    reconciling_commit — a nonterminal session blocks admission,
+    fail-closed) and drives the fenced probe loop over each: fresh
+    connection per probe, live finalizer ≠ rollback, transient outcomes
+    (finalizer_in_progress / database_unavailable) retried with
+    exponential backoff + jitter.
+
+    exit 0  -> nothing to do, or every stuck session resolved
+               (committed_accepted / aborted / no_attempt)
+    exit 1  -> still transient after all probes (the next tick retries)
+               or the database was unreachable at the find probe
+    exit 78 -> records_inconsistent — an invariant was broken; a human
+               is required (critical alert recorded by the protocol)
+    """
+    import asyncio
+    import os
+
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    url = os.environ.get("NOEZEMA_DATABASE_URL", "")
+    if not url:
+        click.echo("NOEZEMA_DATABASE_URL is not set", err=True)
+        sys.exit(EXIT_USAGE_ERROR)
+
+    from packages.domain.services.audit import AuditService
+    from packages.domain.services.reconciler import reconcile_tick as run_reconcile_tick
+
+    engine = create_async_engine(url)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    async def _run() -> int:
+        try:
+            result = await run_reconcile_tick(
+                factory,
+                lambda db: AuditService(db),
+                max_probes=max_probes,
+                lock_timeout_ms=lock_timeout_ms,
+            )
+        except Exception as exc:
+            click.echo(
+                f"reconcile-tick: database_unavailable ({type(exc).__name__}: {str(exc)[:200]})",
+                err=True,
+            )
+            return 1
+        for outcome in (*result.resolved, *result.transient, *result.inconsistent):
+            line = f"reconcile-tick: {str(outcome.session_id)[:8]} {outcome.outcome}"
+            if outcome.detail:
+                line += f" ({outcome.detail[:200]})"
+            click.echo(line)
+        if not (result.resolved or result.transient or result.inconsistent):
+            click.echo("reconcile-tick: nothing to do (no stuck sessions)")
+            return 0
+        click.echo(
+            f"reconcile-tick: resolved={len(result.resolved)} "
+            f"transient={len(result.transient)} inconsistent={len(result.inconsistent)}"
+        )
+        if result.inconsistent:
+            return 78
+        if result.transient:
+            return 1
+        return 0
+
+    try:
+        code = asyncio.run(_run())
+    finally:
+        asyncio.run(engine.dispose())
+    sys.exit(code)
+
+
 @main.command("activate-online")
 @click.option("--payload", "payload_file", required=True, type=click.Path(exists=True))
 @click.option("--reason", required=True)
-def activate_online(payload_file: str, reason: str) -> None:
+@click.option(
+    "--drain-wait-seconds",
+    default=2400,  # keep in sync: packages.memory.activation.DEFAULT_DRAIN_WAIT_SECONDS
+    show_default=True,
+    help=(
+        "T7.26 (ADR-0013): the budget for the drain wait — the bounded wait for "
+        "the window BETWEEN sessions (the durable activation intent is "
+        "published first, then the activation waits for the in-flight session "
+        "to end). On timeout the intent is cancelled (slot cleared, candidate "
+        "stays draft) and exit 1 is returned — retry later. Size it to cover "
+        "the longest in-flight session (phase deadline + margin); a serial "
+        "eval series needs this so the mid-run flip can land."
+    ),
+)
+def activate_online(payload_file: str, reason: str, drain_wait_seconds: int) -> None:
     """Run an ONLINE config change (T4.5, §8.7.2; runtime is live, root).
 
     Crash-idempotent: the run resumes from the candidate state
     (preparing_heads / ready / publishing / post_publish). The
     activating slot quiesces the worker and sessions for the whole
     prepare → flip → post-publish window; the slot clears in the
-    terminal cleanup. exit 1 means the activation failed (or is
-    blocked — the repair lane completes a post_publish_blocked
-    manifest).
+    terminal cleanup.
+
+    T7.26 (ADR-0013): the run first publishes the durable activation
+    intent (the DRAIN — the fenced slot; the candidate stays draft) and
+    then waits, bounded by ``--drain-wait-seconds``, for the window
+    between sessions (zero active sessions / admission records /
+    unresolved attempts). On timeout the intent is cancelled and the
+    error is clear — the next call re-publishes the drain.
+
+    exit 1 means the activation failed (drain timeout, pre-publish
+    failure) or is blocked (the repair lane completes a
+    post_publish_blocked manifest).
     """
     import asyncio
     import json
@@ -391,7 +965,12 @@ def activate_online(payload_file: str, reason: str) -> None:
         async with factory() as db:
             audit = AuditService(db)
             try:
-                result = await act.run_online_change(db, audit, requested_payload=payload)
+                result = await act.run_online_change(
+                    db,
+                    audit,
+                    requested_payload=payload,
+                    drain_wait_seconds=drain_wait_seconds,
+                )
             except act.ActivationError as exc:
                 click.echo(f"activate-online failed: {exc}", err=True)
                 return 1
@@ -834,6 +1413,254 @@ def blind_sample(run_ref: str, out_file: str | None, fragment_chars: int) -> Non
     sys.exit(code)
 
 
+@main.command("ask")
+@click.argument("text")
+@click.option(
+    "--priority",
+    default=0,
+    show_default=True,
+    type=int,
+    help="FIFO rank (higher is served earlier, §5.3.2): the operator's way to put a question forward.",
+)
+def ask(text: str, priority: int) -> None:
+    """T7.59: put an operator question into the FIFO queue (origin 'message').
+
+    Thin wrapper over the same intake service as POST /api/v1/questions
+    (packages/domain/services/question_intake.py): validation (non-empty
+    stripped text, length and priority bounds), exact-text dedup — a repeat
+    returns the id already in the queue instead of creating a duplicate — and
+    the queue position, i.e. the place the FIFO selector will actually serve
+    it from (§5.3.2). Needs NOEZEMA_DATABASE_URL; exit 2 on a rejected
+    formulation. No LLM and no session are started: the next wake takes the
+    question (or `wake-tick` runs immediately if the schedule is due).
+    """
+    import asyncio
+    import os
+
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    url = os.environ.get("NOEZEMA_DATABASE_URL", "")
+    if not url:
+        click.echo("NOEZEMA_DATABASE_URL is not set", err=True)
+        sys.exit(EXIT_USAGE_ERROR)
+
+    from packages.domain.db.uow import transaction
+    from packages.domain.services.question_intake import (
+        QuestionIntakeError,
+        put_operator_question,
+        queue_position,
+    )
+
+    engine = create_async_engine(url)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    async def _run() -> int:
+        try:
+            async with factory() as db, transaction(db):
+                question, created = await put_operator_question(
+                    db, raw_text=text, raw_priority=priority
+                )
+                position = await queue_position(db, question)
+        except QuestionIntakeError as exc:
+            click.echo(f"ask: {exc}", err=True)
+            return EXIT_USAGE_ERROR
+        label = "question accepted" if created else "already in the queue (idempotent replay)"
+        click.echo(f"ask: {label}")
+        click.echo(f"  id       {question.id}")
+        click.echo(
+            f"  origin   {question.origin} · state {question.state} · priority {question.priority}"
+        )
+        click.echo(
+            "  position "
+            + (
+                str(position)
+                if position is not None
+                else "— (not a candidate, or deeper than the queue window)"
+            )
+        )
+        return 0
+
+    try:
+        code = asyncio.run(_run())
+    finally:
+        asyncio.run(engine.dispose())
+    sys.exit(code)
+
+
+@main.command("claim-dispute")
+@click.option("--claim", "claim_ref", required=True, help="Утверждение: uuid или начало uuid из списка знания.")
+@click.option(
+    "--primary",
+    required=True,
+    help=(
+        "Адрес первоисточника: улика утверждения или производитель, которому хост "
+        "уже приписал эту улику (оба перечислены в блоке происхождения)."
+    ),
+)
+@click.option(
+    "--retelling",
+    required=True,
+    help="Адрес страницы-пересказа, которую оператор считает второй «независимой» опорой.",
+)
+@click.option(
+    "--reason",
+    required=True,
+    help="Причина спора своими словами: почему это пересказ. Остаётся в истории и видна людям.",
+)
+def claim_dispute(claim_ref: str, primary: str, retelling: str, reason: str) -> None:
+    """T7.81: оспорить действующее утверждение фактом о происхождении источника (§11.3).
+
+    Operator instrument for a contested claim on the stand. The operator does not
+    grade anything: they assert a FACT about a source ("this page retells that one"),
+    which becomes a `source_graph_corrections` row with this host as actor, the read
+    artifact of the retelling page as basis and an audit event carrying the reason —
+    exactly the operator lever §11.3 allows. The existing cascade then requeues every
+    affected assessment for recomputation and queues a recheck question that quotes the
+    statement; the rules engine decides the outcome (fewer independence groups →
+    `insufficient_independence` → E1/hypothesis, so the «Проверено» badge goes away
+    because independence went away). Idempotent by the correction's natural key: a
+    repeat says so instead of duplicating anything. Reversible with
+    `noezemactl claim-dispute-cancel`. Needs NOEZEMA_DATABASE_URL; exit 2 on refusal.
+    """
+    import asyncio
+    import os
+
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    url = os.environ.get("NOEZEMA_DATABASE_URL", "")
+    if not url:
+        click.echo("NOEZEMA_DATABASE_URL is not set", err=True)
+        sys.exit(EXIT_USAGE_ERROR)
+
+    from packages.domain.db.uow import transaction
+    from packages.domain.services.audit import AuditService
+    from packages.domain.services.question_intake import queue_position
+    from packages.memory.dispute import ACTOR_HOSTCTL, DisputeError, dispute_claim
+
+    claim_id = _claim_uuid(claim_ref)
+    engine = create_async_engine(url)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    async def _run() -> int:
+        from packages.domain.models.questions import ORMQuestion
+
+        try:
+            async with factory() as db, transaction(db):
+                outcome = await dispute_claim(
+                    db,
+                    AuditService(db),
+                    claim_id=claim_id,
+                    primary_uri=primary,
+                    retelling_uri=retelling,
+                    reason=reason,
+                    actor=ACTOR_HOSTCTL,
+                )
+                question = await db.get(ORMQuestion, outcome.question_id)
+                position = await queue_position(db, question) if question is not None else None
+        except DisputeError as exc:
+            click.echo(f"claim-dispute: отказ ({exc.code}) {exc.detail}".rstrip(), err=True)
+            return EXIT_USAGE_ERROR
+        label = "уже оспорено этим оператором (идемпотентный повтор)" if outcome.replayed else "оспорено"
+        click.echo(f"claim-dispute: {label}")
+        click.echo(f"  утверждение   {outcome.claim_id}")
+        pair = f"{outcome.retelling_uri} → {outcome.primary_uri}"
+        click.echo(f"  коррекция     {outcome.correction_id} (merge: {pair})")
+        click.echo(f"  актор         {outcome.actor}")
+        click.echo(f"  причина       {outcome.reason}")
+        click.echo(
+            f"  перепроверка  снятых оценок: {outcome.invalidated}, затронутых утверждений: "
+            f"{outcome.affected_claims}, заведённых задач пересчёта: {outcome.jobs_created}"
+        )
+        state = "новый" if outcome.question_created else "уже в очереди"
+        suffix = f", позиция {position}" if position is not None else ""
+        click.echo(f"  вопрос        {outcome.question_id} ({state}{suffix})")
+        click.echo(
+            "  дальше        оценку пересчитают правила на ближайшем maint-тике "
+            "(noezemactl reassessment-tick); бейдж меняется только вместе с ней"
+        )
+        return 0
+
+    try:
+        code = asyncio.run(_run())
+    finally:
+        asyncio.run(engine.dispose())
+    sys.exit(code)
+
+
+@main.command("claim-dispute-cancel")
+@click.option("--claim", "claim_ref", required=True, help="Утверждение: uuid или начало uuid.")
+@click.option("--reason", default=None, help="Почему спор снимается (по желанию; записывается в журнал).")
+def claim_dispute_cancel(claim_ref: str, reason: str | None) -> None:
+    """T7.81: снять операторский спор, не удаляя ни знание, ни прежнюю оценку (§14).
+
+    Cancels the operator's own source-graph correction the same way it was made:
+    the row is not deleted — `valid = false` plus a second §11.3 cascade over the
+    same pair of sources. The rules engine then recomputes independence without
+    the merge, so a previous grade comes back if it is again supported by enough
+    independent groups. History (the claim, its evidence, every assessment ever
+    made) stays in the database untouched.
+    """
+    import asyncio
+    import os
+
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    url = os.environ.get("NOEZEMA_DATABASE_URL", "")
+    if not url:
+        click.echo("NOEZEMA_DATABASE_URL is not set", err=True)
+        sys.exit(EXIT_USAGE_ERROR)
+
+    from packages.domain.db.uow import transaction
+    from packages.domain.services.audit import AuditService
+    from packages.memory.dispute import ACTOR_HOSTCTL, DisputeError, cancel_dispute
+
+    claim_id = _claim_uuid(claim_ref)
+    engine = create_async_engine(url)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    async def _run() -> int:
+        try:
+            async with factory() as db, transaction(db):
+                outcome = await cancel_dispute(
+                    db,
+                    AuditService(db),
+                    claim_id=claim_id,
+                    reason=reason,
+                    actor=ACTOR_HOSTCTL,
+                )
+        except DisputeError as exc:
+            click.echo(f"claim-dispute-cancel: отказ ({exc.code}) {exc.detail}".rstrip(), err=True)
+            return EXIT_USAGE_ERROR
+        click.echo("claim-dispute-cancel: спор снят")
+        click.echo(f"  утверждение   {outcome.claim_id}")
+        click.echo(f"  коррекция     {outcome.correction_id} (valid = false, строка осталась)")
+        click.echo(f"  актор         {outcome.actor}")
+        click.echo(
+            f"  перепроверка  оценок снято: {outcome.invalidated}, утверждений затронуто: "
+            f"{outcome.affected_claims}, задач пересчёта заведено: {outcome.jobs_created}"
+        )
+        click.echo(
+            "  дальше        оценку пересчитают правила на ближайшем maint-тике; "
+            "если независимости снова достаточно, прежняя оценка вернётся сама"
+        )
+        return 0
+
+    try:
+        code = asyncio.run(_run())
+    finally:
+        asyncio.run(engine.dispose())
+    sys.exit(code)
+
+
+def _claim_uuid(raw: str) -> uuid.UUID:
+    """Утверждение по uuid или по его началу (как его показывает витрина)."""
+    try:
+        return uuid.UUID(raw.strip())
+    except ValueError:
+        click.echo(f"нужен полный uuid утверждения, получено: {raw}", err=True)
+        sys.exit(EXIT_USAGE_ERROR)
+
+
 @main.command("eval-run")
 @click.option("--label", required=True, help="Run label (e.g. EVAL-1).")
 @click.option(
@@ -888,13 +1715,22 @@ def eval_run(
         click.echo("NOEZEMA_DATABASE_URL is not set", err=True)
         sys.exit(EXIT_USAGE_ERROR)
     from apps.orchestrator.main import build_orchestrator
+    from apps.orchestrator.node_guard import NodeSessionGuard
     from apps.orchestrator.scheduler import (
+        REASON_SESSION_IN_PROGRESS,
+        WORKSPACE_SUBDIR,
         ReassessmentAdmissionError,
         RepairAdmissionError,
         WakeScheduleError,
         WakeScheduler,
         data_root_from_env,
         node_owner_from_env,
+    )
+    from apps.orchestrator.tool_executors import (
+        SANDBOX_MODE,
+        ToolExecutorConfigError,
+        ToolExecutorUnavailableError,
+        tool_executor_mode_from_env,
     )
     from packages.domain.services.config import ConfigError, ConfigService
     from packages.evaluation.gates import compute_gates
@@ -1010,105 +1846,183 @@ def eval_run(
         import time as _time
         from datetime import UTC, datetime
 
+        from apps.orchestrator.scheduler import REASON_ACTIVATION_SLOT
+        from packages.memory.activation import ActivationInFlightError
+
         completed = 0
         succeeded = 0
         for i in range(count):
-            deadline = _time.monotonic() + 600
-            decision = None
-            while _time.monotonic() < deadline:
-                async with factory() as db:
-                    decision = await WakeScheduler(
-                        db, node_owner=owner, data_root=root
-                    ).decide(source="wake_now", now=datetime.now(UTC))
-                if decision.action == "wake":
-                    break
-                if decision.action == "skip" and await _load_node_state() == "paused":
-                    # an auto-pause (consecutive failures) is sticky until the
-                    # operator resume; apply that semantics once, then retry
-                    click.echo(
-                        f"session {i + 1}: node paused ({decision.reason}); "
-                        "operator resume"
-                    )
-                    await _operator_resume()
-                    continue
-                click.echo(
-                    f"session {i + 1}: {decision.action} ({decision.reason}); retry"
-                )
-                await asyncio.sleep(10)
-            if decision is None or decision.action != "wake":
-                click.echo(
-                    f"session {i + 1}: admission never granted; aborting series", err=True
-                )
-                break
-
-            await _node_state_set("session_running")
-            orchestrator, gateway = build_orchestrator(factory, root / "workspace")
-            t0 = _time.monotonic()
-            outcome_steps = 0
-            try:
-                outcome = await orchestrator.run_session()
-            except Exception as exc:  # infra failure around the session
-                # T7.7 (EVAL-2): a LeaseLost can be reported after the
-                # session already committed — the guard's last refused
-                # renewal (phase deadline) is detected at guard exit,
-                # while the fenced commit's own is_live() check passed.
-                # The durable row wins: re-read the session state before
-                # counting a failure (the EVAL-2 smoke session
-                # f8c548cc was succeeded in the DB but reported failed).
-                final_state = "failed"
-                outcome_steps = 0
-                if "LeaseLost" in type(exc).__name__ or "lease lost" in str(exc).lower():
-                    # the session id is in the LeaseLost message
-                    sid = None
-                    for part in str(exc).split():
-                        if len(part) == 36 and part.count("-") == 4:
-                            sid = part
-                            break
-                    if sid is not None:
-                        async with factory() as probe:
-                            row = (
-                                await probe.execute(
-                                    text(
-                                        "SELECT state, termination_reason "
-                                        "FROM sessions WHERE id = :id"
-                                    ),
-                                    {"id": uuid.UUID(sid)},
-                                )
-                            ).first()
-                    else:
-                        row = None
-                    if row is not None and row[0] in (
-                        "succeeded", "succeeded_partial"
+            aborted = False
+            while True:
+                # T7.26 (ADR-0013): an in-flight activation drain can
+                # reject the admission of a wake granted on a stale
+                # read — the session did not start; retry the admission
+                # for the SAME session index (below).
+                deadline = _time.monotonic() + 600
+                decision = None
+                while True:
+                    async with factory() as db:
+                        decision = await WakeScheduler(
+                            db, node_owner=owner, data_root=root
+                        ).decide(source="wake_now", now=datetime.now(UTC))
+                    if decision.action == "wake":
+                        break
+                    if (
+                        decision.action == "skip"
+                        and decision.reason == REASON_ACTIVATION_SLOT
                     ):
-                        final_state = row[0]
+                        # T7.26 (ADR-0013): an activation (drain) is in
+                        # flight — the durable intent is published and
+                        # its wait is BOUNDED in the DB (the drain
+                        # timeout cancels it, or the drain lease
+                        # expires). This is not a nonterminal_session
+                        # and not a reason to give up: wait for the
+                        # window between sessions WITHOUT the 600 s
+                        # admission deadline.
                         click.echo(
-                            f"session {i + 1}: lease-lost reported after "
-                            f"durable {row[0]} commit (reason={row[1]!r}) — "
-                            f"counted as {final_state}"
+                            f"session {i + 1}: activation in flight (drain); "
+                            "waiting for the window between sessions"
                         )
+                        await asyncio.sleep(10)
+                        continue
+                    if _time.monotonic() >= deadline:
+                        break
+                    if decision.action == "skip" and await _load_node_state() == "paused":
+                        # an auto-pause (consecutive failures) is sticky until the
+                        # operator resume; apply that semantics once, then retry
+                        click.echo(
+                            f"session {i + 1}: node paused ({decision.reason}); "
+                            "operator resume"
+                        )
+                        await _operator_resume()
+                        continue
+                    click.echo(
+                        f"session {i + 1}: {decision.action} ({decision.reason}); retry"
+                    )
+                    await asyncio.sleep(10)
+                if decision is None or decision.action != "wake":
+                    click.echo(
+                        f"session {i + 1}: admission never granted; aborting series", err=True
+                    )
+                    aborted = True
+                    break
+
+                # T7.58 (ADR-0023): NOEZEMA_TOOL_EXECUTOR is resolved here per
+                # session (the same builder as the wake tick); sandbox mode means
+                # one container per session for this whole series. The build runs
+                # BEFORE the node is marked session_running: an unavailable
+                # engine/image refuses the whole eval-run (exit 78) and must not
+                # leave a wedged node_state behind.
+                if tool_executor_mode_from_env() == SANDBOX_MODE:
+                    click.echo(
+                        f"session {i + 1}: tool executor=sandbox (one container per session)"
+                    )
+                orchestrator, gateway = build_orchestrator(factory, root / WORKSPACE_SUBDIR)
+
+                # T7.61(а) (§5.2.1): the same session lane as every other entry point. The series is a
+                # sequence of sessions on ONE node, and a scheduled tick racing it would produce two live
+                # sessions exactly like the stand race. Per session, not per series: the lane is released
+                # before the next admission, so a paused/backed-off node cannot hold it hostage.
+                guard = NodeSessionGuard(url, owner)
+                if not await guard.acquire():
+                    click.echo(
+                        f"session {i + 1}: skip ({REASON_SESSION_IN_PROGRESS}); "
+                        "another session owns this node; retry"
+                    )
+                    await asyncio.sleep(10)
+                    continue
+                try:
+                    await _node_state_set("session_running")
+                    t0 = _time.monotonic()
+                    outcome_steps = 0
+                    in_flight = False
+                    try:
+                        outcome = await orchestrator.run_session()
+                    except ActivationInFlightError as exc:
+                        # T7.26 (ADR-0013): phase 0 was rejected under the
+                        # head lock (a drain was published after this wake
+                        # was granted) — the session did NOT start (no
+                        # session row, no admission record). Not a failure
+                        # and not a nonterminal_session: back to the
+                        # admission loop for the same session.
+                        in_flight = True
+                        click.echo(
+                            f"session {i + 1}: admission rejected "
+                            f"({type(exc).__name__}); retrying admission"
+                        )
+                    except Exception as exc:  # infra failure around the session
+                        # T7.7 (EVAL-2): a LeaseLost can be reported after the
+                        # session already committed — the guard's last refused
+                        # renewal (phase deadline) is detected at guard exit,
+                        # while the fenced commit's own is_live() check passed.
+                        # The durable row wins: re-read the session state before
+                        # counting a failure (the EVAL-2 smoke session
+                        # f8c548cc was succeeded in the DB but reported failed).
+                        final_state = "failed"
+                        outcome_steps = 0
+                        if "LeaseLost" in type(exc).__name__ or "lease lost" in str(exc).lower():
+                            # the session id is in the LeaseLost message
+                            sid = None
+                            for part in str(exc).split():
+                                if len(part) == 36 and part.count("-") == 4:
+                                    sid = part
+                                    break
+                            if sid is not None:
+                                async with factory() as probe:
+                                    row = (
+                                        await probe.execute(
+                                            text(
+                                                "SELECT state, termination_reason "
+                                                "FROM sessions WHERE id = :id"
+                                            ),
+                                            {"id": uuid.UUID(sid)},
+                                        )
+                                    ).first()
+                            else:
+                                row = None
+                            if row is not None and row[0] in (
+                                "succeeded", "succeeded_partial"
+                            ):
+                                final_state = row[0]
+                                click.echo(
+                                    f"session {i + 1}: lease-lost reported after "
+                                    f"durable {row[0]} commit (reason={row[1]!r}) — "
+                                    f"counted as {final_state}"
+                                )
+                            else:
+                                click.echo(
+                                    f"session {i + 1}: error (LeaseLost: {exc})", err=True
+                                )
+                        else:
+                            click.echo(
+                                f"session {i + 1}: error ({type(exc).__name__}: {exc})", err=True
+                            )
                     else:
-                        click.echo(
-                            f"session {i + 1}: error (LeaseLost: {exc})", err=True
-                        )
-                else:
-                    click.echo(f"session {i + 1}: error ({type(exc).__name__}: {exc})", err=True)
-            else:
-                final_state = outcome.final_state.value
-                outcome_steps = outcome.steps
-            finally:
-                await gateway.close()
-            elapsed = _time.monotonic() - t0
-            async with factory() as db:
-                node_state = await WakeScheduler(
-                    db, node_owner=owner, data_root=root
-                ).record_session_result(final_state=final_state, now=datetime.now(UTC))
-            completed += 1
-            if final_state in ("succeeded", "succeeded_partial"):
-                succeeded += 1
-            click.echo(
-                f"session {i + 1}/{count}: {final_state} (steps={outcome_steps}, "
-                f"{elapsed:.0f}s, node_state={node_state})"
-            )
+                        final_state = outcome.final_state.value
+                        outcome_steps = outcome.steps
+                    finally:
+                        await gateway.close()
+                    if in_flight:
+                        continue  # the session did not start — retry admission
+                    elapsed = _time.monotonic() - t0
+                    async with factory() as db:
+                        node_state = await WakeScheduler(
+                            db, node_owner=owner, data_root=root
+                        ).record_session_result(final_state=final_state, now=datetime.now(UTC))
+                    completed += 1
+                    if final_state in ("succeeded", "succeeded_partial"):
+                        succeeded += 1
+                    click.echo(
+                        f"session {i + 1}/{count}: {final_state} (steps={outcome_steps}, "
+                        f"{elapsed:.0f}s, node_state={node_state})"
+                    )
+                    break
+                finally:
+                    # T7.61(а): released after the accounting (§5.2.1), also when `continue` above
+                    # returns to the admission loop or an error aborts the iteration.
+                    await guard.release()
+            if aborted:
+                break
         return completed, succeeded
 
     async def _finish(run_id: uuid.UUID, completed: int, succeeded: int) -> None:
@@ -1117,14 +2031,17 @@ def eval_run(
         async with factory() as db, db.begin():
             run = await get_evaluation_run(db, run_id)
             assert run is not None
-            gates = await compute_gates(db, run=run)
+            # one wall-clock instant for the gates (the §8.6 freshness
+            # rule, T7.27) and the run finish row
+            ts = datetime.now(UTC)
+            gates = await compute_gates(db, run=run, now=ts)
             finished = await finish_evaluation_run(
                 db,
                 run_id,
                 gates=gates,
                 eligible_sessions=completed,
                 completed_sessions=succeeded,
-                now=datetime.now(UTC),
+                now=ts,
             )
             click.echo(f"run finished: outcome={finished.outcome}")
             click.echo("gates (§22.2; ratio gates carry the 95% Wilson ci95):")
@@ -1181,6 +2098,10 @@ def eval_run(
         WakeScheduleError,
         ReassessmentAdmissionError,
         RepairAdmissionError,
+        # T7.58 (ADR-0023): a bad executor switch or an unusable sandbox engine/image
+        # refuses the eval-run before any session is counted (no _finish, exit 78).
+        ToolExecutorConfigError,
+        ToolExecutorUnavailableError,
     ) as exc:
         click.echo(f"eval-run: fail-closed ({type(exc).__name__}: {exc})", err=True)
         sys.exit(78)

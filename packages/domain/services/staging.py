@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import uuid
 
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.domain.canonical import canonical_sha256
@@ -23,6 +24,7 @@ from packages.domain.models.enums import AuditEventType
 from packages.domain.models.questions import ORMQuestion
 from packages.domain.models.sessions import ORMSession
 from packages.domain.repositories.questions import QuestionRepository
+from packages.domain.sanitization import mask_nul_deep
 from packages.domain.services.audit import AuditService
 from packages.domain.services.reserve import HostReserveService, StagingBudgetExceeded
 
@@ -60,12 +62,41 @@ class StagingService:
             proposed_evidence=proposed_evidence,
             proposed_questions=proposed_questions,
         )
+        # T7.24 (EVAL-4 abort 2026-09-21): the per-session recording
+        # order. Staging is written by the session's own phase-1
+        # transaction (single connection, statements sequential), so
+        # MAX+1 in the same transaction is race-free; the unique
+        # (session_id, seq) constraint is the backstop. The commit
+        # boundary reads the ops in THIS order — the proposal order the
+        # claim_index/evidence_index links refer to.
+        seq = (
+            (
+                await db.execute(
+                    text(
+                        "SELECT COALESCE(MAX(seq), -1) + 1 FROM session_staging "
+                        "WHERE session_id = :s"
+                    ),
+                    {"s": session.id},
+                )
+            )
+            .scalar_one()
+        )
+        # T7.47a (ADR-0020): the staging DEFENSIVE line. session_staging
+        # payload is JSONB — a NUL here rolls back the whole phase-1
+        # transaction. The model-text entry boundary (LLMMiddleware.chat)
+        # already masks; this is the idempotent backstop for any future
+        # non-gateway source. Mask-THEN-hash: payload_hash is computed
+        # over the stored (masked) value, so the stored payload and every
+        # derived hash (commit staging_hash, dedup on the stored text)
+        # agree. Identity on NUL-free payloads.
+        payload = mask_nul_deep(payload)
         row = ORMStagingOp(
             session_id=session.id,
             op=op,
             payload=payload,
             payload_hash=canonical_sha256(payload),
             schema_version=STAGING_SCHEMA_VERSION,
+            seq=int(seq),
         )
         db.add(row)
         await db.flush()
@@ -120,7 +151,9 @@ class StagingService:
                 await db.execute(
                     select(ORMStagingOp)
                     .where(ORMStagingOp.session_id == session.id, ORMStagingOp.state == "recorded")
-                    .order_by(ORMStagingOp.created_at)
+                    # T7.24: recording (proposal) order — created_at is the
+                    # constant start of the phase-1 transaction
+                    .order_by(ORMStagingOp.seq)
                 )
             )
             .scalars()

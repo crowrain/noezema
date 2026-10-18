@@ -25,7 +25,8 @@ Canonical scope shape (``host-scope-v1``):
 
     claim scope:    {"scope_schema": "host-scope-v1",
                      "as_of": "2026-01-01" | None,
-                     "source_domains": ["example.org", ...]}
+                     "source_domains": ["example.org", ...],
+                     "date_anchor": "explicit" | "relative" | "none"}
     evidence scope: {"scope_schema": "host-scope-v1",
                      "as_of": "2026-09-16T13:49:14+00:00" | None,
                      "source_domain": "example.org" | None}
@@ -50,9 +51,14 @@ never silently re-grade existing knowledge in either direction.
 from __future__ import annotations
 
 import re
+import uuid
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
+from typing import Final
 
 from packages.domain.models.base import JsonDict
+from packages.domain.models.enums import ClaimDateAnchor
+from packages.domain.sanitization import mask_nul
 from packages.memory.independence import registrable_domain
 
 #: the marker of a host-derived (canonical) scope; stored on the
@@ -68,6 +74,12 @@ CLAIM_SOURCE_DOMAINS_KEY = "source_domains"
 EVIDENCE_AS_OF_KEY = "as_of"
 #: the evidence scope's source's registrable domain
 EVIDENCE_SOURCE_DOMAIN_KEY = "source_domain"
+#: the claim scope's date ANCHOR (T7.32, ADR-0017): which branch of
+#: ``derive_claim_as_of`` produced the reference date — a value of
+#: ``ClaimDateAnchor``. It is the persisted form of the anchor: the
+#: write paths (commit, reassessment) derive the reverify deadline from
+#: it (the worker has no question to re-derive from).
+DATE_ANCHOR_KEY = "date_anchor"
 
 _RU_MONTHS = {
     "января": 1,
@@ -119,7 +131,17 @@ _DATE_FORMS: tuple[tuple[re.Pattern[str], str, dict[str, int]], ...] = (
     (_YMD, "ymd", {}),
 )
 
-_URL_RE = re.compile(r"https?://[^\s\"'<>)\]]+", re.IGNORECASE)
+#: start of a named-source URL candidate; the token after the scheme is
+#: scanned with a parenthesis-balance counter (``_scan_url_token``,
+#: T7.57 — the old single regex cut every URL at its first ``)``, which
+#: broke Wikipedia-style titles ``…/Go_(язык_программирования)``)
+_URL_START_RE = re.compile(r"https?://", re.IGNORECASE)
+
+#: characters that always end a URL candidate — unchanged from T7.17:
+#: whitespace, quotes, ``<``, ``>``, ``]``; the only terminator with a
+#: condition is ``)`` (an unmatched closer belongs to the surrounding
+#: text, not to the URL — see ``_scan_url_token``)
+_URL_STOP_CHARS = frozenset("\"'<>]")
 
 #: the closed deterministic set of RELATIVE reference-date forms
 #: (T7.18, ADR-0007). The question names its anchor as "now" rather
@@ -186,15 +208,152 @@ def _date_from_match(m: re.Match[str], form: str, months: dict[str, int]) -> dat
         return None
 
 
+def _scan_url_token(text: str, start: int) -> int | None:
+    """End (exclusive) of the URL candidate that starts at ``start``
+    (the first character after the ``http(s)://`` scheme), or None when
+    nothing follows the scheme.
+
+    Balanced-parenthesis rule (T7.57): a ``(`` is part of the URL, and a
+    ``)`` belongs to it only while it closes a ``(`` already seen inside
+    the token — so a Wikipedia-style title ``…/Go_(язык_программирования)``
+    is extracted whole (arbitrary nesting via the counter). An unmatched
+    ``)`` — the enclosing parenthesis of the sentence («(см. url)»), the
+    closing paren of markdown link syntax «[текст](url)», a stray closer
+    — ends the URL and stays OUTSIDE it. The other terminators are the
+    T7.17 set: whitespace, quotes, ``<``, ``>``, ``]``."""
+    depth = 0
+    pos = start
+    while pos < len(text):
+        ch = text[pos]
+        if ch.isspace() or ch in _URL_STOP_CHARS:
+            break
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            if depth == 0:
+                break
+            depth -= 1
+        pos += 1
+    return pos if pos > start else None
+
+
 def extract_question_urls(text: str) -> tuple[str, ...]:
     """The http(s) URLs named in a question (deduplicated, order kept).
-    Trailing punctuation is stripped."""
+    Trailing punctuation is stripped; URL paths with balanced parentheses
+    — Wikipedia-style ``…/Go_(язык_программирования)`` — are extracted
+    whole, while an enclosing ``)`` of the sentence never rides into the
+    URL (T7.57: the old regex cut at the first ``)``, which made the
+    coverage gate demand an unfetchable truncated URL and eventually
+    cost the Go question its claim — SMOKE-V14 §4.3)."""
     urls: list[str] = []
-    for m in _URL_RE.finditer(text):
-        url = m.group(0).rstrip(".,;:!?")
-        if url not in urls:
+    consumed_to = 0
+    for m in _URL_START_RE.finditer(text):
+        if m.start() < consumed_to:
+            # the scheme starts INSIDE an already-consumed URL token —
+            # not a new URL (the same semantics as the old contiguous regex)
+            continue
+        end = _scan_url_token(text, m.end())
+        if end is None:
+            continue  # nothing after "://" — not a URL (same as the old [..]+ )
+        consumed_to = end
+        url = text[m.start():end].rstrip(".,;:!?")
+        if url and url not in urls:
             urls.append(url)
     return tuple(urls)
+
+
+@dataclass(frozen=True)
+class ClaimAsOf:
+    """The result of ``derive_claim_as_of`` (T7.30, ADR-0016; the
+    anchor — T7.32, ADR-0017): the host-derived reference datetime of
+    the claim row AND the ANCHOR that produced it — the closed set of
+    question branches. Callers must never re-derive the anchor from the
+    question (no second ``parse_question_date`` /
+    ``question_uses_relative_date`` call): this function is the single
+    source of truth for both values."""
+
+    as_of: datetime | None
+    anchor: ClaimDateAnchor
+
+
+def derive_claim_as_of(
+    *,
+    question: str | None,
+    as_of: datetime | None,
+    session_date: date | None = None,
+) -> ClaimAsOf:
+    """The reference datetime of one claim row and its ANCHOR —
+    HOST-DERIVED (T7.30, ADR-0016; the anchor — T7.32, ADR-0017). This
+    is the single source of truth for the reference date AND for the
+    anchor: the claim row's ``as_of``, the claim scope's reference date
+    and anchor (``derive_claim_scope``) and the existence of the
+    ``reverify_after`` deadline (§8.6/§22.2) are all decided from this
+    one function — the same priority rule T7.18 uses for the scope,
+    one function, no copied logic.
+
+    Priority (T7.17, refined by T7.18 — ADR-0007; ADR-0016):
+    1. the date the QUESTION names explicitly (the operator's input,
+       trusted — leftmost valid match of the closed form set) →
+       anchor ``explicit`` (a claim about a FIXED point — no reverify
+       deadline, ADR-0017);
+    2. else, when the QUESTION anchors the date RELATIVELY (a closed
+       set: «на текущую дату», «сейчас», …) — the SESSION's date on
+       the host's trusted clock (``session_date``, UTC — the session
+       START, not the commit moment, ADR-0007 T7.18) → anchor
+       ``relative`` (a claim about the PRESENT — the only claim class
+       that gets a reverify deadline: the verification moment + the
+       volatility window, ADR-0017);
+    3. else (the question names no date at all, neither explicitly
+       nor relatively — including a relative form with no session
+       date available, the fail-closed fallback of T7.18) — the
+       claim's typed ``as_of`` (the model's value; host-validated
+       structure, not free-form; see ADR-0007, уточнение T7.18) →
+       anchor ``none`` (a claim about a FIXED point — no reverify
+       deadline, ADR-0017).
+    The model's ``as_of`` can never shift the reference date of a
+    question that carries a date anchor (explicit or relative): with a
+    date anchor it is an audit-only value (staging payload + audit),
+    never stored on the claim row (ADR-0016).
+    """
+    if question:
+        day = parse_question_date(question)
+        if day is not None:
+            return ClaimAsOf(
+                datetime(day.year, day.month, day.day, tzinfo=UTC),
+                ClaimDateAnchor.EXPLICIT,
+            )
+        if question_uses_relative_date(question) and session_date is not None:
+            return ClaimAsOf(
+                datetime(session_date.year, session_date.month, session_date.day, tzinfo=UTC),
+                ClaimDateAnchor.RELATIVE,
+            )
+    if as_of is not None:
+        return ClaimAsOf(
+            as_of if as_of.tzinfo is not None else as_of.replace(tzinfo=UTC),
+            ClaimDateAnchor.NONE,
+        )
+    return ClaimAsOf(None, ClaimDateAnchor.NONE)
+
+
+def anchor_from_scope(scope: JsonDict) -> ClaimDateAnchor:
+    """The claim's date anchor from a STORED host scope (T7.32,
+    ADR-0017) — the persistence seam for the write paths that have no
+    question to derive from (the reassessment worker).
+
+    Legacy scopes (pre-ADR-0017 rows, or scopes without the
+    ``date_anchor`` key) are treated as ``relative`` — the
+    CONSERVATIVE default: a deadline is kept/refreshed (the claim is
+    re-verified) rather than declared valid forever on the strength of
+    missing data. Every claim committed at or after T7.32 carries the
+    anchor explicitly."""
+    value = scope.get(DATE_ANCHOR_KEY)
+    if value in (
+        ClaimDateAnchor.EXPLICIT.value,
+        ClaimDateAnchor.RELATIVE.value,
+        ClaimDateAnchor.NONE.value,
+    ):
+        return ClaimDateAnchor(value)
+    return ClaimDateAnchor.RELATIVE
 
 
 def derive_claim_scope(
@@ -205,30 +364,26 @@ def derive_claim_scope(
 ) -> JsonDict:
     """The canonical scope of one claim (host-scope-v1).
 
-    - ``as_of``: the reference date, host-derived, in priority order
-      (T7.17, refined by T7.18 — ADR-0007):
-      1. the date the QUESTION names explicitly (the operator's input,
-         trusted — leftmost valid match of the closed form set);
-      2. else, when the QUESTION anchors the date RELATIVELY (a closed
-         set: «на текущую дату», «сейчас», …) — the SESSION's date on
-         the host's trusted clock (``session_date``, UTC);
-      3. else (the question names no date at all, neither explicitly
-         nor relatively) — the claim's typed ``as_of`` (host-validated
-         structure, not free-form; see ADR-0007, уточнение T7.18);
-      The model's ``as_of`` can never shift the reference date of a
-      question that carries a date anchor (explicit or relative): it is
-      stored on the claim row and in the staging/audit only.
+    - ``as_of``: the reference date — the DATE part of the host-derived
+      reference datetime (``derive_claim_as_of`` — the single source of
+      truth, shared with the claim row, ADR-0016):
+      1. the date the QUESTION names explicitly;
+      2. else, when the QUESTION anchors the date RELATIVELY — the
+         SESSION's date on the host's trusted clock (UTC);
+      3. else — the claim's typed ``as_of`` (the model's value,
+         host-validated structure).
     - ``source_domains``: the registrable domains of the sources the
       question names (empty = the question names no sources — no source
-      constraint).
+      constraint);
+    - ``date_anchor`` (T7.32, ADR-0017): the ANCHOR that produced the
+      reference date (a value of ``ClaimDateAnchor``) — the persisted
+      form of the branch of ``derive_claim_as_of``: it decides whether
+      the claim has a reverify deadline at all (only ``relative``
+      does), so the write paths (commit, reassessment) can derive the
+      deadline from the stored scope without a question.
     """
-    day: date | None = None
-    if question:
-        day = parse_question_date(question)
-        if day is None and question_uses_relative_date(question) and session_date is not None:
-            day = session_date
-    if day is None and as_of is not None:
-        day = as_of.date() if as_of.tzinfo is None else as_of.astimezone(UTC).date()
+    reference = derive_claim_as_of(question=question, as_of=as_of, session_date=session_date)
+    day = reference.as_of.date() if reference.as_of is not None else None
     domains: list[str] = []
     if question:
         for url in extract_question_urls(question):
@@ -239,6 +394,7 @@ def derive_claim_scope(
         SCOPE_SCHEMA_KEY: SCOPE_SCHEMA,
         CLAIM_AS_OF_KEY: day.isoformat() if day is not None else None,
         CLAIM_SOURCE_DOMAINS_KEY: domains,
+        DATE_ANCHOR_KEY: reference.anchor.value,
     }
 
 
@@ -261,6 +417,280 @@ def derive_evidence_scope(
         EVIDENCE_AS_OF_KEY: at,
         EVIDENCE_SOURCE_DOMAIN_KEY: source_domain,
     }
+
+
+# ── T7.78 (ADR-0029): происхождение ЗНАЧЕНИЯ, на котором стоит утверждение ────────
+#
+# Страничное решение производности (T7.75) живёт на строке источника. Когда страница
+# неоднозначна (двое первоисточников в одном тексте), решает решение об **улике**: этот
+# фрагмент пересказывает вот этот первоисточник. Хост записывает его здесь, дополнительным
+# ключом evidence scope — отдельной таблицы нет (миграция = стоп-критерий), и это безопасно:
+#
+# - идентичность улики (`packages/memory/evidence.py::source_assertion_identity`) и её дедуп
+#   (`UNIQUE (claim_id, evidence_kind, identity_hash)`) скоуп не содержат;
+# - множество улик оценки (`_evidence_set_hash`) — kind/relation/identity_hash, без скоупа;
+# - предикат покрытия читает канонические измерения (`as_of`, `source_domain`) либо ключи
+#   УТВЕРЖДЕНИЯ (легаси-ветвь), лишний ключ доказательства никогда не запрашивается.
+#
+# Канал влияния на оценку один: загрузчик снимка независимости
+# (`packages/memory/source_graph.py`) подставляет этому источнику эффективного родителя.
+# Форма разбирается строго и fail-closed: повреждённая запись не даёт склейки.
+
+#: дополнительный ключ evidence scope (хостовый, модель его не пишет)
+EVIDENCE_VALUE_ATTRIBUTION_KEY = "value_attribution"
+#: маркер формы записи внутри ключа: решение можно отличить от записи другой версии детектора.
+#: С T7.85 маркер НЕ поднимается, хотя поле записи появилось новое (`pairing`): прежние улики
+#: обязаны остаться читаемыми (`parse_value_attribution` fail-closed), а отклонение прежних
+#: записей поднятием схемы молча повысило бы независимость уже склеенных пересказов — ослабление,
+#: замаскированное под смену версии. Отличаются версии МЕТОДА (`method` в записи), именно
+#: на этом различии переатрибуция пересматривает прежние решения.
+VALUE_ATTRIBUTION_SCHEMA = "host-value-attribution-v1"
+
+#: какой pairing дал решение о происхождении значения (T7.85). `value_and_primary_in_fragment` —
+#: строгий режим ADR-0029 (значение и первоисточник в одном фрагменте); `publication_window` —
+#: узкий второй режим: публикация первоисточника объявлена в предыдущих предложениях того же
+#: блока страницы. Поле записывается, чтобы более слабое основание было видно оператору.
+#: `bibliography_known_producer` (T7.107, ADR-0029 дополнение) — третий, самый узкий режим:
+#: страница назвала список источников, в нём стоит производитель X, значение утверждения
+#: измерено на странице, а ДРУГАЯ улика того же утверждения уже приписана X строгим режимом
+#: или режимом публикации (без цепочек новым режимом). Родитель записывается той же формой,
+#: что у строгого режима.
+#: `known_producer_mentioned` (T7.116 часть а, ADR-0029 дополнение) — четвёртый, последний
+#: режим fallback: производитель X УЖЕ известен по другой улике того же утверждения (записан
+#: строгим режимом или режимом публикации — не этим режимом и не bibliography: сборщики
+#: `known_claim_primaries` pairing нового режима не читают, цепочек нет), значение утверждения
+#: стоит на странице (диапазон — целиком или обоими концами, одиночное — одиночным), словарный
+#: алиас X назван где-либо на странице, вето собственной оценки в окрестности значения не
+#: сработало, страница не домашняя для X и другой известный производитель на странице не
+#: назван. Форма записи — как у строгого режима (родитель → источник X), ключей scope новых
+#: нет.
+VALUE_ATTRIBUTION_PAIRING_STRICT: Final = "value_and_primary_in_fragment"
+VALUE_ATTRIBUTION_PAIRING_PUBLICATION: Final = "publication_window"
+VALUE_ATTRIBUTION_PAIRING_BIBLIOGRAPHY: Final = "bibliography_known_producer"
+VALUE_ATTRIBUTION_PAIRING_KNOWN_PRODUCER_MENTIONED: Final = "known_producer_mentioned"
+VALUE_ATTRIBUTION_PAIRINGS: Final[frozenset[str]] = frozenset(
+    {
+        VALUE_ATTRIBUTION_PAIRING_STRICT,
+        VALUE_ATTRIBUTION_PAIRING_PUBLICATION,
+        VALUE_ATTRIBUTION_PAIRING_BIBLIOGRAPHY,
+        VALUE_ATTRIBUTION_PAIRING_KNOWN_PRODUCER_MENTIONED,
+    }
+)
+
+@dataclass(frozen=True)
+class ValueAttribution:
+    """Запись об улике: чей пересказ она читает (T7.78). `parent_source_id` — строка
+    источников (прочитанный первоисточник или якорь заявленного), уже разрешённая хостом."""
+
+    primary_key: str
+    primary_name: str
+    primary_uri: str
+    parent_source_id: str
+    method: str
+    basis_fragment: str
+    #: аддитивное поле T7.85: какой pairing дал решение (`VALUE_ATTRIBUTION_PAIRINGS`)
+    pairing: str = VALUE_ATTRIBUTION_PAIRING_STRICT
+
+    def as_scope(self) -> JsonDict:
+        return {
+            "schema": VALUE_ATTRIBUTION_SCHEMA,
+            "primary_key": self.primary_key,
+            "primary_name": self.primary_name,
+            "primary_uri": self.primary_uri,
+            "parent_source_id": self.parent_source_id,
+            "method": self.method,
+            "basis_fragment": self.basis_fragment,
+            "pairing": self.pairing,
+        }
+
+
+def build_value_attribution(
+    *,
+    primary_key: str,
+    primary_name: str,
+    primary_uri: str,
+    parent_source_id: str,
+    method: str,
+    basis_fragment: str = "",
+    pairing: str = VALUE_ATTRIBUTION_PAIRING_STRICT,
+) -> ValueAttribution | None:
+    """Собрать запись об улике. Строго: нестроковые/пустые поля, не-UUID родителя и слишком
+    длинные значения — отказ (None): решение о склейке не строится на битой записи."""
+    fields: dict[str, object] = {
+        "primary_key": primary_key,
+        "primary_name": primary_name,
+        "primary_uri": primary_uri,
+        "parent_source_id": parent_source_id,
+        "method": method,
+    }
+    cleaned: dict[str, str] = {}
+    for name, value in fields.items():
+        if not isinstance(value, str):
+            return None
+        text = mask_nul(value).strip()
+        limit = 500 if name == "primary_uri" else 200
+        if not text or len(text) > limit:
+            return None
+        cleaned[name] = text
+    try:
+        uuid.UUID(cleaned["parent_source_id"])
+    except (ValueError, TypeError):
+        return None
+    basis = mask_nul(basis_fragment).strip()
+    if len(basis) > 1_000:
+        basis = basis[:1_000]
+    if pairing not in VALUE_ATTRIBUTION_PAIRINGS:
+        return None  # неизвестный режим pairing — битая запись, склейки не будет
+    return ValueAttribution(
+        primary_key=cleaned["primary_key"],
+        primary_name=cleaned["primary_name"],
+        primary_uri=cleaned["primary_uri"],
+        parent_source_id=cleaned["parent_source_id"],
+        method=cleaned["method"],
+        basis_fragment=basis,
+        pairing=pairing,
+    )
+
+
+def parse_value_attribution(scope: JsonDict | None) -> ValueAttribution | None:
+    """Прочитать запись из evidence scope. Нет ключа / не та форма / не UUID — None
+    (fail-closed: отсутствие решения означает «не склеиваем»). Записи прежних версий поля
+    `pairing` не имеют: у них строгий режим (тогда решал только он)."""
+    if not isinstance(scope, dict):
+        return None
+    raw = scope.get(EVIDENCE_VALUE_ATTRIBUTION_KEY)
+    if not isinstance(raw, dict) or raw.get("schema") != VALUE_ATTRIBUTION_SCHEMA:
+        return None
+    pairing = raw.get("pairing", VALUE_ATTRIBUTION_PAIRING_STRICT)
+    if not isinstance(pairing, str):
+        return None
+    return build_value_attribution(
+        primary_key=str(raw.get("primary_key", "")),
+        primary_name=str(raw.get("primary_name", "")),
+        primary_uri=str(raw.get("primary_uri", "")),
+        parent_source_id=str(raw.get("parent_source_id", "")),
+        method=str(raw.get("method", "")),
+        basis_fragment=str(raw.get("basis_fragment", "")),
+        pairing=pairing,
+    )
+
+
+# ─── T7.101 (ADR-0029 дополнение, ADR-0035 §19): собственная публикация производителя ──────────
+#
+# `attribute_value_in_fragment` умеет решить, что значение утверждения на прочитанной странице —
+# собственная публикация производителя на ЕГО домашнем хосте (`self_primary`), но это решение
+# нигде не записывалось: витрина молчала «Подтверждено слабо» там, где подтверждение есть —
+# публикация производителя (замер стенда .92: `c6729d4c`, страницы ЦБ CPD_2026-7 и Infl_exp_26-09).
+# Запись живёт отдельным ключом evidence scope рядом с `value_attribution` и НЕ является
+# родительским указателем: первоисточник не может быть родителем самого себя, склейки источников
+# эта запись не создаёт — группировка, оценки и движок правил её не читают (тот же список
+# потребителей, что у `value_attribution` выше, минус загрузчик снимка независимости).
+# Канал один: витрина (`apps/web/producer_view.py`) читает её как указатель на производителя.
+
+#: дополнительный ключ evidence scope (хостовый, модель его не пишет)
+EVIDENCE_SELF_PUBLICATION_KEY = "value_self_publication"
+#: маркер формы записи внутри ключа; версии метода различаются полем `method` — та же схема,
+#: что у `VALUE_ATTRIBUTION_SCHEMA`: поднятие маркера формы отклоняло бы прежние записи, а
+#: переатрибуция пересматривает решения по метке МЕТОДА, не по маркеру формы.
+SELF_PUBLICATION_SCHEMA = "host-value-self-publication-v1"
+
+
+@dataclass(frozen=True)
+class SelfPublication:
+    """Запись об улике: значение утверждения на прочитанной странице — собственная публикация
+    производителя на его домашнем хосте (T7.101). Родителя нет по построению: это не склейка."""
+
+    primary_key: str
+    primary_name: str
+    #: адрес ПРОЧИТАННОЙ страницы (не домашний URI словаря): витрина обязана проверить, что
+    #  хост источника — домашний хост названного производителя, а не поверить записи на слово
+    primary_uri: str
+    method: str
+    basis_fragment: str
+
+    def as_scope(self) -> JsonDict:
+        return {
+            "schema": SELF_PUBLICATION_SCHEMA,
+            "primary_key": self.primary_key,
+            "primary_name": self.primary_name,
+            "primary_uri": self.primary_uri,
+            "method": self.method,
+            "basis_fragment": self.basis_fragment,
+        }
+
+
+def build_self_publication(
+    *,
+    primary_key: str,
+    primary_name: str,
+    primary_uri: str,
+    method: str,
+    basis_fragment: str = "",
+) -> SelfPublication | None:
+    """Собрать запись о собственной публикации. Строго, как у `build_value_attribution`:
+    нестроковые/пустые поля и слишком длинные значения — отказ (None). UUID-родителя нет:
+    запись не склеивает."""
+    fields: dict[str, object] = {
+        "primary_key": primary_key,
+        "primary_name": primary_name,
+        "primary_uri": primary_uri,
+        "method": method,
+    }
+    cleaned: dict[str, str] = {}
+    for name, value in fields.items():
+        if not isinstance(value, str):
+            return None
+        text = mask_nul(value).strip()
+        limit = 500 if name == "primary_uri" else 200
+        if not text or len(text) > limit:
+            return None
+        cleaned[name] = text
+    basis = mask_nul(basis_fragment).strip()
+    if len(basis) > 1_000:
+        basis = basis[:1_000]
+    return SelfPublication(
+        primary_key=cleaned["primary_key"],
+        primary_name=cleaned["primary_name"],
+        primary_uri=cleaned["primary_uri"],
+        method=cleaned["method"],
+        basis_fragment=basis,
+    )
+
+
+def parse_self_publication(scope: JsonDict | None) -> SelfPublication | None:
+    """Прочитать запись из evidence scope. Нет ключа / не та форма — None (fail-closed:
+    отсутствие решения означает «витрина молчит»)."""
+    if not isinstance(scope, dict):
+        return None
+    raw = scope.get(EVIDENCE_SELF_PUBLICATION_KEY)
+    if not isinstance(raw, dict) or raw.get("schema") != SELF_PUBLICATION_SCHEMA:
+        return None
+    return build_self_publication(
+        primary_key=str(raw.get("primary_key", "")),
+        primary_name=str(raw.get("primary_name", "")),
+        primary_uri=str(raw.get("primary_uri", "")),
+        method=str(raw.get("method", "")),
+        basis_fragment=str(raw.get("basis_fragment", "")),
+    )
+
+
+def carry_value_attribution(current_scope: JsonDict | None, derived_scope: JsonDict) -> JsonDict:
+    """Перенести решения об улике в ПЕРЕСЧИТАННЫЙ скоуп (T7.17 пересчитывает скоуп каждой
+    улики утверждения из его провенанса и перезаписывает строку — без переноса решение
+    исчезало бы при следующем коммите). Ничего кроме хостовых решений не переносится:
+    канонические измерения всегда берутся из свежего провенанса. С T7.101 переносятся оба
+    хостовых ключа (`value_attribution` и `value_self_publication`) — иначе переатрибуция
+    записала бы собственную публикацию, а следующий коммит того же утверждения молча её стёр."""
+    attribution = parse_value_attribution(current_scope)
+    publication = parse_self_publication(current_scope)
+    if attribution is None and publication is None:
+        return derived_scope
+    carried = dict(derived_scope)
+    if attribution is not None:
+        carried[EVIDENCE_VALUE_ATTRIBUTION_KEY] = attribution.as_scope()
+    if publication is not None:
+        carried[EVIDENCE_SELF_PUBLICATION_KEY] = publication.as_scope()
+    return carried
 
 
 def scope_covers(evidence_scope: JsonDict, claim_scope: JsonDict) -> bool:

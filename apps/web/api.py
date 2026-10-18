@@ -4,7 +4,17 @@ M1 slice:
   - GET  /api/v1/status     — node state, config head, active session, counts;
   - GET  /api/v1/timeline   — audit events for a session (sequence order);
   - POST /api/v1/messages   — inbox message (created/queued);
-  - POST /api/v1/commands   — closed operator commands with idempotency key.
+  - GET  /api/v1/questions  — the FIFO question queue view (T7.59);
+  - POST /api/v1/questions  — operator question intake, admin-token guarded (T7.59);
+  - GET  /api/v1/questions/{question_id}/answer — one question's answer card:
+    result, live claims, steps of work built from the session's event feed (T7.65);
+  - POST /api/v1/commands   — closed operator commands with idempotency key;
+  - GET  /api/v1/glossary   — human labels for every enum value the web shows (T7.64).
+
+Pages (T7.65): `/` is the simple operator view «Вопросы и ответы», `/answer/<id>`
+shows one question's answer, and the previous full main page moved verbatim to
+`/engineer`. `/session`, `/knowledge`, `/claim`, `/diagnostics`, `/metrics` and
+`/evaluation` are unchanged.
 
 M1 command semantics: pause/resume (node state), wake_now (run one session
 through the attached orchestrator), stop_gracefully / abort_session (set the
@@ -20,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import time
 import uuid
@@ -27,8 +38,9 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select, text
@@ -39,11 +51,22 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
+from apps.orchestrator.node_guard import NodeSessionGuard, NodeSessionGuardError
 from apps.orchestrator.orchestrator import Orchestrator, SessionOutcome
-from apps.orchestrator.scheduler import WakeScheduler, data_root_from_env, node_owner_from_env
+from apps.orchestrator.scheduler import (
+    REASON_SESSION_IN_PROGRESS,
+    WakeScheduler,
+    data_root_from_env,
+    node_owner_from_env,
+)
+from apps.orchestrator.session_assembly import build_session_orchestrator
+from apps.web import answer as answer_queries
 from apps.web import diagnostics as diagnostics_queries
 from apps.web import knowledge as knowledge_queries
+from apps.web import labels as ui_labels
 from apps.web import metrics as metrics_queries
+from apps.web import questions_view as questions_view_queries
+from apps.web.bind import resolve_standalone_workspace
 from apps.web.host_status import HostStatus, HostStatusAdapter
 from packages.domain.db.engine import DatabaseSettings
 from packages.domain.db.uow import transaction
@@ -60,14 +83,104 @@ from packages.domain.models.questions import ORMQuestion
 from packages.domain.models.sessions import ORMSession
 from packages.domain.repositories.inbox import MessageRepository, OperatorCommandRepository
 from packages.domain.repositories.sessions import SessionRepository
+from packages.domain.services.audit import AuditService
 from packages.domain.services.config import ConfigError, ConfigService
+from packages.domain.services.question_intake import (
+    MAX_QUESTION_TEXT_CHARS,
+    PRIORITY_MAX,
+    PRIORITY_MIN,
+    QuestionIntakeError,
+    put_operator_question,
+    queue_position,
+)
+from packages.memory.dispute import (
+    ACTOR_WEB,
+    REASON_MAX_CHARS,
+    REASON_MIN_CHARS,
+    REFUSAL_CLAIM_NOT_FOUND,
+    REFUSAL_CORRECTION_NOT_FOUND,
+    DisputeError,
+    cancel_dispute,
+    dispute_claim,
+)
 
 NODE_STATE_KEY = "node_state"
 NODE_STATES = ("idle", "paused", "session_running")
 
+# codes → HTTP: спор — это конфликт с текущим состоянием знания (409);
+# «нет такого утверждения» и «нет действующего спора» отвечают 404.
+_DISPUTE_REFUSAL_STATUS: dict[str, int] = {
+    REFUSAL_CLAIM_NOT_FOUND: 404,
+    REFUSAL_CORRECTION_NOT_FOUND: 404,
+}
+
+
+def annotate_reasons(result: object) -> JsonDict:
+    """Аддитивные подписи причины отказа команды (T7.64, ADR-0026).
+
+    Чистая функция presentation-слоя: только уже переданные поля, ничего не
+    решает и не пересчитывает. Известная строка отказа получает label/hint/action
+    из единого словаря подписей; неизвестная остаётся как есть (label = сам
+    текст) — выдумывать причину нельзя. Существующие ключи ответа не меняются.
+    """
+    out: JsonDict = dict(result) if isinstance(result, dict) else {}
+    reason = out.get("reason")
+    if isinstance(reason, str) and reason:
+        entry = ui_labels.describe_refusal(reason)
+        if not entry["hint"]:
+            # отказ мог быть кодом допуска (scheduler REASON_*), а не фразой
+            entry = ui_labels.describe_reason(reason)
+        out["reason_label"] = entry["label"]
+        out["reason_hint"] = entry["hint"]
+        out["reason_action"] = entry["action"]
+    for key, category in (("wake_reason", "wake_reason"), ("paused_reason", "paused_reason")):
+        value = out.get(key)
+        if isinstance(value, str) and value:
+            entry = ui_labels.describe(category, value)
+            out[f"{key}_label"] = entry["label"]
+            out[f"{key}_hint"] = entry["hint"]
+            out[f"{key}_action"] = entry["action"]
+    return out
+
+
+def annotate_host_status(host: object) -> JsonDict:
+    """Подпись состояния восстановления в баннере узла (аддитивно)."""
+    out: JsonDict = dict(host) if isinstance(host, dict) else {}
+    state = out.get("recovery_state")
+    if isinstance(state, str) and state:
+        entry = ui_labels.describe("recovery_state", state)
+        out["recovery_state_label"] = entry["label"]
+        out["recovery_state_hint"] = entry["hint"]
+        out["recovery_state_action"] = entry["action"]
+    return out
+
+
+def annotate_question(row: object) -> JsonDict:
+    """Подписи состояния и происхождения вопроса (аддитивно, строка очереди)."""
+    out: JsonDict = dict(row) if isinstance(row, dict) else {}
+    for key, category in (("state", "question_state"), ("origin", "question_origin")):
+        value = out.get(key)
+        if isinstance(value, str) and value:
+            entry = ui_labels.describe(category, value)
+            out[f"{key}_label"] = entry["label"]
+            out[f"{key}_hint"] = entry["hint"]
+    session = out.get("session")
+    if isinstance(session, dict):
+        inner = dict(session)
+        state = inner.get("state")
+        if isinstance(state, str) and state:
+            inner["state_label"] = ui_labels.describe("session_state", state)["label"]
+        out["session"] = inner
+    return out
+
+
 # T3.20/T3.21: minimal HTML shell. The page is a thin viewer over the JSON
 # API; all invariants live server-side, the HTML only renders them.
-_MAIN_HTML = """<!doctype html>
+#
+# T7.65 (UI simplification, stage 2): this full engineer view is NOT removed and
+# NOT weakened — it moved verbatim to `/engineer` (only one link line was added).
+# The simple operator view (`_HOME_HTML`, «Вопросы и ответы») now answers `/`.
+_ENGINEER_HTML = """<!doctype html>
 <html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>NOEZEMA — узел</title>
@@ -77,18 +190,44 @@ _MAIN_HTML = """<!doctype html>
  .ok{color:#7bd88f}.bad{color:#e06c75}.warn{color:#e5c07b}
  #banner{padding:.6rem 1rem;border-radius:6px;font-weight:600}
  .none{background:#1c2a22}.retry{background:#2a2a1c}.degraded{background:#2a2416}.blocked{background:#2a1616}
+ table{border-collapse:collapse;width:100%;font-size:.92rem;margin-top:.5rem}
+ th,td{border-bottom:1px solid #2a3142;padding:.3rem .45rem;text-align:left;vertical-align:top}
+ td.wrap{overflow-wrap:anywhere;max-width:40rem}
+ textarea, input[type=number], input[type=password]{background:#0b0e13;border:1px solid #2a3142;
+   border-radius:5px;padding:.35rem;color:#e6e6e6}
+ button{background:#2a3142;color:#e6e6e6;border:1px solid #3d4658;border-radius:5px;padding:.35rem .7rem;cursor:pointer}
  code{background:#0b0e13;padding:.1rem .3rem;border-radius:4px}
  ul{margin:.3rem 0 .3rem 1.2rem}
 </style></head><body>
 <h1>NOEZEMA — узел</h1>
+<p><a href="/">← простой режим</a></p>
 <p><a href="/knowledge">Знание (граф)</a> · <a href="/diagnostics">Диагностика</a></p>
 <p><a href="/metrics">Метрики (§16)</a> · <a href="/evaluation">Evaluation (§22.2)</a></p>
 <div id="banner" class="none">загрузка…</div>
-<div class="card"><b>Узел:</b> <span id="node">—</span> · <b>Фазa:</b> <span id="phase">—</span></div>
+<div class="card"><b>Узел:</b> <span id="node">—</span> · <b>Фаза:</b> <span id="phase">—</span></div>
 <div class="card"><b>Конфиг:</b> <code id="cfg">—</code></div>
 <div class="card"><b>Сессия:</b> <span id="sess">—</span></div>
 <div class="card"><b>Ресурсы:</b> <span id="counts">—</span></div>
 <div class="card"><b>Предупреждения:</b> <ul id="warns"></ul></div>
+<div class="card"><b>Задать вопрос</b> (operator intake, T7.59)
+ <form id="ask-form">
+  <p><textarea id="ask-text" rows="3" cols="64" maxlength="2000"
+    placeholder="Вопрос NOEZEMA: origin message, priority поднимает его в начало очереди"></textarea></p>
+  <p><label>priority <input id="ask-priority" type="number" min="-100" max="100" step="1" value="0"></label>
+     <label>admin token <input id="ask-token" type="password" size="18" placeholder="X-Admin-Token"></label>
+     <button type="submit">Задать вопрос</button></p>
+ </form>
+ <p id="ask-result" class="warn"></p>
+</div>
+<div class="card"><b>Очередь вопросов</b> (FIFO: priority ↓, затем возраст)
+ <table id="queue"><thead><tr><th>#</th><th>id</th><th>текст</th><th>state</th><th>pr</th>
+  <th>origin</th><th>сессия</th><th>created_at</th></tr></thead><tbody></tbody></table>
+ <p id="queue-error" class="warn"></p>
+</div>
+<div class="card"><b>Узел</b> · <button id="wake-now" type="button">wake now</button>
+ <span>§5.2.1: обходит тайминг расписания, шлюзы admission остаются</span>
+ <p id="wake-result" class="warn"></p>
+</div>
 <script>
 async function tick(){
   try{
@@ -112,7 +251,513 @@ async function tick(){
       li.textContent=x; li.className='warn'; w.appendChild(li); }
   }catch(e){ document.getElementById('banner').textContent='ошибка чтения статуса'; }
 }
+const TOKEN_KEY='noezema.admin.token';
+function esc(v){return String(v===null||v===undefined?'':v);}
+function adminToken(){
+  const el=document.getElementById('ask-token');
+  const t=(el.value||'').trim() || (sessionStorage.getItem(TOKEN_KEY)||'');
+  if(t) sessionStorage.setItem(TOKEN_KEY,t);
+  return t;
+}
+(function(){ const t=sessionStorage.getItem(TOKEN_KEY); if(t) document.getElementById('ask-token').value=t; })();
+async function loadQueue(){
+  try{
+    const r = await fetch('/api/v1/questions?limit=25'); const d = await r.json();
+    const tb = document.querySelector('#queue tbody'); tb.innerHTML='';
+    for(const q of d.questions){
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td>${q.position===null||q.position===undefined?'':q.position}</td>`+
+        `<td>${esc(q.id).slice(0,8)}</td><td class="wrap">${esc(q.text)}</td>`+
+        `<td>${esc(q.state)}</td><td>${q.priority}</td><td>${esc(q.origin)}</td>`+
+        `<td>${q.session?`<a href="/session/${esc(q.session.id)}">${esc(q.session.state)}</a>`:'—'}</td>`+
+        `<td>${new Date(q.created_at).toLocaleString()}</td>`;
+      tb.appendChild(tr);
+    }
+    document.getElementById('queue-error').textContent =
+      d.questions.length ? '' : 'очередь пуста: задай вопрос или дождись новых кандидатов';
+  }catch(err){ document.getElementById('queue-error').textContent='очередь недоступна'; }
+}
+document.getElementById('ask-form').addEventListener('submit', async (ev)=>{
+  ev.preventDefault();
+  const out = document.getElementById('ask-result');
+  const body = {text:document.getElementById('ask-text').value,
+                priority:Number(document.getElementById('ask-priority').value||0)};
+  let r;
+  try{
+    r = await fetch('/api/v1/questions', {method:'POST',
+      headers:{'Content-Type':'application/json','X-Admin-Token':adminToken()},
+      body:JSON.stringify(body)});
+  }catch(err){ out.textContent='ошибка отправки'; return; }
+  const d = await r.json().catch(()=>({}));
+  if(r.status===201) out.textContent=`вопрос принят: id ${d.id}`+
+    ` · позиция в очереди ${d.position===null?'—':d.position}`;
+  else if(r.status===200) out.textContent=`такой текст уже в очереди: id ${d.id} · state ${d.state}`;
+  else if(r.status===401) out.textContent='нужен admin token (заголовок X-Admin-Token)';
+  else if(r.status===423) out.textContent='хост деградирован: mutating endpoints закрыты';
+  else out.textContent=`отклонено (${r.status}): ${d.detail||d.error||''}`;
+  loadQueue();
+});
+ function idemKey(){
+   // crypto.randomUUID exists only in a secure context; on a LAN stand over http it does not.
+   const c = window.crypto && typeof crypto.randomUUID === 'function' ? crypto.randomUUID() : null;
+   return c || ('web-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10));
+ }
+ document.getElementById('wake-now').addEventListener('click', async ()=>{
+   const out = document.getElementById('wake-result'); out.textContent='запуск…';
+   let r;
+   try{
+     r = await fetch('/api/v1/commands', {method:'POST',
+       headers:{'Content-Type':'application/json','X-Admin-Token':adminToken()},
+       body:JSON.stringify({type:'wake_now', idempotency_key:idemKey(), reason='web: wake now'})});
+   }catch(err){ out.textContent='ошибка отправки'; return; }
+   const d = await r.json().catch(()=>({}));
+   if(r.status===202) out.textContent = `${d.state||''}: `+
+     (d.result&&d.result.reason ? d.result.reason : (d.result&&d.result.node_state)||'');
+   else if(r.status===401) out.textContent='нужен admin token (заголовок X-Admin-Token)';
+   else if(r.status===423) out.textContent='хост деградирован: команды закрыты';
+   else out.textContent=`отклонено (${r.status}): ${d.detail||d.error||''}`;
+   tick(); loadQueue();
+ });
 tick(); setInterval(tick, 3000);
+loadQueue(); setInterval(loadQueue, 5000);
+</script></body></html>
+"""
+
+# T7.65 (упрощение интерфейса, этап 2): простая страница оператора «Вопросы и
+# ответы». Она смотрит те же JSON-маршруты, что и инженерная, и не знает ни одного
+# кода состояния: все подписи состояний, этапов и итогов приходят от сервера из
+# единого словаря (`apps/web/labels.py`), поэтому словарь не задублирован в JS.
+_HOME_HTML = """<!doctype html>
+<html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NOEZEMA — вопросы и ответы</title>
+<style>
+ body{font-family:system-ui,sans-serif;margin:2rem;background:#0e1116;color:#e6e6e6}
+ h1{font-size:1.35rem} h2{font-size:1.1rem}
+ .card{background:#171c26;border:1px solid #2a3142;border-radius:8px;padding:1rem;margin:0.7rem 0}
+ .ok{color:#7bd88f}.bad{color:#e06c75}.warn{color:#e5c07b}.muted{color:#98a2b3;font-size:.9rem}
+ #banner{padding:.6rem 1rem;border-radius:6px;font-weight:600;background:#1c2a22}
+ #banner.warn{background:#2a2a1c}#banner.bad{background:#2a1616}
+ table{border-collapse:collapse;width:100%;font-size:.95rem;margin-top:.5rem}
+ th,td{border-bottom:1px solid #2a3142;padding:.4rem .5rem;text-align:left;vertical-align:top}
+ td.wrap{overflow-wrap:anywhere;max-width:40rem}
+ textarea, input[type=number], input[type=password], select{background:#0b0e13;
+   border:1px solid #2a3142;border-radius:5px;padding:.35rem;color:#e6e6e6}
+ button{background:#2a3142;color:#e6e6e6;border:1px solid #3d4658;border-radius:5px;
+   padding:.4rem .8rem;cursor:pointer;margin-right:.35rem}
+ details{margin-top:.4rem} a{color:#8ab4f8}
+ label{margin-right:.7rem;display:inline-block;margin-bottom:.35rem}
+ .badge{display:inline-block;padding:.15rem .55rem;border-radius:99px;font-size:.82rem;
+   font-weight:700;color:#0e1116;background:#98a2b3;margin-right:.45rem}
+</style></head><body>
+<h1>NOEZEMA — вопросы и ответы</h1>
+<p><a href="/knowledge">Все знания</a> · <a href="/diagnostics">Диагностика</a>
+ · <a href="/engineer">Для инженера</a></p>
+<div id="banner">загрузка…</div>
+<div class="card"><b>Узел сейчас:</b> <span id="node">—</span>
+ <div class="muted" id="node-hint"></div>
+ <div class="muted" id="queue-count"></div>
+ <div class="muted" id="last-work"></div></div>
+
+<div class="card"><b>Задать вопрос</b>
+ <form id="ask-form">
+  <p><textarea id="ask-text" rows="3" cols="64" maxlength="2000"
+    placeholder="Спросите NOEZEMA: например, «сколько будет 6×7?»"></textarea></p>
+  <p><label>Насколько срочно <select id="ask-urgency">
+    <option value="0" selected>Обычный</option>
+    <option value="9">Срочно (вперёд очереди)</option>
+    <option value="-5">Потом</option>
+   </select></label>
+   <label>Пароль оператора <input id="ask-token" type="password" size="18"
+     placeholder="нужен, чтобы задать вопрос"></label>
+   <button type="submit">Отправить</button></p>
+  <details><summary>дополнительно</summary>
+   <p><label>Число в очереди (обычно не нужно)
+    <input id="ask-priority" type="number" min="-100" max="100" step="1" value=""></label></p>
+   <p class="muted">Если заполнено это число, оно важнее выбора срочности.</p>
+  </details>
+  <p id="ask-result" class="warn"></p>
+ </form>
+</div>
+
+<div class="card"><b>Обработка очереди</b>
+ <p><button id="wake-now" type="button">Запустить обработку</button>
+    <button id="resume-node" type="button">Возобновить</button>
+    <button id="pause-node" type="button">Пауза</button></p>
+ <p class="muted">Один запуск обрабатывает один вопрос из очереди, обычно 30–60 секунд.
+    Пауза останавливает плановые запуски узла, возобновление её снимает.</p>
+ <p id="wake-result" class="warn"></p>
+</div>
+
+<div class="card"><b>Мои вопросы</b>
+ <p class="muted">Очередь вопросов: последние заданные — сверху. № — общий номер по порядку задания,
+     «в очереди» — каким по счёте узел возьмёт вопрос. Вопросы, предложенные системой, помечены.</p>
+ <table id="queue"><thead><tr><th>№</th><th>Вопрос</th><th>Ответ</th><th>Когда</th><th></th></tr></thead>
+  <tbody></tbody></table>
+ <p id="queue-error" class="muted"></p>
+</div>
+
+<script>
+const TOKEN_KEY='noezema.admin.token';
+function esc(v){return String(v===null||v===undefined?'':v);}
+function setText(id,value){document.getElementById(id).textContent=esc(value);}
+function badgeFor(reliability){
+  const b=document.createElement('span'); b.className='badge';
+  b.textContent=reliability&&reliability.label?reliability.label:'оценка неизвестна';
+  if(reliability&&reliability.hint) b.title=reliability.hint;
+  // цвет — логический токен из серверного перевода уже вычисленной оценки
+  if(reliability&&reliability.color) b.style.backgroundColor=reliability.color;
+  return b;
+}
+function adminToken(){
+  const el=document.getElementById('ask-token');
+  const t=(el.value||'').trim() || (sessionStorage.getItem(TOKEN_KEY)||'');
+  if(t) sessionStorage.setItem(TOKEN_KEY,t);
+  return t;
+}
+(function(){ const t=sessionStorage.getItem(TOKEN_KEY); if(t) document.getElementById('ask-token').value=t; })();
+(function(){ const q=new URLSearchParams(window.location.search).get('ask');
+  if(q) document.getElementById('ask-text').value=q; })();
+async function tick(){
+  try{
+    const r=await fetch('/api/v1/status'); const s=await r.json();
+    const h=s.host||{}; const b=document.getElementById('banner');
+    b.textContent=(h.recovery_state_label||'состояние служебного контура неизвестно')+
+      ' · '+(h.recovery_state_hint||'попробуйте обновить страницу');
+    b.className=(h.healthy===false)?'bad':((h.warnings&&h.warnings.length)?'warn':'');
+    setText('node', s.node_state_label||'состояние узла неизвестно');
+    setText('node-hint', s.node_state_hint||'');
+    const c=s.counts||{};
+    setText('queue-count','задано вопросов: '+(c.questions===undefined?'—':c.questions));
+  }catch(e){
+    const b=document.getElementById('banner');
+    b.textContent='не удалось прочитать состояние узла'; b.className='bad';
+    setText('node-hint','страница попробует обновиться через несколько секунд');
+  }
+}
+async function loadQueue(){
+  try{
+    const r=await fetch('/api/v1/questions?limit=50&order=recent'); const d=await r.json();
+    const rows=d.questions||[]; const tb=document.querySelector('#queue tbody'); tb.innerHTML='';
+    let last=null;
+    for(const q of rows){
+      const s=q.session;
+      if(s && (!last || String(q.created_at)>String(last.created_at))) last=q;
+      const tr=document.createElement('tr');
+      const numCell=document.createElement('td');
+      numCell.textContent=(q.number===null||q.number===undefined)?'':q.number;
+      tr.appendChild(numCell);
+      const askCell=document.createElement('td'); askCell.className='wrap';
+      const askText=document.createElement('div'); askText.textContent=esc(q.text); askCell.appendChild(askText);
+      if(q.created_by_operator===false && q.origin_label){
+        const tag=document.createElement('div'); tag.className='muted'; tag.textContent=q.origin_label;
+        askCell.appendChild(tag);
+      }
+      tr.appendChild(askCell);
+      const ansCell=document.createElement('td');
+      const a=q.answer||{};
+      if(a.statement){
+        if(a.reliability) ansCell.appendChild(badgeFor(a.reliability));
+        const st=document.createElement('span'); st.textContent=a.statement; ansCell.appendChild(st);
+      } else {
+        const parts=[];
+        if(a.label) parts.push(a.label);
+        if(q.queue_place) parts.push('в очереди: '+q.queue_place+'-й');
+        const sp=document.createElement('span'); sp.textContent=parts.join(' · '); ansCell.appendChild(sp);
+      }
+      tr.appendChild(ansCell);
+      const whenCell=document.createElement('td');
+      whenCell.textContent=new Date(q.created_at).toLocaleString();
+      tr.appendChild(whenCell);
+      const openCell=document.createElement('td');
+      const link=document.createElement('a'); link.href='/answer/'+esc(q.id); link.textContent='Открыть ответ';
+      openCell.appendChild(link);
+      tr.appendChild(openCell);
+      tb.appendChild(tr);
+    }
+    setText('queue-error', rows.length?'':'Очередь пуста. Задайте вопрос выше.');
+    if(last){
+      const s=last.session||{};
+      setText('last-work','последняя работа узла: '+
+        [s.state_label,last.state_label].filter(Boolean).join(' · '));
+    } else { setText('last-work',''); }
+  }catch(err){ setText('queue-error','очередь сейчас недоступна'); }
+}
+document.getElementById('ask-form').addEventListener('submit', async (ev)=>{
+  ev.preventDefault();
+  const out=document.getElementById('ask-result'); out.textContent='отправляю…';
+  const extra=(document.getElementById('ask-priority').value||'').trim();
+  const priority=(extra==='')?Number(document.getElementById('ask-urgency').value||0):Number(extra);
+  let r;
+  try{
+    r=await fetch('/api/v1/questions',{method:'POST',
+      headers:{'Content-Type':'application/json','X-Admin-Token':adminToken()},
+      body:JSON.stringify({text:document.getElementById('ask-text').value,priority:priority})});
+  }catch(err){ out.textContent='не удалось отправить вопрос'; return; }
+  const d=await r.json().catch(()=>({}));
+  const pos=(d.position===null||d.position===undefined)?'—':d.position;
+  if(r.status===201) out.textContent='вопрос принят · позиция в очереди '+pos+
+    ' · ответ появится, когда узел его обработает';
+  else if(r.status===200) out.textContent='такой вопрос уже задан · позиция в очереди '+pos;
+  else if(r.status===401) out.textContent='нужен пароль оператора (поле «Пароль оператора»)';
+  else if(r.status===423) out.textContent=
+    [d.reason_label,d.reason_action].filter(Boolean).join(' — ')||
+    'служебный контур нездоров: изменять ничего нельзя';
+  else out.textContent='вопрос не принят ('+r.status+'): '+(d.detail||d.error||'');
+  loadQueue(); tick();
+});
+function idemKey(){
+  // crypto.randomUUID существует только в secure context; на стенде по http его нет.
+  const c=window.crypto && typeof crypto.randomUUID==='function'?crypto.randomUUID():null;
+  return c || ('web-'+Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,10));
+}
+async function runCommand(type, note){
+  const out=document.getElementById('wake-result'); out.textContent='выполняю…';
+  let r;
+  try{
+    r=await fetch('/api/v1/commands',{method:'POST',
+      headers:{'Content-Type':'application/json','X-Admin-Token':adminToken()},
+      body:JSON.stringify({type:type, idempotency_key:idemKey(), reason:note})});
+  }catch(err){ out.textContent='не удалось отправить команду'; return; }
+  const d=await r.json().catch(()=>({})); const res=d.result||{};
+  if(r.status===202){
+    const said=[d.state_label,res.reason_label].filter(Boolean).join(': ');
+    const help=[res.reason_hint,res.reason_action].filter(Boolean).join(' ');
+    out.textContent=(said||'команда выполнена')+(help?(' — '+help):'');
+  }
+  else if(r.status===401) out.textContent='нужен пароль оператора (поле «Пароль оператора»)';
+  else if(r.status===423) out.textContent=
+    [res.reason_label,res.reason_action].filter(Boolean).join(' — ')||
+    'служебный контур нездоров: команды закрыты';
+  else out.textContent='команда не принята ('+r.status+'): '+(d.detail||'');
+  tick(); loadQueue();
+}
+document.getElementById('wake-now').addEventListener('click', ()=>runCommand('wake_now','web: wake now'));
+document.getElementById('resume-node').addEventListener('click', ()=>runCommand('resume','web: resume'));
+document.getElementById('pause-node').addEventListener('click', ()=>runCommand('pause','web: pause'));
+tick(); setInterval(tick, 3000);
+loadQueue(); setInterval(loadQueue, 5000);
+</script></body></html>
+"""
+
+# T7.65: страница ответа на один вопрос («Что я спросил → что получилось»).
+# Бейдж надёжности берёт текст и цвет из серверного перевода уже вычисленной
+# оценки (apps/web/reliability.py), поэтому «Проверено» здесь физически невозможно
+# показать для непроверенного вывода.
+_ANSWER_HTML = """<!doctype html>
+<html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NOEZEMA — ответ на вопрос</title>
+<style>
+ body{font-family:system-ui,sans-serif;margin:2rem;background:#0e1116;color:#e6e6e6}
+ h1{font-size:1.35rem} h2{font-size:1.1rem;margin:.2rem 0}
+ .card{background:#171c26;border:1px solid #2a3142;border-radius:8px;padding:1rem;margin:0.7rem 0}
+ .muted{color:#98a2b3;font-size:.9rem}.warn{color:#e5c07b}
+ #banner{padding:.6rem 1rem;border-radius:6px;font-weight:600;background:#1c2a22}
+ #banner.warn{background:#2a2a1c}#banner.bad{background:#2a1616}
+ .badge{display:inline-block;padding:.15rem .55rem;border-radius:99px;font-size:.82rem;
+   font-weight:700;color:#0e1116;background:#98a2b3;margin-right:.45rem}
+ .claim{border-top:1px solid #2a3142;padding:.55rem 0}
+ .inactive{opacity:.72}
+ ol,ul{margin:.4rem 0 .4rem 1.2rem} li{margin:.25rem 0}
+ a{color:#8ab4f8} code{background:#0b0e13;padding:.1rem .3rem;border-radius:4px}
+</style></head><body>
+<h1>NOEZEMA — ответ на вопрос</h1>
+<p><a href="/">Все вопросы</a> · <a href="/knowledge">Все знания</a> · <a href="/engineer">Для инженера</a></p>
+<div id="banner">загрузка…</div>
+<div class="card"><div class="muted" id="q-number"></div><h2 id="q-text">—</h2>
+ <div class="muted" id="q-meta"></div></div>
+<div class="card"><b>Ответ</b><div id="answer"></div>
+ <p class="muted" id="answer-note"></p>
+ <div id="other-answers"></div>
+ <div id="relied-answers"></div></div>
+<div class="card"><b>Как это получено</b><ol id="steps"></ol>
+ <p class="muted" id="steps-note"></p>
+ <details id="engineer-details"><summary>подробно (для инженера)</summary>
+  <p id="session-link"></p><ul id="events"></ul></details></div>
+<div class="card"><b>Честно об этом ответе</b><ul id="honesty"></ul>
+ <p class="muted" id="honesty-note"></p></div>
+<div class="card"><b>Что можно сделать дальше</b><p id="next-actions"></p></div>
+<script>
+const QUESTION_ID='__QUESTION_ID__';
+let timer=null; let workSessionId=''; let eventsLoadedFor='';
+function esc(v){return String(v===null||v===undefined?'':v);}
+function setText(id,value){document.getElementById(id).textContent=esc(value);}
+function when(value){ return value?new Date(value).toLocaleString():''; }
+function banner(text,kind){ const b=document.getElementById('banner');
+  b.textContent=esc(text); b.className=esc(kind); }
+function renderError(text){ banner(text,'bad');
+  ['answer','steps','honesty','next-actions'].forEach((id)=>{document.getElementById(id).innerHTML='';});
+  setText('answer-note',''); setText('steps-note',''); setText('honesty-note',''); }
+function badgeFor(reliability){
+  const b=document.createElement('span'); b.className='badge';
+  b.textContent=reliability&&reliability.label?reliability.label:'оценка неизвестна';
+  if(reliability&&reliability.hint) b.title=reliability.hint;
+  // цвет — логический токен из серверного перевода уже вычисленной оценки
+  if(reliability&&reliability.color) b.style.backgroundColor=reliability.color;
+  return b;
+}
+function renderClaim(claim,inactive){
+  const row=document.createElement('div'); row.className='claim'+(inactive?' inactive':'');
+  row.appendChild(badgeFor(claim.reliability));
+  const statement=document.createElement('b'); statement.textContent=claim.statement;
+  row.appendChild(statement);
+  // T7.74: как именно этот вопрос связан с выводом (подпись и пояснение — серверные).
+  if(claim.relation_label){
+    const rel=document.createElement('div'); rel.className='muted';
+    rel.textContent=claim.relation_label;
+    if(claim.relation_hint) rel.title=claim.relation_hint;
+    row.appendChild(rel);
+  }
+  // T7.74: что перепроверка сделала с оценкой (строку составляет сервер, JS её печатает).
+  for(const past of (claim.reverify_history||[])){
+    if(!past || !past.text) continue;
+    const line=document.createElement('div'); line.className='muted';
+    line.textContent=past.text; row.appendChild(line);
+  }
+  const checked=document.createElement('div'); checked.className='muted';
+  const lines=(claim.verification||[]).filter(Boolean);
+  if(lines.length){
+    const lead = claim.verification_lead||'чем подтверждено';
+    checked.textContent = lead+': '+lines.join('; '); row.appendChild(checked);
+  }
+  // T7.87 (ADR-0035 §6.1): почему оценка именно такая. Всю строку составляет сервер
+  // («причина: …» + подпись rules engine), JS только печатает то, что пришло.
+  for(const reason of (claim.grade_reason_lines||[])){
+    if(!reason) continue;
+    const line=document.createElement('div'); line.className='muted';
+    line.textContent=reason; row.appendChild(line);
+  }
+  // T7.99 (ADR-0033 §13): повторная запись того же значения свёрнута под основной:
+  // сервер даёт и счётчик («и 1 …»), и строку дубля с его собственной оценкой-бейджем,
+  // и подпись ссылки; JS печатает присланное и ведёт в карточку свёрнутой записи.
+  const dupLead=claim.duplicates_lead;
+  if(dupLead){ const d0=document.createElement('div'); d0.className='muted';
+    d0.textContent=dupLead; row.appendChild(d0); }
+  for(const dup of (claim.duplicates||[])){
+    if(!dup||!dup.text) continue;
+    const line=document.createElement('div'); line.className='muted';
+    if(dup.reliability) line.appendChild(badgeFor(dup.reliability));
+    const txt=document.createElement('span'); txt.textContent=dup.text; line.appendChild(txt);
+    if(dup.duplicate_hint) line.title=dup.duplicate_hint;
+    row.appendChild(line);
+    const dmeta=[dup.type_label,dup.grade_label,dup.freshness_label,dup.relation_label].filter(Boolean).join(' · ');
+    if(dmeta){ const m=document.createElement('div'); m.className='muted'; m.textContent=dmeta; row.appendChild(m); }
+    const dlink=document.createElement('a'); dlink.href='/claim/'+esc(dup.id);
+    dlink.textContent=dup.link_label||''; row.appendChild(dlink);
+  }
+  // T7.88 (ADR-0035 вариант D): «Независимые оценки» — каждую строку подраздела составил
+  // сервер, JS печатает то, что пришло, и бейдж уже вычисленной оценки кандидата.
+  const est=claim.estimates;
+  if(est&&est.heading&&Array.isArray(est.rows)&&est.rows.length){
+    const estHead=document.createElement('div'); estHead.className='muted';
+    estHead.textContent=est.heading; row.appendChild(estHead);
+    for(const estRow of est.rows){
+      if(!estRow||!estRow.text) continue;
+      const line=document.createElement('div'); line.className='muted';
+      if(estRow.reliability) line.appendChild(badgeFor(estRow.reliability));
+      const txt=document.createElement('span'); txt.textContent=estRow.text; line.appendChild(txt);
+      row.appendChild(line);
+    }
+  }
+  const meta=[claim.type_label,claim.grade_label,claim.freshness_label].filter(Boolean).join(' · ');
+  if(meta){ const m=document.createElement('div'); m.className='muted'; m.textContent=meta; row.appendChild(m); }
+  const link=document.createElement('a'); link.href='/claim/'+esc(claim.id);
+  link.textContent='подробнее об этом выводе'; row.appendChild(link);
+  return row;
+}
+function render(d){
+  const q=d.question||{}; const result=d.result||{}; const claims=d.claims||[];
+  const sessions=d.sessions||[]; const work=d.work||{};
+  if(result.active){
+    const stage=(sessions[0]&&sessions[0].stage)||{};
+    banner('Идёт: '+(stage.name||'этап неизвестен')+' ('+
+      (stage.index===null||stage.index===undefined?'—':stage.index)+' из '+
+      (stage.of===undefined?'—':stage.of)+')','warn');
+  } else if(claims.length){ banner(result.label||'ответ готов',''); }
+  else if(sessions.length){ banner(result.label||'ответа пока нет','bad'); }
+  else { banner(result.label||'ответа пока нет',''); }
+  setText('q-number', (q.number===null||q.number===undefined)?'':'Вопрос №'+esc(q.number));
+  setText('q-text', q.text);
+  const meta=[q.state_label,q.origin_label,when(q.created_at)].filter(Boolean).join(' · ');
+  setText('q-meta',meta+(q.state_hint?(' — '+q.state_hint):''));
+  if(!result.active && result.hint) setText('answer-note',result.hint);
+  else if(result.action) setText('answer-note',result.action);
+  const box=document.getElementById('answer'); box.innerHTML='';
+  for(const claim of claims) box.appendChild(renderClaim(claim,false));
+  const others=d.other_claims||[]; const otherBox=document.getElementById('other-answers');
+  otherBox.innerHTML='';
+  if(others.length){
+    const head=document.createElement('p'); head.className='muted';
+    head.textContent='Есть и другие выводы по этому вопросу, но они сейчас не действуют:';
+    otherBox.appendChild(head);
+    for(const claim of others) otherBox.appendChild(renderClaim(claim,true));
+  }
+  // T7.82 (B): «использовано из знаний» — серверная подпись отношения у каждой строки,
+  // своей надписи в JS нет; блок идёт под записанными выводами этого вопроса.
+  const reliedBox=document.getElementById('relied-answers');
+  reliedBox.innerHTML='';
+  for(const claim of (d.relied_claims||[])) reliedBox.appendChild(renderClaim(claim,false));
+  const steps=document.getElementById('steps'); steps.innerHTML='';
+  for(const step of (d.steps||[])){ const li=document.createElement('li');
+    li.textContent=step.text; steps.appendChild(li); }
+  setText('steps-note', steps.children.length?'':
+    'Рассказать пока нечего: записанных шагов работы по этому вопросу нет.');
+  const honestyList=document.getElementById('honesty'); honestyList.innerHTML='';
+  for(const note of (d.honesty||[])){ const li=document.createElement('li');
+    li.textContent=note; honestyList.appendChild(li); }
+  setText('honesty-note', honestyList.children.length?'':'Замечаний нет.');
+  const next=document.getElementById('next-actions'); next.innerHTML='';
+  const askLink=document.createElement('a');
+  askLink.href='/?ask='+encodeURIComponent(q.text||''); askLink.textContent='Задать уточняющий вопрос';
+  next.appendChild(askLink);
+  const kn=document.createElement('a'); kn.href='/knowledge'; kn.textContent=' · Показать все знания';
+  next.appendChild(kn);
+  workSessionId=work.session_id?String(work.session_id):'';
+  if(workSessionId){
+    const eng=document.createElement('a');
+    eng.href='/session/'+esc(workSessionId); eng.textContent=' · Для инженера';
+    next.appendChild(eng);
+    const linkBox=document.getElementById('session-link'); linkBox.innerHTML='';
+    const a=document.createElement('a'); a.href='/session/'+esc(workSessionId);
+    a.textContent='полная лента этой работы'; linkBox.appendChild(a);
+    ensureEvents();
+  } else {
+    document.getElementById('session-link').innerHTML='';
+    document.getElementById('events').innerHTML=''; eventsLoadedFor='';
+  }
+  if(timer){ clearTimeout(timer); timer=null; }
+  if(result.active) timer=setTimeout(load, 2500);
+}
+async function loadEvents(sessionId){
+  const list=document.getElementById('events'); list.innerHTML='';
+  try{
+    const r=await fetch('/api/v1/sessions/'+encodeURIComponent(sessionId));
+    if(!r.ok){ list.innerHTML=''; return; }
+    const d=await r.json(); eventsLoadedFor=sessionId;
+    for(const e of (d.events||[])){ const li=document.createElement('li');
+      li.textContent=(e.sequence===undefined?'':e.sequence)+': '+(e.type_label||'событие без подписи');
+      list.appendChild(li); }
+  }catch(err){ list.innerHTML=''; }
+}
+function ensureEvents(){
+  if(!workSessionId || eventsLoadedFor===workSessionId) return;
+  if(!document.getElementById('engineer-details').open) return;
+  loadEvents(workSessionId);
+}
+async function load(){
+  if(timer){ clearTimeout(timer); timer=null; }
+  let r;
+  try{ r=await fetch('/api/v1/questions/'+encodeURIComponent(QUESTION_ID)+'/answer'); }
+  catch(e){ renderError('не удалось прочитать ответ'); return; }
+  if(r.status===404){ renderError('такого вопроса нет'); return; }
+  if(!r.ok){ renderError('ответ сейчас недоступен'); return; }
+  const d=await r.json().catch(()=>null);
+  if(!d){ renderError('ответ пришёл пустым'); return; }
+  render(d);
+}
+document.getElementById('engineer-details').addEventListener('toggle', ensureEvents);
+load();
 </script></body></html>
 """
 
@@ -136,7 +781,7 @@ async function tick(){
     if(!r.ok){document.getElementById('detail').textContent='не найдена';return;}
     const s = await r.json();
     document.getElementById('detail').innerHTML =
-      `<b>Фазa:</b> ${s.state} · <b>Вопрос:</b> ${s.question_id||'—'}`;
+      `<b>Фаза:</b> ${s.state} · <b>Вопрос:</b> ${s.question_id||'—'}`;
     const ul = document.getElementById('events'); ul.innerHTML='';
     for(const e of s.events){ const li=document.createElement('div'); li.className='ev';
       li.innerHTML = `<span class="t">${e.sequence} ${e.type}</span> `+
@@ -227,6 +872,14 @@ async function tick(){
         `${hd.activation_state||hd.activation_mode||'?'})</li>`;
     }
     h += '</ul></div>';
+    // T7.87 (ADR-0035 §6.1): та же причина, что показывает карточка ответа: строку целиком
+    // составляет сервер («причина: …» + подпись rules engine), здесь её только печатают.
+    const reasons = (d.grade_reason_lines || []).filter(Boolean);
+    if(reasons.length){
+      h += '<div class="card"><b>Почему оценка такая:</b><ul>';
+      for(const reason of reasons) h += `<li>${esc(reason)}</li>`;
+      h += '</ul></div>';
+    }
     h += '<div class="card"><b>Зависимости:</b><ul>';
     for(const x of d.depends_on)
       h += `<li>зависит от: <a href="/claim/${x.claim_id}">${esc(x.statement.slice(0,80))}</a> (${x.kind})</li>`;
@@ -255,9 +908,113 @@ async function tick(){
         h += '<br><b>Группы окружений:</b> ' + p.environment_groups.map(g => `<code>${g.group_id}</code>`).join(', ');
       }
       h += '</ul></div>';
+      h += disputeCard(p);
     }
     document.getElementById('box').innerHTML = h;
+    wireForm();
   }catch(e){ document.getElementById('box').textContent='ошибка чтения'; }
+}
+const TOKEN_KEY = 'noezema.admin.token';
+function disputeCard(p){
+  const corr = p.operator_corrections || [];
+  const uris = sourceUris(p);
+  let h = '<div class="card"><b>Отношение оператора к этому утверждению:</b>';
+  const active = corr.filter(c => c.state === 'disputed');
+  const past = corr.filter(c => c.state !== 'disputed');
+  if(!active.length && !past.length){
+    h += '<br>операторских споров нет: утверждение стоит так, как его оценили правила.';
+  }
+  for(const c of active){
+    h += `<div class="warn"><br><b>${esc(c.state_label)}</b> — ${esc(c.kind_hint)}`+
+      `<br>пересказ: <code>${esc((c.retelling_uri||'').slice(0,80))}</code>`+
+      ` ← первоисточник: <code>${esc((c.primary_uri||'').slice(0,80))}</code>`+
+      `<br>причина: ${esc(c.reason||'—')}`+
+      `<br><small>${esc(c.actor_label)} · ${esc((c.created_at||'').slice(0,19))} · ${esc(c.state_hint)}`+
+      `</small></div>`;
+  }
+  for(const c of past){
+    h += `<div><br><b>${esc(c.state_label)}</b> (история): <code>${esc((c.retelling_uri||'').slice(0,60))}</code>`+
+      ` ← <code>${esc((c.primary_uri||'').slice(0,60))}</code>`+
+      `<br><small>${esc(c.actor_label)} · ${esc((c.created_at||'').slice(0,19))} · ${esc(c.state_hint)}`;
+    if(c.withdrawn_by_label){
+      h += `<br>снял спор: ${esc(c.withdrawn_by_label)} · ${esc((c.withdrawn_at||'').slice(0,19))}`+
+        (c.withdraw_reason ? ` · почему: ${esc(c.withdraw_reason)}` : '');
+    }
+    h += '</small></div>';
+  }
+  if(uris.length){
+    const opts = uris.map(u => `<option value="${esc(u)}">${esc(u.slice(0,70))}</option>`).join('');
+    const primaryOpts = primaryUris(p).map(u => `<option value="${esc(u)}">${esc(u.slice(0,70))}</option>`).join('');
+    h += '<br><b>Оспорить (фактом о происхождении источника):</b>'+
+      '<div><label>первоисточник <select id="d-primary">'+primaryOpts+'</select></label>'+
+      ' <label>пересказ <select id="d-retelling">'+opts+'</select></label>'+
+      '<br><label>причина своими словами <input id="d-reason" size="40"></label>'+
+      ' <label>admin token <input id="d-token" type="password" size="18" placeholder="X-Admin-Token"></label>'+
+      '<br><button id="d-do">Оспорить</button> <button id="d-cancel">Снять спор</button>'+
+      '<br><small>Здесь не выбирают оценку: спор убавляет независимость источников, а оценку и бейдж '+
+      'пересчитывают правила на ближайшем тике перепроверки. Действующая оценка видна до пересчёта. '+
+      'Первоисточником можно назвать и производителя, которому хост уже приписал улики этого '+
+      'утверждения (они добавлены в список первоисточника); пересказ — только сама улика.</small>'+
+      '<pre id="d-out">—</pre></div>';
+  }
+  h += '</div>';
+  return h;
+}
+function sourceUris(p){
+  const seen = new Set(); const out = [];
+  for(const e of p.evidence || []){
+    const u = e.source && e.source.canonical_uri;
+    if(u && !seen.has(u)){ seen.add(u); out.push(u); }
+  }
+  return out;
+}
+function primaryUris(p){
+  const out = sourceUris(p); const seen = new Set(out);
+  for(const s of p.dispute_producers || []){
+    const u = s && s.canonical_uri;
+    if(u && !seen.has(u)){ seen.add(u); out.push(u); }
+  }
+  return out;
+}
+function wireForm(){
+  const out = document.getElementById('d-out');
+  if(!out) return;
+  const tok = document.getElementById('d-token');
+  const saved = sessionStorage.getItem(TOKEN_KEY);
+  if(saved && tok && !tok.value) tok.value = saved;
+  async function call(path, body){
+    const t = ((tok && tok.value) || '').trim();
+    if(t) sessionStorage.setItem(TOKEN_KEY, t);
+    let r;
+    try{
+      r = await fetch('/api/v1/knowledge/claims/'+cid+path, {
+        method:'POST', headers:{'Content-Type':'application/json','X-Admin-Token':t},
+        body: JSON.stringify(body),
+      });
+    }catch(err){ out.textContent='узел не ответил'; return; }
+    const j = await r.json().catch(() => ({}));
+    if(r.status===401){ out.textContent='нужен admin token (заголовок X-Admin-Token)'; return; }
+    if(j.rejected){
+      out.textContent = [j.reason_label || 'отказ', j.reason_hint || '', j.detail || ''].filter(Boolean).join('\\n');
+      return;
+    }
+    out.textContent = linesFor(j);
+  }
+  document.getElementById('d-do').onclick = () => call('/dispute', {
+    primary_uri: document.getElementById('d-primary').value,
+    retelling_uri: document.getElementById('d-retelling').value,
+    reason: document.getElementById('d-reason').value,
+  });
+  document.getElementById('d-cancel').onclick = () => call('/dispute/cancel', {});
+}
+function linesFor(j){
+  const rows = (j.operator_corrections || []).filter(c => c.state === 'disputed');
+  const head = j.cancelled ? 'спор снят' : (j.replayed ? 'уже оспорено этим оператором (повтор)' : 'оспорено');
+  const counts = 'снятых оценок: ' + (j.assessments_requeued ?? 0) +
+    ', затронутых утверждений: ' + (j.claims_touched ?? 0) +
+    ', заведённых задач пересчёта: ' + (j.recheck_jobs_created ?? 0);
+  const state = rows.length ? rows.map(c => c.state_label + ' — ' + c.kind_hint).join('; ') : 'действующего спора нет';
+  return [head, state, counts].join('\\n');
 }
 tick(); setInterval(tick, 5000);
 </script></body></html>
@@ -480,6 +1237,43 @@ class MessageIn(BaseModel):
     sender: str = Field(default="owner", min_length=1, max_length=100)
 
 
+class QuestionIn(BaseModel):
+    """T7.59: operator question intake. The bounds are the intake service's
+    (one source for CLI + API); the service re-validates them itself, so a
+    hand-built request that skips pydantic still cannot bypass them."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    text: str = Field(min_length=1, max_length=MAX_QUESTION_TEXT_CHARS)
+    priority: int = Field(default=0, ge=PRIORITY_MIN, le=PRIORITY_MAX)
+
+
+class ClaimDisputeIn(BaseModel):
+    """T7.81: операторский спор об утверждении (§11.3).
+
+    Оператор называет ФАКТ о происхождении источника («эта страница — пересказ
+    той») и причину. Ни grade, ни `epistemic_status`, ни состояние головы здесь
+    не принимаются: их назначает rules engine после пересчёта независимости.
+    Границы причины — у сервиса `packages/memory/dispute.py` (один источник для
+    CLI и API), сервис перепроверяет их сам. Клиентского `idempotency_key` нет:
+    повтор опознаётся по естественному ключу коррекции (§20.10).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    primary_uri: str = Field(min_length=1, max_length=500)
+    retelling_uri: str = Field(min_length=1, max_length=500)
+    reason: str = Field(min_length=REASON_MIN_CHARS, max_length=REASON_MAX_CHARS)
+
+
+class ClaimDisputeCancelIn(BaseModel):
+    """Снятие спора той же операцией, что и сам спор (отмена обратима)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str | None = Field(default=None, max_length=REASON_MAX_CHARS)
+
+
 class CommandIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -491,14 +1285,52 @@ class CommandIn(BaseModel):
 
 
 class _Node:
-    """M1 node state: in-memory, persisted to system_constants across
-    restarts (the host transition protocol lands in M2)."""
+    """What the web process owns IN MEMORY (T7.59(в)).
+
+    The node STATE is deliberately not here. `system_constants.node_state` in the DB is the single
+    source of truth (AGENTS §3 "effective config/Host-контур": the state is a host fact, and an
+    external `hostctl wake-tick` — a different process — writes it). Reading it once in the
+    lifespan made the copy stale forever: a dev stand whose web started while an external tick held
+    a session remembered `session_running`, answered every later «wake now» with "a session is
+    already running" and showed the wrong node_state in /api/v1/status even though the DB said
+    `idle`. Only what no other process can know stays in memory: the session task THIS process
+    started, and its last error.
+    """
 
     def __init__(self) -> None:
-        self.state: str = "idle"
         self.session_task: asyncio.Task[SessionOutcome] | None = None
         self.last_error: str | None = None
+        # T7.61(а): this process's hold on the node's session lane (see apps/orchestrator/node_guard.py).
+        # It lives here, not in the DB, because it IS this process: released when the session task ends
+        # and — as a safety net — by the lifespan shutdown if the task was cancelled before starting.
+        self.session_guard: NodeSessionGuard | None = None
         self._resets: set[asyncio.Task[None]] = set()
+
+
+# T7.63: how long a shutdown may wait for the accounting work this process started itself. A ceiling
+# against a hang — no test and no production path is allowed to depend on this duration.
+_SHUTDOWN_DRAIN_CEILING_SECONDS = 20.0
+
+logger = logging.getLogger(__name__)
+
+
+async def _await_with_ceiling(*tasks: asyncio.Task[Any], ceiling: float = _SHUTDOWN_DRAIN_CEILING_SECONDS) -> None:
+    """Wait for tasks this process owns, but never longer than `ceiling` seconds (T7.63).
+
+    A task that does not finish is cancelled and NAMED in the log: shutdown must not hang on a wedged
+    database, and an abandoned accounting write has to be visible rather than silent.
+    """
+    pending = [task for task in tasks if not task.done()]
+    if not pending:
+        return
+    _, still_running = await asyncio.wait(pending, timeout=ceiling)
+    for task in still_running:
+        logger.warning(
+            "shutdown drain: %s did not finish within %.1f s — cancelled, its accounting is incomplete",
+            task.get_name(),
+            ceiling,
+        )
+        task.cancel()
 
 
 def _now() -> datetime:
@@ -506,11 +1338,49 @@ def _now() -> datetime:
 
 
 async def _load_node_state(db: AsyncSession) -> str:
+    """The DB truth about the node state (also what /api/v1/status reports)."""
     stmt = select(ORMSystemConstant).where(ORMSystemConstant.key == NODE_STATE_KEY)
     row = (await db.execute(stmt)).scalar_one_or_none()
     if row is None:
         return "idle"
     return row.value if row.value in NODE_STATES else "idle"
+
+
+def _owns_live_session(node: _Node) -> bool:
+    """True while this web process runs a session it started itself (wake_now)."""
+    return node.session_task is not None and not node.session_task.done()
+
+
+def effective_node_state(
+    raw: str, *, web_owns_session: bool, db_has_nonterminal_session: bool
+) -> str:
+    """The state a command is decided on (§5.2.1, T7.59(в)).
+
+    `session_running` is a marker written by whoever started the session — the web or an external
+    tick — and it only means something while a session really runs. When the marker is
+    `session_running`, no session row is nonterminal and this process owns no session task, the
+    marker is left over from an external tick that has since ended (a killed/timed-out unit, a
+    crash before the session row existed): honouring it would wedge the node — every «wake now»
+    refused forever. Everything else (`idle`, `paused`) is taken from the DB as is: an operator
+    pause is sticky until the operator resume.
+
+    Invariant kept: while an external tick really holds a session (the DB says `session_running`
+    AND a nonterminal session exists), wake_now is refused; after that session terminates it is
+    accepted again.
+    """
+    if raw == "session_running" and not web_owns_session and not db_has_nonterminal_session:
+        return "idle"
+    return raw
+
+
+async def _effective_state(db: AsyncSession, node: _Node) -> str:
+    """Read the DB truth for this request and resolve a leftover external-tick marker."""
+    active = await SessionRepository.list_nonterminal(db)
+    return effective_node_state(
+        await _load_node_state(db),
+        web_owns_session=_owns_live_session(node),
+        db_has_nonterminal_session=bool(active),
+    )
 
 
 async def _save_node_state(db: AsyncSession, state: str) -> None:
@@ -552,11 +1422,26 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-        async with factory() as db:
-            node.state = await _load_node_state(db)
+        # T7.59(в): no state is cached here — the node state is read from the DB on every command
+        # and every status query, so an external tick (or another writer) cannot desynchronise us.
         yield
         if node.session_task is not None and not node.session_task.done():
             node.session_task.cancel()
+            # T7.63: awaiting it is what lets its done-callback run — and that callback CREATES the
+            # outcome task (§5.2.1 «учёт исхода»). Draining without this would drain an empty set and
+            # abandon the accounting write all the same.
+            await _await_with_ceiling(node.session_task)
+        # T7.63 (§5.2.1 «…сессия → учёт исхода → снятие»): the outcome task writes through THIS engine.
+        # Abandoning it loses the wake bookkeeping mid-write and leaves its session attached to the DB as
+        # a live idle transaction until the process dies — visible as `database ... is being accessed by
+        # other users` for anyone who has to drop or recreate that DB. Bounded, so shutdown still cannot
+        # hang on a wedged database: an unfinished task is cancelled and named in the log.
+        await _await_with_ceiling(*list(node._resets))
+        # T7.61(а): safety net for the session lane. The task's own finally releases it; this covers the
+        # edge where the process shuts down with a held guard (cancelled before starting, or a release that
+        # could not run). An unheld guard releases to a no-op — no lock is dropped that is not ours.
+        if node.session_guard is not None:
+            await node.session_guard.release()
         if owns_engine:
             await engine.dispose()
 
@@ -581,6 +1466,23 @@ def create_app(
             raise HTTPException(status_code=401, detail="invalid admin token")
         # no token configured: local single-operator, allow (MVP)
 
+    def _command_orchestrator() -> Orchestrator | None:
+        """The orchestrator that answers a command is the one ATTACHED AT COMMAND TIME.
+
+        T7.59(в) defect of the real stand: `build_standalone_app` — the entry every stand and every
+        production web unit uses — cannot build the orchestrator before the app owns its session
+        factory (the orchestrator shares that factory), so it attaches the orchestrator to
+        `app.state.orchestrator` AFTER create_app returned. The command handler closed over the
+        create_app argument instead, which is None in that path, so every «wake now» answered
+        `rejected: orchestrator not attached`. Tests never caught it because they passed the
+        orchestrator as a create_app argument.
+
+        `create_app(orchestrator=…)` behaviour is unchanged — it seeds app.state.orchestrator;
+        reading app.state at command time simply also honours what was attached later.
+        """
+        attached: Orchestrator | None = app.state.orchestrator
+        return attached
+
     # ── queries ───────────────────────────────────────────────────────────
 
     @app.get("/api/v1/status")
@@ -592,13 +1494,21 @@ def create_app(
                 raise HTTPException(status_code=503, detail=str(exc)) from exc
             active = await SessionRepository.list_nonterminal(db)
             session = active[0] if active else None
+            node_state = await _load_node_state(db)
             counts = {
                 "questions": (await db.execute(select(func.count(ORMQuestion.id)))).scalar_one(),
                 "sessions": (await db.execute(select(func.count(ORMSession.id)))).scalar_one(),
                 "messages": (await db.execute(select(func.count(ORMMessage.id)))).scalar_one(),
             }
             out = {
-                "node_state": node.state,
+                # T7.59(в): the node state in the view is the DB value, not a copy made at startup.
+                # `node_state_stale_marker` names the one case where the marker no longer describes
+                # a running session (session_running without any nonterminal session and without a
+                # session this web started) — commands are decided on the resolved state instead.
+                "node_state": node_state,
+                "node_state_stale_marker": node_state == "session_running"
+                and not active
+                and not _owns_live_session(node),
                 "last_error": node.last_error,
                 "config": {
                     "snapshot_id": str(snapshot.id),
@@ -629,7 +1539,11 @@ def create_app(
                 recovery_state="resume_blocked",
                 warnings=[f"host_status_unreadable:{type(exc).__name__}"],
             )
-        out["host"] = host.to_dict()
+        out["host"] = annotate_host_status(host.to_dict())
+        # T7.64 (ADR-0026): человеческая подпись состояния узла; сырое значение
+        # остаётся на месте — старые ключи и значения не тронуты.
+        out["node_state_label"] = ui_labels.describe("node_state", node_state)["label"]
+        out["node_state_hint"] = ui_labels.describe("node_state", node_state)["hint"]
         return out
 
     @app.get("/api/v1/timeline")
@@ -661,6 +1575,7 @@ def create_app(
                     {
                         "sequence": e.sequence,
                         "type": e.type,
+                        "type_label": ui_labels.describe("audit_event_type", e.type)["label"],
                         "occurred_at": e.occurred_at.isoformat(),
                         "actor": e.actor,
                         "public_summary": e.public_summary,
@@ -693,12 +1608,18 @@ def create_app(
         if not host.healthy:
             return JSONResponse(
                 status_code=423,
-                content={
-                    "rejected": True,
-                    "reason": "host_not_healthy",
-                    "recovery_state": host.recovery_state,
-                    "warnings": host.warnings,
-                },
+                # T7.64 (ADR-0026): причина отказа и состояние восстановления
+                # подписаны поверх существующих ключей; fail-closed поведение прежнее.
+                content=annotate_reasons(
+                    annotate_host_status(
+                        {
+                            "rejected": True,
+                            "reason": "host_not_healthy",
+                            "recovery_state": host.recovery_state,
+                            "warnings": host.warnings,
+                        }
+                    )
+                ),
             )
         async with factory() as db, transaction(db):
             command = ORMOperatorCommand(
@@ -714,9 +1635,11 @@ def create_app(
                 return {
                     "id": str(command.id),
                     "type": command.type,
+                    "type_label": ui_labels.describe("command_type", command.type)["label"],
                     "state": command.state,
+                    "state_label": ui_labels.describe("command_state", command.state)["label"],
                     "replayed": True,
-                    "result": command.result,
+                    "result": annotate_reasons(command.result),
                 }
             state, result = await _apply_command(db, command, body)
             command.state = state.value
@@ -727,32 +1650,36 @@ def create_app(
             return {
                 "id": str(command.id),
                 "type": command.type,
+                "type_label": ui_labels.describe("command_type", command.type)["label"],
                 "state": command.state,
+                "state_label": ui_labels.describe("command_state", command.state)["label"],
                 "replayed": False,
-                "result": result,
+                "result": annotate_reasons(result),
             }
 
     async def _apply_command(
         db: AsyncSession, command: ORMOperatorCommand, body: CommandIn
     ) -> tuple[OperatorCommandState, JsonDict]:
         ctype = OperatorCommandType(command.type)
+        # T7.59(в): the node state for THIS command comes from the DB — an external tick writes
+        # system_constants.node_state, and a copy taken at startup goes stale (that was the stand
+        # defect: «wake now» answered "a session is already running" while the DB said idle).
+        state = await _effective_state(db, node)
 
         if ctype is OperatorCommandType.PAUSE:
-            if node.state in ("paused",):
+            if state == "paused":
                 return OperatorCommandState.COMPLETED, {"node_state": "paused", "noop": True}
-            if node.state == "session_running":
+            if state == "session_running":
                 return OperatorCommandState.REJECTED, {"reason": "session is running; stop_gracefully instead"}
-            node.state = "paused"
-            await _save_node_state(db, node.state)
+            await _save_node_state(db, "paused")
             # T3.29: explain the pause for the wake admission audit
             await _set_pause_reason(db, "operator")
             return OperatorCommandState.COMPLETED, {"node_state": "paused"}
 
         if ctype is OperatorCommandType.RESUME:
-            if node.state != "paused":
+            if state != "paused":
                 return OperatorCommandState.REJECTED, {"reason": "node is not paused"}
-            node.state = "idle"
-            await _save_node_state(db, node.state)
+            await _save_node_state(db, "idle")
             # T3.29: the operator resume clears the failure bookkeeping, so
             # the node is eligible for the next scheduled tick immediately.
             await db.execute(
@@ -766,11 +1693,12 @@ def create_app(
             return OperatorCommandState.COMPLETED, {"node_state": "idle"}
 
         if ctype is OperatorCommandType.WAKE_NOW:
-            if node.state == "paused":
+            if state == "paused":
                 return OperatorCommandState.REJECTED, {"reason": "node is paused"}
-            if node.state == "session_running":
+            if state == "session_running":
                 return OperatorCommandState.REJECTED, {"reason": "a session is already running"}
-            if orchestrator is None:
+            orchestrator_ref = _command_orchestrator()
+            if orchestrator_ref is None:
                 return OperatorCommandState.REJECTED, {"reason": "orchestrator not attached"}
             # T3.29 (§5.2.1): wake_now bypasses the schedule timing (interval,
             # minimum gap, backoff) but NOT admission. Evaluated on a fresh
@@ -784,8 +1712,39 @@ def create_app(
                     "reason": decision.reason,
                     "paused_reason": decision.detail,
                 }
-            node.state = "session_running"
-            await _save_node_state(db, node.state)
+
+            # T7.61(а) (§5.2.1): admitted wake ≠ free session lane. The stand race of this task is exactly
+            # this: «wake now» (web) and `noezema-dev-tick.service` (another process) were both admitted
+            # 36 s apart because phase 1 keeps the running session's row uncommitted until COMMITTING, and
+            # `node_state='session_running'` is not an admission condition. The node advisory lock is taken
+            # BEFORE this process writes the marker; whoever cannot take it does not start a session.
+            guard = NodeSessionGuard(engine, _node_owner)
+            try:
+                lane_free = await guard.acquire()
+            except NodeSessionGuardError as exc:
+                node.last_error = str(exc)[:500]
+                return OperatorCommandState.REJECTED, {"reason": f"session lane unavailable: {exc}"}
+            if not lane_free:
+                # Same operator-visible answer as the in-process case above (§5.2.1: exact reason recorded).
+                return OperatorCommandState.REJECTED, {
+                    "reason": "a session is already running",
+                    "wake_reason": REASON_SESSION_IN_PROGRESS,
+                }
+
+            await _save_node_state(db, "session_running")
+            node.session_guard = guard
+
+            async def _run_locked_session() -> SessionOutcome:
+                """The session task, wrapped so the lane is returned on EVERY exit (§5.2.1).
+
+                A normal finish, an exception inside `run_session` and a cancellation (the lifespan
+                shutdown cancels this task) all run this finally — that is what keeps a web-side crash
+                from blocking «wake now» until the process restarts. `release()` is idempotent.
+                """
+                try:
+                    return await orchestrator_ref.run_session()
+                finally:
+                    await guard.release()
 
             def _reset(task: asyncio.Task[SessionOutcome]) -> None:
                 # runs on the event loop after the session task settles
@@ -795,7 +1754,7 @@ def create_app(
                 node._resets.add(reset_task)
                 reset_task.add_done_callback(node._resets.discard)
 
-            node.session_task = asyncio.create_task(orchestrator.run_session())
+            node.session_task = asyncio.create_task(_run_locked_session())
             node.session_task.add_done_callback(_reset)
             return OperatorCommandState.COMPLETED, {"node_state": "session_running"}
 
@@ -835,10 +1794,12 @@ def create_app(
         else:
             final_state = task.result().final_state.value
         async with factory() as db:
-            new_state = await WakeScheduler(db, node_owner=_node_owner, data_root=_data_root).record_session_result(
+            # T3.29 (§5.2.1): the resulting state is written by the scheduler into
+            # system_constants.node_state — and read back from there by /api/v1/status and by the
+            # next command (T7.59(в)); nothing is mirrored in memory.
+            await WakeScheduler(db, node_owner=_node_owner, data_root=_data_root).record_session_result(
                 final_state=final_state, now=_now()
             )
-        node.state = new_state
 
     # ── T3.22: message lifecycle (lazy TTL -> expired) ────────────────────
 
@@ -878,6 +1839,114 @@ def create_app(
                     for m in rows
                 ]
             }
+
+    # ── T7.59: operator question intake (§5.3, §5.3.2, §13.6) ─────────────
+    #
+    # The read half (the queue view) is open like every other GET. The
+    # mutating half belongs to the Command API family: admin token (T3.18) +
+    # the host fail-closed gate (T3.24), i.e. the identical 423 body as
+    # /api/v1/commands. It does not touch memory directly: it appends a
+    # candidate row to the question registry that the FIFO selector serves
+    # (§5.3.2).
+
+    @app.get("/api/v1/questions")
+    async def list_questions(
+        limit: int = 100,
+        order: str = Query(default="queue", pattern="^(queue|recent)$"),
+    ) -> JsonDict:
+        """The question queue: candidates in FIFO order with their position,
+        then already-worked questions, each annotated with the newest session
+        that took it (id + state) when there is one.
+
+        T7.67a (additive): every row gains a cross-table creation number
+        (`number`, №1 = the node's first question; stable across status changes
+        and new questions), an answer summary built by the same logic as the
+        answer card (`answer`, current claims only), `queue_place` and
+        `created_by_operator`. `order=recent` sorts the page newest-first for
+        the simple view without touching FIFO positions; the default order and
+        all pre-existing fields stay exactly as before."""
+        async with factory() as db:
+            rows = await questions_view_queries.list_question_rows(
+                db, limit=max(1, min(limit, 200)), order=order
+            )
+            # T7.64 (ADR-0026): человеческие подписи состояния и происхождения
+            # добавляются к существующим полям строки очереди, ничего не заменяя.
+            return {"questions": [annotate_question(row) for row in rows], "count": len(rows)}
+
+    @app.post("/api/v1/questions", status_code=201)
+    async def post_question(body: QuestionIn, request: Request) -> JSONResponse:
+        """Accept one operator question (origin 'message', state 'candidate').
+
+        Idempotent by exact text: a repeated formulation returns the existing
+        question with 200 and ``replayed=True`` — no duplicate candidate, no
+        silent priority mutation. Validation failure is 400 with the intake
+        reason; a missing or wrong token is 401; a degraded host closes the
+        mutating endpoint with 423 (the same rule as commands).
+        """
+        _check_admin(request)
+        # T3.24 rule, applied to intake: while the host is not fully healthy
+        # the web drops to read-only and every mutating endpoint refuses.
+        host = host_adapter.read()
+        if not host.healthy:
+            return JSONResponse(
+                status_code=423,
+                # T7.64 (ADR-0026): причина отказа и состояние восстановления
+                # подписаны поверх существующих ключей; fail-closed поведение прежнее.
+                content=annotate_reasons(
+                    annotate_host_status(
+                        {
+                            "rejected": True,
+                            "reason": "host_not_healthy",
+                            "recovery_state": host.recovery_state,
+                            "warnings": host.warnings,
+                        }
+                    )
+                ),
+            )
+        try:
+            async with factory() as db, transaction(db):
+                question, created = await put_operator_question(
+                    db, raw_text=body.text, raw_priority=body.priority
+                )
+                position = await queue_position(db, question)
+                payload: JsonDict = {
+                    "id": str(question.id),
+                    "text": question.text,
+                    "origin": question.origin,
+                    "state": question.state,
+                    "priority": question.priority,
+                    "created_at": question.created_at.isoformat(),
+                    "position": position,
+                    "replayed": not created,
+                }
+        except QuestionIntakeError as exc:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "invalid_question", "detail": str(exc)},
+            )
+        return JSONResponse(
+            status_code=201 if created else 200, content=annotate_question(payload)
+        )
+
+    # ── T7.65: карточка ответа на вопрос оператора (открытый GET, §13.1) ───
+
+    @app.get("/api/v1/questions/{question_id}/answer")
+    async def question_answer(question_id: uuid.UUID) -> JsonDict:
+        """Что узел знает по одному вопросу: итог, действующие выводы, шаги работы.
+
+        Открытый читальный маршрут (как очередь и лента сессии): он ничего не
+        меняет и ничего не оценивает — только собирает уже записанные строки и
+        подписывает их единым словарем (`apps/web/labels.py`, `reliability.py`).
+        Шаги («как это получено») берутся из ленты событий этой работы по
+        `sequence` (AGENTS §7), а не по времени строк. Действующим считается
+        утверждение с головой `current` на действующем снимке правил; прочие
+        выводятся отдельно и как ответ не считаются. Несуществующий вопрос — 404.
+        """
+        async with factory() as db:
+            payload = await answer_queries.question_answer(db, question_id)
+        if payload is None:
+            raise HTTPException(status_code=404, detail="question not found")
+        return payload
 
     # ── T3.19: SSE timeline (committed outbox + host notifications) ───────
 
@@ -971,6 +2040,10 @@ def create_app(
             return {
                 "id": str(session.id),
                 "state": session.state,
+                # T7.64 (ADR-0026): человеческое состояние и этап из пяти; индекс
+                # None у состояний вне линейной шкалы (остановка, прерывание, неудача).
+                "state_label": ui_labels.describe("session_state", session.state)["label"],
+                "stage": ui_labels.session_stage(session.state),
                 "question_id": str(session.question_id) if session.question_id else None,
                 "config_snapshot_id": str(session.config_snapshot_id) if session.config_snapshot_id else None,
                 "stop_requested_at": session.stop_requested_at.isoformat() if session.stop_requested_at else None,
@@ -979,6 +2052,7 @@ def create_app(
                     {
                         "sequence": e.sequence,
                         "type": e.type,
+                        "type_label": ui_labels.describe("audit_event_type", e.type)["label"],
                         "occurred_at": e.occurred_at.isoformat(),
                         "public_summary": e.public_summary,
                         "payload": e.payload,
@@ -1026,6 +2100,137 @@ def create_app(
     async def knowledge_claim_provenance(claim_id: uuid.UUID) -> JsonDict:
         async with factory() as db:
             return await knowledge_queries.claim_provenance(db, claim_id)
+
+    # ── T7.81: операторский спор об утверждении (§11.3, ADR-0031) ───────────
+
+    @app.post("/api/v1/knowledge/claims/{claim_id}/dispute", response_model=None)
+    async def post_claim_dispute(
+        claim_id: uuid.UUID, body: ClaimDisputeIn, request: Request
+    ) -> JSONResponse:
+        """Оспорить действующее утверждение фактом о происхождении источника.
+
+        Что происходит (всё — существующими механизмами): коррекция графа
+        источников `merge` (актор = вход оператора, основание = артефакт
+        прочитанной страницы пересказа, причина = событие журнала) → каскад
+        §11.3 (`apply_source_graph_change`: головы действующих оценок затронутых
+        утверждений уходят в pending и заводятся долговременные задачи пересчёта)
+        → вопрос на перепроверку, цитирующий statement якоря. Оценка и бейдж
+        меняются только после пересчёта правилами: независимых групп стало меньше
+        → `insufficient_independence` → E1/hypothesis. Действующая оценка при этом
+        остаётся видимой и подписанной «перепроверяется» — ничего не прячется.
+
+        Идемпотентность — естественный ключ коррекции (UNIQUE актёр+пара+вид+
+        версия правил): повтор тем же оператором по той же паре отвечает 200 с
+        `replayed=True` и не заводит ни второй строка графа, ни второго вопроса.
+        Отказ — 409 (конфликт с состоянием знания) или 404, подписанный словарём.
+        Токен оператора и здоровый служебный контур обязательны, как у команд.
+        """
+        _check_admin(request)
+        host = host_adapter.read()
+        if not host.healthy:
+            return JSONResponse(
+                status_code=423,
+                content=annotate_reasons(
+                    annotate_host_status(
+                        {
+                            "rejected": True,
+                            "reason": "host_not_healthy",
+                            "recovery_state": host.recovery_state,
+                            "warnings": host.warnings,
+                        }
+                    )
+                ),
+            )
+        try:
+            async with factory() as db, transaction(db):
+                outcome = await dispute_claim(
+                    db,
+                    AuditService(db),
+                    claim_id=claim_id,
+                    primary_uri=body.primary_uri,
+                    retelling_uri=body.retelling_uri,
+                    reason=body.reason,
+                    actor=ACTOR_WEB,
+                )
+                corrections = await knowledge_queries.claim_source_corrections(db, claim_id)
+        except DisputeError as exc:
+            return JSONResponse(
+                status_code=_DISPUTE_REFUSAL_STATUS.get(exc.code, 409),
+                content=annotate_reasons({"rejected": True, "reason": exc.code, "detail": exc.detail}),
+            )
+        return JSONResponse(
+            status_code=200 if outcome.replayed else 201,
+            content={
+                "claim_id": str(outcome.claim_id),
+                "replayed": outcome.replayed,
+                "correction_id": str(outcome.correction_id),
+                "actor": outcome.actor,
+                "reason": outcome.reason,
+                "assessments_requeued": outcome.invalidated,
+                "claims_touched": outcome.affected_claims,
+                "recheck_jobs_created": outcome.jobs_created,
+                "question_id": str(outcome.question_id),
+                "question_created": outcome.question_created,
+                "operator_corrections": corrections,
+            },
+        )
+
+    @app.post("/api/v1/knowledge/claims/{claim_id}/dispute/cancel", response_model=None)
+    async def post_claim_dispute_cancel(
+        claim_id: uuid.UUID, body: ClaimDisputeCancelIn, request: Request
+    ) -> JSONResponse:
+        """Снять операторский спор тем же механизмом, которым он был сделан.
+
+        Строка коррекции не удаляется: `valid = false` + повторный каскад §11.3
+        по той же паре источников, дальше правила пересчитывают независимость
+        без склейки (прежний grade возвращается, если групп снова достаточно).
+        История — знание и прежняя оценка — остаётся в базе целиком (§14).
+        """
+        _check_admin(request)
+        host = host_adapter.read()
+        if not host.healthy:
+            return JSONResponse(
+                status_code=423,
+                content=annotate_reasons(
+                    annotate_host_status(
+                        {
+                            "rejected": True,
+                            "reason": "host_not_healthy",
+                            "recovery_state": host.recovery_state,
+                            "warnings": host.warnings,
+                        }
+                    )
+                ),
+            )
+        try:
+            async with factory() as db, transaction(db):
+                outcome = await cancel_dispute(
+                    db,
+                    AuditService(db),
+                    claim_id=claim_id,
+                    reason=body.reason,
+                    actor=ACTOR_WEB,
+                )
+                corrections = await knowledge_queries.claim_source_corrections(db, claim_id)
+        except DisputeError as exc:
+            return JSONResponse(
+                status_code=_DISPUTE_REFUSAL_STATUS.get(exc.code, 409),
+                content=annotate_reasons({"rejected": True, "reason": exc.code, "detail": exc.detail}),
+            )
+        return JSONResponse(
+            status_code=200,
+            content={
+                "claim_id": str(outcome.claim_id),
+                "cancelled": True,
+                "correction_id": str(outcome.correction_id),
+                "actor": outcome.actor,
+                "reason": outcome.reason,
+                "assessments_requeued": outcome.invalidated,
+                "claims_touched": outcome.affected_claims,
+                "recheck_jobs_created": outcome.jobs_created,
+                "operator_corrections": corrections,
+            },
+        )
 
     # ── T7.1: diagnostics (reconciliation, invalidation, jobs) ────────────
 
@@ -1130,11 +2335,39 @@ def create_app(
                 "outcome": run.outcome,
             }
 
-    # ── T3.20/T3.21/T7.1: HTML pages ─────────────────────────────────────
+    # ── T7.64 (ADR-0026): единый словарь человеческих подписей ─────────────
+
+    @app.get("/api/v1/glossary")
+    async def glossary() -> JsonDict:
+        """Открытый GET: категория → значение → {label, hint, action}.
+
+        Источник — презентационный слой `apps/web.labels`: будущая страница
+        «Справка» (T7.66) читает тексты отсюда, а не дублирует их. Здесь только
+        подписи: правила, пороги и оценку держат домен и rules engine.
+        """
+        categories = ui_labels.glossary()
+        return {
+            "categories": categories,
+            "category_count": len(categories),
+            "entry_count": sum(len(entries) for entries in categories.values()),
+            "stage_count": ui_labels.STAGE_COUNT,
+        }
+
+    # ── T3.20/T3.21/T7.1/T7.65: HTML pages ────────────────────────────────
 
     @app.get("/", response_class=HTMLResponse)
     async def main_page() -> str:
-        return _MAIN_HTML
+        """Простой режим (T7.65): «Вопросы и ответы» для оператора."""
+        return _HOME_HTML
+
+    @app.get("/engineer", response_class=HTMLResponse)
+    async def engineer_page() -> str:
+        """Полный инженерный вид — прежняя главная страница, перенесена целиком."""
+        return _ENGINEER_HTML
+
+    @app.get("/answer/{question_id}", response_class=HTMLResponse)
+    async def answer_page(question_id: uuid.UUID) -> str:
+        return _ANSWER_HTML.replace("__QUESTION_ID__", str(question_id))
 
     @app.get("/session/{session_id}", response_class=HTMLResponse)
     async def session_page(session_id: uuid.UUID) -> str:
@@ -1164,24 +2397,34 @@ def create_app(
 
 
 def build_standalone_app() -> FastAPI:
-    """Entry helper: build the app with an orchestrator from env config."""
-    from pathlib import Path
+    """Entry helper: build the app with an orchestrator from env config.
 
-    from apps.orchestrator.executor import StubToolExecutor
-    from packages.llm_gateway.client import LLMMiddleware
-    from packages.llm_gateway.config import LLMGatewayConfig, ModelProfile
+    The app is created first (it owns the engine + session factory), the orchestrator is built on
+    THAT factory and attached to `app.state.orchestrator`. A command reads the attachment at
+    command time (`_command_orchestrator` in create_app) — this is the path a real stand uses, and
+    the order here is exactly why an argument-only lookup used to answer "orchestrator not
+    attached" on the stand while tests that passed the orchestrator as an argument stayed green.
 
+    T7.68 (ADR-0027 §1): the orchestrator is assembled by the same pure builder as the wake tick,
+    eval-run and the manual entry (`apps.orchestrator.session_assembly`), so «wake now» now has a
+    research proxy too — before this wiring it had none, and every web-started session answered
+    `research.fetch` with "research proxy is not configured for this host" (docs/web-access-design.md
+    G1). The artifact store lands at `<NOEZEMA_DATA_ROOT>/artifacts` — the sibling of this factory's
+    workspace (`resolve_standalone_workspace`) and, on one node with one data root, the same directory
+    the tick writes. Like before T7.68 the web process does not close its gateway (it lives as long
+    as the app); tests close it through `app.state.orchestrator.gateway`.
+    """
     settings = DatabaseSettings()
-    llm_config = LLMGatewayConfig()
     # app owns the single engine; the orchestrator shares its factory
     app = create_app(db_url=settings.database_url)
     factory = app.state.factory
-    gateway = LLMMiddleware(llm_config)
-    orchestrator = Orchestrator(
-        session_factory=factory,
-        gateway=gateway,
-        profile=ModelProfile(model_alias=llm_config.model, backend_name="local"),
-        executor=StubToolExecutor(Path("/var/lib/noezema/workspace")),
+    # T7.58 (ADR-0023) + T7.59(b): the workspace follows NOEZEMA_DATA_ROOT (the env the wake tick
+    # uses) instead of a hardcoded production path — same value when the env is unset, but a stand
+    # that runs as an ordinary user can actually create it. Sandbox mode ignores this path: its host
+    # overlay lives in NOEZEMA_SANDBOX_WORK_ROOT; the artifact store (host-side research.fetch) does
+    # not ignore it — executor choice never moves the data root (T7.68).
+    orchestrator, _gateway = build_session_orchestrator(
+        factory, resolve_standalone_workspace(data_root_from_env())
     )
     app.state.orchestrator = orchestrator
     return app

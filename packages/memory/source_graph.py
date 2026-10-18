@@ -21,7 +21,9 @@ tx, §3.8).
 from __future__ import annotations
 
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Any
 
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -42,6 +44,7 @@ from packages.memory.independence import (
     SourceGraphInput,
     group_source_graph,
 )
+from packages.memory.scope import VALUE_ATTRIBUTION_SCHEMA
 
 
 @dataclass(frozen=True)
@@ -52,14 +55,126 @@ class SourceGraphChangeResult:
     revision: int
 
 
-async def build_source_independence_snapshot(
+async def _value_attribution_parents(
     db: AsyncSession, *, claim_id: uuid.UUID
-) -> tuple[uuid.UUID | None, dict[uuid.UUID, tuple[str, str]]]:
-    """The §11.3 snapshot over the claim's sources (deterministic,
-    versioned). Returns (snapshot_id, {source_id: (group_id, basis)});
-    (None, {}) when the claim has no source-based evidence. The snapshot
-    and members rows are immutable (the assessment fixes the id); a new
-    assessment always gets a fresh snapshot — like T4.6."""
+) -> dict[uuid.UUID, set[uuid.UUID]]:
+    """T7.78 (ADR-0029): эффективные родители этого утверждения по записям улик.
+
+    Читает только уже записанное хостом решение (`evidence.scope.value_attribution`,
+    `packages/memory/scope.py`) — детектор отсюда не вызывается: `packages/` не импортирует
+    `apps/`. Ничего, кроме ВХОДА группировщика, от решения не зависит.
+
+    Консервативно: если улики одного утверждения при одном и том же источнике приписывают
+    значение разным первоисточникам, эффективного родителя нет (разные группы, как до задачи).
+    Форма записии проверяется по маркеру схемы; не-UUID родителя игнорируется.
+    """
+    rows = (
+        (
+            await db.execute(
+                text(
+                    "SELECT source_id,"
+                    " scope -> 'value_attribution' ->> 'parent_source_id' AS parent_id"
+                    " FROM evidence"
+                    " WHERE claim_id = :c AND source_id IS NOT NULL"
+                    " AND jsonb_typeof(scope -> 'value_attribution') = 'object'"
+                    " AND scope -> 'value_attribution' ->> 'schema' = :schema"
+                ),
+                {"c": claim_id, "schema": VALUE_ATTRIBUTION_SCHEMA},
+            )
+        )
+        .all()
+    )
+    parents: dict[uuid.UUID, set[uuid.UUID]] = {}
+    for raw_source, raw_parent in rows:
+        source_id = _as_uuid(raw_source)
+        parent_id = _as_uuid(raw_parent)
+        if source_id is None or parent_id is None or parent_id == source_id:
+            continue
+        parents.setdefault(source_id, set()).add(parent_id)
+    return parents
+
+
+def _as_uuid(value: Any) -> uuid.UUID | None:
+    """asyncpg возвращает свой UUID-тип (AGENTS §7): guard перед приведением."""
+    if isinstance(value, uuid.UUID):
+        return value
+    if isinstance(value, str):
+        try:
+            return uuid.UUID(value)
+        except ValueError:
+            return None
+    return None
+
+
+@dataclass(frozen=True)
+class GraphNode:
+    """One graph node as the grouping input sees it (T7.117 assembly split)."""
+
+    source_id: Any
+    canonical_uri: str | None
+    content_hash: str | None
+    #: страничный указатель `sources.parent_source_id` (T7.75)
+    pointer_parent: Any
+
+
+@dataclass(frozen=True)
+class SourceGraphAssembly:
+    """Read-only assembly of the grouping input for one claim (T7.117):
+    the graph facts the loader collects, plus the host's recorded value-level
+    parents. `grouping_arguments` is the ONLY place that decides which parent
+    enters the input — so production and preview share one priority rule."""
+
+    #: evidence sources of the claim — the snapshot members
+    member_ids: tuple[Any, ...]
+    #: members first, then parent nodes (both id-sorted: group names are stable)
+    nodes: tuple[GraphNode, ...]
+    edges: tuple[SourceGraphEdge, ...]
+    corrections: tuple[SourceGraphCorrection, ...]
+    effective_parent: Mapping[Any, Any]
+
+
+def grouping_arguments(
+    assembly: SourceGraphAssembly,
+) -> tuple[list[SourceGraphInput], list[SourceGraphEdge], list[SourceGraphCorrection]]:
+    """Сборка ВХОДА группировщика (T7.78; приоритет — T7.117, ADR-0029).
+
+    T7.117 (решение пользователя 2026-10-15 «вариант 1»): для источника, у улик
+    ЭТОГО утверждения которого есть единственный эффективный родитель по записям
+    значения (`effective_parent`: разные родители записей — эффективного нет, прежний
+    консерватизм T7.78), во вход группировщика идёт именно он; страничный указатель
+    `sources.parent_source_id` используется только когда эффективного родителя по
+    записям нет (старые улики эпохи до поуровневого детектора, отказы детектора
+    значения). Тот же приоритет витрина закрепила T7.109 часть б3 и T7.116 часть б:
+    запись о значении важнее якоря-родителя этой же строки — страничный указатель
+    есть свойство страницы, а не значения (T7.98), и на витрине он называет строку
+    только когда утверждение называет того же производителя.
+
+    Узлы графа включают ОБА указателя (страничный и записанный родителем — см.
+    `load_source_graph_assembly`), поэтому при смене приоритета источник, ставший
+    родителем, остаётся узлом графа и продолжает склеивать своих детей; рёбра и
+    коррекции оператора — как прежде. `group_source_graph` не различает, откуда
+    взялся parent, и склеивает существующим основанием `parent:<short12>` — сам
+    алгоритм группировки не тронут."""
+    inputs = [
+        SourceGraphInput(
+            source_id=n.source_id,
+            canonical_uri=n.canonical_uri,
+            content_hash=n.content_hash,
+            # запись значения приоритетнее страничного указателя (T7.117);
+            # указатель — когда эффективного родителя по записям нет
+            parent_source_id=assembly.effective_parent.get(n.source_id) or n.pointer_parent,
+        )
+        for n in assembly.nodes
+    ]
+    return inputs, list(assembly.edges), list(assembly.corrections)
+
+
+async def load_source_graph_assembly(
+    db: AsyncSession, *, claim_id: uuid.UUID
+) -> SourceGraphAssembly | None:
+    """Read-only load of the graph facts for one claim (§11.3 input; T7.117).
+
+    Returns ``None`` when the claim has no source-based evidence."""
     source_ids = [
         row[0]
         for row in (
@@ -74,7 +189,7 @@ async def build_source_independence_snapshot(
         ).all()
     ]
     if not source_ids:
-        return None, {}
+        return None
 
     sources = (
         (
@@ -85,10 +200,23 @@ async def build_source_independence_snapshot(
         .scalars()
         .all()
     )
+    # T7.78 (ADR-0029): эффективный родитель значения для ЭТОГО утверждения — решение хоста,
+    # записанное на улике; детектор отсюда не вызывается (`packages/` не импортирует `apps/`).
+    attribution_parents = await _value_attribution_parents(db, claim_id=claim_id)
+    effective_parent = {
+        sid: next(iter(parents))
+        for sid, parents in attribution_parents.items()
+        if len(parents) == 1
+    }
     # direct parents of the set: graph nodes (two children of one parent
-    # merge through it) but not members of the snapshot
+    # merge through it) but not members of the snapshot. T7.117: узлы включают
+    # и страничные указатели, и родителей по записям — смена приоритета не выносит
+    # прежнего родителя из графа, он остаётся узлом и склейкой своих детей.
     parent_ids = sorted(
-        {s.parent_source_id for s in sources if s.parent_source_id is not None}
+        (
+            {s.parent_source_id for s in sources if s.parent_source_id is not None}
+            | set(effective_parent.values())
+        )
         - set(source_ids)
     )
     parent_rows = (
@@ -133,34 +261,49 @@ async def build_source_independence_snapshot(
         .all()
     )
 
-    inputs = [
-        SourceGraphInput(
-            source_id=s.id,
-            canonical_uri=s.canonical_uri,
-            content_hash=s.content_hash,
-            parent_source_id=s.parent_source_id,
-        )
-        for s in (*sources, *parent_rows)
-    ]
-    edges = [
-        SourceGraphEdge(
-            edge_id=e.id,
-            from_id=e.from_source_id,
-            to_id=e.to_source_id,
-            kind=e.kind,
-        )
-        for e in edges_rows
-    ]
-    corrections = [
-        SourceGraphCorrection(
-            correction_id=c.id,
-            from_id=c.from_source_id,
-            to_id=c.to_source_id,
-            kind=c.kind,
-            valid=c.valid,
-        )
-        for c in correction_rows
-    ]
+    return SourceGraphAssembly(
+        member_ids=tuple(source_ids),
+        nodes=tuple(
+            GraphNode(
+                source_id=s.id,
+                canonical_uri=s.canonical_uri,
+                content_hash=s.content_hash,
+                pointer_parent=s.parent_source_id,
+            )
+            for s in (*sources, *parent_rows)
+        ),
+        edges=tuple(
+            SourceGraphEdge(edge_id=e.id, from_id=e.from_source_id, to_id=e.to_source_id, kind=e.kind)
+            for e in edges_rows
+        ),
+        corrections=tuple(
+            SourceGraphCorrection(
+                correction_id=c.id,
+                from_id=c.from_source_id,
+                to_id=c.to_source_id,
+                kind=c.kind,
+                valid=c.valid,
+            )
+            for c in correction_rows
+        ),
+        effective_parent=effective_parent,
+    )
+
+
+async def build_source_independence_snapshot(
+    db: AsyncSession, *, claim_id: uuid.UUID
+) -> tuple[uuid.UUID | None, dict[uuid.UUID, tuple[str, str]]]:
+    """The §11.3 snapshot over the claim's sources (deterministic,
+    versioned). Returns (snapshot_id, {source_id: (group_id, basis)});
+    (None, {}) when the claim has no source-based evidence. The snapshot
+    and members rows are immutable (the assessment fixes the id); a new
+    assessment always gets a fresh snapshot — like T4.6."""
+    assembly = await load_source_graph_assembly(db, claim_id=claim_id)
+    if assembly is None:
+        return None, {}
+    source_ids = list(assembly.member_ids)
+
+    inputs, edges, corrections = grouping_arguments(assembly)
 
     result = group_source_graph(inputs, edges, corrections)
 

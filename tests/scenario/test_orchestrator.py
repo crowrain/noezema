@@ -19,7 +19,7 @@ from apps.orchestrator.executor import StubToolExecutor
 from apps.orchestrator.orchestrator import Orchestrator
 from packages.domain.db.uow import transaction
 from packages.domain.models.base import JsonDict
-from packages.domain.models.enums import QuestionOrigin, QuestionState, SessionState
+from packages.domain.models.enums import AuditEventType, QuestionOrigin, QuestionState, SessionState
 from packages.domain.models.questions import ORMQuestion
 from packages.domain.repositories.questions import QuestionRepository
 from packages.llm_gateway.client import LLMMiddleware
@@ -49,6 +49,21 @@ COMPLETE: JsonDict = {
     "public_rationale": "Вопрос отвечен",
     "decision": {"kind": "complete", "reason": "goal_reached"},
 }
+# ровно одно утверждение — тот же конверт, что CURATOR_OK (без new_questions): нужна
+# чистая пара «применённое знание → terminal вопроса» (T7.79)
+CURATOR_ONE_CLAIM: JsonDict = {
+    "summary": "Одно утверждение",
+    "claims": [
+        {
+            "statement": "6*7 равно 42",
+            "claim_type": "computed_result",
+            "scope": {"expr": "6*7"},
+        }
+    ],
+    "evidence_links": [{"evidence_index": 0, "claim_index": 0, "relation": "supports"}],
+    "new_questions": [],
+}
+
 CURATOR_OK: JsonDict = {
     "summary": "Одно утверждение",
     "claims": [
@@ -390,28 +405,57 @@ async def test_cross_lingual_search_and_staging(migrated_db, fake_llm: FakeLLM, 
     assert list(row2[0]) == ["Caching reduces response time on repeated requests."]
 
 
+# T7.51 (the `pytest -n auto` flake: LeaseLost "lease lost during long
+# operation" — starvation, NOT the T7.47b cancel-mid-execute race):
+# LeaseHeartbeatGuard renews every ttl/3 and LeaseService.heartbeat REFUSES a
+# renewal whose UPDATE actually executes after the TTL has elapsed, so one
+# renewal may be late by at most ttl - ttl/3 = 2·ttl/3 of wall clock before the
+# lease is genuinely lost. At TTL 1 s that margin was 0.67 s — measured: under
+# xdist contention (6 workers migrating scratch DBs against one PostgreSQL;
+# a pure CPU burn does NOT reproduce it) the heartbeat lands later than that,
+# the guard raises LeaseLost and the session aborts. The product behaviour is
+# exactly §5.2.3 (abort + fenced commit), so only the test's absolute scale is
+# fragile: it is scaled 3x with every ratio preserved — renewal interval
+# ttl/3 = 1 s, model delay 2.5×TTL (a call stays >2 TTL long), ≈7 renewals per
+# call; only the jitter margin grows, 0.67 s → 2.0 s.
+LEASE_TTL_SECONDS = 3.0
+MODEL_DELAY_SECONDS = 2.5 * LEASE_TTL_SECONDS  # a model call is 2.5x the TTL long
+
+# T7.56 (measured): this test alone survived N=20 under the PostgreSQL DDL storm, the clone storm
+# (the T7.55 template-fixture profile) and 12 CPU burns at the T7.51 scale above — that scale stays.
+# What it does NOT survive is multi-worker contention in full `-n auto` runs (flake history: T7.51
+# acceptance, T7.55 red windows). It is therefore marked `timing`: full checks and CI run it in a
+# dedicated SERIAL stage after the parallel pool (AGENTS.md §6), where no pytest neighbors hammer the
+# shared Postgres while the heartbeat guard awaits its renewals. Timing values unchanged.
+
+
 @pytest.mark.asyncio
+@pytest.mark.timing
 async def test_slow_llm_does_not_lose_commit_lease(migrated_db, fake_llm: FakeLLM, tmp_path: Path) -> None:
     """T3.30 regression (first real MVP session, qwen36-35b-a3b-q6-mtp):
 
     a model call longer than the lease TTL must not starve the fenced
     commit — the background guard renews the lease mid-call (§5.2.3).
     Without the guard this session ends commit_lease_lost → reconciled_abort.
+
+    T7.51: LEASE_TTL_SECONDS / MODEL_DELAY_SECONDS keep the same relations as
+    before (delay = 2.5×TTL, renewal every TTL/3) at a 3x larger absolute
+    scale — see the constants above for the measured xdist margin.
     """
     scratch_url, _engine = migrated_db
     question_id = await _seed_question(scratch_url)
 
-    # every model call takes 2.5 s — more than 2x the 1 s lease TTL below
+    # every model call takes 2.5× the lease TTL (T7.51 constants above)
     fake_llm.script(
         [
-            {"content": TOOL_PYTHON, "delay_seconds": 2.5},
-            {"content": TOOL_WRITE, "delay_seconds": 2.5},
-            {"content": COMPLETE, "delay_seconds": 2.5},
-            {"content": CURATOR_OK, "delay_seconds": 2.5},
+            {"content": TOOL_PYTHON, "delay_seconds": MODEL_DELAY_SECONDS},
+            {"content": TOOL_WRITE, "delay_seconds": MODEL_DELAY_SECONDS},
+            {"content": COMPLETE, "delay_seconds": MODEL_DELAY_SECONDS},
+            {"content": CURATOR_OK, "delay_seconds": MODEL_DELAY_SECONDS},
         ]
     )
     orch, gateway, engine = _make_orchestrator(
-        scratch_url, fake_llm, tmp_path / "ws", lease_ttl=timedelta(seconds=1)
+        scratch_url, fake_llm, tmp_path / "ws", lease_ttl=timedelta(seconds=LEASE_TTL_SECONDS)
     )
     try:
         outcome = await orch.run_session(question_id)
@@ -900,3 +944,187 @@ async def test_curator_cycle_dependency_rejected_graph_unchanged(
         {"s": str(outcome3.session_id)},
     )
     assert int(rejected[0]) == 1
+
+
+@pytest.mark.asyncio
+async def test_stub_unsupported_tool_is_a_normal_step_failure(
+    migrated_db, fake_llm: FakeLLM, tmp_path: Path
+) -> None:
+    """T7.57(b): shell.execute разрешён реестром policy-инструментов (и списком
+    инструментов config-снапшота), но не реализован в dev/eval StubToolExecutor.
+    Такой шаг — обычная НЕудача оркестратора: action FAILED с явной диагностикой
+    `tool_not_supported:` (не безликий `unreachable`), ACTION_FAILED в audit,
+    evidence нет; цикл explorer продолжается и сессия штатно доходит до complete
+    (ни краха, ни бесконечного повтора). Повтор-гард (T7.12) считает и неудачные
+    исполненные вызовы: третий идентичный — deny без обращения."""
+    scratch_url, _engine = migrated_db
+    qid = await _seed_question(scratch_url, text="Вычисли 6*7 в песочнице")
+    tool_shell: JsonDict = {
+        "public_rationale": "Посмотреть файлы песочницы",
+        "expected_information": "Список файлов",
+        "decision": {"kind": "tool", "tool": "shell.execute", "arguments": {"command": "ls"}},
+    }
+    curator_empty: JsonDict = {
+        "content": {"summary": "Знания нет", "claims": [], "evidence_links": [], "new_questions": []},
+    }
+    outcome = await _run_fake_session(
+        scratch_url,
+        fake_llm,
+        tmp_path,
+        qid,
+        [{"content": tool_shell}, {"content": COMPLETE}, {"content": curator_empty}],
+    )
+
+    # сессия не сломалась: обычный путь до консолидации и commit
+    assert outcome.final_state is SessionState.SUCCEEDED
+    assert outcome.claims_proposed == 0
+
+    row = await _scalar(
+        scratch_url,
+        "SELECT state, error_code FROM actions WHERE session_id=:s AND tool='shell.execute'",
+        {"s": str(outcome.session_id)},
+    )
+    assert row is not None, "the shell.execute action must exist as an executed step"
+    state, error_code = row
+    assert state == "failed"
+    assert error_code is not None and error_code.startswith("tool_not_supported: shell.execute")
+    assert "unreachable" not in error_code
+
+    failed_audit = await _scalar(
+        scratch_url,
+        "SELECT count(*) FROM audit_events WHERE type='action_failed' AND session_id=:s",
+        {"s": str(outcome.session_id)},
+    )
+    assert int(failed_audit[0]) == 1
+
+    # failed observation не производит evidence (§5: наблюдение — только ok-результат)
+    ev = await _scalar(
+        scratch_url,
+        "SELECT count(*) FROM evidence WHERE created_in_session=:s",
+        {"s": str(outcome.session_id)},
+    )
+    assert int(ev[0]) == 0
+
+# ─── T7.79: итог сессии без единого утверждения (ADR-0011 доп.) ────────────────
+
+CURATOR_EMPTY: JsonDict = {
+    "summary": "Прочитанное не содержит ответа на вопрос",
+    "claims": [],
+    "evidence_links": [],
+    "new_questions": [],
+}
+
+
+async def _question_state(scratch_url: str, question_id: uuid.UUID) -> str:
+    row = await _scalar(scratch_url, "SELECT state FROM questions WHERE id=:q", {"q": str(question_id)})
+    return str(row[0])
+
+
+@pytest.mark.asyncio
+async def test_succeeded_without_claims_does_not_verify_the_question(
+    migrated_db, fake_llm: FakeLLM, tmp_path: Path
+) -> None:
+    """T7.79 (стендовый отказ 96c710ff): сессия дошла до `complete: goal_reached`, куратор
+    предложил ноль утверждений — «ответ получен и проверен» выставлялся над пустотой (вопрос
+    выглядел закрытым, хотя ответ записан не был). Теперь такой итог = partially_answered
+    (существующее значение enum, миграции нет): завершившаяся работа БЕЗ ответа.
+
+    Провераются обе точки правки: правило оркестратора (terminal вопроса) и fail-closed
+    страховка на границе коммита (хост решает по применённым claim-операциям staging)."""
+    scratch_url, _engine = migrated_db
+    question_id = await _seed_question(scratch_url, "Какая годовая инфляция в России по итогам декабря 2025 года?")
+
+    fake_llm.script(
+        [
+            {"content": TOOL_PYTHON},
+            {"content": COMPLETE},
+            {"content": CURATOR_EMPTY},
+        ]
+    )
+    orch, gateway, engine = _make_orchestrator(scratch_url, fake_llm, tmp_path / "ws")
+    try:
+        outcome = await orch.run_session(question_id)
+    finally:
+        await gateway.close()
+        await engine.dispose()
+
+    # работа действительно завершена успешно: отказом это считать нельзя
+    assert outcome.final_state is SessionState.SUCCEEDED
+    assert outcome.termination_reason == "goal_reached"
+    assert outcome.claims_proposed == 0
+
+    state = await _question_state(scratch_url, question_id)
+    assert state != QuestionState.VERIFIED.value, "ноль утверждений не может означать «ответ проверен»"
+    assert state == QuestionState.PARTIALLY_ANSWERED.value, state
+
+    # хост пишет то состояние, которое реально применил, и называет его в аудите фиксации
+    audit = await _scalar(
+        scratch_url,
+        "SELECT payload->>'question_state' FROM audit_events WHERE type = :t ORDER BY sequence DESC LIMIT 1",
+        {"t": AuditEventType.COMMIT_ATTEMPT_COMMITTED.value},
+    )
+    assert audit is not None and str(audit[0]) == QuestionState.PARTIALLY_ANSWERED.value, audit
+
+    session_row = await _scalar(
+        scratch_url, "SELECT state, termination_reason FROM sessions WHERE id=:s", {"s": str(outcome.session_id)}
+    )
+    assert str(session_row[0]) == SessionState.SUCCEEDED.value
+    assert str(session_row[1]) == "goal_reached"
+
+
+@pytest.mark.asyncio
+async def test_curator_failure_keeps_the_question_honest_too(
+    migrated_db, fake_llm: FakeLLM, tmp_path: Path
+) -> None:
+    """Та же граница на другом пути нуля утверждений: куратор недоступен (отказ модели) —
+    сессия фиксируется успешно, но вопрос не становится «проверенным»."""
+    scratch_url, _engine = migrated_db
+    question_id = await _seed_question(scratch_url, "Сколько будет 6*7?")
+
+    fake_llm.script(
+        [
+            {"content": TOOL_PYTHON},
+            {"content": COMPLETE},
+            {"error": "invalid_json"},
+            {"error": "invalid_json"},
+        ]
+    )
+    orch, gateway, engine = _make_orchestrator(scratch_url, fake_llm, tmp_path / "ws")
+    try:
+        outcome = await orch.run_session(question_id)
+    finally:
+        await gateway.close()
+        await engine.dispose()
+
+    assert outcome.final_state is SessionState.SUCCEEDED
+    assert outcome.claims_proposed == 0
+    state = await _question_state(scratch_url, question_id)
+    assert state != QuestionState.VERIFIED.value, state
+    assert state == QuestionState.PARTIALLY_ANSWERED.value, state
+
+
+@pytest.mark.asyncio
+async def test_one_applied_claim_still_verifies_the_question(migrated_db, fake_llm: FakeLLM, tmp_path: Path) -> None:
+    """Правка не должна обесценивать настоящую работу: ровно одно применённое утверждение —
+    и terminal вопроса остаётся `verified` (иначе правка была бы ослаблением)."""
+    scratch_url, _engine = migrated_db
+    question_id = await _seed_question(scratch_url, "Сколько будет 6*7?")
+
+    fake_llm.script(
+        [
+            {"content": TOOL_PYTHON},
+            {"content": COMPLETE},
+            {"content": CURATOR_ONE_CLAIM},
+        ]
+    )
+    orch, gateway, engine = _make_orchestrator(scratch_url, fake_llm, tmp_path / "ws")
+    try:
+        outcome = await orch.run_session(question_id)
+    finally:
+        await gateway.close()
+        await engine.dispose()
+
+    assert outcome.final_state is SessionState.SUCCEEDED
+    assert outcome.claims_proposed == 1
+    state = await _question_state(scratch_url, question_id)
+    assert state == QuestionState.VERIFIED.value, state

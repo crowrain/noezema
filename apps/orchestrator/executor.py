@@ -16,6 +16,7 @@ from pathlib import Path
 
 from packages.domain.canonical import canonical_sha256
 from packages.domain.models.base import JsonDict
+from packages.domain.sanitization import mask_nul
 from packages.domain.schemas.observation import Observation
 
 # re-exported for backward compatibility (M1 tests import from here)
@@ -67,7 +68,22 @@ class StubToolExecutor:
                 # Host-side effects are applied by the orchestrator, which
                 # owns the DB transaction.
                 return Observation(tool=tool, ok=True, data={"deferred": True, "arguments": arguments})
-            return Observation(tool=tool, ok=False, error="unreachable")  # pragma: no cover
+            # T7.57(b): a tool that IS in the policy registry but is not implemented
+            # by this dev/eval stub (e.g. shell.execute — only the sandboxed ToolBroker
+            # runs it; research.fetch is host-side via the research proxy). The old
+            # opaque "unreachable" gave the model no diagnosis and hid the config gap
+            # (SMOKE-V14B §5: shell.execute -> FAILED `unreachable`, no consequences,
+            # but no explanation either). Normal step failure: ok=False, non-transient
+            # (repeatability classes unchanged; the orchestrator records FAILED and
+            # the loop continues).
+            return Observation(
+                tool=tool,
+                ok=False,
+                error=(
+                    f"tool_not_supported: {tool} is not available in this executor "
+                    "(dev/eval stub); use python.execute or workspace.* instead"
+                ),
+            )
         except Exception as exc:
             return Observation(tool=tool, ok=False, error=str(exc)[:500])
 
@@ -105,7 +121,14 @@ class StubToolExecutor:
         return Observation(
             "workspace.read",
             ok=True,
-            data={"path": str(path.relative_to(self.workspace_dir)), "content": data.decode("utf-8", "replace")},
+            # T7.46a: mask NUL at the capture (the SOURCE layer) — a NUL
+            # in an observation used to reach the evidence payload and
+            # the report audit (JSONB) and roll back the whole session
+            # transaction (SMOKE-V12-K2 §3)
+            data={
+                "path": str(path.relative_to(self.workspace_dir)),
+                "content": mask_nul(data.decode("utf-8", "replace")),
+            },
         )
 
     async def _workspace_list(self, arguments: JsonDict) -> Observation:
@@ -143,10 +166,13 @@ class StubToolExecutor:
         return Observation(
             "python.execute",
             ok=proc.returncode == 0,
+            # T7.46a: mask NUL at the capture (the SOURCE layer, SMOKE-
+            # V12-K2 §3) — the mask runs BEFORE the cap so the marker
+            # (4 chars) is what spends the cap budget
             data={
                 "exit_code": proc.returncode,
-                "stdout": stdout.decode("utf-8", "replace")[:MAX_OUTPUT_BYTES],
-                "stderr": stderr.decode("utf-8", "replace")[:MAX_OUTPUT_BYTES],
+                "stdout": mask_nul(stdout.decode("utf-8", "replace"))[:MAX_OUTPUT_BYTES],
+                "stderr": mask_nul(stderr.decode("utf-8", "replace"))[:MAX_OUTPUT_BYTES],
             },
             error=None if proc.returncode == 0 else f"exit code {proc.returncode}",
         )

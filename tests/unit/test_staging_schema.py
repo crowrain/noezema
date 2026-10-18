@@ -94,6 +94,79 @@ def test_relations_closed() -> None:
         EvidenceLink(evidence_index=0, claim_index=0, relation="neutral")
 
 
+# ─── reverify of an existing claim (T7.34, ADR-0018) ────────────────────────
+
+
+def test_reverify_field_defaults_none() -> None:
+    c = ClaimProposal(statement="X", claim_type=ClaimType.SELF_MODEL)
+    assert c.existing_claim_id is None
+    p = CuratorProposal(summary="s", claims=[c])
+    assert p.validate_against(evidence_count=0) == []
+
+
+def test_reverify_field_accepts_uuid_and_prefix() -> None:
+    c = ClaimProposal(
+        statement="факт снова проверен",
+        claim_type=ClaimType.EXTERNAL_FACT,
+        existing_claim_id=uuid.uuid4().hex[:16],
+    )
+    assert c.existing_claim_id is not None
+    c2 = ClaimProposal(
+        statement="факт снова проверен",
+        claim_type=ClaimType.EXTERNAL_FACT,
+        existing_claim_id=str(uuid.uuid4()),
+    )
+    assert c2.existing_claim_id is not None
+
+
+def test_reverify_field_rejects_too_short() -> None:
+    # 7 hex chars — too short to be a reference (the resolver's floor
+    # is 8; the schema floor keeps garbage out before the host)
+    with pytest.raises(ValidationError):
+        ClaimProposal(statement="X", claim_type=ClaimType.SELF_MODEL, existing_claim_id="6e70379")
+    with pytest.raises(ValidationError):
+        ClaimProposal(statement="X", claim_type=ClaimType.SELF_MODEL, existing_claim_id="")
+
+
+def test_reverify_field_rejects_too_long() -> None:
+    with pytest.raises(ValidationError):
+        ClaimProposal(
+            statement="X",
+            claim_type=ClaimType.SELF_MODEL,
+            existing_claim_id="6e70379ee1f52284" * 3,
+        )
+
+
+def test_reverify_schema_is_halogen_compatible() -> None:
+    """ADR-0012: the engine refuses `format`/`pattern`; the new field
+    must not introduce them (anyOf string|null is accepted — ADR-0012 §1).
+    The host validates the RESPONSE with the full pydantic model."""
+    from packages.llm_gateway.schema_compat import strip_schema_keywords
+
+    schema = CuratorProposal.model_json_schema()
+
+    def keywords(node: object, path: str = "") -> list[str]:
+        found: list[str] = []
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if k in ("format", "pattern"):
+                    found.append(f"{path}/{k}")
+                found.extend(keywords(v, f"{path}/{k}"))
+        elif isinstance(node, list):
+            for i, v in enumerate(node):
+                found.extend(keywords(v, f"{path}[{i}]"))
+        return found
+
+    stripped = strip_schema_keywords(schema, {"format", "pattern"})
+    assert keywords(stripped) == []
+    ecid = stripped["$defs"]["ClaimProposal"]["properties"]["existing_claim_id"]
+    # string 8..36 or null — no uuid/format machinery
+    assert ecid["anyOf"] == [
+        {"type": "string", "minLength": 8, "maxLength": 36},
+        {"type": "null"},
+    ]
+
+
 # ─── claim dependencies (T4.1) ──────────────────────────────────────────────
 
 
@@ -151,3 +224,53 @@ def test_duplicate_dependencies_flagged() -> None:
     )
     p = CuratorProposal(summary="s", claims=[c])
     assert any("duplicate" in x for x in p.validate_against(evidence_count=0))
+
+
+def test_reverify_of_a_temporal_fact_may_omit_the_date() -> None:
+    """T7.73 (уточнение ADR-0018): перепроверка УЖЕ существующего утверждения
+    не обязана приносить опорную дату — у якоря она есть, и решает её хост.
+
+    Прежняя проверка требовала дату безусловно и исполнялась ДО подстановки
+    типа якоря в оркестраторе (`apps/orchestrator/orchestrator.py`), поэтому
+    модель, честно перепроверяющая временной факт без даты, получала отказ
+    схемы — и уходила в `external_fact`, где дата терялась совсем.
+    """
+    p = CuratorProposal(
+        summary="перепроверка",
+        claims=[
+            ClaimProposal(
+                statement="годовая инфляция 5,59",
+                claim_type=ClaimType.TEMPORAL_FACT,
+                existing_claim_id=str(uuid.uuid4()),
+            )
+        ],
+    )
+    assert p.validate_against(evidence_count=1) == []
+
+
+def test_a_new_temporal_fact_still_needs_the_date() -> None:
+    """Ворота не ослаблены: НОВОМУ временному утверждению без даты хост нечего
+    оценить — отказ схемы остаётся (`existing_claim_id` тут нет)."""
+    p = CuratorProposal(
+        summary="новое",
+        claims=[ClaimProposal(statement="годовая инфляция 5,59", claim_type=ClaimType.TEMPORAL_FACT)],
+    )
+    assert any("temporal_fact requires as_of" in x for x in p.validate_against(evidence_count=0))
+
+
+def test_reverify_still_validated_for_new_claims_in_the_same_proposal() -> None:
+    """Ослабление относится только кclaims с `existing_claim_id`: в одном
+    предложении новое временное утверждение без даты по-прежнему флагается."""
+    p = CuratorProposal(
+        summary="смешанное",
+        claims=[
+            ClaimProposal(
+                statement="старое",
+                claim_type=ClaimType.TEMPORAL_FACT,
+                existing_claim_id=str(uuid.uuid4()),
+            ),
+            ClaimProposal(statement="новое", claim_type=ClaimType.TEMPORAL_FACT),
+        ],
+    )
+    problems = p.validate_against(evidence_count=0)
+    assert problems == ["claim[1]: temporal_fact requires as_of"]

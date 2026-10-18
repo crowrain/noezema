@@ -17,12 +17,42 @@ page is reachable inside a 2000-char window).
 Pure, host-side, deterministic. The selected fragment is NOT part of
 the §14.3 identity (identity stays over the original content hash, so
 dedupe semantics are unchanged).
+
+T7.22 (ADR-0011, §6.4): the single term-density window misses the
+assertion in a measured 7 of 12 EVAL-3d group-A cases — the fact lives
+in the lead/infobox (Wikipedia), the first paragraph (a news page), or
+a data widget (cbr.ru), a region the term density skips (or lands 200–300
+chars short of) while the term-densest region is the TOC (which repeats
+the question's words) or an unrelated body section. ``select_assertion_windows``
+adds a SECOND, non-overlapping "value" window: the budget window around
+the number-position where a significant number (a data value, not a
+date/year/TOC index) co-occurs with the question's terms inside the
+fact zone (the first ``_FACT_ZONE_DECAY`` chars — beyond that, the deep
+number-dense regions on long pages are data tables, not assertions).
+The primary window and its selection are unchanged.
+
+T7.79 (ADR-0011 доп.): the second window is an ANCHOR problem, not a density
+problem — the values the question asks for («5,59%», «5,6%», 21.01.2026) and
+the exact substrings the researcher already read are matched literally
+(whitespace/soft-hyphen insensitive, positions mapped back to the original
+text) and take priority over general terms and over "any number near the top".
+
+T7.79a (ADR-0011 §10 уточнение): a verbatim quote found in the source PINS its
+window. The T7.79 veto dropped an anchor whose budget window overlapped the term
+window — so a value/quote occurring ONCE on the page was discarded and the slot
+fell back to the generic "any significant number near the top" candidate (on the
+cbr.ru analytics page: navigation chrome at 140, while «5,59%» sat at 3238). Now
+an overlapping exact signal displaces the term window instead of being dropped;
+the freed slot takes the generic value candidate that does not overlap the pinned
+window. Budget, window count, identity and the primary (term-density) selection
+algorithm are unchanged.
 """
 
 from __future__ import annotations
 
 import re
 import urllib.parse
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 #: the window (in chars of the lowercased normalized text) over which
@@ -312,3 +342,648 @@ def select_assertion_window(
 
     start = max(0, best_pos - lead)
     return AssertionWindow(text=text[start : start + budget], start=start)
+
+
+# ── T7.22 (ADR-0011): the second, value-anchored window ─────────────────
+
+
+#: T7.22: fact-zone decay for the value window's score. The fact the
+#: question is about is stated FIRST on the page (lead/infobox); on the
+#: measured EVAL-3d corpus all seven recoverable group-A facts sit at
+#: offsets ≤ 10k, while the deep number-dense regions past ~12k on the
+#: long pages (Wikipedia country stats tables, historical population
+#: tables, UN accession lists) are data tables, not assertions. The
+#: candidate score decays linearly to zero at this offset, so a deep
+#: table can never outrank a lead fact. Derived from the EVAL-3d
+#: measurements (ADR-0011 §2).
+_FACT_ZONE_DECAY = 16_000
+
+#: T7.22: weight of one significant number in the value-window score
+#: (relative to one distinct question term). A fact is a VALUE ("193
+#: государства", "8.3 billion", "14,00%") — the number is its anchor —
+#: so a region with two values beats a region with one more term and
+#: no values; but a single value without any term co-occurrence is not
+#: enough to override the term signal (the 2:1 ratio keeps the terms
+#: dominant, the same tie-break discipline as _NUMBER_BONUS_MAX).
+_VALUE_WEIGHT = 2.0
+
+#: digit runs (lowercased text)
+_NUMBER_RE = re.compile(r"\d+")
+
+#: maximal dot-joined groups ("27.07.2026" is ONE match, "8.3" is one,
+#: "8,000,000,000" is nine separate digit runs — the comma is not a dot)
+_DOTTED_RE = re.compile(r"\d+(?:\.\d+)*")
+
+#: a dot-separated Russian date ("27.07.2026") — a date, not a value
+_ISO_DATE_RE = re.compile(r"^\d{1,2}\.\d{1,2}\.\d{4}$")
+
+#: a MediaWiki TOC section index ("1.1 Background") is a decimal whose
+#: digit groups are all single-digit and which is immediately followed
+#: by the section title (a capitalized word). A data value with the
+#: same shape ("8.3 billion", "66.2% Christianity") is followed by a
+#: lowercase word or a punctuation mark — the one reliable
+#: deterministic separator between the two.
+_TOC_INDEX_AFTER = re.compile(r"\s+[A-ZА-ЯЁ]")
+
+#: T7.22: TOC chrome markers (in the lowercased normalized text). A
+#: span containing one of these is a table-of-contents / navigation
+#: block, never an assertion region: the TOC repeats the page's section
+#: titles (which echo the question's words) and its section indexes
+#: (which look like data values). Measured on the EVAL-3d corpus:
+#: en.wikipedia carries "move to sidebar" / "toggle ... subsection",
+#: ru.wikipedia carries «переместить в боковую панель» /
+#: «Отобразить/Скрыть подраздел».
+_TOC_MARKERS = (
+    "move to sidebar",
+    "переместить в боковую панель",
+    "отобразить",
+    "подраздел",
+)
+
+
+def _is_table_of_contents(span: str) -> bool:
+    """True when the span is a TOC / navigation block (see
+    _TOC_MARKERS). ``span`` is lowercased normalized text."""
+    if any(marker in span for marker in _TOC_MARKERS):
+        return True
+    return "toggle" in span and "subsection" in span
+
+
+def _significant_numbers(span: str) -> int:
+    """Count the DATA VALUES in the span (T7.22, ADR-0011).
+
+    A significant number is what an assertion actually states:
+    - 3+ digits, unless a plausible year (1900–2099): "193", "370",
+      "8,000,000,000" (each comma-separated digit run counts);
+    - a decimal value ("8.3", "66.2", "18.6") — except a dot-separated
+      date ("27.07.2026") and a TOC section index ("1.1 Background");
+    - any length immediately before "%": "4,0%" → the "0" before "%".
+
+    Excluded on purpose: 4-digit years (the question is almost always
+    about a value, and a page of dates — a Wikipedia TOC's
+    "(1948–1957)" entries, an accession list — must not look dense),
+    1–2 digit integers without a value context (TOC indexes, list
+    numbers, "27" in "27 member states" carries no weight of its own —
+    the co-occurring question term localizes it), and ISO dates.
+    """
+    n = 0
+    for m in _DOTTED_RE.finditer(span):
+        s = m.group()
+        parts = s.split(".")
+        if len(parts) > 1:
+            if _ISO_DATE_RE.match(s):
+                continue
+            if all(len(p) == 1 for p in parts) and _TOC_INDEX_AFTER.match(
+                span[m.end() : m.end() + 8]
+            ):
+                continue
+            n += 1
+        else:
+            v = int(s)
+            if (len(s) >= 3 and not (len(s) == 4 and 1900 <= v <= 2099)) or (
+                span[m.end() : m.end() + 1] == "%"
+            ):
+                n += 1
+    return n
+
+
+def _fact_region_candidates(
+    text: str, question: str, match_span: int
+) -> list[tuple[int, float, int, int]]:
+    """Value-window candidates (T7.22): ``(pos, score, terms, values)``
+    for every number-position anchor ``pos`` in the fact zone
+    (``pos < _FACT_ZONE_DECAY``).
+
+    score = (distinct question terms in the ``2*match_span`` span
+            + _VALUE_WEIGHT * significant numbers in the span)
+            * (1 - pos / _FACT_ZONE_DECAY)
+
+    The terms are the RAW ``extract_terms`` output — WITHOUT the
+    page-wide dominant-term cap and WITHOUT the _CHROME filter that
+    protect the primary window: the value window is a secondary anchor,
+    and the cap would erase the only signal on cross-language pages
+    (where every question term is "dominant" or absent), while the
+    decay keeps a deep number-dense table from outranking the lead.
+    ``score`` is 0.0 for anchors with neither signal (they are filtered
+    out by the caller, along with TOC spans).
+    """
+    tl = text.lower()
+    terms = extract_terms(question) if question else []
+    anchors = [m.start() for m in _NUMBER_RE.finditer(tl) if m.start() < _FACT_ZONE_DECAY]
+    out: list[tuple[int, float, int, int]] = []
+    for pos in anchors:
+        span = tl[pos : pos + 2 * match_span]
+        t = sum(1 for s in terms if s in span)
+        sig = _significant_numbers(span)
+        if t == 0 and sig == 0:
+            continue
+        score = (t + _VALUE_WEIGHT * sig) * (1.0 - pos / _FACT_ZONE_DECAY)
+        out.append((pos, score, t, sig))
+    return out
+
+
+# ─── T7.79 (ADR-0011 доп.): якоря по точному значению и по цитате исследователя ───
+
+#: Точные значения формулировки вопроса: десятичная величина с запятой или
+#: точкой («5,59», «6.2»), вместе с процентами, и дата д.м.гггг. Год-одиночка
+#: сигналом не считается — по той же причине, по которой ``_significant_numbers``
+#: исключает 1900–2099: дата стоит в навигации каждой страницы, и якорь по году
+#: выбирает хром вместо факта. Термины вопроса чисел не дают вовсе
+#: (``extract_terms`` отбрасывает токены только из цифр, :198), поэтому этот
+#: сигнал — отдельный класс, а не частный случай терминов.
+_QUESTION_VALUE_RE = re.compile(r"\d{1,3}(?:[.,]\d+)+")
+
+#: Пробелы (обычный, NBSP U+00A0, узкий U+202F и прочие Unicode-пробелы) и «мягкие»
+#: символы живой вёрстки — софт-гифен U+00AD, ZW-символы, BOM, word joiner
+#: U+2060 — убираются только при ПОИСКЕ точного совпадения: вопрос пишет
+#: «5,59%», а страница набирает «5,59\xa0%» (AGENTS §7, T7.77). Позиции
+#: возвращаются картой индексов ``_fold_with_map``, поэтому окно вырезается из
+#: ОРИГИНАЛЬНОГО текста: невидимые символы в доказательство не исчезают и хеш
+#: артефакта не меняется.
+_FOLD_DROP_CHARS = frozenset(
+    " \t\n\r\v\f\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008"
+    "\u2009\u200a\u202f\u205f\u3000\u00ad\u200b\u200c\u200d\u2060\ufeff"
+)
+
+#: цитата в явных кавычках короче этого — не цитата; обычная фраза без кавычек
+#: обязана быть длиннее: короткие фразы совпадают со служебным текстом страницы
+_MIN_QUOTED_CHARS = 24
+_MIN_CLAUSE_CHARS = 60
+#: потолок сигналов: выбор окна обязан быть дешёвым и предсказуемым
+_MAX_QUOTE_TERMS = 8
+#: сколько кандидатов вообще рассматривается (кавычки — первыми, свежее — раньше)
+_MAX_QUOTE_SCAN = 40
+#: подстрока, которая встречается в тексте чаще этого числа раз, — страница или
+#: её хром, а не то, что исследователь выделил руками
+#: T7.82 (ADR-0011 доп. «Реселекция окон»): цитата обязана встречаться в тексте РОВНО
+#: один раз. Фраза, повторённая на странице, — не указатель на прочитанный факт, а
+#: заголовок/фурнитура: на стенде (.92, сессия f0d7e844) исследователь процитировал
+#: название материала «Инфляционные ожидания и потребительские настроения» (два
+#: вхождения: шапка и навигация), и этот якорь забрал второй слот окном [0..2000) —
+#: ключевая фраза «наблюдаемая населением годовая инфляция … 14,5%» на смещении 2452
+#: осталась за обоими окнами. Уникальное предложение факта таким дублированием не
+#: обладает (замерено на обеих сохранённых страницах cbr.ru).
+_MAX_QUOTE_OCCURRENCES = 1
+
+#: T7.82: потолок сигналов-значений из публичной rationale исследователя — тот же,
+#: что у цитат: вывод называет несколько чисел, локализуют окно самые свежие.
+_MAX_EXPLORER_VALUE_TERMS = 8
+#: сколько вхождений одного якоря просматривается в поисках непересекающегося окна
+_MAX_OCCURRENCE_ATTEMPTS = 12
+
+_SENTENCE_SPLIT_RE = re.compile(r"[.!?:;\u2026]+")
+_QUOTED_SPAN_RE = re.compile("\u00ab([^\u00bb]+)\u00bb|\u201c([^\u201d]+)\u201d|\"([^\"]+)\"")
+_QUOTE_WRAP_CHARS = "«»\"”“’„‚'()[]{}‘’"
+
+
+def _fold(text: str) -> str:
+    """Нижний регистр без пробелов и невидимых символов (только для поиска)."""
+    return "".join(ch.lower() for ch in text if ch not in _FOLD_DROP_CHARS)
+
+
+def _fold_with_map(text: str) -> tuple[str, list[int]]:
+    """``_fold`` плюс карта позиций: ``map[i]`` — индекс символа ``fold[i]`` в
+    ОРИГИНАЛЬНОМ тексте. Совпадение, найденное в складке, переводится обратно,
+    чтобы окно было дословным фрагментом источника."""
+    chars: list[str] = []
+    positions: list[int] = []
+    for i, ch in enumerate(text):
+        if ch in _FOLD_DROP_CHARS:
+            continue
+        chars.append(ch.lower())
+        positions.append(i)
+    return "".join(chars), positions
+
+
+def _numeric_boundary_ok(text: str, raw_start: int, raw_end: int) -> bool:
+    """Значение обязано быть отдельным числом (ADR-0011 §10 (б)).
+
+    «5,6» внутри «15,6%» — не искомое значение вопроса: без этой проверки короткий
+    якорь цепляет первое попавшееся числовое вхождение.
+
+    Граница проверяется по соседним символам ОРИГИНАЛЬНОГО текста, а не склеенной
+    складки (T7.79a). ``_fold`` убирает переводы строк и пробелы, поэтому соседние
+    ячейки таблицы («… 6,6\\n5,6\\nПродовольственные …») в складке выглядят одним
+    непрерывным рядом цифр, и собственное значение таблицы казалось бы частью чужого
+    числа: на странице cbr.ru/analytics/dkp/dinamic/CPD_2025-12/ «5,6» на смещении
+    4984 отвергалась именно так. Разделитель двух чисел — не цифра (перевод строки,
+    пробел, NBSP, пунктуация); внутрь «15,6» или «53,5948» игла по-прежнему не
+    попадает — там слева стоит цифра.
+
+    ``raw_start``/``raw_end`` — границы совпадения в ОРИГИНАЛЬНОМ тексте: их даёт
+    карта ``_fold_with_map``, т.е. проверка уже учитывает NBSP и софт-гифен внутри
+    самой иглы.
+    """
+    before_ok = raw_start == 0 or not text[raw_start - 1].isdigit()
+    after_ok = raw_end >= len(text) or not text[raw_end].isdigit()
+    return before_ok and after_ok
+
+
+#: Классы точных сигналов второго окна (T7.79a, T7.82). Цитата — самый сильный: она
+#: показывает, КАКУЮ ФРАЗУ источника исследователь уже читал. Десятичное значение
+#: вопроса — то, о чём спрашивают. Значение из вывода исследователя (T7.82) — число,
+#: которое он сам назвал прочитанным: оно слабее значения доверенного вопроса (вопрос
+#: — операторский вход, вывод — текст модели) и сильнее даты. Дата д.м.гггг — якорь
+#: низшего класса: дата стоит в навигации и подвале почти каждой страницы (та же
+#: причина, по которой год-одиночка значением не считается), поэтому любое значение
+#: важнее даты.
+_SIGNAL_QUOTE = 0
+_SIGNAL_VALUE = 1
+_SIGNAL_EXPLORER_VALUE = 2
+_SIGNAL_DATE = 3
+
+
+@dataclass(frozen=True, slots=True)
+class AnchorSignal:
+    """Один точный сигнал второго окна (T7.79a).
+
+    ``needle`` — дословная подстрока из доверенного текста (формулировка вопроса или
+    публичной rationale исследователя), которую ищем в источнике; ``kind`` —
+    «quote» | «value» | «date».
+    """
+
+    needle: str
+    kind: str
+
+
+def _signal_specificity(needle: str) -> int:
+    """Специфичность значения — число значащих цифр: «5,59» (3) специфичнее «5,6»
+    (2), «53,5948» специфичнее «53,59». Уточняет порядок только внутри одного
+    класса сигналов и ничего не перекрашивает между классами."""
+    return sum(1 for ch in needle if ch.isdigit())
+
+
+def anchor_signals(
+    quote_terms: Sequence[str],
+    value_terms: Sequence[str],
+    explorer_value_terms: Sequence[str] = (),
+) -> list[AnchorSignal]:
+    """Точные сигналы второго окна в порядке значимости (T7.79a, T7.82).
+
+    Порядок классов (ADR-0011 §10 + доп. «Реселекция окон»): цитаты исследователя →
+    значения вопроса → значения вывода исследователя → даты. Внутри класса значений —
+    сначала более специфичное (больше цифр), при равенстве — порядок появления
+    (``question_value_terms`` сохраняет порядок формулировки вопроса,
+    ``explorer_value_terms`` — порядок «свежее раньше прежнего»). Специфичность нужна
+    потому, что якорь одиночный: вопрос называет и точное значение, и округлённое
+    («5,59%» и «5,6%»), страница содержит оба — менее специфичное цепляется за первое
+    попавшееся вхождение (в таблице) и закрывает сигнал про то значение, о котором
+    спрашивали.
+    """
+    ranked: list[tuple[int, int, int, AnchorSignal]] = []
+    for order, needle in enumerate(quote_terms):
+        ranked.append((_SIGNAL_QUOTE, 0, order, AnchorSignal(needle=needle, kind="quote")))
+    for order, needle in enumerate(value_terms):
+        kind = "date" if _ISO_DATE_RE.match(needle) else "value"
+        rank = _SIGNAL_DATE if kind == "date" else _SIGNAL_VALUE
+        ranked.append((rank, -_signal_specificity(needle), order, AnchorSignal(needle=needle, kind=kind)))
+    for order, needle in enumerate(explorer_value_terms):
+        kind = "date" if _ISO_DATE_RE.match(needle) else "explorer_value"
+        rank = _SIGNAL_DATE if kind == "date" else _SIGNAL_EXPLORER_VALUE
+        ranked.append((rank, -_signal_specificity(needle), order, AnchorSignal(needle=needle, kind=kind)))
+    ranked.sort(key=lambda item: (item[0], item[1], item[2]))
+    return [item[3] for item in ranked]
+
+
+def question_value_terms(question: str) -> list[str]:
+    """Точные значения формулировки вопроса (folds), в порядке появления.
+
+    Текст вопроса — доверенный операторский вход (§1, ADR-0024): спрашиваемое
+    значение хост знает точно и обязан использовать его как самый сильный якорь
+    окна, а не растворять в общей плотности терминов.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for match in _QUESTION_VALUE_RE.finditer(_fold(question)):
+        needle = match.group()
+        if needle not in seen:
+            seen.add(needle)
+            out.append(needle)
+    return out
+
+
+def explorer_value_terms(researcher_text: str) -> list[str]:
+    """Значения из публичной rationale исследователя (T7.82), свежие раньше прежних.
+
+    Это поисковый сигнал о том, какое ЧИСЛО исследователь назвал прочитанным, — и
+    только: то же доверенное ограничение, что у цитат (ADR-0011 §10). Текст модели
+    не становится содержимым окна; значение, которого нет в этом источнике, ничего
+    не «дотягивает» (его отбракует поиск точного якоря). Год-одиночка не значение
+    (тот же критерий, что у ``question_value_terms``: десятичная группа), дата
+    д.м.гггг остаётся сигналом низшего класса.
+    """
+    matches = [match.group() for match in _QUESTION_VALUE_RE.finditer(_fold(researcher_text))]
+    out: list[str] = []
+    seen: set[str] = set()
+    for needle in reversed(matches):
+        # свежее раньше прежнего: позже в сигнальном окне — свежее по времени шага
+        if needle not in seen:
+            seen.add(needle)
+            out.append(needle)
+    return out[:_MAX_EXPLORER_VALUE_TERMS]
+
+
+def has_exact_anchor(
+    text: str,
+    *,
+    quote_terms: Sequence[str] = (),
+    value_terms: Sequence[str] = (),
+    explorer_value_terms: Sequence[str] = (),
+) -> bool:
+    """Есть ли в тексте ТОЧНЫЙ якорь из данных сигналов (T7.82)?
+
+    Тот же критерий приемлемости, что у второго окна: граница числа по оригинальному
+    тексту и отбраковка оглавления/навигации. ``primary_start = -1`` — окно свободно,
+    поэтому ответ зависит только от того, встречается ли сигнал в ЭТОМ источнике
+    осмысленно. Пустой ответ — реселекция не нужна: окна остаются как при чтении.
+    """
+    signals = anchor_signals(quote_terms, value_terms, explorer_value_terms)
+    if not signals:
+        return False
+    start, _displaced = _exact_anchor_start(
+        text, signals, budget=max(len(text), 1), lead=_LEAD, primary_start=-1
+    )
+    return start >= 0
+
+
+def _candidate_clauses(researcher_text: str) -> list[tuple[str, int]]:
+    """Кандидаты в цитаты: (подстрока, минимальная длина).
+
+    Явные кавычки исследователя идут первыми — это то, что он сам назвал фразой
+    источника; обычные фразы — вторыми, с более высоким порогом длины.
+    """
+    out: list[tuple[str, int]] = []
+    quoted: list[str] = []
+    plain: list[str] = []
+    for line in researcher_text.splitlines():
+        for match in _QUOTED_SPAN_RE.finditer(line):
+            span = next(group for group in match.groups() if group)
+            quoted.append(span.strip())
+        for chunk in _SENTENCE_SPLIT_RE.split(_QUOTED_SPAN_RE.sub(" ", line)):
+            plain.append(chunk.strip().strip(_QUOTE_WRAP_CHARS).strip())
+    out.extend((span, _MIN_QUOTED_CHARS) for span in reversed(quoted))
+    out.extend((chunk, _MIN_CLAUSE_CHARS) for chunk in reversed(plain))
+    return out
+
+
+def researcher_quote_terms(researcher_text: str, source_text: str) -> list[str]:
+    """Подстроки текста исследователя, которые дословно есть в тексте источника.
+
+    Это поисковый сигнал о том, на какую фразу этого источника он уже опёрся, —
+    и только. Текст модели нигде не становится содержимым окна: окно остаётся
+    вырезанным фрагментом нормализованного текста источника (T7.79). Подстрока,
+    которой в этом источнике нет, отбрасывается и ничего не «дотягивает»;
+    подстрока, встречающаяся в тексте НЕ один раз, — заголовок/страницный хром
+    (шапка + навигация), а не прочитанный факт (T7.82).
+    Порядок — явные кавычки раньше обычных фраз, свежее раньше прежнего.
+    """
+    if not researcher_text or not source_text:
+        return []
+    folded_source = _fold(source_text)
+    accepted: list[str] = []
+    seen: set[str] = set()
+    for index, (chunk, min_chars) in enumerate(_candidate_clauses(researcher_text)):
+        if index >= _MAX_QUOTE_SCAN:
+            break
+        needle = _fold(chunk)
+        if len(needle) < min_chars or needle in seen:
+            continue
+        occurrences = folded_source.count(needle)
+        if 1 <= occurrences <= _MAX_QUOTE_OCCURRENCES:
+            seen.add(needle)
+            accepted.append(needle)
+    return accepted[:_MAX_QUOTE_TERMS]
+
+
+def _exact_anchor_start(
+    text: str,
+    signals: Sequence[AnchorSignal],
+    *,
+    budget: int,
+    lead: int,
+    primary_start: int,
+    match_span: int = _MATCH_SPAN,
+) -> tuple[int, bool]:
+    """Начало окна вокруг самой убедительной ТОЧНОЙ подстроки (T7.79, T7.79a, T7.82).
+
+    ``signals`` — порядок значимости из ``anchor_signals`` (цитаты → значения вопроса
+    → значения вывода → даты); внутри сигнала — самое раннее вхождение, дающее окно
+    без пересечения с основным окном. Для числовых якорей требуется граница числа по
+    оригинальному тексту («5,6» не цепляет «15,6%»).
+
+    Блок оглавления/навигации отбраковывается тем же правилом, что и запасной
+    value-кандидат T7.22: маркер ищется В ОКРЕСТНОСТИ вхождения
+    (``[raw_start − 2*match_span, raw_start + 2*match_span]``), а не по всему extent
+    окна (T7.82). Проверка по whole окну браковала факт-регион из-за служебного слова в середине
+    страницы: на cbr.ru/…/Infl_exp_25-12 окно [2152..4152), содержащее «наблюдаемая
+    населением годовая инфляция … 14,5%», отбрасывалось словом «подраздел» на
+    смещении 3957 — через 1500 знаков после факта, внутри цитируемого исследователем
+    абзаца. Терминологическое окно таких слов не боится (вето там нет) — и второму
+    окну хватит совести судить о навигации по месту якоря, а не по дальнему хвосту.
+
+    Результат — ``(start, displaced)``:
+
+    - ``(-1, False)`` — точных совпадений нет, поведение прежнее (T7.22);
+    - ``(start, False)`` — окно становится в свободный слот, терминальное окно
+      остаётся (как в T7.79);
+    - ``(start, True)`` — сигнал найден, но КАЖДОЕ его окно неизбежно пересекается с
+      терминальным: значение или цитата встречаются на странице один раз. Точный
+      сигнал фиксирует окно, а терминальное окно освобождает слот (T7.79a (а)). На
+      стенде именно эта ветка не существовала: плотностное окно лежало ниже по
+      тексту, и якорь по «5,59%» выбрасывался целиком, уступая слот общему
+      value-якорю.
+    - Значение, которое УЖЕ целиком лежит внутри терминального окна, сигналом не
+      считается: смещать плотностное окно ради дубля смысла нет, слот остаётся за
+      запасным value-окном T7.22 (прежнее поведение).
+    """
+    if not signals:
+        return -1, False
+    folded, positions = _fold_with_map(text)
+    for signal in signals:
+        needle = _fold(signal.needle)
+        if len(needle) < 2:
+            continue
+        numeric = needle[0].isdigit()
+        search_from = 0
+        pinned = -1
+        covered = False
+        for _attempt in range(_MAX_OCCURRENCE_ATTEMPTS):
+            found = folded.find(needle, search_from)
+            if found < 0:
+                break
+            search_from = found + 1
+            raw_start = positions[found]
+            raw_end = positions[found + len(needle) - 1] + 1
+            if numeric and not _numeric_boundary_ok(text, raw_start, raw_end):
+                continue
+            start = max(0, raw_start - lead)
+            end = min(len(text), start + budget)
+            veto_from = max(0, raw_start - 2 * match_span)
+            if _is_table_of_contents(text[veto_from : raw_start + 2 * match_span].lower()):
+                continue  # якорь стоит внутри оглавления/навигации — не регион факта
+            if primary_start >= 0:
+                if primary_start <= raw_start and raw_end <= primary_start + budget:
+                    covered = True  # значение уже показано терминальным окном
+                    break
+                if start < primary_start + budget and end > primary_start:
+                    if pinned < 0:
+                        pinned = start
+                    continue  # следующее вхождение; если их нет — вытеснение
+            return start, False
+        if covered:
+            continue
+        if pinned >= 0:
+            return pinned, True
+    return -1, False
+
+
+def _best_value_window_start(
+    text: str,
+    question: str,
+    budget: int,
+    match_span: int,
+    lead: int,
+    avoid_start: int,
+) -> int:
+    """Запасной общий value-якорь T7.22: лучший кандидат факт-зоны, чьё окно не
+    пересекается с ``avoid_start`` (``-1`` — подходящих кандидатов нет)."""
+    best_start = -1
+    best_score = 0.0
+    tl = text.lower()
+    for pos, score, _t, _sig in _fact_region_candidates(text, question, match_span):
+        if score <= 0.0:
+            continue
+        if _is_table_of_contents(tl[pos : pos + 2 * match_span]):
+            continue
+        start = max(0, pos - lead)
+        end = min(len(text), start + budget)
+        if avoid_start >= 0 and start < avoid_start + budget and end > avoid_start:
+            continue  # overlaps the avoided window → next-best candidate
+        if score > best_score:
+            best_start = start
+            best_score = score
+    return best_start
+
+
+def select_assertion_windows(
+    text: str,
+    question: str,
+    budget: int,
+    *,
+    max_windows: int = 2,
+    match_span: int = _MATCH_SPAN,
+    lead: int = _LEAD,
+    value_terms: Sequence[str] = (),
+    quote_terms: Sequence[str] = (),
+    explorer_value_terms: Sequence[str] = (),
+) -> list[AssertionWindow]:
+    """Pick up to ``max_windows`` NON-OVERLAPPING ``budget``-char
+    fragments for the ``source_assertion`` payload (T7.22, ADR-0011).
+
+    Window 1 — the T7.16 term-density window
+    (``select_assertion_window``, unchanged): where the question's
+    content terms are densest.
+    Window 2 — the value window: the budget window around the best
+    fact-zone candidate of ``_fact_region_candidates``. EVAL-3d group A
+    (ADR-0010 §2 / ADR-0011 §2) — 12 claims where the second source was
+    fetched but the curator attached one — showed the term window misses
+    the assertion in 7 of 12: the fact sits in the lead/infobox, the
+    first paragraph, or a data widget, and the term-densest region is
+    the TOC or an unrelated body section.
+
+    T7.79 (ADR-0011 доп.) — exact anchors take window 2 BEFORE the generic
+    value window: ``quote_terms`` first (substrings of the researcher's own
+    text that occur verbatim in THIS source), then ``value_terms`` (the exact
+    values the trusted question asks for — «5,59», «5,6», dates д.м.гггг).
+    The generic value window scores ANY data value near the top of the page
+    and knows nothing about which value the question is about: on a long
+    narrative page it picked a number-dense block, while the key sentence —
+    «Годовая инфляция … составила 5,59%» at offset ~14k of the cbr.ru CPD
+    page — stayed outside both fragments. Matching ignores spaces and soft
+    hyphens (positions come back through the index map), the window is still
+    a verbatim slice of the ORIGINAL normalized text, no model text enters
+    the evidence, and neither the number of windows nor their length changes.
+
+    T7.79a (ADR-0011 §10 уточнение) — an exact signal that exists but has no
+    non-overlapping placement (the value/quote occurs once on the page) PINS its
+    window and displaces the term-density window; the freed slot goes to the
+    generic value candidate placed around the pinned window. A value already fully
+    inside the term window is not an anchor signal (no duplicate windows), and
+    within ``value_terms`` the more specific number wins the tie («5,59» before
+    «5,6»), dates last — see ``anchor_signals``.
+
+    T7.82 (ADR-0011 доп. «Реселекция окон») — ``explorer_value_terms``: exact values
+    named by the researcher's own public rationale (``explorer_value_terms``), ranked
+    between the trusted question's values and dates. Used by the post-exploration
+    re-selection (evidence.py); with the default empty tuple nothing changes. A quote
+    term now must occur EXACTLY ONCE in this source (page titles repeated in header
+    and nav no longer hijack the exact slot — measured on the stand, session
+    f0d7e844). Neither the number of windows nor their budget changes.
+
+    Fallbacks (each degrades to the T7.16 behavior):
+    - text shorter than the budget → the whole text, one window;
+    - no value candidate (no numbers at all, or every candidate is a
+      TOC span or scores 0) → the primary window alone;
+    - the primary window is the leading-prefix fallback (``start=-1``,
+      no term matched — a cross-language page) and a value window
+      exists → the value window REPLACES the prefix: the prefix is
+      navigation chrome and the value window is the only content
+      signal.
+
+    Deterministic: ties go to the EARLIEST candidate; the value window
+    never overlaps the primary window (the next-best non-overlapping
+    candidate is chosen instead).
+    """
+    if budget <= 0:
+        raise ValueError(f"budget must be positive, got {budget}")
+    if max_windows < 1:
+        raise ValueError(f"max_windows must be >= 1, got {max_windows}")
+    if len(text) <= budget:
+        return [AssertionWindow(text=text, start=0)]
+    primary = select_assertion_window(
+        text, question, budget, match_span=match_span, lead=lead
+    )
+    if max_windows == 1:
+        return [primary]
+
+    # T7.79 (ADR-0011 доп.): второе окно отдаётся ТОЧНОМУ якорю — цитате
+    # исследователя, затем значению вопроса, затем значениям его вывода (T7.82);
+    # общий value-якорь остаётся запасным. Ни число окон, ни их длина не растут:
+    # слот тот же, меняется только то, что в него попадает.
+    signals = anchor_signals(quote_terms, value_terms, explorer_value_terms)
+    exact_start, displaced = _exact_anchor_start(
+        text, signals, budget=budget, lead=lead, primary_start=primary.start, match_span=match_span
+    )
+    if exact_start >= 0:
+        exact = AssertionWindow(text=text[exact_start : exact_start + budget], start=exact_start)
+        if primary.start < 0:
+            # leading-prefix — страницный хром: оставляем только окно по факту
+            return [exact]
+        if not displaced:
+            return [primary, exact]
+        # T7.79a (а): точный сигнал ФИКСИРУЕТ окно. Если его естественное положение
+        # пересекается с терминальным окном (значение или цитата встречаются на
+        # странице один раз), терминальное окно уступает слот, и в него становится
+        # запасной value-якорь T7.22 — при условии, что он не пересекается с
+        # фиксированным окном. Два окна по budget, как и было.
+        fill = _best_value_window_start(
+            text, question, budget, match_span, lead, avoid_start=exact_start
+        )
+        if fill < 0:
+            return [exact]
+        filler = AssertionWindow(text=text[fill : fill + budget], start=fill)
+        return sorted([filler, exact], key=lambda window: window.start)
+
+    best_start = _best_value_window_start(
+        text, question, budget, match_span, lead, avoid_start=primary.start
+    )
+    if best_start < 0:
+        return [primary]
+    if primary.start < 0:
+        # cross-language fallback: the prefix is chrome, keep only the
+        # value window (it is the only content signal on the page)
+        return [AssertionWindow(text=text[best_start : best_start + budget], start=best_start)]
+    return [
+        primary,
+        AssertionWindow(text=text[best_start : best_start + budget], start=best_start),
+    ]

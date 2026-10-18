@@ -21,7 +21,11 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from packages.domain.services.audit import AuditService
-from packages.domain.services.reconciler import LockTimeoutError, reconcile_commit
+from packages.domain.services.reconciler import (
+    LockTimeoutError,
+    reconcile_commit,
+    reconcile_tick,
+)
 
 pytestmark = [pytest.mark.scenario]
 
@@ -237,3 +241,155 @@ async def test_no_prepared_attempt_is_pre_boundary_failure(migrated_db: Any) -> 
             await db.execute(text("SELECT state FROM sessions WHERE id=:id"), {"id": sid})
         ).scalar_one()
     assert state == "failed"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_tick_resolves_stuck_committing_session(
+    migrated_db: Any, fake_llm: Any, tmp_path: Any
+) -> None:
+    """T7.24 (EVAL-4 abort 2026-09-21) — the exact incident shape.
+
+    Session 44bf319e was left in ``committing`` with a ``prepared``
+    attempt and an EXPIRED owned lease: the final-transaction exception
+    raised AFTER the prepared row was durably written, and no hostctl
+    entry point existed to run the reconciler, so fail-closed admission
+    blocked the whole series (16 of 69 sessions). One reconcile tick
+    must: resolve the attempt, end the session in a terminal state, and
+    grant admission of the next session (a real full session runs to a
+    terminal state).
+    """
+    from datetime import UTC, datetime, timedelta
+    from pathlib import Path
+
+    from apps.orchestrator.executor import StubToolExecutor
+    from apps.orchestrator.orchestrator import Orchestrator
+    from packages.domain.models.enums import SessionState
+    from packages.domain.models.questions import ORMQuestion
+    from packages.domain.repositories.questions import QuestionRepository
+    from packages.domain.repositories.sessions import SessionRepository
+    from packages.llm_gateway.client import LLMMiddleware
+    from packages.llm_gateway.config import LLMGatewayConfig, ModelProfile
+
+    _url, engine = migrated_db
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    sid = uuid.uuid4()
+    qid = uuid.uuid4()
+    attempt_id = uuid.uuid4()
+    async with factory() as db, db.begin():
+        await db.execute(
+            text(
+                "INSERT INTO questions (id, text, state, origin) "
+                "VALUES (:q, 'Q', 'researching', 'seeded')"
+            ),
+            {"q": qid},
+        )
+        # the exact EVAL-4 shape: committing, owned lease EXPIRED
+        await db.execute(
+            text(
+                "INSERT INTO sessions (id, state, question_id, config_snapshot_id, "
+                "lease_owner, lease_expires_at) "
+                "VALUES (:id, 'committing', :q, (SELECT id FROM config_snapshots LIMIT 1), "
+                ":owner, :expires)"
+            ),
+            {
+                "id": sid,
+                "q": qid,
+                "owner": "node-1052986",
+                "expires": datetime.now(UTC) - timedelta(hours=1),
+            },
+        )
+        await db.execute(
+            text(
+                "INSERT INTO commit_attempts (id, session_id, status, staging_hash, "
+                "base_knowledge_revision, base_dependency_graph_revision) "
+                "VALUES (:a, :s, 'prepared', 'h', 0, 0)"
+            ),
+            {"a": attempt_id, "s": sid},
+        )
+        await db.execute(
+            text("UPDATE sessions SET commit_attempt_id = :a WHERE id = :s"),
+            {"a": attempt_id, "s": sid},
+        )
+
+    # the tick: fresh connection per probe, fenced row-locks, backoff
+    result = await reconcile_tick(
+        factory,
+        lambda db: AuditService(db),
+        max_probes=3,
+        base_delay=0.01,
+        lock_timeout_ms=300,
+    )
+    assert len(result.resolved) == 1
+    assert result.resolved[0].session_id == sid
+    assert result.resolved[0].outcome == "aborted"
+    assert result.transient == ()
+    assert result.inconsistent == ()
+
+    async with factory() as db:
+        row = (
+            (
+                await db.execute(
+                    text("SELECT state, termination_reason FROM sessions WHERE id = :id"),
+                    {"id": sid},
+                )
+            )
+            .mappings()
+            .first()
+        )
+        assert row["state"] == "failed"
+        assert row["termination_reason"] == "reconciled_abort"
+        status = (
+            await db.execute(
+                text("SELECT status FROM commit_attempts WHERE id = :a"), {"a": attempt_id}
+            )
+        ).scalar_one()
+    assert status == "aborted"
+
+    # admission predicate: no nonterminal session remains
+    async with factory() as db:
+        assert await SessionRepository.list_nonterminal(db) == []
+
+    # and the NEXT session is actually admitted and runs to a terminal state
+    async with factory() as db, db.begin():
+        qrow = ORMQuestion(text="Сколько будет 6*7?", origin="seeded")
+        await QuestionRepository.create(db, qrow)
+        next_qid = qrow.id
+
+    fake_llm.script(
+        [
+            {
+                "content": {
+                    "public_rationale": "r",
+                    "expected_information": "e",
+                    "decision": {
+                        "kind": "tool",
+                        "tool": "python.execute",
+                        "arguments": {"code": "print(6*7)"},
+                    },
+                }
+            },
+            {
+                "content": {
+                    "public_rationale": "r",
+                    "expected_information": "e",
+                    "decision": {"kind": "complete", "reason": "goal_reached"},
+                }
+            },
+            {"content": {"summary": "s", "claims": [], "evidence_links": [], "new_questions": []}},
+        ]
+    )
+    orch = Orchestrator(
+        session_factory=factory,
+        gateway=LLMMiddleware(
+            LLMGatewayConfig(
+                base_url=fake_llm.base_url, model="fake-thinker", max_retries=2, retry_base_delay=0.01
+            )
+        ),
+        profile=ModelProfile(model_alias="fake-thinker"),
+        executor=StubToolExecutor(Path(str(tmp_path)) / "ws"),
+    )
+    try:
+        outcome = await orch.run_session(next_qid)
+    finally:
+        await orch.gateway.close()
+    assert outcome.final_state is SessionState.SUCCEEDED

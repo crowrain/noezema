@@ -1,0 +1,24 @@
+# NOEZEMA dev stand maintenance tick (T7.59(b)): the two things a running node needs between
+# sessions — reassessment batches (§5.9.1) and commit-boundary reconciliation (§5.2.2).
+#
+# Two sequential ExecStart lines are valid for Type=oneshot: reassessment-tick first (it drains the
+# dependency-critical queue in the window between sessions), then reconcile-tick (it drives the
+# fenced probe loop for anything stuck at committing/reconciling_commit — a nonterminal session
+# blocks admission, so leaving it stuck would silently freeze the stand).
+# No production unit is reused here; prod splits these into its own admission/resume chain.
+[Unit]
+Description=NOEZEMA dev stand maintenance: reassessment batch + reconciliation tick
+Documentation=file:@REPO@/deploy/dev-stand/README.md
+PartOf=noezema-dev.target
+
+[Service]
+Type=oneshot
+User=@USER@
+Group=@GROUP@
+WorkingDirectory=@REPO@
+EnvironmentFile=-@ENVFILE@
+TimeoutStartSec=600
+NoNewPrivileges=yes
+UMask=0077
+ExecStart=@REPO@/.venv/bin/python -m hostctl.cli reassessment-tick
+ExecStart=@REPO@/.venv/bin/python -m hostctl.cli reconcile-tick

@@ -1,0 +1,16 @@
+# NOEZEMA dev stand maintenance timer (T7.59(b)).
+[Unit]
+Description=NOEZEMA dev stand reassessment+reconcile every 60 s
+Documentation=file:@REPO@/deploy/dev-stand/README.md
+Requires=noezema-dev-maint.service
+Before=noezema-dev-maint.service
+
+[Timer]
+OnBootSec=2m
+OnUnitActiveSec=60s
+AccuracySec=5s
+Persistent=false
+Unit=noezema-dev-maint.service
+
+[Install]
+WantedBy=noezema-dev.target

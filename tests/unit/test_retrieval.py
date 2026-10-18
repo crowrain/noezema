@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -16,7 +17,7 @@ from packages.cognition.retrieval import (
     PENDING_LABEL,
     retrieve,
 )
-from packages.domain.models.enums import AssessmentState, EpistemicStatus
+from packages.domain.models.enums import AssessmentState, EpistemicStatus, FreshnessStatus
 
 pytestmark = [pytest.mark.unit]
 
@@ -45,6 +46,8 @@ async def _make_claim(
     grade: str | None,
     confidence: float | None,
     search_statements: list[str] | None = None,
+    stored_freshness: str = "fresh",
+    reverify_after: datetime | None = None,
 ) -> uuid.UUID:
     """Insert a claim + head (+assessment when current). Returns claim_id."""
     factory = async_sessionmaker(engine, expire_on_commit=False)
@@ -53,10 +56,16 @@ async def _make_claim(
         await db.execute(
             text(
                 "INSERT INTO claims (id, statement, search_statements, claim_type, "
-                "freshness_status) "
-                "VALUES (:id, :st, :ss, 'computed_result', 'fresh')"
+                "freshness_status, reverify_after) "
+                "VALUES (:id, :st, :ss, 'computed_result', :f, :rv)"
             ),
-            {"id": cid, "st": statement, "ss": json.dumps(search_statements or [])},
+            {
+                "id": cid,
+                "st": statement,
+                "ss": json.dumps(search_statements or []),
+                "f": stored_freshness,
+                "rv": reverify_after,
+            },
         )
         assessment_id = None
         if state == "current":
@@ -246,3 +255,85 @@ async def test_retrieval_foreign_query_without_rendering_still_empty(
     async with factory() as db:
         res = await retrieve(db, "what is caching", snapshot_id=snap)
     assert res.current == []
+
+
+# ── freshness rule at the retrieval seam (T7.27, ADR-0014) ──────────────
+
+
+@pytest.mark.asyncio
+async def test_retrieval_does_not_surface_overdue_claim_as_fresh(
+    migrated_db: Any,
+) -> None:
+    """T7.27 (EVAL-4d, §8.6/T3.7): a claim whose ``reverify_after`` is in
+    the past is surfaced as DUE — even when the stored
+    ``freshness_status`` column still says 'fresh' (no reassessment ran,
+    no flip happened). The control claim (deadline in the future) stays
+    FRESH; at equal relevance/grade the overdue claim ranks below it."""
+    _url, engine = migrated_db
+    snap = await _snapshot_id(engine)
+    now = datetime(2026, 9, 22, 8, 0, tzinfo=UTC)
+    overdue = await _make_claim(
+        engine, snap,
+        statement="Ставка ЦБ РФ составляет 14 процентов",
+        state="current", epistemic="supported", grade="E3", confidence=0.75,
+        stored_freshness="fresh",  # the EVAL-4d state: the cache was never updated
+        reverify_after=now - timedelta(days=1),
+    )
+    within = await _make_claim(
+        engine, snap,
+        statement="Ставка ЦБ РФ составляет 16 процентов",
+        state="current", epistemic="supported", grade="E3", confidence=0.75,
+        stored_freshness="fresh",
+        reverify_after=now + timedelta(days=29),
+    )
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with factory() as db:
+        res = await retrieve(db, "Ставка ЦБ РФ", snapshot_id=snap, now=now)
+    by_id = {c.claim_id: c for c in res.current}
+    assert set(by_id) == {overdue, within}
+    # the overdue claim is NOT surfaced as fresh
+    assert by_id[overdue].freshness is FreshnessStatus.DUE
+    assert by_id[within].freshness is FreshnessStatus.FRESH
+    # the rule drives the score: equal relevance/grade, the due claim
+    # (0.4) ranks below the fresh one (1.0)
+    assert by_id[within].score > by_id[overdue].score
+    assert res.current[0].claim_id == within
+    assert res.current[1].claim_id == overdue
+
+
+@pytest.mark.asyncio
+async def test_retrieval_no_deadline_claim_is_evergreen_not_downranked(
+    migrated_db: Any,
+) -> None:
+    """T7.32 (ADR-0017): a claim without a reverify deadline is about a
+    FIXED point — no deadline by construction, valid forever →
+    EVERGREEN, and it is NOT doubtful: at equal relevance/grade it
+    ranks EXACTLY like a fresh claim, never below it (the pre-T7.32
+    unknown/0.7 weight demoted immutable facts like «Спутник-1 запущен
+    4 октября 1957» below fresh ones)."""
+    _url, engine = migrated_db
+    snap = await _snapshot_id(engine)
+    now = datetime(2026, 9, 22, 8, 0, tzinfo=UTC)
+    evergreen = await _make_claim(
+        engine, snap,
+        statement="Спутник-1 запущен 4 октября 1957",
+        state="current", epistemic="supported", grade="E3", confidence=0.75,
+        stored_freshness="evergreen",
+        reverify_after=None,
+    )
+    fresh = await _make_claim(
+        engine, snap,
+        statement="Спутник-2 запущен 12 августа 1957",
+        state="current", epistemic="supported", grade="E3", confidence=0.75,
+        stored_freshness="fresh",
+        reverify_after=now + timedelta(days=29),
+    )
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with factory() as db:
+        res = await retrieve(db, "Спутник", snapshot_id=snap, now=now)
+    by_id = {c.claim_id: c for c in res.current}
+    assert set(by_id) == {evergreen, fresh}
+    assert by_id[evergreen].freshness is FreshnessStatus.EVERGREEN
+    # the immutable fact is not downranked as doubtful: same score as
+    # the fresh claim (evergreen weight 1.0 = fresh weight)
+    assert by_id[evergreen].score == by_id[fresh].score

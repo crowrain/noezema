@@ -4,9 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from packages.domain.models.base import JsonDict
+from packages.llm_gateway.reasoning_compat import require_reasoning_profile
+from packages.llm_gateway.schema_compat import SCHEMA_PROFILES
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,3 +54,35 @@ class LLMGatewayConfig(BaseSettings):
     max_retries: int = 3
     retry_base_delay: float = 1.0
     retry_multiplier: float = 2.0
+    # T7.23 (ADR-0012): engine JSON Schema compatibility profile.
+    # "none" (the default) sends the pydantic schema byte-for-byte
+    # unchanged — the current behavior, so frozen config-v2/v3 runs and
+    # the qwen36-35b-a3b-q6-mtp / EVAL-3d comparability are untouched.
+    # "halogen" strips exactly the keywords that engine refuses
+    # (format, pattern) from the schema SENT to the engine only; the
+    # host still validates the model's answer against the full model.
+    schema_profile: str = "none"
+    # T7.80 (ADR-0030): engine REASONING compatibility profile — how THIS
+    # engine is asked to stop thinking, when a config snapshot switches a call
+    # phase "off" (`model.reasoning_by_phase`). Same reasoning as schema_profile
+    # (ADR-0012 §3): a capability of the deployment, not of the research.
+    # "none" (the default) sends no reasoning parameter at all — request bodies
+    # stay byte-for-byte as before, so frozen runs and prior comparisons are
+    # untouched. "halogen" = `reasoning_effort: "none"`; "chat-template" =
+    # `chat_template_kwargs: {"enable_thinking": false}` (llama.cpp Qwen).
+    # An unknown profile is a deployment mistake: the process refuses to start.
+    reasoning_profile: str = "none"
+
+    @field_validator("schema_profile")
+    @classmethod
+    def _check_schema_profile(cls, value: str) -> str:
+        if value not in SCHEMA_PROFILES:
+            known = ", ".join(sorted(SCHEMA_PROFILES))
+            raise ValueError(f"unknown schema_profile {value!r}; known profiles: {known}")
+        return value
+
+    @field_validator("reasoning_profile")
+    @classmethod
+    def _check_reasoning_profile(cls, value: str) -> str:
+        require_reasoning_profile(value)  # fail-closed: names the known profiles
+        return value

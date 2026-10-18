@@ -24,6 +24,7 @@ tools:
   message.reply: true
   artifact.create: true
   research.fetch: true      # M6: только через Research Proxy
+  web.search: true          # T7.71 (§5.12, ADR-0027 §4): навигационный поиск через тот же proxy (curated)
 paths:
   writable: ["/workspace"]
   readable: ["/base", "/workspace"]

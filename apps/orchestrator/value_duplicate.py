@@ -1,0 +1,1101 @@
+"""T7.83 + T7.83a (ADR-0033): чистый детектор «дубля по значению» в кураторском предложении.
+
+Defect shape (stand .92, session f452a978, config-v19): the curator summary says it
+reverified two claims already visible in the context pack, but both proposal ops
+arrive without `existing_claim_id`. Byte-exact dedup (T7.9) cannot see a paraphrase,
+so the commit writes a SECOND claim carrying the same value of the same indicator for
+the same period — and the answer card shows «5,59%» twice with contradictory badges.
+
+Host definition of a value duplicate (conservative, deterministic, no LLM):
+a new op (no `existing_claim_id`) and a context-pack candidate are value duplicates
+when all three hold:
+
+* equal `claim_type`;
+* equal NON-EMPTY set of significant numbers in the two statements — decimal tokens
+  with digit boundaries (`\\d+(?:[.,]\\d+)+`, the same boundary semantics as
+  assertion_window): «5,59» ≠ «5,6», and «105,59» is ONE token, never a hit on «5,59».
+  Integers without a decimal separator are NOT values (years and dates stay out);
+* compatible period: the new statement's years (plus its `as_of` year) form a NON-EMPTY
+  set that is a SUBSET of the candidate's years (plus its `as_of` year) — the candidate
+  may name extra years («опубликовано … 2026» belongs to the candidate, not to the period).
+
+Fixture pair proof (SELECT from noezema-dev): e189c80d ↔ 9266248e is a duplicate;
+391c4388 ↔ 6d9a12ff is NOT (values {14.5} vs {13.1, 15.6}).
+
+T7.83a — the acceptance finding: those three conditions are NOT yet «the same fact».
+«Инфляционные ожидания населения … составили 13,7%» and «Средняя ключевая ставка Банка
+России … составила 13,7%» match type + values + period, but they are two DIFFERENT
+INDICATORS: merging them attaches evidence about one indicator to a statement about
+another and can RAISE its grade — a dishonest badge. Two host conditions are added on
+top of the three above, both conservative (an extra duplicate on the card is cheaper
+than a foreign piece of evidence under a claim):
+
+* RELIED FILTER: the host merges only a candidate the curator itself declared as an
+  support of this answer (`relied_claim_ids`, T7.82/ADR-0032). A candidate outside that
+  list leaves the op exactly as proposed, with the reason recorded. The count of
+  «exactly one candidate» is taken AFTER this filter; ≥2 relied candidates are still an
+  ambiguity → kept. Rationale: `existing_claim_id` (T7.34) already lets the model merge
+  any visible claim explicitly — the relied list is the same declaration written without
+  an operation, so it is the only claim whose identity the host may reuse on its own.
+* INDICATOR MATCH: if both sides declare a scope metric (`scope.metric` / `indicator` /
+  `показатель` / `объект`) the normalized values must be equal; otherwise the two
+  statements must share an indicator vocabulary — significant letters-only words, lower-
+  cased, compared by a fixed-length stem prefix, with an overlap at least
+  `INDICATOR_OVERLAP_MIN`. Additionally two statements that name DIFFERENT territories
+  (from the closed `_TERRITORY_GROUPS` dictionary) are never the same indicator, and neither
+  are two statements that name mutually exclusive indicator QUALIFIERS of one topic —
+  «наблюдаемая инфляция» (what people already feel) vs «инфляционные ожидания / ожидаемая
+  инфляция» (what they expect for the next 12 months), T7.96, `_INDICATOR_QUALIFIER_GROUPS`.
+  T7.96a adds two dictionaries of the same shape, because ONE survey publishes SEVERAL
+  indicators whose formulations differ by exactly one word: WHOSE readings are named
+  («инфляционные ожидания населения» 14,2% vs «ценовые ожидания предприятий» 7,0%,
+  `_INDICATOR_RESPONDENT_GROUPS`) and which HORIZON the formulation names in words
+  («на годовом горизонте» 14,2% vs «на 5 лет вперёд» 10,7%, `_INDICATOR_HORIZON_MARKERS`
+  + `_INDICATOR_HORIZON_SCALES`). All three dictionaries stay veto-only: a conflict is a
+  refusal only when BOTH statements name the differentiator and their group sets do not
+  intersect, and none of them takes part in the overlap count.
+
+Decision policy (variant (i)/(ii) of T7.83): exactly ONE candidate matches strictly and
+the op's evidence links are all `supports` → the host converts the op into a reverify of
+that candidate (variant (i): the new supporting evidence joins the candidate's union and
+can only keep or raise its grade — see ADR-0033; the anchor's as_of/scope are preserved
+by packages/memory/reverify.py). No strict match, several matches, no reliance, an
+indicator mismatch, or counter-evidence in the links → the op is left alone with an
+honest reason recorded (variant (ii) territory: without new supporting evidence nothing
+justifies touching the candidate, and a dispute must remain a dispute). Zero suspects →
+silent: the payload stays byte-identical to pre-T7.83.
+
+T7.85 adds a second, narrower detector in this module — `find_identical_statement_duplicates`:
+an op whose statement is BYTE-identical to exactly one context-pack claim but whose `claim_type`
+differs. Dedup T7.9 (it requires equal statement AND equal type) and the numeric gate (its first
+condition is equal type) both cannot see it, so the stand wrote the same sentence twice with
+different grades (2d010d53 external_fact / 58e2d5d4 temporal_fact). Byte-exactness is what makes
+this rule safe without T7.83a's `relied_claim_ids` filter: identical text means identical
+indicator, period and values by construction, so the host is not choosing between two different
+formulations — it keeps the one claim the curator already stated.
+
+The module decides; applying the conversion (staged copies + audit annotation) is the
+host's job in apps/orchestrator/orchestrator.py — ops with an explicit `existing_claim_id`
+are never passed here (T7.34 already owns them).
+"""
+
+from __future__ import annotations
+
+import re
+import unicodedata
+from collections.abc import Sequence
+from dataclasses import dataclass
+from datetime import datetime
+from fractions import Fraction
+
+from apps.orchestrator.curator_period_gate import named_month_numbers
+from packages.domain.models.base import JsonDict
+
+#: decimal value token: maximal run of digits joined by ',' or '.', with digit
+#: boundaries — mirrors apps/orchestrator/assertion_window.py::_numeric_boundary_ok
+#: semantics (a value never starts or ends inside another number).
+_VALUE_TOKEN_RE = re.compile(r"(?<![0-9])(\d+(?:[.,]\d+)+)(?![0-9])")
+
+#: T7.98 (ADR-0033): целые концы диапазона, названного с единицей, — тоже значения:
+#: «6–7%» и «6,0–7,0%» записывают одно и то же числовое множество {6.0, 7.0}.
+#: Правило ровно то же, что у `_VALUE_TOKEN_RE` (целое без разделителя значением не
+#: считается), распространённое на пару «целое␠тире␠целое␠единица»: десятичные концы
+#: («6,0–7,0%», «4,5–5,5%») уже значения и в этом скане не нуждаются, смешанный диапазон
+#: («6,5–7%», «6–7,5%») остаётся нечитаемым — правый/левый конец с разделителем блокирует
+#: пару, и значением считается только десятичный токен (консервативность T7.83a сохранена:
+#: витрина `apps/web/estimates.py` разбирает роли по «6,5–7%» как по одному значению 6,5,
+#: гейт — ровно так же). Диапазон читается значением ТОЛЬКО когда правый конец стоит
+#: вплотную к единице (% или п.п.): «16–21 января», «5-6 месяцев», «2024–2025 годы» — не
+#: значения (единицы нет → диапазон не про значение, а про даты/длительность). Тире
+#: читается любым типографским (–—-).
+_RANGE_TOKEN_RE = re.compile(r"(?<![0-9.,])(\d+)\s*[–—-]\s*(\d+)(?![0-9.,])\s*(?:%|п\.п\.)")
+
+#: a period year: a standalone 4-digit token (1000–2099) outside any value token;
+#: «год-одиночка» inside the text counts, digits inside a decimal value never do.
+_YEAR_TOKEN_RE = re.compile(r"(?<!\d)(1[0-9]{3}|20[0-9]{2})(?!\d)")
+
+# ── T7.83a: словарь показателя (детерминированный, без LLM) ────────────────
+
+#: основа слова: нижний регистр + ПРЕФИКС ФИКСИРОВАННОЙ ДЛИНЫ. Пять знаков —
+#: минимальная длина, которая (а) переживает падеж и род русско/англоязычного
+#: показателя («инфляция/инфляции/инфляцией», «ставка/ставки», «средняя/среднее» →
+#: один стем) и (б) ещё достаточно длинна, чтобы не сводить разные показатели к
+#: одному стему. Сравнение по началу слова, а не по окончанию, выбрано специально:
+#: окончания в русском меняются сильнее, чем начала слов.
+INDICATOR_STEM_LEN = 5
+
+#: порог перекрытия словарей показателя (отношение пересечения к объединению).
+#: подобран на РЕАЛЬНЫХ формулировках фикстуры .92 и на отрицательных примерах
+#: приёмки; все замеры — точные рациональные числа, без float:
+#:   слияние:  e189c80d↔9266248e = 3/5; перефраз наблюдаемой инфляции = 4/5;
+#:             «средняя ключевая ставка Банка России» ↔ её перефраз = 1;
+#:   отказ:    ожидания(13,7%)↔ключевая ставка(13,7%) = 0; безработица↔ВВП = 0;
+#:             инфляция РФ↔Казахстан = 1/3 (+территориальный конфликт);
+#:             «ставка по вкладам»↔«ключевая ставка» = 1/2; ожидания↔инфляция = 1/4.
+#: 3/5 — наименьшее значение, которое отделяет реальную пару фикстуры (3/5) от
+#: ближайшего ошибочного кандидата (1/2); спорные пары всегда решаются в сторону
+#: «kept» (лишний дубль на карточке дешевле чужой улики у утверждения).
+INDICATOR_OVERLAP_MIN = Fraction(3, 5)
+
+#: служебные слова: СРАВНИВАЮТСЯ ТОЧНО (иначе предлог «в» убьёт слово «вклада»,
+#: «на» — «население», «и» — «инфляция»). Короткие предлоги и связки.
+_STOP_WORDS: frozenset[str] = frozenset(
+    {
+        "в", "во", "со", "с", "у", "к", "по", "за", "на", "из", "от", "до", "для",
+        "при", "о", "об", "и", "или", "не", "как", "это", "этот", "эта", "эти", "их",
+        "его", "её", "ее", "что", "все", "всех", "более", "менее", "около", "примерно",
+        "же", "ли", "бы", "а", "no", "of", "the", "a", "in", "for", "and", "or", "to",
+        "at", "by", "was", "is",
+    }
+)
+
+#: служебные основы: сравниваются как ПРЕФИКСЫ по цельным корням служебных слов.
+#: «составил*», «год*», «итог*», «данн*» и т. п. из задачи — плюс периодные и
+#: атрибутивные маркеры: они описывают значение, период и источник, но не то,
+#: КАКОЙ показатель измеряется. Кратчайшая основа — «год» (единственная трёхзначная):
+#: иначе «годовая/году» остались бы показателем; она же снимает «город…» — название
+#: города показателем не является. Предлоги и связки в этот список не входят: для них
+#: есть `_STOP_WORDS`, где сравнение точное (префиксным «в» убило бы «вклада»).
+#: «банк» и «росстат» сюда НЕ входят осознанно:
+#: «ключевая ставка Банка России» — часть имени показателя.
+_STOP_STEMS: frozenset[str] = frozenset(
+    {
+        # связка «значение = N» и её синонимы (T7.98: «повысил/понизил прогноз до N» —
+        # та же связка со знаком изменения; основа снимает и «повышение/понижение» —
+        # по образцу «увелич», которое уже снимает «увеличение»; знак изменения решает
+        # словарь значений, а не словарь показателя)
+        "составил", "составля", "составит", "достиг", "превысил", "увелич", "снизил",
+        "вырос", "упал", "изменил", "показал", "оценка", "оценк",
+        "повыс", "пониз", "пониж",
+        # период и его маркеры (годовая/годовые/году — один показатель периода)
+        "год", "месяц", "квартал", "период", "итог", "данн", "датир", "число", "дата",
+        # отсылка к источнику как таковая
+        "опубликов", "сообща", "сообщил", "источник", "согласно", "показател", "значени",
+    }
+)
+
+#: названия месяцев (в любой форме: декабрь/декабря/декабрю/декабре) — маркеры
+#: периода, а не показателя.
+_MONTH_PREFIXES: tuple[str, ...] = (
+    "январ", "феврал", "март", "апрел", "мая", "мае", "июн", "июл", "август",
+    "сентябр", "октябр", "ноев", "декабр",
+)
+
+#: ЗАКРЫТЫЙ словарь территорий. Показатель привязан к территории: «инфляция в
+#: России» и «инфляция в Казахстане» — разные показатели, даже если все прочие
+#: слова совпали (перекрытие 1/3 … 3/5). Правило одностороннее и потому безопасное:
+#: конфликт засчитывается ТОЛЬКО когда обе формулировки называют территорию из
+#: этого списка и множества территорий не пересекаются; словарь неполный, и это
+#: не создаёт ложных склеек (неполнота решает «не увидел конфликта»).
+_TERRITORY_GROUPS: tuple[frozenset[str], ...] = (
+    frozenset({"росси", "россий"}),
+    frozenset({"сша", "амери"}),
+    frozenset({"европ", "евроз"}),
+    frozenset({"миров", "глоба"}),
+    frozenset({"белару", "белорус"}),
+    frozenset({"казах"}),
+    frozenset({"украи"}),
+    frozenset({"кита"}),
+    frozenset({"турц"}),
+    frozenset({"герман"}),
+    frozenset({"инди"}),
+    frozenset({"япон"}),
+)
+
+#: ЗАКРЫТЫЙ словарь групп взаимоисключающих УТОЧНИТЕЛЕЙ показателя (T7.96, по образцу
+#: `_TERRITORY_GROUPS`). Стендовый дефект (карты 7c8c9afe и cc75e97f, вопрос 5a68172e,
+#: сессия bdd9ef8d, .92): один и тот же опрос инФОМ даёт ДВА показателя — «наблюдаемая
+#: населением годовая инфляция» (насколько цены УЖЕ выросли за прошедший год) и
+#: «инфляционные ожидания населения» (какими они видятся на следующие 12 месяцев).
+#: Формулировки различаются ровно одним словом при остальной идентичной лексике, поэтому
+#: одного порога перекрытия не хватает: 7c8c9afe↔cc75e97f = 3/4, 391c4388↔7c8c9afe (тот же
+#: показатель, другой месяц) = 3/4, «наблюдаемая 14,5%»↔«ожидания 14,5%» = ровно 3/5 —
+#: все три выше `INDICATOR_OVERLAP_MIN`. Значит различие обязано решать словарь уточнителей,
+#: а не доля общих слов.
+#: Правило одностороннее, как у территорий: конфликт засчитывается ТОЛЬКО когда обе
+#: формулировки называют уточнитель из этого словаря и множества групп не пересекаются.
+#: Неполнота словаря никогда не создаёт ложной склейки и не создаёт ложного отказа — она
+#: лишь не видит конфликта (сравнение ведёт тот же conservative-выбор, что и территории).
+#: Уточнитель — ИМЕННО имя измеряемой величины: месяцы/«год»/«с начала года» сюда не входят
+#: (это период, его отсекает правило периода гейта и `_MONTH_PREFIXES`), «медианная/средняя»
+#: не входят (это агрегация одного и того же измерения, а не другой показатель), «прогноз»
+#: не входит (роль значения разбирает `apps/web/estimates.value_roles`, T7.88b/T7.94 — тот
+#: же замкнутый список точных форм, расширять его без замера живых формулировок нельзя).
+#: Формы словаря — начала слов той же парадигмы, что мерится на стенде: «наблюдаем*» покрывает
+#: «наблюдаемая/наблюдаемой/наблюдаемые», но НЕ «наблюдение/наблюдает»; слова атрибуции
+#: («по данным», «опрос», «ООО», названия организаций) из словаря показателя НЕ исключены:
+#: замер всех 15 формулировок дампа claims_live.tsv (STATUS T7.96) показывает, что их
+#: исключение не чинит этот дефект (пара остаётся ≥3/5) и при этом поднимает перекрытие
+#: других пар — то есть могло бы ДОБАВИТЬ склейки, чего правило делать не должно.
+#: Дополнение T7.96a: та же группа получила глагольные формы того же семейства
+#: («наблюдает/наблюдал/наблюдение», «ощущает») и слово «оценка*» в значении «оценка уже
+#: состоявшегося изменения»: пробы менеджера на c221369 склеивали «Население России НАБЛЮДАЕТ
+#: годовую инфляцию … 15,1%» с ожиданиями 14,2% (перекрытие 2/3) и «Годовая инфляция ПО ОЦЕНКЕ
+#: населения России … 15,1%» с теми же ожиданиями (6/7). «оценка*» при этом остаётся служебным
+#: словом словаря показателя (`_STOP_STEMS`) — его читает только словарь-вето, и читает по всем
+#: буквенным словам формулировки (`_differentiator_words`), а не по словарю показателя.
+#: Опасный класс «медианная оценка ожиданий» этим не расщепляется: такая формулировка называет
+#: обе группы сразу. Замер всех пар корпуса (все буквенные формулировки тестов + 15 формулировок
+#: дампа claims_live.tsv, 194 376 пар, 1 235 склеек на c221369; STATUS T7.96a): ни одна прежняя
+#: законная склейка не сломана, новых склеек 0.
+_INDICATOR_QUALIFIER_GROUPS: tuple[frozenset[str], ...] = (
+    # показания опроса об уже состоявшемся изменении цен (T7.96 + формы T7.96a)
+    frozenset({"наблюдаем", "воспринимаем", "наблюда", "ощуща", "оцен"}),
+    # показания опроса о предстоящем изменении цен (имя показателя «ожидания»)
+    frozenset({"ожидани", "ожидаем", "ожидающ"}),
+)
+
+#: ЗАКРЫТЫЙ словарь групп РЕСПОНДЕНТА — «чьи именно показания опроса названы» (T7.96a, та же
+#: форма правила, что у `_TERRITORY_GROUPS`). Стендовые тексты ЦБ держат рядом два показателя
+#: одного периода и одной формы имени: «инфляционные ожидания НАСЕЛЕНИЯ России … 14,2%» и
+#: «ценовые ожидания ПРЕДПРИЯТИЙ России … 7,0%». Лексика имени у них общая (инфляционн-,
+#: ожидания, России, месяц), поэтому словарь показателя даёт ровно порог — 3/5 — и склеивает;
+#: различает пары только это слово. Правило двустороннее: отказ лишь когда обе стороны назвали
+#: респондента и группы не пересекаются (формулировка «ожидания населения и предприятий» называет
+#: обе группы — конфликта нет).
+_INDICATOR_RESPONDENT_GROUPS: tuple[frozenset[str], ...] = (
+    frozenset({"насел", "гражд", "домохозяй"}),
+    frozenset({"предпр", "бизнес", "компани"}),
+)
+
+#: ЗАКРЫТЫЙ словарь ГОРИЗОНТА формулировки (T7.96a). Живые тексты ЦБ называют горизонт
+#: ожидания словом: «на годовом ГОРИЗОНТЕ» 14,2% против «на 5 ЛЕТ ВПЕРЁД» 10,7% — имена
+#: показателя при этом идентичны («инфляционные ожидания населения России»), и словарь
+#: даёт 2/3 выше порога. Числа в сравнение НЕ берутся (цифра — не слово): сопоставляются
+#: группы словесных форм, где горизонт назван МАРКЕРОМ направления («вперёд», «горизонт»)
+#: и ШКАЛОЙ в том же словосочетании (годовая / многолетняя). Период сам по себе («год»,
+#: «месяц», «по итогам года») горизонтом не считается: его отсекает правило периода гейта,
+#: и в словарь показателя эти слова возвращать нельзя (ADR-0033 §10.5).
+_INDICATOR_HORIZON_MARKERS: tuple[str, ...] = ("вперед", "горизонт")
+#: основа «год» снимает и название города — оно не шкала горизонта
+_HORIZON_SCALE_EXCLUSIONS: tuple[str, ...] = ("город",)
+_INDICATOR_HORIZON_SCALES: tuple[frozenset[str], ...] = (
+    # «на годовом горизонте», «на год вперёд»
+    frozenset({"год"}),
+    # «на 5 лет вперёд», «на десять лет вперёд» (шкала стоит рядом с маркером)
+    frozenset({"лет", "пятилет", "десятилет"}),
+)
+
+#: сколько слов может стоять между маркером и шкалой, чтобы это оставалось одним
+#: словосочетанием: 0, то есть шкала обязана стоять рядом с маркером («на годовом ГОРИЗОНТЕ»,
+#: «на год ВПЕРЁД», «на 5 ЛЕТ ВПЕРЁД»). Расширить окно — значит начать читать шкалой слово из
+#: соседней конструкции: в фразе «на 5 лет вперёд в сентябре 2026 года» при окне в одно слово
+#: годовой шкалой стало бы «года» из даты, и формулировка получила бы второй горизонт, которого
+#: она не называет (замер на корпусе это подтверждает: склейка (4) перестала бы отказывать).
+_HORIZON_MAX_GAP_WORDS = 0
+
+#: ключи scope, которые хост читает как метку показателя. Реальное употребление:
+#: `metric` (tests/scenario/test_commit_boundary.py — единственный свободный scope
+#: с явным метрическим ключом), `объект` (`curator` пишет его в предложениях:
+#: tests/scenario/test_relied_claims.py), плюс английские синонимы. На строке
+#: `claims` колонки scope НЕТ вовсе (packages/domain/models/memory.py::ORMClaim):
+#: метку показателя хост может взять только из assessed_scope текущей головы
+#: (host-scope-v1 несёт as_of/date_anchor/source_domains, то есть для свежих
+#: стендовых claims её нет — решает словарь формулировок) либо из legacy-строк,
+#: где assessed_scope был свободным словарём модели (packages/memory/scope.py).
+SCOPE_METRIC_KEYS: tuple[str, ...] = ("metric", "indicator", "показатель", "объект")
+
+#: буквы (кириллица и латиница), числа и подчёркивания в слова не попадают
+_WORD_RE = re.compile(r"[^\W\d_]+", re.UNICODE)
+
+
+def _normalize_text(statement: str) -> str:
+    """Типографика живых страниц (T7.77): NBSP/узкий пробел → обычный пробел,
+    софт-гифен убирается, ё→е (иначе «ставка» и «ставка» — разные слова)."""
+    text = statement.replace("\u00a0", " ").replace("\u202f", " ").replace("\u00ad", "")
+    text = unicodedata.normalize("NFKC", text)
+    return text.replace("ё", "е")
+
+
+def _indicator_tokens(statement: str) -> list[str]:
+    """Значимые слова формулировки: только буквы, без чисел/годов/месяцев/дат и
+    без служебных слов (см. `_STOP_WORDS`, `_STOP_STEMS`, `_MONTH_PREFIXES`)."""
+    tokens: list[str] = []
+    for raw in _WORD_RE.findall(_normalize_text(statement)):
+        word = raw.lower()
+        if len(word) < 3 or word in _STOP_WORDS:
+            continue
+        if any(word.startswith(stem) for stem in _STOP_STEMS):
+            continue
+        if any(word.startswith(month) for month in _MONTH_PREFIXES):
+            continue
+        tokens.append(word)
+    return tokens
+
+
+def statement_indicator_words(statement: str) -> frozenset[str]:
+    """Словарь показателя формулировки: основы значимых слов (`INDICATOR_STEM_LEN`)."""
+    return frozenset(token[:INDICATOR_STEM_LEN] for token in _indicator_tokens(statement))
+
+
+def _territory_words(statement: str) -> frozenset[str]:
+    """Слова-территории формулировки (закрытый словарь `_TERRITORY_GROUPS`)."""
+    found: set[str] = set()
+    for word in _indicator_tokens(statement):
+        if any(word.startswith(prefix) for group in _TERRITORY_GROUPS for prefix in group):
+            found.add(word)
+    return frozenset(found)
+
+
+def _territory_group_ids(words: frozenset[str]) -> set[int]:
+    """Номера групп территорий, названных формулировкой (для сравнения «одно и то же
+    ли это название»: Россия/Российской — одна группа, Россия/Казахстан — разные)."""
+    groups: set[int] = set()
+    for index, group in enumerate(_TERRITORY_GROUPS):
+        if any(word.startswith(prefix) for prefix in group for word in words):
+            groups.add(index)
+    return groups
+
+
+def _differentiator_words(statement: str) -> list[str]:
+    """Буквенные слова формулировки для словарей-вето (T7.96a). Словарь показателя здесь НЕ
+    используется сознательно: «год», «месяц», «оценка» — служебные слова `_STOP_STEMS`, и
+    возвращать их в словарь показателя нельзя (ADR-0033 §10.5: период решает правило периода
+    гейта), но как средство различия одного и того же имени показателя их прочитать надо.
+    Этот список никогда не участвует в подсчёте перекрытия: он может только ОТМЕНИТЬ склейку."""
+    return [word.lower() for word in _WORD_RE.findall(_normalize_text(statement)) if len(word) >= 3]
+
+
+def _indicator_qualifier_words(statement: str) -> frozenset[str]:
+    """Слова-уточнители показателя формулировки (закрытый словарь
+    `_INDICATOR_QUALIFIER_GROUPS`, T7.96)."""
+    found: set[str] = set()
+    for word in _differentiator_words(statement):
+        if any(
+            word.startswith(prefix) for group in _INDICATOR_QUALIFIER_GROUPS for prefix in group
+        ):
+            found.add(word)
+    return frozenset(found)
+
+
+def _indicator_qualifier_group_ids(words: frozenset[str]) -> set[int]:
+    """Номера групп уточнителей, названных формулировкой («наблюдаемая» и «ожидания» —
+    разные группы; «наблюдаемая» и «ожидаемая населением инфляция» в одной формулировке —
+    обе группы, то есть конфликта нет)."""
+    groups: set[int] = set()
+    for index, group in enumerate(_INDICATOR_QUALIFIER_GROUPS):
+        if any(word.startswith(prefix) for prefix in group for word in words):
+            groups.add(index)
+    return groups
+
+
+def _respondent_words(statement: str) -> frozenset[str]:
+    """Слова, которыми формулировка назвала респондента (закрытый словарь
+    `_INDICATOR_RESPONDENT_GROUPS`, T7.96a)."""
+    found: set[str] = set()
+    for word in _differentiator_words(statement):
+        if any(
+            word.startswith(prefix) for group in _INDICATOR_RESPONDENT_GROUPS for prefix in group
+        ):
+            found.add(word)
+    return frozenset(found)
+
+
+def _respondent_group_ids(words: frozenset[str]) -> set[int]:
+    """Номера групп респондента («населения» и «предприятий» — разные группы; «населения и
+    предприятий» в одной формулировке — обе группы, конфликта нет)."""
+    groups: set[int] = set()
+    for index, group in enumerate(_INDICATOR_RESPONDENT_GROUPS):
+        if any(word.startswith(prefix) for prefix in group for word in words):
+            groups.add(index)
+    return groups
+
+
+def _indicator_horizon_words(statement: str) -> frozenset[str]:
+    """Слова словосочетания, которым формулировка назвала горизонт ожидания (T7.96a):
+    маркер направления и шкала рядом с ним (`_HORIZON_MAX_GAP_WORDS`). Пустое множество —
+    горизонт не назван (маркер без шкалы рядом, «годовая инфляция», «за следующие 12 месяцев»,
+    «на горизонте в один год»): тогда вето молчит и решение остаётся за словарём показателя."""
+    words = _differentiator_words(statement)
+    found: set[str] = set()
+    for index, word in enumerate(words):
+        if not word.startswith(_INDICATOR_HORIZON_MARKERS):
+            continue
+        low = max(0, index - _HORIZON_MAX_GAP_WORDS - 1)
+        high = min(len(words), index + _HORIZON_MAX_GAP_WORDS + 2)
+        for other_index in range(low, high):
+            if other_index == index:
+                continue
+            other = words[other_index]
+            if other.startswith(_INDICATOR_HORIZON_MARKERS):
+                continue
+            if _horizon_scale_group(other) is not None:
+                found.update((word, other))
+    return frozenset(found)
+
+
+def _horizon_scale_group(word: str) -> int | None:
+    """Группа шкалы одного слова («годовом» → годовая, «лет»/«пятилетние» → многолетняя).
+    Название города («город», «городе») годовой шкалой не считается: `_STOP_STEMS` снимает его
+    из словаря показателя по той же основе «год», и здесь путаница так же исключена."""
+    if word.startswith(_HORIZON_SCALE_EXCLUSIONS):
+        return None
+    for index, group in enumerate(_INDICATOR_HORIZON_SCALES):
+        if any(word.startswith(prefix) for prefix in group):
+            return index
+    return None
+
+
+def _indicator_horizon_group_ids(words: frozenset[str]) -> set[int]:
+    """Номера групп шкалы («годовой горизонт» и «5 лет вперёд» — разные группы)."""
+    return {group for word in words if (group := _horizon_scale_group(word)) is not None}
+
+
+def declared_scope_metric(scope: JsonDict | None) -> str | None:
+    """Нормализованная метка показателя из свободного scope (T7.17: свободный scope
+    модели живёт в staging-предложении и в assessed_scope legacy-строк).
+
+    None — метки нет: тогда решает словарь формулировок (`indicator_check`)."""
+    if not isinstance(scope, dict):
+        return None
+    for key in SCOPE_METRIC_KEYS:
+        raw = scope.get(key)
+        if not isinstance(raw, str):
+            continue
+        normalized = " ".join(_WORD_RE.findall(_normalize_text(raw))).lower()
+        if normalized:
+            return normalized
+    return None
+
+
+@dataclass(frozen=True)
+class IndicatorCheck:
+    """Решение сверки показателя + человекочитаемая деталь для причины в payload."""
+
+    matched: bool
+    detail: str
+
+
+def indicator_check(
+    claim_statement: str,
+    candidate_statement: str,
+    claim_metric: str | None = None,
+    candidate_metric: str | None = None,
+) -> IndicatorCheck:
+    """Тот же ли это показатель (T7.83a)? Сомнение → False (гейт остаётся консервативным).
+
+    (а) обе стороны назвали метку показателя — метки обязаны совпасть после
+        нормализации (это самый сильный сигнал: он не зависит от формулировки);
+    (б) хотя бы у одной метки нет — словари значимых слов обязаны пересечься не
+        слабее `INDICATOR_OVERLAP_MIN`, и формулировки не должны называть разные территории
+        (T7.83a), взаимоисключающие уточнители одного показателя (T7.96: «наблюдаемая
+        инфляция» против «инфляционные ожидания / ожидаемая инфляция»; T7.96a расширил ту же
+        группу глагольными формами «наблюдает/ощущает»), разных респондентов одного опроса
+        (T7.96a: «ожидания населения» и «ценовые ожидания предприятий») либо несовместимый
+        названный горизонт (T7.96a: «на годовом горизонте» против «на 5 лет вперёд»). Пустой
+        словарь у одной из сторон = сравнить нечего → False.
+
+    Все четыре словаря-вето двусторонние и только ОТМЕНЯЮТ склейку: они не участвуют в
+    подсчёте перекрытия и не могут сделать пару «тот же показатель», если порог или
+    другой словарь её не пустили бы."""
+    if claim_metric is not None and candidate_metric is not None:
+        return IndicatorCheck(
+            matched=claim_metric == candidate_metric,
+            detail=(
+                f"declared scope metric {claim_metric!r} vs {candidate_metric!r}"
+                if claim_metric != candidate_metric
+                else f"same declared scope metric {claim_metric!r}"
+            ),
+        )
+    claim_words = statement_indicator_words(claim_statement)
+    candidate_words = statement_indicator_words(candidate_statement)
+    if not claim_words or not candidate_words:
+        return IndicatorCheck(
+            matched=False,
+            detail="one of the statements has no comparable indicator vocabulary",
+        )
+    claim_territories = _territory_words(claim_statement)
+    candidate_territories = _territory_words(candidate_statement)
+    if (
+        claim_territories
+        and candidate_territories
+        and not (_territory_group_ids(claim_territories) & _territory_group_ids(candidate_territories))
+    ):
+        return IndicatorCheck(
+            matched=False,
+            detail=(
+                f"the statements name different territories "
+                f"{sorted(claim_territories)} vs {sorted(candidate_territories)}"
+            ),
+        )
+    claim_qualifiers = _indicator_qualifier_words(claim_statement)
+    candidate_qualifiers = _indicator_qualifier_words(candidate_statement)
+    if (
+        claim_qualifiers
+        and candidate_qualifiers
+        and not (
+            _indicator_qualifier_group_ids(claim_qualifiers)
+            & _indicator_qualifier_group_ids(candidate_qualifiers)
+        )
+    ):
+        return IndicatorCheck(
+            matched=False,
+            detail=(
+                f"the statements name different indicator qualifiers "
+                f"{sorted(claim_qualifiers)} vs {sorted(candidate_qualifiers)}"
+            ),
+        )
+    claim_respondents = _respondent_words(claim_statement)
+    candidate_respondents = _respondent_words(candidate_statement)
+    if (
+        claim_respondents
+        and candidate_respondents
+        and not (_respondent_group_ids(claim_respondents) & _respondent_group_ids(candidate_respondents))
+    ):
+        return IndicatorCheck(
+            matched=False,
+            detail=(
+                f"the statements name different survey respondents "
+                f"{sorted(claim_respondents)} vs {sorted(candidate_respondents)}"
+            ),
+        )
+    claim_horizon = _indicator_horizon_words(claim_statement)
+    candidate_horizon = _indicator_horizon_words(candidate_statement)
+    if (
+        claim_horizon
+        and candidate_horizon
+        and not (
+            _indicator_horizon_group_ids(claim_horizon) & _indicator_horizon_group_ids(candidate_horizon)
+        )
+    ):
+        return IndicatorCheck(
+            matched=False,
+            detail=(
+                f"the statements name different indicator horizons "
+                f"{sorted(claim_horizon)} vs {sorted(candidate_horizon)}"
+            ),
+        )
+    union = claim_words | candidate_words
+    overlap = Fraction(len(claim_words & candidate_words), len(union))
+    return IndicatorCheck(
+        matched=overlap >= INDICATOR_OVERLAP_MIN,
+        detail=(
+            f"indicator vocabulary overlap {overlap.numerator}/{overlap.denominator} "
+            f"(shared stems: {sorted(claim_words & candidate_words)})"
+        ),
+    )
+
+
+def _canonical_value(token: str) -> str | None:
+    """Canonical form of one decimal token: separators → '.', float round-trip.
+
+    Returns None for a token that cannot be canonicalized (e.g. «0,53.59») — the
+    caller then treats the whole statement as unanalyzable (conservative silence)."""
+    normalized = token.replace(",", ".")
+    try:
+        value = float(normalized)
+    except ValueError:
+        return None
+    if value != value or value in (float("inf"), float("-inf")):
+        return None
+    return repr(value)
+
+
+def statement_values(statement: str) -> frozenset[str]:
+    """Set of significant decimal values; empty set = nothing significant to match.
+
+    A statement containing an unanalyzable numeric run is treated as having NO
+    values (conservative: never declare a duplicate on a text we cannot read)."""
+    values: set[str] = set()
+    for m in _VALUE_TOKEN_RE.finditer(statement):
+        canonical = _canonical_value(m.group(1))
+        if canonical is None:
+            return frozenset()
+        values.add(canonical)
+    for m in _RANGE_TOKEN_RE.finditer(statement):
+        for group in (m.group(1), m.group(2)):
+            canonical = _canonical_value(group)
+            if canonical is None:
+                return frozenset()
+            values.add(canonical)
+    return frozenset(values)
+
+
+def statement_years(statement: str) -> frozenset[int]:
+    """Standalone 4-digit years in the text, after masking decimal value tokens
+    (so a year glued to a value — «12,2026» — is neither a value nor a year)."""
+    masked = _VALUE_TOKEN_RE.sub(" ", statement)
+    return frozenset(int(m.group(1)) for m in _YEAR_TOKEN_RE.finditer(masked))
+
+
+@dataclass(frozen=True)
+class ValueDuplicateClaim:
+    """One claim op of the proposal WITHOUT an explicit existing_claim_id.
+
+    `metric` is the op's declared indicator label (T7.83a): the host passes the
+    normalized `declared_scope_metric(claim.scope)`."""
+
+    index: int
+    statement: str
+    claim_type: str
+    as_of_year: int | None
+    has_support_link: bool
+    has_counter_link: bool
+    metric: str | None = None
+
+
+@dataclass(frozen=True)
+class ValueDuplicateCandidate:
+    """One claim of the session's context pack that has a head in this snapshot.
+
+    `relied` is T7.83a's hard condition for a merge: the curator declared this claim
+    in `relied_claim_ids`. `metric` — the label stored with the claim (from the current
+    head's assessed_scope; empty for host-scope-v1, see `SCOPE_METRIC_KEYS`).
+    `created_at` (T7.121 часть 4) — момент записи кандидата: нужен только чтобы выбрать
+    якорь взаимно-дублирующегося кластера (ранейшая запись); None — хост не знает даты,
+    такой кандидат идёт после известных (выбор остаётся детерминированным по claim_id)."""
+
+    claim_id: str
+    statement: str
+    claim_type: str
+    as_of_year: int | None
+    relied: bool = False
+    metric: str | None = None
+    created_at: datetime | None = None
+
+
+def _period(
+    statement: str, as_of_year: int | None
+) -> frozenset[int]:
+    years: set[int] = set(statement_years(statement))
+    if as_of_year is not None:
+        years.add(as_of_year)
+    return frozenset(years)
+
+
+# ── T7.121 (часть 4, ADR-0038 §4): guard названных месяцев и mutual-кластер ─────────
+#
+# Стендовой случай с3: в контекст-паке ДВЕ уже записанные формулировки одного факта
+# («5,59 % по итогам 2025 года», разный пересказ), предложение куратора совпадает с обеими,
+# `relied_claim_ids` не объявлен ни один — гейт T7.83a объявлял ambiguous и писал ТРЕТЬЮ
+# запись того же числа. Спор «какой из двух кандидатов тот же» испаряется, когда кандидаты
+# являются дублями ДРУГ ДРУГА: склейка с любым из них записывает значение в тот же самый
+# факт. Тогда хост берёт якорем ранейшую запись (детерминированно), а не отказывает.
+# Ограничения conservative-политики сохранены: ветка только для `not relied_strict`
+# (объявленная опора по-прежнему решает, ≥2 relied-кандидатов — прежний ambiguous);
+# взаимность проверяется предикатом витрины T7.99 в хронологическом направлении
+# (поздний кандидат склеивается в ранейший; при неизвестной дате — в обе стороны), сам
+# предикат НЕ изменяется — его тесты закреплены; плюс guard названных месяцев: «август 2026» и
+# «июль 2026» одного числа — наблюдения РАЗНЫХ периодов, взаимного кластера нет.
+# Тот же guard добавлен в строгую выборку кандидатов: месяц, названный операцией, обязан
+# пересекаться с месяцем кандидата, если месяцы названы обеими сторонами (годовой фильтр
+# T7.83 не ослаблен; стороны без названного месяца — прежняя тишина).
+
+
+def _months_conflict(op_months: frozenset[int], candidate_months: frozenset[int]) -> bool:
+    """Несовместимость названных месяцев (T7.121 часть 4). Месяцы смотрятся ТОЛЬКО когда
+    их называют обе стороны; конфликт — только при непересекающихся множествах
+    («декабрь 2025» {12} против «декабрьского опроса 2025» {12} — совместимы;
+    «август 2026» {8} против «июль 2026» {7} — конфликт). Датировочные строки
+    («опубликовано 21 января») добавляют здесь лишний месяц: консервативное направление —
+    лишний месяц ослабляет вето, но не создаёт его."""
+    return bool(op_months) and bool(candidate_months) and not (op_months & candidate_months)
+
+
+def _cluster_anchor(members: Sequence[ValueDuplicateCandidate]) -> ValueDuplicateCandidate:
+    """Якорь взаимного кластера — ранейшая запись по `created_at`. Равенство created_at
+    внутри одной phase-1 транзакции (ловушка AGENTS §7) разрешается порядком `claim_id`;
+    кандидат без известной даты идёт после известных."""
+    dated = [member for member in members if member.created_at is not None]
+    if dated:
+        return min(dated, key=lambda member: (member.created_at, member.claim_id))
+    return min(members, key=lambda member: member.claim_id)
+
+
+def _cluster_pair(anchor: ValueDuplicateCandidate, member: ValueDuplicateCandidate) -> bool:
+    """Кандидат `member` — дубль якоря `anchor` (T7.121 часть 4). Направление проверки —
+    хронологическое, ровно как у предиката витрины T7.99 `value_duplicate_pair` (поздняя
+    запись склеивается в ранейшую; «опубликовано …» добавляет кандидату годы и покрытию
+    не мешает). Если хронология неизвестна (у одного из кандидатов нет `created_at` —
+    так устроены старые unit-фикстуры) — консервативно требуется полное взаимное покрытие
+    в обе стороны: без известной даты хост не вправе придумывать порядок записей."""
+    if _months_conflict(named_month_numbers(anchor.statement), named_month_numbers(member.statement)):
+        return False
+
+    def _merge_into(candidate: ValueDuplicateCandidate, target: ValueDuplicateCandidate) -> bool:
+        return value_duplicate_pair(
+            op_claim_type=candidate.claim_type,
+            op_statement=candidate.statement,
+            op_as_of_year=candidate.as_of_year,
+            candidate_claim_type=target.claim_type,
+            candidate_statement=target.statement,
+            candidate_as_of_year=target.as_of_year,
+            op_metric=candidate.metric,
+            candidate_metric=target.metric,
+        )
+
+    if anchor.created_at is None or member.created_at is None:
+        return _merge_into(member, anchor) and _merge_into(anchor, member)
+    if anchor.created_at <= member.created_at:
+        return _merge_into(member, anchor)
+    return _merge_into(anchor, member)
+
+
+def _entry(
+    claim: ValueDuplicateClaim,
+    *,
+    action: str,
+    target: str | None,
+    reason: str,
+) -> JsonDict:
+    return {
+        "claim_index": claim.index,
+        "target": target,
+        "action": action,
+        "reason": reason,
+    }
+
+
+# ── T7.85 (ADR-0033 дополнение): побайтово та же формулировка при другом claim_type ─────
+#
+# Стендовая форма (сессия a09977e1, .92): одно и то же предложение записано дважды — как
+# `external_fact` 2d010d53 и как `temporal_fact` 58e2d5d4; формулировки совпадают побайтово, а
+# `existing_claim_id` куратор не указал. Дедуп T7.9 (`packages/memory/service.py`: равенство
+# `statement` И равенство `claim_type`) такого дубля не видит — типы разные. Числовой гейт
+# T7.83/T7.83a тоже не видит: его первое условие — тот же `claim_type`. На карточке появляется
+# второе утверждение того же факта с другой оценкой.
+#
+# Правило аддитивно к числовому гейту и намеренно уже его: формулировки обязаны совпасть
+# ПОБАЙТОВО (та же канонизация, что у дедупа T7.9 — сравнение строк без нормализаций), поэтому
+# «похожести» здесь быть не может: если текст тот же, то и показатель, и период, и значения те
+# же. Из этого же следует, что фильтр `relied_claim_ids` (T7.83a) этому правилу НЕ нужен: он
+# запрещал хосту решать за куратора склейку ДВУХ РАЗНЫХ формулировок; побайтовая идентичность
+# снимает неопределённость — хост не выбирает чужой факт, он остаётся на том же утверждении.
+# Операция конвертируется в перепроверку этого claim, и оценка считается по ТИПУ ЯКОРЯ
+# (T7.34/ADR-0018: тип предложения при перепроверке не волен), а не по типу, который модель
+# выдумала вторым проходом. Побайтовое совпадение с claim того же типа — территория дедупа T7.9,
+# хост туда не лезет; операции с явным `existing_claim_id` сюда не передаются вообще (T7.34).
+
+
+def find_identical_statement_duplicates(
+    claims: Sequence[ValueDuplicateClaim],
+    candidates: Sequence[ValueDuplicateCandidate],
+) -> list[JsonDict]:
+    """Решения только для операций, чья формулировка побайтово совпадает с утверждением
+    контекст-пака, а `claim_type` — другой. Остальное молчит (пустой список → нет ключа в
+    payload → прежние аудит-события байт-в-байт прежние).
+
+    Ровно один кандидат → перепроверка этого claim (`reverified`). Два и больше → операция
+    остаётся как предложена: какой из них «тот же самый» — решает куратор, не хост. Тот же текст
+    при том же типе → молчание: это ведёт дедуп T7.9. Ограничения по связям те же, что у
+    числового гейта: улика-опровержение не пристёгивается к чужой записи, а без поддерживающей
+    улики кандидату нечего добавить."""
+    decisions: list[JsonDict] = []
+    ordered = sorted(candidates, key=lambda candidate: candidate.claim_id)
+    for claim in claims:
+        if not claim.statement:
+            continue
+        same_text = [candidate for candidate in ordered if candidate.statement == claim.statement]
+        if not same_text:
+            continue  # побайтового совпадения нет — это территория числового гейта выше
+        if any(candidate.claim_type == claim.claim_type for candidate in same_text):
+            continue  # тот же текст и тот же тип ведёт дедуп T7.9, хост его не подменяет
+        different = [c for c in same_text if c.claim_type != claim.claim_type]
+        if len(different) >= 2:
+            decisions.append(
+                _entry(
+                    claim,
+                    action="kept",
+                    target=None,
+                    reason=(
+                        f"the statement is byte-identical to {len(different)} context-pack claims "
+                        f"of another type ({', '.join(c.claim_id for c in different)}) — which one "
+                        "is the same claim cannot be decided by the host; left as proposed"
+                    ),
+                )
+            )
+            continue
+        target = different[0]
+        if claim.has_counter_link:
+            decisions.append(
+                _entry(
+                    claim,
+                    action="kept",
+                    target=None,
+                    reason=(
+                        f"byte-identical statement of {target.claim_id}, but the op carries "
+                        "counterevidence links — a dispute stays a dispute, the candidate is "
+                        "not touched"
+                    ),
+                )
+            )
+            continue
+        if not claim.has_support_link:
+            decisions.append(
+                _entry(
+                    claim,
+                    action="kept",
+                    target=None,
+                    reason=(
+                        f"byte-identical statement of {target.claim_id}, but the op has no "
+                        "supporting evidence — nothing new to add to the candidate"
+                    ),
+                )
+            )
+            continue
+        decisions.append(
+            _entry(
+                claim,
+                action="reverified",
+                target=target.claim_id,
+                reason=(
+                    f"same statement, type relabelled {claim.claim_type} → {target.claim_type}: "
+                    f"the formulation is byte-identical to {target.claim_id}, so the value, the "
+                    "period and the indicator are the same by construction (the reliance filter "
+                    "of T7.83a is not needed here — it exists to keep the host from choosing "
+                    "between two different formulations); converted to a reverify of that claim, "
+                    "assessed under its own claim type"
+                ),
+            )
+        )
+    return decisions
+
+
+def find_value_duplicates(
+    claims: Sequence[ValueDuplicateClaim],
+    candidates: Sequence[ValueDuplicateCandidate],
+) -> list[JsonDict]:
+    """Decisions ONLY for ops that have same-type/same-value suspects; everything
+    else stays silent (no entry → no payload key → old audits byte-identical).
+
+    T7.83a ordering (deterministic, each refusal names its own honest reason):
+    suspects (type+values) → period covered → RELIED candidates (`relied_claim_ids`) →
+    INDICATOR match → all-supports / no-counterevidence → merge. The «exactly one
+    candidate» count is taken after the relied filter; ≥2 remains an ambiguity."""
+    ordered_candidates = sorted(candidates, key=lambda c: (not c.relied, c.claim_id))
+    decisions: list[JsonDict] = []
+    for claim in claims:
+        new_values = statement_values(claim.statement)
+        if not new_values:
+            continue  # integers/years only — conservative silence (T7.9 owns byte-exact dups)
+        new_period = _period(claim.statement, claim.as_of_year)
+        new_months = named_month_numbers(claim.statement)
+        suspects = [
+            candidate
+            for candidate in ordered_candidates
+            if candidate.claim_type == claim.claim_type
+            and statement_values(candidate.statement) == new_values
+        ]
+        if not suspects:
+            continue
+        strict: list[ValueDuplicateCandidate] = []
+        month_vetoed: list[ValueDuplicateCandidate] = []
+        for candidate in suspects:
+            if not (new_period and new_period <= _period(candidate.statement, candidate.as_of_year)):
+                continue
+            if _months_conflict(new_months, named_month_numbers(candidate.statement)):
+                # T7.121 (часть 4): годы покрыты, но названный месяц операции противоречит
+                # названному месяцу кандидата — наблюдение другого периода, кандидат
+                # уходит из строгой выборки (годовой фильтр T7.83 при этом не ослаблен).
+                month_vetoed.append(candidate)
+            else:
+                strict.append(candidate)
+        if not strict:
+            if month_vetoed:
+                veto_detail = "; ".join(
+                    f"candidate {candidate.claim_id} names months "
+                    f"{sorted(named_month_numbers(candidate.statement))}, the op names "
+                    f"{sorted(new_months)}"
+                    for candidate in month_vetoed
+                )
+                reason = (
+                    f"value {sorted(new_values)} matches candidate(s) "
+                    f"{', '.join(candidate.claim_id for candidate in suspects)} by type and "
+                    f"values, but the period {sorted(new_period)} is not covered — named months "
+                    f"do not overlap ({veto_detail}); left as proposed"
+                )
+            else:
+                reason = (
+                    f"value {sorted(new_values)} matches candidate(s) "
+                    f"{', '.join(candidate.claim_id for candidate in suspects)} by type and "
+                    f"values, but the period {sorted(new_period)} is not covered — left as proposed"
+                )
+            decisions.append(
+                _entry(
+                    claim,
+                    action="kept",
+                    target=None,
+                    reason=reason,
+                )
+            )
+            continue
+        relied_strict = [candidate for candidate in strict if candidate.relied]
+        cluster_merged: list[ValueDuplicateCandidate] = []
+        if relied_strict:
+            if len(relied_strict) >= 2:
+                decisions.append(
+                    _entry(
+                        claim,
+                        action="kept",
+                        target=None,
+                        reason=(
+                            "ambiguous value duplicate: "
+                            f"{len(relied_strict)} candidates share type, values and period "
+                            f"({', '.join(candidate.claim_id for candidate in relied_strict)}) — "
+                            "the op is left as proposed"
+                        ),
+                    )
+                )
+                continue
+            target = relied_strict[0]
+        elif len(strict) >= 2:
+            # T7.83a: value+type+period совпали, но куратор НЕ объявил ни одного из
+            # этих claims опорой своего ответа — хост не имеет права решать за него.
+            # Исключение (T7.121 часть 4, ADR-0038 §4): если строгие кандидаты являются
+            # дублями ДРУГ ДРУГА (предикат витрины в хронологическом направлении — см.
+            # `_cluster_pair` — плюс guard месяцев), спор
+            # «какой из них тот же» испаряется — любой вариант склейки записывает значение
+            # в тот же уже записанный факт; хост берёт якорем ранейшую запись.
+            shared = ", ".join(candidate.claim_id for candidate in strict)
+            anchor = _cluster_anchor(strict)
+            others = [candidate for candidate in strict if candidate.claim_id != anchor.claim_id]
+            if all(_cluster_pair(anchor, candidate) for candidate in others):
+                target = anchor
+                cluster_merged = [anchor, *others]
+            else:
+                decisions.append(
+                    _entry(
+                        claim,
+                        action="kept",
+                        target=None,
+                        reason=(
+                            f"ambiguous value duplicate: {len(strict)} candidates share type, values "
+                            f"and period ({shared}) and none of them is declared in relied_claim_ids "
+                            "— the op is left as proposed"
+                        ),
+                    )
+                )
+                continue
+        else:
+            decisions.append(
+                _entry(
+                    claim,
+                    action="kept",
+                    target=None,
+                    reason=(
+                        f"value {sorted(new_values)} matches candidate {strict[0].claim_id} by type, "
+                        f"values and period, but that candidate is not in relied_claim_ids — only a "
+                        "candidate the curator declared as the support of this answer may be merged; "
+                        "left as proposed"
+                    ),
+                )
+            )
+            continue
+        check = indicator_check(claim.statement, target.statement, claim.metric, target.metric)
+        if not check.matched:
+            # T7.83a defect shape: то же десятичное число и тот же период у ДРУГОГО
+            # показателя — склейка привязала бы улику не к тому утверждению.
+            decisions.append(
+                _entry(
+                    claim,
+                    action="kept",
+                    target=None,
+                    reason=(
+                        f"value duplicate of {target.claim_id} by type, values and period, but "
+                        f"the indicator does not match ({check.detail}) — the value belongs to "
+                        "another indicator; left as proposed"
+                    ),
+                )
+            )
+            continue
+        if claim.has_counter_link:
+            decisions.append(
+                _entry(
+                    claim,
+                    action="kept",
+                    target=None,
+                    reason=(
+                        f"value duplicate of {target.claim_id}, but the op carries "
+                        "counterevidence links — a dispute stays a dispute, the "
+                        "candidate is not touched"
+                    ),
+                )
+            )
+            continue
+        if not claim.has_support_link:
+            decisions.append(
+                _entry(
+                    claim,
+                    action="kept",
+                    target=None,
+                    reason=(
+                        f"value duplicate of {target.claim_id}, but the op has no "
+                        "supporting evidence — nothing new to add to the candidate"
+                    ),
+                )
+            )
+            continue
+        if cluster_merged:
+            reliance_note = (
+                f"none of the {len(cluster_merged)} candidates sharing type, values and period "
+                f"({', '.join(candidate.claim_id for candidate in cluster_merged)}) is declared in "
+                "relied_claim_ids, but they are mutual value duplicates of each other "
+                "(T7.121 часть 4, ADR-0038 §4): any merge writes the value into the same "
+                f"already-recorded fact, so the earliest record {target.claim_id} is the anchor — "
+                "a third copy is not written"
+            )
+        else:
+            reliance_note = "the candidate is declared in relied_claim_ids"
+        decisions.append(
+            _entry(
+                claim,
+                action="reverified",
+                target=target.claim_id,
+                reason=(
+                    f"value duplicate of {target.claim_id}: same claim type "
+                    f"({claim.claim_type}), same value set {sorted(new_values)}, period "
+                    f"{sorted(new_period)} covered by the candidate and the same indicator "
+                    f"({check.detail}); {reliance_note} — "
+                    "converted to a reverify so the value is written once"
+                ),
+            )
+        )
+    return decisions
+
+
+# ── T7.99 (ADR-0033 §13): тот же предикат пары для витрины — без условия опоры ──────────
+#
+# Решение пользователя 2026-10-12: уже записанные дубли показывать свёрнутыми на карточке
+# ответа (только витрина; знание не трогается). Витрине нужен ровно тот же ответ, что даёт
+# строгий кандидат гейта, НО без фильтра `relied_claim_ids` и без условий улик:
+# `relied` и `has_support_link`/`has_counter_link` существуют, чтобы хост не решал за
+# куратора СКЛЕЙКУ записи (запись — территория гейта); витрина ничего не записывает и
+# ничего не склеивает — она лишь решает, показывать ли две уже записанные строки одной.
+# Поэтому витрине нужны четыре условия строгого кандидата: равный `claim_type`, равное
+# НЕПУСТОЕ множество значений, непустой период операции, покрытый периодом кандидата, и
+# `indicator_check` со всеми вето T7.83a/T7.96/T7.96a и чтением диапазонов T7.98.
+# Направление то же, что у гейта: `op_*` — более поздняя запись (ту, что гейт предложил бы
+# склеить), `candidate_*` — более ранняя (якорь). Гейт (`find_value_duplicates`) эту
+# функцию НЕ вызывает: его решения с причинами по каждому шагу остаются прежними.
+
+
+def value_duplicate_pair(
+    *,
+    op_claim_type: str,
+    op_statement: str,
+    op_as_of_year: int | None,
+    candidate_claim_type: str,
+    candidate_statement: str,
+    candidate_as_of_year: int | None,
+    op_metric: str | None = None,
+    candidate_metric: str | None = None,
+) -> bool:
+    """True ровно когда две уже записанные формулировки — «дубль по значению» по
+    определению гейта T7.83/T7.83a/T7.98 (type + values + period + indicator), без
+    условий записи (`relied`, улики). Консервативная тишина сохранена: непустые
+    значения, покрытый период, совпавший показатель."""
+    op_values = statement_values(op_statement)
+    if not op_values:
+        return False  # целые/годы — тихий отказ (T7.9 владеет побайтовыми дублями)
+    if op_claim_type != candidate_claim_type:
+        return False
+    if statement_values(candidate_statement) != op_values:
+        return False
+    op_period = _period(op_statement, op_as_of_year)
+    if not op_period:
+        return False
+    if op_period > _period(candidate_statement, candidate_as_of_year):
+        return False
+    return indicator_check(
+        op_statement, candidate_statement, op_metric, candidate_metric
+    ).matched

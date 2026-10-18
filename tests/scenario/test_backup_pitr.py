@@ -7,6 +7,18 @@ every referenced hash re-verified, boot reconciliation + admission
 before the runtime would start, verified_at stamp + audit), and the
 failure paths (corrupted store object, expired retention, surprise
 active head).
+
+T7.46b (the time bomb): the drill must run on the INJECTED clock — the
+same clock ``create_backup`` stamped ``retention_until`` with — not on
+the DB ``now()`` (the pre-fix drill compared host-stamped
+``retention_until`` against the wall clock, so a manifest that was
+retained at backup time expired "by itself" 10/20 days later and the
+drill tests failed on every run after 2026-09-25 12:00Z). The tests
+anchor on the FIXED reference date ``NOW`` and parameterize the drill
+clock via ``drill_now`` (+0/+1y/+5y — via a parameter, not a wall-clock
+change), proving the suite is independent of the day it runs on while
+keeping the expired-window semantics testable (see
+test_restore_drill_no_retained_backup).
 """
 
 from __future__ import annotations
@@ -34,6 +46,9 @@ from packages.domain.db.uow import transaction
 
 pytestmark = [pytest.mark.scenario]
 
+# the module's FIXED reference date (NOT the run date, T7.46b): every
+# backup is stamped from it and the drill clock is a shift of it, so no
+# test in this file depends on the day it runs on.
 NOW = datetime(2026, 9, 15, 12, 0, 0, tzinfo=UTC)
 
 
@@ -42,6 +57,20 @@ class _LastChoiceRng:
 
     def choice(self, seq: list[Any]) -> Any:
         return seq[-1]
+
+
+@pytest.fixture(params=[0, 1, 5])
+def drill_now(request: pytest.FixtureRequest) -> datetime:
+    """T7.46b: the drill's injected clock — the fixed reference NOW
+    shifted by 0/1/5 YEARS (a parameter, not a wall-clock change). The
+    drill must select on this clock (restore.py: the same clock stamps
+    ``verified_at``); with it, a 10-day retention window anchored at the
+    shifted now is still open for the drill no matter when the suite
+    runs — the +1y/+5y shifts prove the tests are independent of the
+    run date (pre-fix, the drill compared retention_until against the
+    DB ``now()``, so the 10-day windows expired on 2026-09-25 12:00Z
+    and the 20-day ones on 2026-10-05 — the time bomb)."""
+    return NOW.replace(year=NOW.year + request.param)
 
 
 async def _scalar(
@@ -226,7 +255,7 @@ async def test_backup_db_check_rejects_inconsistent_host_state(
 
 @pytest.mark.asyncio
 async def test_restore_drill_random_retained_point_and_verification(
-    migrated_db: tuple[str, AsyncEngine], tmp_path: Path
+    migrated_db: tuple[str, AsyncEngine], tmp_path: Path, drill_now: datetime
 ) -> None:
     _scratch_url, engine = migrated_db
     store = FilesystemArtifactStore(tmp_path / "artifacts")
@@ -246,12 +275,13 @@ async def test_restore_drill_random_retained_point_and_verification(
         )
 
     # an EXPIRED backup (retention window passed) and two retained ones
+    # — all relative to the drill's clock (T7.46b)
     async with factory() as db, transaction(db):
-        await create_backup(db, store, base, retention_days=1, now=NOW - timedelta(days=40))
+        await create_backup(db, store, base, retention_days=1, now=drill_now - timedelta(days=40))
     async with factory() as db, transaction(db):
-        b1 = await create_backup(db, store, base, retention_days=10, now=NOW)
+        b1 = await create_backup(db, store, base, retention_days=10, now=drill_now)
     async with factory() as db, transaction(db):
-        b2 = await create_backup(db, store, base, retention_days=20, now=NOW)
+        b2 = await create_backup(db, store, base, retention_days=20, now=drill_now)
     retained = {b1["backup_id"], b2["backup_id"]}
 
     seen: list[str] = []
@@ -260,7 +290,7 @@ async def test_restore_drill_random_retained_point_and_verification(
     for seed in range(20):
         rng = random.Random(seed)
         async with factory() as db, transaction(db):
-            drill = await run_restore_drill(db, store, base, rng=rng, now=NOW)
+            drill = await run_restore_drill(db, store, base, rng=rng, now=drill_now)
         seen.append(drill.backup_id)
         assert drill.outcome == "passed"
         assert drill.backup_id in retained  # never the expired one
@@ -284,7 +314,7 @@ async def test_restore_drill_random_retained_point_and_verification(
 
 @pytest.mark.asyncio
 async def test_restore_drill_detects_corrupted_object(
-    migrated_db: tuple[str, AsyncEngine], tmp_path: Path
+    migrated_db: tuple[str, AsyncEngine], tmp_path: Path, drill_now: datetime
 ) -> None:
     _scratch_url, engine = migrated_db
     store = FilesystemArtifactStore(tmp_path / "artifacts")
@@ -303,14 +333,14 @@ async def test_restore_drill_detects_corrupted_object(
             {"id": uuid.uuid4(), "s": sha, "n": len(data)},
         )
     async with factory() as db, transaction(db):
-        b = await create_backup(db, store, base, retention_days=10, now=NOW)
+        b = await create_backup(db, store, base, retention_days=10, now=drill_now)
 
     # corrupt the store object (the content no longer matches its hash)
     path = store.root / sha[:2] / sha
     path.write_bytes(b"corrupted")
 
     async with factory() as db, transaction(db):
-        drill = await run_restore_drill(db, store, base, rng=random.Random(1), now=NOW)
+        drill = await run_restore_drill(db, store, base, rng=random.Random(1), now=drill_now)
     assert drill.outcome == "failed"
     assert drill.backup_id == b["backup_id"]
     assert any(p.startswith("artifact_hash_mismatch") for p in drill.problems)
@@ -329,7 +359,7 @@ async def test_restore_drill_detects_corrupted_object(
 
 @pytest.mark.asyncio
 async def test_restore_drill_detects_registry_drift(
-    migrated_db: tuple[str, AsyncEngine], tmp_path: Path
+    migrated_db: tuple[str, AsyncEngine], tmp_path: Path, drill_now: datetime
 ) -> None:
     _scratch_url, engine = migrated_db
     store = FilesystemArtifactStore(tmp_path / "artifacts")
@@ -349,7 +379,7 @@ async def test_restore_drill_detects_registry_drift(
             {"id": art_id, "s": sha, "n": len(data)},
         )
     async with factory() as db, transaction(db):
-        await create_backup(db, store, base, retention_days=10, now=NOW)
+        await create_backup(db, store, base, retention_days=10, now=drill_now)
 
     # the registry row now points to a different hash (drift)
     async with factory() as db, db.begin():
@@ -359,14 +389,14 @@ async def test_restore_drill_detects_registry_drift(
         )
 
     async with factory() as db, transaction(db):
-        drill = await run_restore_drill(db, store, base, rng=random.Random(1), now=NOW)
+        drill = await run_restore_drill(db, store, base, rng=random.Random(1), now=drill_now)
     assert drill.outcome == "failed"
     assert any(p.startswith("registry_drift") for p in drill.problems)
 
 
 @pytest.mark.asyncio
 async def test_restore_drill_boot_reconciliation_degraded(
-    migrated_db: tuple[str, AsyncEngine], tmp_path: Path
+    migrated_db: tuple[str, AsyncEngine], tmp_path: Path, drill_now: datetime
 ) -> None:
     """An active transition head recorded in the manifest is the EXPECTED
     degraded state: admission flags it, the drill passes (the prediction
@@ -379,24 +409,24 @@ async def test_restore_drill_boot_reconciliation_degraded(
 
     # a clean backup
     async with factory() as db, transaction(db):
-        await create_backup(db, store, base, retention_days=10, now=NOW)
+        await create_backup(db, store, base, retention_days=10, now=drill_now)
 
     # now a transition starts (after the backup): a surprise for that
     # manifest
     _seed_transition(base, "attempt-late")
 
     async with factory() as db, transaction(db):
-        drill = await run_restore_drill(db, store, base, rng=random.Random(1), now=NOW)
+        drill = await run_restore_drill(db, store, base, rng=random.Random(1), now=drill_now)
     assert drill.outcome == "failed"
     assert any("host_mismatch" in p or "admission_mismatch" in p for p in drill.problems)
 
     # a backup taken WITH the active transition: the degraded state is
     # exactly what the manifest predicted
     async with factory() as db, transaction(db):
-        b2 = await create_backup(db, store, base, retention_days=10, now=NOW)
+        b2 = await create_backup(db, store, base, retention_days=10, now=drill_now)
     async with factory() as db, transaction(db):
         drill2 = await run_restore_drill(
-            db, store, base, rng=_LastChoiceRng(), now=NOW
+            db, store, base, rng=_LastChoiceRng(), now=drill_now
         )
     assert drill2.outcome == "passed"
     assert drill2.backup_id == b2["backup_id"]
@@ -407,7 +437,7 @@ async def test_restore_drill_boot_reconciliation_degraded(
 
 @pytest.mark.asyncio
 async def test_restore_drill_no_retained_backup(
-    migrated_db: tuple[str, AsyncEngine], tmp_path: Path
+    migrated_db: tuple[str, AsyncEngine], tmp_path: Path, drill_now: datetime
 ) -> None:
     _scratch_url, engine = migrated_db
     store = FilesystemArtifactStore(tmp_path / "artifacts")
@@ -415,17 +445,54 @@ async def test_restore_drill_no_retained_backup(
     base.mkdir()
     factory = async_sessionmaker(engine, expire_on_commit=False)
 
+    # the ONLY backup is outside its retention window AT THE DRILL'S
+    # CLOCK (T7.46b — the expired-window semantics stay testable on
+    # any run date, because both the window and the drill's clock are
+    # anchored at the same shifted now)
     async with factory() as db, transaction(db):
-        await create_backup(db, store, base, retention_days=1, now=NOW - timedelta(days=40))
+        await create_backup(db, store, base, retention_days=1, now=drill_now - timedelta(days=40))
 
     async with factory() as db, transaction(db):
         with pytest.raises(RestoreDrillError):
-            await run_restore_drill(db, store, base, rng=random.Random(1), now=NOW)
+            await run_restore_drill(db, store, base, rng=random.Random(1), now=drill_now)
+
+
+@pytest.mark.asyncio
+async def test_restore_drill_selects_on_injected_clock_not_wall_clock(
+    migrated_db: tuple[str, AsyncEngine], tmp_path: Path
+) -> None:
+    """T7.46b regression guard: the drill must select on the INJECTED
+    clock. The backup's retention window (NOW + 10d = 2026-09-25
+    12:00Z) is already closed on the WALL clock (any run date after
+    2026-09-25 12:00Z) but still open at the injected now=NOW — it must
+    be selected. If the selection regresses to the DB ``now()``, the
+    drill raises RestoreDrillError on every such run date (this is the
+    exact time bomb that failed the suite from 2026-09-25)."""
+    _scratch_url, engine = migrated_db
+    store = FilesystemArtifactStore(tmp_path / "artifacts")
+    base = tmp_path / "host"
+    base.mkdir()
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    async with factory() as db, transaction(db):
+        b = await create_backup(db, store, base, retention_days=10, now=NOW)
+
+    async with factory() as db, transaction(db):
+        drill = await run_restore_drill(db, store, base, rng=_LastChoiceRng(), now=NOW)
+    assert drill.outcome == "passed"
+    assert drill.backup_id == b["backup_id"]
+    # and the stamp uses the SAME injected clock
+    row = await _scalar(
+        engine, "SELECT verified_at FROM backup_manifests WHERE id = :id",
+        {"id": b["backup_id"]},
+    )
+    assert row is not None
+    assert row[0] == NOW
 
 
 @pytest.mark.asyncio
 async def test_restore_drill_policy_change_head_predicted(
-    migrated_db: tuple[str, AsyncEngine], tmp_path: Path
+    migrated_db: tuple[str, AsyncEngine], tmp_path: Path, drill_now: datetime
 ) -> None:
     """An active host-policy-change head recorded in the manifest is the
     expected degraded state: admission flags it, the drill passes, and
@@ -438,7 +505,7 @@ async def test_restore_drill_policy_change_head_predicted(
 
     _seed_policy_change(base, "change-1")
     async with factory() as db, transaction(db):
-        result = await create_backup(db, store, base, retention_days=10, now=NOW)
+        result = await create_backup(db, store, base, retention_days=10, now=drill_now)
 
     hs = result["host_state"]
     assert hs["policy_change_head"]["change_id"] == "change-1"
@@ -448,7 +515,7 @@ async def test_restore_drill_policy_change_head_predicted(
     ]
 
     async with factory() as db, transaction(db):
-        drill = await run_restore_drill(db, store, base, rng=_LastChoiceRng(), now=NOW)
+        drill = await run_restore_drill(db, store, base, rng=_LastChoiceRng(), now=drill_now)
     assert drill.outcome == "passed"
     assert drill.admission["ok"] is False
     assert "host_policy_change_in_progress" in drill.admission["problems"]

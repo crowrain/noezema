@@ -227,6 +227,34 @@ class FreshnessStatus(StrEnum):
     DUE = "due"
     STALE = "stale"
     UNKNOWN = "unknown"
+    # T7.32 (ADR-0017): no reverify deadline BY CONSTRUCTION — the claim
+    # is about a fixed point (explicit question date / dateless question
+    # with the model's as_of), later events cannot spoil it, it can
+    # never become due. Not "unknown": the system knows there is no
+    # deadline, and the claim is valid forever.
+    EVERGREEN = "evergreen"
+
+
+class ClaimDateAnchor(StrEnum):
+    """T7.32 (ADR-0017): the closed set of date ANCHORS of the
+    question, as derived by ``derive_claim_as_of`` (the single source
+    of truth, one function). Determines whether the claim has a
+    reverify deadline at all:
+
+    - ``explicit`` — the question names a date explicitly: the claim
+      is about a FIXED point in time → no deadline;
+    - ``relative`` — the question anchors the date RELATIVELY
+      («на текущую дату», «сейчас», …): the claim is about the
+      PRESENT → deadline = the verification moment + the volatility
+      window;
+    - ``none`` — the question names no date at all (the model's
+      ``as_of`` stands as the reference date): the claim is about a
+      fixed point → no deadline.
+    """
+
+    EXPLICIT = "explicit"
+    RELATIVE = "relative"
+    NONE = "none"
 
 
 class ClaimType(StrEnum):
@@ -436,6 +464,11 @@ class AuditEventType(StrEnum):
     STAGING_REJECTED = "staging_rejected"
     CLAIM_CREATED = "claim_created"
     CLAIM_REVISION = "claim_revision"
+    # T7.34 (ADR-0018): the reverify of an existing claim — a claim op
+    # carrying existing_claim_id. The record of the reverify is the
+    # fresh assessment row (created_in_session); this event is the
+    # direct audit trail (model restatement, resolved reference).
+    CLAIM_REVERIFIED = "claim_reverified"
     CLAIM_ASSESSED = "claim_assessed"
     CLAIM_INVALIDATED = "claim_invalidated"
     DEPENDENCY_EDGE_REJECTED = "dependency_edge_rejected"
@@ -460,9 +493,19 @@ class AuditEventType(StrEnum):
     OPERATOR_COMMAND_REJECTED = "operator_command_rejected"
     CONFIG_SNAPSHOT_CREATED = "config_snapshot_created"
     CONFIG_ACTIVATED = "config_activated"
+    # T7.35 (ADR-0019): a session was rejected at admission because a
+    # payload prompt pin could not be satisfied (missing sha256 pin,
+    # content hash mismatch, version-header mismatch). Out-of-session
+    # event (session_id IS NULL): the session never started.
+    PROMPT_PIN_MISMATCH = "prompt_pin_mismatch"
     # T4.5 (§8.7.2): the online activation lifecycle
     ACTIVATION_ACQUIRED = "activation_acquired"
     ACTIVATION_TAKEOVER = "activation_takeover"
+    # T7.26 (§8.7.2, ADR-0013): the drain phase — the durable activation
+    # intent (the fenced slot) is published BEFORE the quiesce check, so a
+    # serial session series gets a window between sessions
+    ACTIVATION_DRAIN_PUBLISHED = "activation_drain_published"
+    ACTIVATION_DRAIN_CANCELLED = "activation_drain_cancelled"
     ACTIVATION_PUBLISHED = "activation_published"
     ACTIVATION_POST_PUBLISH_BATCH = "activation_post_publish_batch"
     ACTIVATION_POST_PUBLISH_COMPLETED = "activation_post_publish_completed"

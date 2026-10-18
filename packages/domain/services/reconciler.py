@@ -210,6 +210,120 @@ async def _mark_failed(
 
 TRANSIENT_OUTCOMES = ("finalizer_in_progress", "database_unavailable")
 
+# ── reconcile tick (T7.24, hostctl reconcile-tick, §5.2.2) ─────────────────
+
+
+@dataclass(frozen=True)
+class ReconcileTickOutcome:
+    session_id: UUID
+    outcome: ReconcileOutcome
+    detail: str = ""
+
+
+@dataclass(frozen=True)
+class ReconcileTickResult:
+    """One tick: every stuck session with its final classification.
+
+    ``transient`` (finalizer_in_progress / database_unavailable after all
+    probes) is retried by the NEXT tick; ``inconsistent`` (records
+    inconsistent — a broken invariant) is NOT retried: a human is
+    required (the critical alert was recorded by the protocol)."""
+
+    resolved: tuple[ReconcileTickOutcome, ...] = ()
+    transient: tuple[ReconcileTickOutcome, ...] = ()
+    inconsistent: tuple[ReconcileTickOutcome, ...] = ()
+
+    @property
+    def all_resolved(self) -> bool:
+        return not self.transient and not self.inconsistent
+
+
+#: Session states that are stuck at the commit boundary: the session row
+#: reached COMMITTING (phase 1 committed) and the commit outcome is
+#: unresolved. Only the final transaction and the reconciler leave these
+#: states.
+STUCK_STATES = ("committing", "reconciling_commit")
+
+#: Probe outcomes that END the session (the loop stops, the next tick
+#: sees nothing for this session).
+TERMINAL_TICK_OUTCOMES = ("committed_accepted", "aborted", "no_attempt")
+
+
+async def find_unresolved_sessions(db: AsyncSession) -> list[UUID]:
+    """The sessions stuck at the commit boundary (T7.24).
+
+    A session in one of these states with a LIVE lease is a running
+    finalizer — the probe loop classifies it as
+    ``finalizer_in_progress`` (transient, retry next tick), never as
+    ``aborted`` (live finalizer ≠ rollback, M2). A session WITHOUT a
+    prepared attempt (a crash between the phase-1 commit and the
+    prepare transaction) is resolved as a pre-boundary failure by the
+    protocol (``no_prepared_attempt``)."""
+    rows = (
+        (
+            await db.execute(
+                text(
+                    "SELECT id FROM sessions "
+                    "WHERE state IN ('committing','reconciling_commit') "
+                    "ORDER BY created_at"
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    # asyncpg returns its own UUID type: guard before uuid.UUID(...)
+    return [r if isinstance(r, UUID) else UUID(str(r)) for r in rows]
+
+
+async def reconcile_tick(
+    make_db: Callable[[], Any],
+    audit_factory: Callable[[Any], AuditService],
+    *,
+    max_probes: int = 5,
+    base_delay: float = 0.5,
+    lock_timeout_ms: int = 2000,
+    sleep: Callable[[float], Any] = asyncio.sleep,
+) -> ReconcileTickResult:
+    """One tick of the reconciliation worker (T7.24, §5.2.2).
+
+    Finds every session stuck at the commit boundary and drives the M2
+    probe loop (``reconcile_with_retries``) over each: a FRESH
+    connection per probe (a dead connection must never decide the
+    outcome), fenced row-locks, ``finalizer_in_progress`` /
+    ``database_unavailable`` retried with exponential backoff + jitter.
+    The find probe uses a fresh connection too.
+
+    Raises when the database is unreachable at the find probe — the
+    caller (the tick command) reports ``database_unavailable`` and the
+    next tick retries."""
+    async with make_db() as db:
+        stuck = await find_unresolved_sessions(db)
+
+    resolved: list[ReconcileTickOutcome] = []
+    transient: list[ReconcileTickOutcome] = []
+    inconsistent: list[ReconcileTickOutcome] = []
+    for session_id in stuck:
+        probe = await reconcile_with_retries(
+            make_db,
+            audit_factory,
+            session_id,
+            max_probes=max_probes,
+            base_delay=base_delay,
+            lock_timeout_ms=lock_timeout_ms,
+            sleep=sleep,
+        )
+        outcome = ReconcileTickOutcome(session_id, probe.outcome, probe.detail)
+        if probe.outcome in TERMINAL_TICK_OUTCOMES:
+            resolved.append(outcome)
+        elif probe.outcome == "records_inconsistent":
+            inconsistent.append(outcome)
+        else:
+            transient.append(outcome)
+    return ReconcileTickResult(
+        resolved=tuple(resolved), transient=tuple(transient), inconsistent=tuple(inconsistent)
+    )
+
 
 async def reconcile_with_retries(
     make_db: Callable[[], Any],

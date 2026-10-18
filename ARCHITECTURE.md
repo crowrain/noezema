@@ -1074,7 +1074,7 @@ epistemic_status: nullable
   hypothesis | supported | disputed | refuted | deferred
 assessment_state:
   current | pending | invalid
-freshness_status: fresh | due | stale | unknown
+freshness_status: fresh | due | stale | unknown | evergreen (срока перепроверки нет по построению, ADR-0017)
 valid_from
 valid_to: nullable
 as_of
@@ -1118,7 +1118,7 @@ Confidence имеет одного producer: rules engine вычисляет е�
 
 ### 8.6. Жизненный цикл знания и каскадная invalidation
 
-- Reverify deadline выводится из claim type, volatility, `as_of` и valid interval. `valid_to=NULL` означает неизвестный конец действия.
+- Reverify deadline существует ТОЛЬКО у утверждения о настоящем (вопрос с относительной формой даты): выводится из claim type и volatility как момент проверки + окно перепроверки и НЕ отсчитывается от `as_of`; утверждение о фиксированном моменте (явная дата вопроса или вопрос без даты с модельным `as_of`) срока перепроверки не имеет — оно не может устареть (ADR-0017). `valid_to=NULL` означает неизвестный конец действия. Опорная дата `as_of` в строке claim выводится доверенным хостом из якоря вопроса (явная дата вопроса; относительная форма → дата сессии по часам хоста; вопрос без опорной даты → модельный `as_of`); модельная дата — аудиторская (ADR-0016).
 - Истечение срока меняет freshness, но не confidence.
 - Hypothesis не служит достаточным evidence; она может быть исследовательской зависимостью только с явной пометкой.
 - Experiment получает reproducibility capsule и structured environment manifest.
@@ -1158,7 +1158,7 @@ Invalidation выполняется так:
 - AND/OR-комбинации методов;
 - предикат покрытия claim scope;
 - максимальный grade при отсутствии обязательных полей;
-- volatility и расчёт `reverify_after`.
+- volatility и расчёт `reverify_after` (срок существует только у утверждения о настоящем: момент проверки + окно volatility; ADR-0017).
 
 Базовые типы v1:
 
@@ -1173,6 +1173,8 @@ external_fact          E3: >=2 source_assertion из разных independence g
 temporal_fact          E3: external_fact rule + обязательные as_of и temporal scope
 self_model             E2: локальное наблюдение config/identity state
 ```
+
+Обязательный `as_of` у `temporal_fact` (и опорная дата `external_fact`) — хост-выводимая опорная дата (ADR-0016): явная дата вопроса, дата сессии при относительной форме или модельный `as_of` только при вопросе без опорной даты; модельное значение остаётся предложением модели (staging/audit).
 
 Пример машиночитаемого правила:
 
@@ -2055,6 +2057,8 @@ UNIQUE(claim_id, config_snapshot_id)
 ```
 
 `claim_assessment_heads.prepared_by` — закрытый enum актора, создавшего head: `session | rules_activation | reassessment_worker`. Он нужен для аудита происхождения lifecycle и для отладки активаций: head, подготовленный runner-ом по быстрому пути, и head, пересчитанный worker-ом, различаются по стоимости доверия к ним.
+
+Перепроверка существующего claim'а (сессия сверяет установленный факт со свежими источниками, не изменяя значения claim'а) записывается отдельной строкой `claim_assessments`, привязанной к сессии: `claim_id` + `created_in_session` = сессия-перепроверка — новый момент проверки по правилу §8.6 (ADR-0017), существующий независимо от того, появилось ли новое evidence (повторно загруженный идентичный источник переиспользует строку evidence якоря по identity, §14.3). Строка создаётся тем же путём, что и оценка нового/переиспользованного claim'а; строки reassessment worker и активации имеют `created_in_session IS NULL` и в сессионную запись не входят. Ссылка модели на существующий claim — по host-issued id (claim-операция `session_staging` с `existing_claim_id`; префикс разрешается только при однозначности среди видимых сессии claim'ов, fail-closed). Перепроверка — не дедупликация (та же строка claim'а по id, а не поиск по statement+type) и не ревизия значения (`claim_revisions`, §8.7: там `previous_value → new_value`). Путь гейта 5 §22.2 «значимые claims переиспользуются/перепроверяются» включает сессионные строки `claim_assessments` (ADR-0018, T7.34).
 
 `config_snapshots.activation_mode` — закрытый enum `bootstrap | offline | online`; bootstrap snapshot сразу имеет `activation_state='active'`.
 

@@ -1,0 +1,866 @@
+"""T7.59(в): deploy/dev-stand scripts are verified with SUBSTITUTED commands only (item 9–14).
+
+A real bootstrap may never run in CI or on the dev box (.87) — these tests run the real scripts in
+--dry-run with stub docker/ss/uv/sudo on PATH. They pin the behaviours that failed on the stand VM:
+the port is checked and picked before secrets are written, a rerun reuses the container's port,
+--force does not rotate secrets, and the uv fallback runs the installer as root into /usr/local/bin.
+"""
+
+from __future__ import annotations
+
+import re
+import subprocess
+from pathlib import Path
+from typing import ClassVar
+
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+BOOTSTRAP = REPO_ROOT / "deploy" / "dev-stand" / "bootstrap.sh"
+STATUS = REPO_ROOT / "deploy" / "dev-stand" / "status.sh"
+
+# bootstrap asks systemctl only whether the tick timer is enabled (T7.61(б)); status.sh additionally lists
+# units and shows timer schedules. STUB_TICK_TIMER_STATE pins the answer for the tick timer specifically.
+_SYSTEMCTL_STUB = """#!/usr/bin/env bash
+if [[ $1 == is-enabled && $2 == noezema-dev-tick.timer && -n "${STUB_TICK_TIMER_STATE:-}" ]]; then
+  printf '%s\n' "$STUB_TICK_TIMER_STATE"; exit 0
+fi
+if [[ $1 == is-enabled ]]; then
+  printf 'disabled\n'; exit 0
+fi
+exit 0
+"""
+
+FAKE_DB_PASSWORD = "faux-db-password-must-never-be-printed"
+FAKE_ADMIN_TOKEN = "faux-admin-token-must-never-be-printed"
+
+_DOCKER_STUB = """#!/usr/bin/env bash
+args="$*"
+if [[ $args == ps* ]]; then
+  if [[ -n "${STUB_CONTAINER_NAME:-}" ]]; then printf '%s\\n' "$STUB_CONTAINER_NAME"; fi
+  exit 0
+fi
+if [[ $args == inspect*HostPort* ]]; then
+  if [[ -n "${STUB_PUBLISHED_PORT:-}" ]]; then printf '%s\\n' "$STUB_PUBLISHED_PORT"; exit 0; fi
+  exit 1
+fi
+if [[ $args == *'.State.Running'* ]]; then printf 'true\\n'; exit 0; fi
+if [[ $args == *health* ]]; then printf 'healthy\\n'; exit 0; fi
+if [[ $args == volume* ]]; then exit "${STUB_VOLUME_EXIT:-1}"; fi
+if [[ $args == *'image inspect'* ]]; then exit "${STUB_IMAGE_EXIT:-0}"; fi
+exit 0
+"""
+
+_SS_STUB = """#!/usr/bin/env bash
+printf 'State Recv-Q Send-Q Local Address:Port Peer Address:Port Process\\n'
+for port in ${STUB_LISTENING:-}; do
+  printf 'LISTEN 0 4096 127.0.0.1:%s 0.0.0.0:*\\n' "$port"
+done
+exit 0
+"""
+
+_ENV_FILE_TEMPLATE = f"""NOEZEMA_DATABASE_URL=postgresql+asyncpg://noezema:{FAKE_DB_PASSWORD}@127.0.0.1:5432/noezema-dev
+NOEZEMA_DB_PASSWORD={FAKE_DB_PASSWORD}
+NOEZEMA_ADMIN_TOKEN={FAKE_ADMIN_TOKEN}
+NOEZEMA_DEV_DB_PORT=5432
+"""
+
+
+def _write_stub(dir_path: Path, name: str, body: str) -> None:
+    script = dir_path / name
+    script.write_text(body, encoding="utf-8")
+    script.chmod(0o755)
+
+
+@pytest.fixture()
+def stubs(tmp_path: Path) -> dict[str, Path]:
+    """PATH containing only the substituted commands plus the real coreutils/python."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_stub(bin_dir, "docker", _DOCKER_STUB)
+    _write_stub(bin_dir, "ss", _SS_STUB)
+    _write_stub(bin_dir, "sudo", '#!/usr/bin/env bash\nexec "$@"\n')
+    _write_stub(bin_dir, "apt-get", '#!/usr/bin/env bash\nexit 0\n')
+    _write_stub(bin_dir, "systemctl", _SYSTEMCTL_STUB)
+    _write_stub(bin_dir, "ufw", '#!/usr/bin/env bash\nprintf "Status: active\\n"\n')
+    _write_stub(bin_dir, "usermod", '#!/usr/bin/env bash\nexit 0\n')
+    return {
+        "bin": bin_dir,
+        "env_file": tmp_path / "dev.env",
+        "data_root": tmp_path / "var-lib-noezema-dev",
+    }
+
+
+def _run_bootstrap(
+    stubs: dict[str, Path],
+    *flags: str,
+    listening: tuple[int, ...] = (),
+    container_name: str = "",
+    published_port: str = "",
+    with_uv: bool = True,
+    extra_env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run the real bootstrap.sh in --dry-run against substituted commands."""
+    env = {
+        "PATH": f"{stubs['bin']}:/usr/bin:/bin",
+        "HOME": str(stubs["bin"].parent),
+        "NOEZEMA_DEV_ENV_FILE": str(stubs["env_file"]),
+        "NOEZEMA_DEV_DATA_ROOT": str(stubs["data_root"]),
+        "NOEZEMA_DEV_DB_CONTAINER": "noezema-dev-db-test",
+        "NOEZEMA_DEV_TOOL_EXECUTOR": "stub",
+        "STUB_LISTENING": " ".join(str(port) for port in listening),
+        "STUB_CONTAINER_NAME": container_name,
+        "STUB_PUBLISHED_PORT": published_port,
+    }
+    if with_uv:
+        _write_stub(stubs["bin"], "uv", '#!/usr/bin/env bash\nprintf "uv 0.9.18\\n"\n')
+    env.update(extra_env or {})
+    return subprocess.run(
+        ["bash", str(BOOTSTRAP), "--dry-run", *flags],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+
+
+def _run_status(
+    stubs: dict[str, Path],
+    *flags: str,
+    extra_env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run the real status.sh (read-only by construction) against substituted commands.
+
+    The DB container name is deliberately absent so that the script reports instead of reaching into a real
+    Postgres; LLM and web probes are skipped by flags.
+    """
+    env = {
+        "PATH": f"{stubs['bin']}:/usr/bin:/bin",
+        "HOME": str(stubs["bin"].parent),
+        "NOEZEMA_DEV_ENV_FILE": str(stubs["env_file"]),
+        "NOEZEMA_DEV_DATA_ROOT": str(stubs["data_root"]),
+        "NOEZEMA_DEV_DB_CONTAINER": "noezema-dev-db-not-present",
+        "STUB_TICK_TIMER_STATE": "",
+    }
+    env.update(extra_env or {})
+    return subprocess.run(
+        ["bash", str(STATUS), "--no-llm", "--no-web", *flags],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+
+
+pytestmark = pytest.mark.unit
+
+_REQUIRED_RULES: ClassVar[tuple[str, ...]] = (
+    "sudo ufw allow out on docker0 to 172.17.0.0/16",
+    "sudo ufw allow in from 192.168.1.0/24 to any port $WEB_PORT proto tcp",
+)
+
+
+class TestDevStandBootstrapDryRun:
+    def test_changes_nothing_and_masks_secrets(self, stubs: dict[str, Path]) -> None:
+        stubs["env_file"].write_text(_ENV_FILE_TEMPLATE, encoding="utf-8")
+
+        result = _run_bootstrap(stubs)
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert (result.stdout + result.stderr).count(FAKE_DB_PASSWORD) == 0
+        assert (result.stdout + result.stderr).count(FAKE_ADMIN_TOKEN) == 0
+        # dry-run never touches the env file or the data root.
+        assert stubs["env_file"].read_text(encoding="utf-8") == _ENV_FILE_TEMPLATE
+        assert not stubs["data_root"].exists()
+        assert "[dry-run]" in result.stdout
+
+    def test_port_is_picked_before_secrets_when_5432_is_taken(self, stubs: dict[str, Path]) -> None:
+        # The stand VM runs a native postgresql.service on 127.0.0.1:5432 (observed on 192.168.1.92).
+        result = _run_bootstrap(stubs, listening=(5432,))
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "port БД" in result.stdout or "порт БД" in result.stdout
+        assert "5433" in result.stdout
+        assert "127.0.0.1:5433/noezema-dev" in result.stdout  # the URL written to the env file
+
+    def test_explicit_taken_port_fails_with_a_hint(self, stubs: dict[str, Path]) -> None:
+        result = _run_bootstrap(
+            stubs,
+            listening=(5432,),
+            extra_env={"NOEZEMA_DEV_DB_PORT": "5432"},
+        )
+
+        assert result.returncode != 0
+        assert "уже занят" in result.stderr
+        assert "NOEZEMA_DEV_DB_PORT=5433" in result.stderr
+
+    def test_rerun_reuses_the_existing_container_port(self, stubs: dict[str, Path]) -> None:
+        # Container already publishes 5439; a rerun must not pick anything else and must not die on 5432.
+        stubs["env_file"].write_text(_ENV_FILE_TEMPLATE, encoding="utf-8")
+
+        result = _run_bootstrap(
+            stubs,
+            listening=(5432, 5439),
+            container_name="noezema-dev-db-test",
+            published_port="5439",
+        )
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "переиспользуем" in result.stdout
+        assert "127.0.0.1:5439/noezema-dev" in result.stdout
+        assert "NOEZEMA_DEV_DB_PORT=5433" not in result.stderr
+
+    def test_existing_cluster_without_a_known_password_refuses(self, stubs: dict[str, Path]) -> None:
+        # Inventing a password next to an existing volume would write an env file that cannot connect.
+        result = _run_bootstrap(
+            stubs,
+            container_name="noezema-dev-db-test",
+            published_port="5439",
+        )
+
+        assert result.returncode != 0
+        assert "не найден" in result.stderr
+        assert "docker volume rm noezema-dev-pgdata" in result.stderr
+
+    def test_force_keeps_secrets_of_an_existing_cluster(self, stubs: dict[str, Path]) -> None:
+        stubs["env_file"].write_text(_ENV_FILE_TEMPLATE, encoding="utf-8")
+
+        result = _run_bootstrap(
+            stubs,
+            "--force",
+            container_name="noezema-dev-db-test",
+            published_port="5432",
+        )
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "kept (--force его НЕ ротирует" in result.stdout
+        assert FAKE_ADMIN_TOKEN not in result.stdout
+
+    def test_rotation_is_an_explicit_flag_only(self, stubs: dict[str, Path]) -> None:
+        stubs["env_file"].write_text(_ENV_FILE_TEMPLATE, encoding="utf-8")
+
+        plain = _run_bootstrap(stubs, container_name="noezema-dev-db-test", published_port="5432")
+        rotating = _run_bootstrap(
+            stubs,
+            "--rotate-secrets",
+            container_name="noezema-dev-db-test",
+            published_port="5432",
+        )
+
+        assert plain.returncode == 0 and "kept (--force его НЕ ротирует" in plain.stdout
+        assert rotating.returncode == 0, rotating.stdout + rotating.stderr
+        assert "rotated the admin token" in rotating.stdout
+        # The DB password lives in the volume: rotation there is refused, not silently done.
+        assert "пароль БД НЕ ротирован" in rotating.stdout
+        assert FAKE_DB_PASSWORD not in rotating.stdout
+
+    def test_uv_fallback_installs_as_root_into_usr_local_bin(self, stubs: dict[str, Path]) -> None:
+        # Ubuntu 24.04 has no apt package uv; the old fallback wrote /usr/local/bin without rights.
+        result = _run_bootstrap(stubs, with_uv=False)
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "sudo env UV_INSTALL_DIR=/usr/local/bin" in result.stdout
+        assert "verify uv --version" in result.stdout
+
+
+class TestDevStandScriptContent:
+    """Cheap pins for the two host-facing behaviours that broke on the VM."""
+
+    def test_postgres_healthcheck_names_a_database_that_exists(self) -> None:
+        text = BOOTSTRAP.read_text(encoding="utf-8")
+
+        # Without -d, pg_isready asks for database "noezema" and the container spams unhealthy every 5 s.
+        assert '--health-cmd "pg_isready -U $DB_USER -d postgres"' in text
+
+    def test_readiness_is_probed_on_the_endpoint_the_application_uses(self) -> None:
+        text = BOOTSTRAP.read_text(encoding="utf-8")
+
+        assert "db_endpoint_ok" in text
+        assert "SELECT 1" in text
+        assert '127.0.0.1:$DB_PORT/postgres' in text
+
+    def test_firewall_is_only_diagnosed_never_changed(self) -> None:
+        text = BOOTSTRAP.read_text(encoding="utf-8")
+
+        assert "firewall_diagnostics" in text
+        for rule in _REQUIRED_RULES:
+            assert rule in text
+        # The script prints rules; it must never install them itself.
+        assert "ufw allow" not in _strip_notes(text)
+
+    def test_wake_now_is_described_as_a_button_not_systemctl(self) -> None:
+        for path in (BOOTSTRAP, REPO_ROOT / "deploy" / "dev-stand" / "status.sh"):
+            text = path.read_text(encoding="utf-8")
+            assert "interval_not_elapsed" in text
+            assert "НЕ запускает" in text
+
+    def test_tick_timer_is_reported_by_status_and_bootstrap(self) -> None:
+        # T7.61(б): both scripts must state the tick-timer decision in words an operator can act on.
+        status_text = (REPO_ROOT / "deploy" / "dev-stand" / "status.sh").read_text(encoding="utf-8")
+        bootstrap_text = BOOTSTRAP.read_text(encoding="utf-8")
+        assert "тик-таймер: выключен (сессии — только wake now)" in status_text
+        assert "systemctl disable --now noezema-dev-tick.timer" in status_text
+        assert "--with-tick-timer) WITH_TICK_TIMER=true" in bootstrap_text
+        # An already enabled timer is only reported. The scripts never run systemctl disable themselves.
+        assert "systemctl disable" not in _strip_notes(bootstrap_text)
+
+
+class TestDevStandTickTimerOptIn:
+    """T7.61(б): плановые сессии — только по явному флагу; уже включённый таймер не трогается."""
+
+    def test_tick_timer_is_not_enabled_by_default(self, stubs: dict[str, Path]) -> None:
+        result = _run_bootstrap(stubs)
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        enabled_line = next(
+            (line for line in result.stdout.splitlines() if "systemctl enable" in line), ""
+        )
+        assert "noezema-dev-tick.timer" not in enabled_line
+        # everything else is still enabled: without unit-state the Command API answers 423, without maint
+        # nothing reconciles.
+        for unit in ("noezema-dev-unit-state.timer", "noezema-dev-maint.timer", "noezema-dev-web.service"):
+            assert unit in enabled_line
+        assert "дефолт" in result.stdout and "wake now" in result.stdout
+
+    def test_flag_enables_the_tick_timer(self, stubs: dict[str, Path]) -> None:
+        result = _run_bootstrap(stubs, "--with-tick-timer")
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        enabled_line = next(
+            (line for line in result.stdout.splitlines() if "systemctl enable" in line), ""
+        )
+        assert "noezema-dev-tick.timer" in enabled_line
+        assert "--with-tick-timer" in result.stdout
+
+    def test_already_enabled_timer_is_reported_not_disabled(self, stubs: dict[str, Path]) -> None:
+        result = _run_bootstrap(stubs, extra_env={"STUB_TICK_TIMER_STATE": "enabled"})
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "УЖЕ включён" in result.stdout
+        # The hint is printed for the operator; the script never runs it.
+        assert "sudo systemctl disable --now noezema-dev-tick.timer" in result.stdout
+        # The hint is printed for the operator; the plan itself contains no disable step.
+        assert not [line for line in result.stdout.splitlines() if "[dry-run]" in line and "disable" in line]
+        enabled_line = next(
+            (line for line in result.stdout.splitlines() if "systemctl enable" in line), ""
+        )
+        assert "noezema-dev-tick.timer" not in enabled_line
+
+    def test_flag_is_documented_in_help(self) -> None:
+        result = subprocess.run(
+            ["bash", str(BOOTSTRAP), "--help"], capture_output=True, text=True, timeout=60, check=False
+        )
+        assert result.returncode == 0
+        assert "--with-tick-timer" in result.stdout
+
+    def test_status_shows_the_tick_timer_state(self, stubs: dict[str, Path]) -> None:
+        off = _run_status(stubs)
+        assert off.returncode == 0, off.stdout + off.stderr
+        assert "тик-таймер: выключен (сессии — только wake now)" in off.stdout
+
+        on = _run_status(stubs, extra_env={"STUB_TICK_TIMER_STATE": "enabled"})
+        assert on.returncode == 0, on.stdout + on.stderr
+        assert "тик-таймер: включён" in on.stdout
+        assert "тик-таймер: выключен" not in on.stdout
+
+    def test_readme_documents_how_sessions_start(self) -> None:
+        text = (REPO_ROOT / "deploy" / "dev-stand" / "README.md").read_text(encoding="utf-8")
+        assert "## Как запускать сессии" in text
+        assert "--with-tick-timer" in text
+        assert "systemctl disable --now noezema-dev-tick.timer" in text
+
+
+def _strip_notes(text: str) -> str:
+    """Drop the printed guidance lines, keep only what the script could execute."""
+
+    return "\n".join(
+        line for line in text.splitlines() if not line.lstrip().startswith(("note ", 'note "', "printf"))
+    )
+
+
+# ─── T7.70: пакет поиска (SearXNG) ─────────────────────────────────────────────────────
+
+SEARXNG_SCRIPT = REPO_ROOT / "deploy" / "dev-stand" / "searxng-settings.sh"
+SEARXNG_TEMPLATE = REPO_ROOT / "deploy" / "dev-stand" / "searxng" / "settings.yml"
+
+
+def _run_settings_script(out_path: Path, *flags: str) -> subprocess.CompletedProcess[str]:
+    """The settings renderer is pure local work: openssl + template. No network, no docker."""
+    return subprocess.run(
+        ["bash", str(SEARXNG_SCRIPT), "--out", str(out_path), *flags],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+
+def _secret_of(path: Path) -> str:
+    line = next(ln for ln in path.read_text(encoding="utf-8").splitlines() if "secret_key:" in ln)
+    return line.split("secret_key:", 1)[1].strip().strip('"')
+
+
+class TestDevStandSearchPackage:
+    """Поиск ставится только по явному флагу и никогда не пересоздаётся молча (T7.70)."""
+
+    def test_search_is_not_installed_by_default(self, stubs: dict[str, Path]) -> None:
+        result = _run_bootstrap(stubs)
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "docker run" not in result.stdout or "noezema-searxng" not in result.stdout
+        assert "поиск не ставим (дефолт)" in result.stdout
+        assert "--with-searxng" in result.stdout
+
+    def test_with_searxng_prints_the_exact_container_command(self, stubs: dict[str, Path]) -> None:
+        result = _run_bootstrap(stubs, "--with-searxng")
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        run_lines = [ln for ln in result.stdout.splitlines() if "docker run" in ln and "noezema-searxng" in ln]
+        assert len(run_lines) == 1
+        command = run_lines[0]
+        # Published on 127.0.0.1 only, container listens 8080 internally (the spec's own port).
+        assert "-p 127.0.0.1:8888:8080" in command
+        assert "--restart unless-stopped" in command
+        # Settings come from /etc/noezema/searxng and are mounted read-only.
+        assert "-v /etc/noezema/searxng/settings.yml:/etc/searxng/settings.yml:ro" in command
+        assert "searxng/searxng:latest" in command
+        # The settings file is rendered from the repo template, never copied with a committed secret.
+        assert "searxng-settings.sh --out /etc/noezema/searxng/settings.yml" in result.stdout
+        assert "secret_key генерируется при установке и не печатается" in result.stdout
+
+    def test_egress_is_described_never_opened(self, stubs: dict[str, Path]) -> None:
+        result = _run_bootstrap(stubs, "--with-searxng")
+
+        assert "исходящие 80/443 tcp" in result.stdout
+        assert "DNS" in result.stdout
+        assert "правила применяете ВЫ, не скрипт" in result.stdout
+        text = BOOTSTRAP.read_text(encoding="utf-8")
+        # Firewall words may only appear as prose/notes. What must never exist is a firewall command in
+        # an executable position (optionally under $SUDO) — that is what would actually change the host.
+        assert "ufw allow" not in _strip_notes(text)
+        firewall_command = re.compile(
+            r"(?m)^\s*(?:\"?\$\{?SUDO\}?\"?|sudo)?\s*(-n\s+)?(?:iptables|ip6tables|ufw)\s+(allow|deny|delete|insert|append|-)"
+        )
+        assert firewall_command.search(text) is None
+        assert "DOCKER-USER" not in _strip_notes(text)
+
+    def test_existing_search_container_survives_a_rerun(self, stubs: dict[str, Path]) -> None:
+        result = _run_bootstrap(
+            stubs,
+            "--with-searxng",
+            container_name="noezema-searxng",
+            published_port="8888",
+        )
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "уже есть" in result.stdout
+        assert "НЕ пересоздаём" in result.stdout
+        assert "docker rm -f noezema-searxng" not in result.stdout
+        assert "docker run -d --name noezema-searxng" not in result.stdout
+
+    def test_without_the_flag_an_existing_container_is_only_reported(self, stubs: dict[str, Path]) -> None:
+        result = _run_bootstrap(stubs, container_name="noezema-searxng", published_port="8888")
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "без --with-searxng мы его НЕ меняем" in result.stdout
+        assert "docker rm -f noezema-searxng" not in result.stdout
+
+    def test_rebuilding_the_container_is_an_explicit_flag(self, stubs: dict[str, Path]) -> None:
+        plain = _run_bootstrap(stubs, "--with-searxng", container_name="noezema-searxng", published_port="8888")
+        rebuilt = _run_bootstrap(
+            stubs,
+            "--with-searxng",
+            "--recreate-searxng",
+            container_name="noezema-searxng",
+            published_port="8888",
+        )
+
+        assert plain.returncode == 0 and "docker rm -f noezema-searxng" not in plain.stdout
+        assert rebuilt.returncode == 0, rebuilt.stdout + rebuilt.stderr
+        assert "--recreate-searxng" in rebuilt.stdout
+        assert "docker rm -f noezema-searxng" in rebuilt.stdout
+        assert any("docker run" in ln and "noezema-searxng" in ln for ln in rebuilt.stdout.splitlines())
+
+    def test_taken_search_port_refuses_with_a_hint(self, stubs: dict[str, Path]) -> None:
+        result = _run_bootstrap(stubs, "--with-searxng", listening=(8888,))
+
+        assert result.returncode != 0
+        assert "127.0.0.1:8888 уже занят" in result.stderr
+        assert "NOEZEMA_DEV_SEARXNG_PORT=" in result.stderr
+
+    def test_flags_are_documented_in_help(self) -> None:
+        result = subprocess.run(
+            ["bash", str(BOOTSTRAP), "--help"], capture_output=True, text=True, timeout=60, check=False
+        )
+
+        assert result.returncode == 0
+        assert "--with-searxng" in result.stdout
+        assert "--recreate-searxng" in result.stdout
+
+
+class TestDevStandSearchSettings:
+    """Настройки поиска: секрет живёт только на ВМ (AGENTS §5), шаблон — в репо."""
+
+    def test_template_carries_no_secret(self) -> None:
+        text = SEARXNG_TEMPLATE.read_text(encoding="utf-8")
+
+        assert 'secret_key: "@SECRET@"' in text
+        assert "limiter: false" in text
+        assert "- html" in text and "- json" in text
+        assert "@SECRET@" in text
+        # A committed 32-byte hex key would mean a real secret leaked into the repository.
+        assert re.search(r"secret_key:\s*\"[0-9a-f]{16,}\"", text) is None
+
+    def test_bootstrap_renders_settings_instead_of_committing_them(self) -> None:
+        text = BOOTSTRAP.read_text(encoding="utf-8")
+
+        assert "searxng-settings.sh" in text
+        assert "/etc/noezema/searxng/settings.yml" in text
+
+    def test_renderer_generates_a_secret_and_never_prints_it(self, tmp_path: Path) -> None:
+        out = tmp_path / "settings.yml"
+
+        first = _run_settings_script(out)
+
+        assert first.returncode == 0, first.stdout + first.stderr
+        secret = _secret_of(out)
+        assert re.fullmatch(r"[0-9a-f]{32,64}", secret), "secret_key must be a generated hex token"
+        assert secret not in first.stdout and secret not in first.stderr
+        assert "@SECRET@" not in out.read_text(encoding="utf-8")
+        assert out.stat().st_mode & 0o777 == 0o644  # readable by the (non-owner) uid inside the container
+
+    def test_rerun_keeps_the_secret_rotation_is_explicit(self, tmp_path: Path) -> None:
+        out = tmp_path / "settings.yml"
+
+        _run_settings_script(out)
+        first = _secret_of(out)
+        again = _run_settings_script(out)
+        assert again.returncode == 0, again.stdout + again.stderr
+        assert "оставляем" in again.stdout
+        assert _secret_of(out) == first
+
+        rotated = _run_settings_script(out, "--rotate-secret")
+        assert rotated.returncode == 0, rotated.stdout + rotated.stderr
+        assert _secret_of(out) != first
+        assert first not in rotated.stdout
+
+    def test_check_mode_is_read_only(self, tmp_path: Path) -> None:
+        out = tmp_path / "nested" / "settings.yml"
+
+        missing = subprocess.run(
+            ["bash", str(SEARXNG_SCRIPT), "--out", str(out), "--check"],
+            capture_output=True, text=True, timeout=60, check=False,
+        )
+        assert missing.returncode == 1 and not out.exists()
+
+        _run_settings_script(out)
+        ready = subprocess.run(
+            ["bash", str(SEARXNG_SCRIPT), "--out", str(out), "--check"],
+            capture_output=True, text=True, timeout=60, check=False,
+        )
+        assert ready.returncode == 0 and "готовы" in ready.stdout
+
+    def test_readme_documents_the_search_package(self) -> None:
+        text = (REPO_ROOT / "deploy" / "dev-stand" / "README.md").read_text(encoding="utf-8")
+
+        assert "## Поиск (SearXNG, T7.70)" in text
+        assert "./bootstrap.sh --with-searxng" in text
+        assert "sudo docker rm -v -f noezema-searxng" in text
+        assert "/etc/noezema/searxng/settings.yml" in text
+        assert "127.0.0.1:8888" in text
+        # The rollback and the firewall guidance are operator actions, not script actions.
+        assert "не меняет UFW и iptables" in text
+
+
+class TestDevStandStatusSearch:
+    """status.sh обязан сказать про поиск три вещи: есть/нет, отвечает/нет, режим снапшота."""
+
+    def test_status_reports_the_missing_search_container(self, stubs: dict[str, Path]) -> None:
+        result = _run_status(stubs)
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "SearXNG: контейнера нет" in result.stdout
+        assert "режим research_proxy активного снапшота" in result.stdout
+
+    def test_status_reports_an_existing_container_without_probing_it(self, stubs: dict[str, Path]) -> None:
+        result = _run_status(
+            stubs,
+            "--no-search",
+            extra_env={"STUB_CONTAINER_NAME": "noezema-searxng", "STUB_PUBLISHED_PORT": "8888"},
+        )
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "SearXNG: контейнер есть" in result.stdout
+        assert "не проверяли (--no-search)" in result.stdout
+
+    def test_search_probe_is_opt_out_not_opt_in(self) -> None:
+        text = STATUS.read_text(encoding="utf-8")
+
+        assert "--no-search" in text
+        assert "research_proxy->>'mode'" in text
+        assert "web.search доступен модели в этом снапшоте" in text
+
+
+class TestDevStandConfigVersion:
+    """Стенд по умолчанию поднимает актуальную конфигурацию, а предыдущая остаётся откатом
+    (T7.77 → T7.80 → T7.82(б) → T7.83(б)).
+
+    Это не косметика: менеджер, повторяющий `bootstrap.sh` на .92, активирует ровно тот payload,
+    который закреплён дефолтом скрипта. Если дефолт и откат перепутаны местами, стенд молча вернётся
+    на прежнюю конфигурацию — и следующий замер это измерит не там.
+    """
+
+    V20 = "config-v20-payload.json"
+    V19 = "config-v19-payload.json"
+    V18 = "config-v18-payload.json"
+    V17 = "config-v17-payload.json"
+    V16 = "config-v16-payload.json"
+    V15 = "config-v15-payload.json"
+    #: как эти файлы названы в скриптах (они указывают на payload через $REPO_ROOT)
+    V20_REF = "docs/eval/config-v20-payload.json"
+    V19_REF = "docs/eval/config-v19-payload.json"
+    V18_REF = "docs/eval/config-v18-payload.json"
+    V17_REF = "docs/eval/config-v17-payload.json"
+    V16_REF = "docs/eval/config-v16-payload.json"
+    V15_REF = "docs/eval/config-v15-payload.json"
+    #: canonical-хеші payload'ов: именно они попадают в `config_snapshots.payload_sha256` (AGENTS §8),
+    #  в скриптах и README они названы короткими префиксами — оператор сверяет head по ним
+    V20_CANONICAL = "2b065470"
+    #: T7.97a: canonical config-v21 пересчитан — файл не менял форму (ровно два пина prompt'ов),
+    #: но сами промпты curator-v11 и explorer-v10 правятся на месте (выпущенными ещё не были):
+    #: пример правила 11 заменён вымышленным случаем, ведомство в правилах названо ролью.
+    #: config-v20 при этом байт в байт прежний (`2b065470`), активация v21 — по-прежнему решение
+    #: менеджера, откат v20 не тронут.
+    V21_CANONICAL = "baf6e34c"
+    #: T7.102: canonical config-v22 = config-v21 ровно с одной правкой — пин `prompts.curator` →
+    #: curator-v12 (реальный пример абзаца перефразы правила 7 — 5,59 % / Росстат / 2025 год —
+    #: заменён вымышленным случаем той же формы, смысл правила не изменён). config-v21 байт в байт
+    #: прежний (`baf6e34c`), дефолт bootstrap'а прежний (config-v20): активация v22 — по-прежнему
+    #: решение менеджера (STATUS T7.102).
+    V22_CANONICAL = "05ada8a4"
+    V19_CANONICAL = "4d76c000"
+    V18_CANONICAL = "b5605e4e"
+    V17_CANONICAL = "5c402f4d"
+    V16_CANONICAL = "740ae9a1"
+    V15_CANONICAL = "b3801812"
+
+    def test_bootstrap_defaults_to_config_v20_and_names_v19_as_the_rollback(self) -> None:
+        text = BOOTSTRAP.read_text(encoding="utf-8")
+
+        assert f'CONFIG_PAYLOAD="${{NOEZEMA_DEV_CONFIG_PAYLOAD:-$REPO_ROOT/{self.V20_REF}}}"' in text
+        # откат обязан быть назван явно: прежнему payload'у принадлежит canonical-хеш, не хеш файла
+        rollback_line = next(
+            line
+            for line in text.splitlines()
+            if self.V19_REF in line and "NOEZEMA_DEV_CONFIG_PAYLOAD" in line
+        )
+        assert self.V19_REF in rollback_line
+        assert self.V19_CANONICAL in text and self.V20_CANONICAL in text
+        # причина активации говорит, что именно изменилось (пин куратора: перепроверка перефразы
+        # одного и того же значения через existing_claim_id), а не «обновили конфиг»
+        reason = next(line for line in text.splitlines() if line.startswith("CONFIG_REASON="))
+        assert "config-v20" in reason and "existing_claim_id" in reason
+        # лимит шагов, пороги и бюджеты v20 не трогает — причина говорит об этом прямо
+        assert "unchanged" in reason
+
+    def test_reset_db_reactivates_the_same_config_as_bootstrap(self) -> None:
+        script = (REPO_ROOT / "deploy" / "dev-stand" / "reset-db.sh").read_text(encoding="utf-8")
+
+        assert f'CONFIG_PAYLOAD="${{NOEZEMA_DEV_CONFIG_PAYLOAD:-$REPO_ROOT/{self.V20_REF}}}"' in script
+        assert self.V19_REF in script  # откат не потерян и после сброса базы
+        assert "config-v20" in script
+
+    def test_readme_documents_the_activation_and_the_rollback_with_canonical_hashes(self) -> None:
+        text = (REPO_ROOT / "deploy" / "dev-stand" / "README.md").read_text(encoding="utf-8")
+
+        assert self.V20_CANONICAL in text
+        assert self.V19_CANONICAL in text
+        assert self.V18_CANONICAL in text
+        assert "config-v20-payload.json" in text
+        assert "docs/eval/config-v19-payload.json" in text
+        # активация — команда менеджера с drain, а не тихая правка снапшота
+        assert "activate-online" in text and "--drain-wait-seconds 120" in text
+
+    def test_config_v20_payload_file_exists_next_to_the_older_ones(self) -> None:
+        """Новый номер конфигурации = новый файл, прежние не переписываются (AGENTS §8)."""
+        for name in (
+            "config-v13-payload.json",
+            "config-v14-payload.json",
+            "config-v15-payload.json",
+            self.V16,
+            self.V17,
+            self.V18,
+            self.V19,
+            self.V20,
+        ):
+            path = REPO_ROOT / "docs" / "eval" / name
+            assert path.is_file(), name
+
+    def test_config_v19_is_config_v18_with_one_curator_pin(self) -> None:
+        """T7.82(б): единственная правка v19 — пин `prompts.curator` → curator-v9; canonical-хеш
+        payload'а (то, что попадает в config_snapshots.payload_sha256) закреплён и проверен на
+        живом файле; payload'ы v1…v18 не переписаны."""
+        import json
+
+        from packages.domain.canonical import canonical_sha256
+        from packages.llm_gateway.roles import Role, resolve_prompts
+
+        v18 = json.loads((REPO_ROOT / "docs" / "eval" / self.V18).read_text(encoding="utf-8"))
+        v19 = json.loads((REPO_ROOT / "docs" / "eval" / self.V19).read_text(encoding="utf-8"))
+        assert {k for k in v19 if v19[k] != v18[k]} == {"prompts"}
+        assert {r for r in v19["prompts"] if v19["prompts"][r] != v18["prompts"][r]} == {"curator"}
+        assert canonical_sha256(v19).startswith(self.V19_CANONICAL)
+        resolved = resolve_prompts(v19["prompts"], REPO_ROOT)
+        assert resolved[Role.CURATOR].version == "curator-v9"
+        assert resolved[Role.EXPLORER].version == "explorer-v9"
+        # v18 остаётся ровно прежним canonical (прежние payload'ы не переписываются)
+        assert canonical_sha256(v18).startswith(self.V18_CANONICAL)
+
+    def test_config_v20_is_config_v19_with_one_curator_pin(self) -> None:
+        """T7.83(б): единственная правка v20 — пин `prompts.curator` → curator-v10 (правило 7
+        дополнено перефразой: то же значение того же показателя за тот же период перепроверяется
+        через existing_claim_id); canonical-хеш закреплён и проверен на живом файле; v19 не переписан.
+
+        Хостовый гейт дублей по значению (T7.83(а), ADR-0033) от пин'а не зависит: payload нужен,
+        чтобы модель оформляла перепроверку сама, а не полагалась на хост."""
+        import json
+
+        from packages.domain.canonical import canonical_sha256
+        from packages.llm_gateway.roles import Role, resolve_prompts
+
+        v19 = json.loads((REPO_ROOT / "docs" / "eval" / self.V19).read_text(encoding="utf-8"))
+        v20 = json.loads((REPO_ROOT / "docs" / "eval" / self.V20).read_text(encoding="utf-8"))
+        assert {k for k in v20 if v20[k] != v19[k]} == {"prompts"}
+        assert {r for r in v20["prompts"] if v20["prompts"][r] != v19["prompts"][r]} == {"curator"}
+        assert canonical_sha256(v20).startswith(self.V20_CANONICAL)
+        resolved = resolve_prompts(v20["prompts"], REPO_ROOT)
+        assert resolved[Role.CURATOR].version == "curator-v10"
+        assert resolved[Role.CURATOR].sha256 == v20["prompts"]["curator"]["sha256"]
+        # всё остальное — байт в байт v19 (explorer, пороги, бюджеты)
+        assert resolved[Role.EXPLORER].version == "explorer-v9"
+        for role in (Role.PLANNER, Role.VERIFIER, Role.EXTRACTOR):
+            assert v20["prompts"][role.name.lower()] == v19["prompts"][role.name.lower()], role
+        # v19 остаётся ровно прежним canonical (прежние payload'ы не переписываются)
+        assert canonical_sha256(v19).startswith(self.V19_CANONICAL)
+
+    def test_config_v21_is_config_v20_with_two_prompt_pins(self) -> None:
+        """T7.97: новый payload config-v21 = config-v20 ровно с двумя правками — пины
+        `prompts.explorer` → explorer-v10 (правило 13: итог обязан нести прочитанные
+        собственные оценки не-официальных акторов) и `prompts.curator` → curator-v11
+        (правило 11: такая оценка — отдельный claim с названием актора; публикация
+        ведомства остаётся публикацией ведомства). Пороги, `claim_type_rules`, бюджеты,
+        окна и `model.*` — байт в байт v20; canonical v21 закреплён и проверен на живом
+        файле; v20 не переписан и остаётся откатом (дефолт bootstrap'а — v20 до решения
+        менеджера, см. STATUS T7.97)."""
+        import json
+
+        from packages.domain.canonical import canonical_sha256
+        from packages.llm_gateway.roles import Role, resolve_prompts
+
+        v20 = json.loads((REPO_ROOT / "docs" / "eval" / self.V20).read_text(encoding="utf-8"))
+        v21_path = REPO_ROOT / "docs" / "eval" / "config-v21-payload.json"
+        assert v21_path.is_file()
+        v21 = json.loads(v21_path.read_text(encoding="utf-8"))
+        assert {k for k in v21 if v21[k] != v20[k]} == {"prompts"}
+        assert {r for r in v21["prompts"] if v21["prompts"][r] != v20["prompts"][r]} == {
+            "curator",
+            "explorer",
+        }
+        assert canonical_sha256(v21).startswith(self.V21_CANONICAL)
+        resolved = resolve_prompts(v21["prompts"], REPO_ROOT)
+        assert resolved[Role.CURATOR].version == "curator-v11"
+        assert resolved[Role.CURATOR].sha256 == v21["prompts"]["curator"]["sha256"]
+        assert resolved[Role.EXPLORER].version == "explorer-v10"
+        assert resolved[Role.EXPLORER].sha256 == v21["prompts"]["explorer"]["sha256"]
+        for role in (Role.PLANNER, Role.VERIFIER, Role.EXTRACTOR):
+            assert v21["prompts"][role.name.lower()] == v20["prompts"][role.name.lower()], role
+        # v20 остаётся ровно прежним canonical (прежние payload'ы не переписываются)
+        assert canonical_sha256(v20).startswith(self.V20_CANONICAL)
+
+    def test_config_v22_is_config_v21_with_one_curator_pin(self) -> None:
+        """T7.102: новый payload config-v22 = config-v21 ровно с одной правкой — пин
+        `prompts.curator` → curator-v12 (реальный пример абзаца перефразы правила 7 заменён
+        вымышленным случаем той же формы; смысл правила не изменён). Пороги, `claim_type_rules`,
+        бюджеты, окна, `model.*` и пин explorer-v10 — байт в байт v21; canonical v22 закреплён и
+        проверен на живом файле; config-v21 не переписан и остаётся историей (его canonical
+        `baf6e34c`); дефолт bootstrap'а прежний — config-v20 (активация v22 — решение менеджера,
+        STATUS T7.102)."""
+        import json
+
+        from packages.domain.canonical import canonical_sha256
+        from packages.llm_gateway.roles import Role, resolve_prompts
+
+        v21 = json.loads((REPO_ROOT / "docs" / "eval" / "config-v21-payload.json").read_text(encoding="utf-8"))
+        v22_path = REPO_ROOT / "docs" / "eval" / "config-v22-payload.json"
+        assert v22_path.is_file()
+        v22 = json.loads(v22_path.read_text(encoding="utf-8"))
+        assert {k for k in v22 if v22[k] != v21[k]} == {"prompts"}
+        assert {r for r in v22["prompts"] if v22["prompts"][r] != v21["prompts"][r]} == {"curator"}
+        assert canonical_sha256(v22).startswith(self.V22_CANONICAL)
+        resolved = resolve_prompts(v22["prompts"], REPO_ROOT)
+        assert resolved[Role.CURATOR].version == "curator-v12"
+        assert resolved[Role.CURATOR].sha256 == v22["prompts"]["curator"]["sha256"]
+        assert resolved[Role.EXPLORER].version == "explorer-v10"
+        assert resolved[Role.EXPLORER].sha256 == v21["prompts"]["explorer"]["sha256"]
+        for role in (Role.PLANNER, Role.VERIFIER, Role.EXTRACTOR):
+            assert v22["prompts"][role.name.lower()] == v21["prompts"][role.name.lower()], role
+        # config-v21 остаётся ровно прежним canonical (прежние payload'ы не переписываются)
+        assert canonical_sha256(v21).startswith(self.V21_CANONICAL)
+        # дефолт bootstrap'а не тронут: config-v20, config-v22 в скриптах не упоминается
+        bootstrap = BOOTSTRAP.read_text(encoding="utf-8")
+        assert f'CONFIG_PAYLOAD="${{NOEZEMA_DEV_CONFIG_PAYLOAD:-$REPO_ROOT/{self.V20_REF}}}"' in bootstrap
+        assert "config-v22" not in bootstrap
+
+
+class TestDevStandReasoningProfile:
+    """Профиль рассуждения движка (T7.80, ADR-0030) — возможность ДВИЖКА, поэтому он в окружении
+    стенда, а не в payload'е; политика фаз при этом живёт в снапшоте.
+
+    Дефолт обязан оставаться «none»: без замера конкретного движка стенд не имеет права добавлять
+    в запрос параметр рассуждения — иначе прежние прогоны перестают быть сравнимыми, а неизвестный
+    движок может отклонить сам запрос (ADR-0012 ровно об этом).
+    """
+
+    def test_bootstrap_exposes_the_reasoning_profile_and_writes_it_to_the_env_file(self) -> None:
+        text = BOOTSTRAP.read_text(encoding="utf-8")
+
+        assert 'LLM_REASONING_PROFILE="${NOEZEMA_DEV_LLM_REASONING_PROFILE:-none}"' in text
+        # переменная должна дойти до юнитов: без этой строки профиль так и останется none
+        env_lines = [line for line in text.splitlines() if "NOEZEMA_LLM_REASONING_PROFILE=" in line]
+        assert any("NOEZEMA_LLM_REASONING_PROFILE=$LLM_REASONING_PROFILE" in line for line in env_lines), env_lines
+        # и быть видна в сводке запуска, как schema_profile (оператор сверяет её с фактическим движком)
+        summary = next(line for line in text.splitlines() if "schema_profile=$LLM_SCHEMA_PROFILE" in line)
+        assert "reasoning_profile=$LLM_REASONING_PROFILE" in summary
+
+    def test_readme_names_the_engine_profiles_it_has_measured(self) -> None:
+        """README обязан называть профили, а не абстракцию: менеджер ставит стенд на конкретный
+        движок и выбирает профиль по замеру, а не догадкой."""
+        text = (REPO_ROOT / "deploy" / "dev-stand" / "README.md").read_text(encoding="utf-8")
+
+        assert "NOEZEMA_DEV_LLM_REASONING_PROFILE" in text
+        for profile in ("none", "halogen", "chat-template"):
+            assert profile in text, profile
+        # неизвестный профиль — отказ при старте, а не тихий дефолт
+        assert "fail-closed" in text or "отказ" in text
+
+    def test_bootstrap_default_is_none_and_the_reasoning_policy_lives_in_the_payload(self) -> None:
+        """Разделение ответственности (ADR-0030): payload говорит «где не рассуждать», окружение —
+        «умеет ли этот движок выключать рассуждение». Ни одна из сторон не подменяет другую."""
+        import json
+
+        text = BOOTSTRAP.read_text(encoding="utf-8")
+        assert 'NOEZEMA_DEV_LLM_REASONING_PROFILE:-none' in text
+
+        payload = json.loads((REPO_ROOT / "docs" / "eval" / "config-v20-payload.json").read_text(encoding="utf-8"))
+        assert sorted(payload["model"]["reasoning_by_phase"]) == [
+            "consolidation",
+            "exploration",
+            "extraction",
+            "planning",
+            "verification",
+        ]
+        # потолок вывода не поднят: фиксированная комната ответа halogen (замер T7.80)
+        assert payload["model"]["max_output_tokens"] == 8192
+

@@ -7,6 +7,7 @@ import pytest
 from packages.domain.models.enums import (
     ActionState,
     AssessmentState,
+    ClaimDateAnchor,
     ClaimType,
     CommitAttemptStatus,
     DecisionKind,
@@ -96,7 +97,8 @@ def test_question_resolved_set() -> None:
         (EvidenceKind, 6),
         (EpistemicStatus, 5),
         (AssessmentState, 3),
-        (FreshnessStatus, 4),
+        (FreshnessStatus, 5),  # T7.32 (ADR-0017): + evergreen
+        (ClaimDateAnchor, 3),  # T7.32 (ADR-0017): the question's date anchor
         (ClaimType, 8),
         (QuestionState, 7),
         (QuestionOrigin, 9),

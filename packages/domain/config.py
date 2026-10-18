@@ -47,16 +47,74 @@ BOOTSTRAP_PAYLOAD: dict[str, Any] = {
     },
     "embeddings": {"enabled": False, "dimensions": None},
     "prompts": {
-        "explorer": {"version": "explorer-v3", "path": "prompts/explorer.md"},
-        "curator": {"version": "curator-v3", "path": "prompts/curator.md"},
+        # T7.35 (ADR-0019): every role is a CONTENT PIN — path (the
+        # versioned file, relative to the repo root), version (the
+        # header label) and sha256 of the file bytes. The loader
+        # resolves the prompt BY THIS REFERENCE and verifies the header
+        # AND the content hash; any mismatch is fail-closed (the
+        # session does not start). The versioned files under
+        # prompts/<role>/<version>.md are the single source of truth.
+        # T7.21 (ADR-0010): v4 — rule 7 (fetch every question-named
+        # source before completing; backstop for the host coverage gate)
+        # T7.50 (ADR-0022, option A — class D of SMOKE-V8…V13, 15/20 of
+        # the partials): v5 — the completion protocol: `reason` is
+        # EXACTLY one token from the closed CompleteReason list
+        # (goal_reached | budget_exhausted | no_progress | blocked),
+        # lowercase, no explanation — the explanation (what is
+        # established, on which sources, why stop) goes to
+        # public_rationale of the same response; rule 5 maps each
+        # stopping condition to its token (goal_reached only on
+        # tool-confirmed answers) + a correct/incorrect JSON example
+        # pair (T7.39 pattern: corpus-free topic, no real ids).
+        "explorer": {
+            "version": "explorer-v5",
+            "path": "prompts/explorer/explorer-v5.md",
+            "sha256": "3b1fd49d687a39ab88809ac208cc9dfc4f0390b0da3a9ea848f888cf22a69c3c",
+        },
+        # T7.34 (ADR-0018): v4 — the reverify operation
+        # (`existing_claim_id`: re-check an existing claim without
+        # creating a new one; the record is the fresh assessment row);
+        # T7.38 (SMOKE-V8-K2): v5 — the claim_type↔evidence matrix
+        # (mirrors claim_type_rules allowed_kinds), the reverify rule
+        # with a concrete example, and `dependencies: []` when there
+        # are no dependencies (no placeholder ids);
+        # T7.39 (T7.38 acceptance): v6 — the reverify example swapped
+        # for a corpus-free fact (external_fact, as_of null) with a
+        # fresh UUID present nowhere in the repo or the data — the v5
+        # example quoted a REAL claim id from SMOKE-V8-K2, which the
+        # host would reject on a fresh DB and kill the whole proposal
+        # (T7.34); guard: test_prompt_example_no_real_data.py
+        # T7.43 (SMOKE-V10B-K2): v7 — mandatory evidence binding
+        # (every claim >= 1 evidence_link, 0 evidence never passes the
+        # rules engine; evidence_links vs dependencies contrast) and
+        # the rule-7 negative example (existing_claim_id: null +
+        # «перепроверка» in summary = a duplicate claim) + the weak
+        # (E0/E1) existing-claim reverify case.
+        "curator": {
+            "version": "curator-v7",
+            "path": "prompts/curator/curator-v7.md",
+            "sha256": "19d6c6e8e2d890ae4cf5c42e5e0ec6bd864a2c6ef12fdb2766e01f977bc89a3a",
+        },
         # T5.2 (stage 4): the planner role (multi-step planning)
-        "planner": {"version": "planner-v1", "path": "prompts/planner.md"},
+        "planner": {
+            "version": "planner-v1",
+            "path": "prompts/planner/planner-v1.md",
+            "sha256": "6aeb22bc727b9c0e24bcd8c31ba64fc653b842072bd9130409682283f83a87ee",
+        },
         # T5.3 (stage 4): the verifier role (deterministic checks;
         # never assigns grade/confidence — §3.7)
-        "verifier": {"version": "verifier-v1", "path": "prompts/verifier.md"},
+        "verifier": {
+            "version": "verifier-v1",
+            "path": "prompts/verifier/verifier-v1.md",
+            "sha256": "34fe8069f7ab88dc337efeb82e89c01853f645d3a4cc1c14fec3ce4fd53c9463",
+        },
         # T5.5 (stage 4): the extraction profile (untrusted documents,
         # §11.2) — a model without tools extracts verbatim chunks
-        "extractor": {"version": "extractor-v1", "path": "prompts/extractor.md"},
+        "extractor": {
+            "version": "extractor-v1",
+            "path": "prompts/extractor/extractor-v1.md",
+            "sha256": "af5dba626b8a5a3995f89e6ca0b892a82976d8a7d32737c1f834e4b1b4c37866",
+        },
     },
     "policy": {
         "access_profile": "sealed",
@@ -341,3 +399,43 @@ def bootstrap_payload_bytes() -> bytes:
 
 def activation_mode_name(mode: ActivationMode) -> str:
     return mode.value
+
+
+# T7.119 (решение пользователя 2026-10-16, пункты 2 и 4): два новых НЕОБЯЗАТЕЛЬНЫХ ключа внутри
+# существующей секции `session_limits` — `max_explorer_steps_official_independent` (потолок шагов
+# для вопросов вида «официальные + независимые») и `research_hints` (ручной каталог подсказок
+# независимых источников). Новая ВЕРХНЯЯ секция payload не использована: config_snapshots хранит
+# payload поимёнными колонками (packages/memory/activation.py), новая верхняя секция потребовала бы
+# новой колонки — миграции БД, чем задача не занимается. session_limits переносится целиком и
+# читается существующими потребителями только выборочно (`.get` конкретных ключей), поэтому новый
+# ключ инертен для них. Отсутствие ключа = прежнее поведение. `schema_version` не меняется: он
+# описывает форму секций, а форма `session_limits` — произвольный mapping уже сегодня.
+# Глубокую форму каталога проверяет потребитель (`apps/orchestrator/research_hints.py`), здесь —
+# примитивная проверка типов новых необязательных ключей.
+# Дополнение T7.121a: тот же путь — необязательный булев ключ `curator_record_gates` (гейты честности
+# записей куратора T7.121 включаются конфигурацией; отсутствие ключа = гейты молчат, поведение
+# pre-T7.121). Секция та же, `schema_version` тот же, миграции БД нет.
+
+
+def optional_session_limits_problems(session_limits: Any) -> list[str]:
+    """Проблемы необязательных ключей T7.119 в секции session_limits (чистая функция, без БД).
+
+    Проверяются только сами новые ключи; известные ключи секции здесь не проверяются. Пустой
+    список — корректная или отсутствующая запись; пустой список для payload до config-v27 —
+    отсутствие новых ключей есть корректное прежнее поведение.
+    """
+    problems: list[str] = []
+    if not isinstance(session_limits, dict):
+        return ["session_limits: не словарь"]
+    raised = session_limits.get("max_explorer_steps_official_independent")
+    if raised is not None and (isinstance(raised, bool) or not isinstance(raised, int) or raised <= 0):
+        problems.append(
+            "session_limits.max_explorer_steps_official_independent: должно быть целое положительное число"
+        )
+    hints = session_limits.get("research_hints")
+    if hints is not None and not isinstance(hints, dict):
+        problems.append("session_limits.research_hints: должен быть словарём")
+    gates = session_limits.get("curator_record_gates")
+    if gates is not None and not isinstance(gates, bool):
+        problems.append("session_limits.curator_record_gates: должно быть булевым значением")
+    return problems

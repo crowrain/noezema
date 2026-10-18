@@ -33,6 +33,10 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
 )
 
+from apps.research_proxy.derivative_pointer import (
+    resolve_primary_source,
+    write_derivative_pointer,
+)
 from apps.research_proxy.fetch import FetchClient, FetchError
 from apps.research_proxy.modes import ModeError, ModePolicy, ResearchMode
 from apps.research_proxy.normalization import (
@@ -47,7 +51,14 @@ from apps.research_proxy.search import (
     search_local,
     upstream_request_url,
 )
+from apps.research_proxy.source_attribution import (
+    ATTRIBUTION_METHOD_VERSION,
+    AttributionDecision,
+    PrimarySource,
+    detect_source_attribution,
+)
 from apps.research_proxy.ssrf_guard import SSRFError, SSRFPolicy, validate_url
+from apps.research_proxy.tls import ensure_extra_ca_setting
 from packages.artifacts.store import ArtifactStore
 from packages.domain.canonical import canonical_json_bytes
 from packages.domain.db.uow import transaction
@@ -79,6 +90,9 @@ class ResearchProxyService:
     ) -> None:
         self.session_factory = session_factory
         self.store = artifact_store
+        # T7.77: битая конфигурация NOEZEMA_RESEARCH_EXTRA_CA_FILE — отказ при сборке сервиса
+        # (каждый вход research-proxy поднимает сервис), а не при первой же fetch-операции
+        ensure_extra_ca_setting()
 
     async def fetch(self, url: str) -> dict[str, Any]:
         """Fetch ``url`` through the controlled egress. Returns the
@@ -144,6 +158,14 @@ class ResearchProxyService:
         # content-addressed store has it — the proxy keeps no live
         # copy of fetched content
         result.data = b""
+
+        # T7.75 (ADR-0029 вариант B): производность страницы доказывает её текст, а не модель.
+        # Чистый детектор (`source_attribution`) решает по canonical URI + нормализованному тексту;
+        # здесь из решения вырастает указатель `parent_source_id` для НОВОЙ строки источника.
+        attribution = detect_source_attribution(
+            canonical_uri=result.final_url, text=normalized.text
+        )
+        parent_source_id: str | None = None
 
         async with self.session_factory() as db, transaction(db):
             # the content-addressed registry rows (fs store + DB row
@@ -266,6 +288,8 @@ class ResearchProxyService:
                     "trust": UNTRUSTED_EXTERNAL,
                 },
             )
+            if attribution.is_derivative and not idempotent:
+                parent_source_id = await self._mark_derivative(db, source_id, attribution)
             await AuditService(db).record(
                 AuditEventType.RESEARCH_FETCH_COMPLETED,
                 payload={
@@ -278,12 +302,44 @@ class ResearchProxyService:
                     "idempotent": idempotent,
                     "redirects": result.redirects,
                     "elapsed_ms": result.elapsed_ms,
+                    # T7.75: чем обосновано решение о происхождении. Статус пишется всегда, в том
+                    # числе когда хост сознательно НЕ стал склеивать источники (own_assessment,
+                    # ambiguous_primaries, self_primary, no_value_attribution). Ключ
+                    # `derivativity_written` различает «узнали пересказ» и «проставили указатель»:
+                    # повторный fetch уже прочитанной страницы идемпотенен и задним числом ничего
+                    # не дописывает.
+                    "attribution_status": attribution.status,
+                    "attribution_method": ATTRIBUTION_METHOD_VERSION,
+                    **(
+                        {
+                            "derivativity_written": parent_source_id is not None,
+                            **(
+                                {
+                                    "derivative_of": {
+                                        "key": attribution.primary_key,
+                                        "name": attribution.primary_name,
+                                        "uri": attribution.parent_uri,
+                                    },
+                                    "parent_source_id": parent_source_id,
+                                }
+                                if parent_source_id is not None
+                                else {}
+                            ),
+                        }
+                        if attribution.is_derivative
+                        else {}
+                    ),
                 },
                 actor="research_proxy",
                 public_summary=(
                     f"refetch (idempotent) {result.final_url} (untrusted external)"
                     if idempotent
                     else f"fetched {result.final_url} (untrusted external)"
+                )
+                + (
+                    f" · пересказывает: {attribution.primary_name}"
+                    if attribution.is_derivative and not idempotent
+                    else ""
                 ),
             )
 
@@ -300,8 +356,30 @@ class ResearchProxyService:
             "content_type": result.content_type,
             "redirects": result.redirects,
             "trust_class": UNTRUSTED_EXTERNAL,
+            # T7.75 (только добавляются): решение детектора происхождения и, если указатель
+            # реально проставлен, на кого именно он ведёт
+            "attribution_status": attribution.status,
+            "derivative_of": (
+                {"key": attribution.primary_key, "name": attribution.primary_name,
+                 "uri": attribution.parent_uri, "source_id": parent_source_id}
+                if parent_source_id is not None
+                else None
+            ),
             "note": "недоверенный внешний контент: использовать только за fence-ом",
         }
+
+    async def _resolve_primary_source(self, db: AsyncSession, spec: PrimarySource) -> str:
+        """Общая реализация указателя — `apps/research_proxy/derivative_pointer.py` (T7.77:
+        та же функция работает при fetch и при переатрибуции; про якорь и запрет цепочек —
+        там же)."""
+        return await resolve_primary_source(db, spec)
+
+    async def _mark_derivative(
+        self, db: AsyncSession, source_id: str, decision: AttributionDecision
+    ) -> str | None:
+        """Указатель происхождения новой строки источника (T7.75). Вызывается ровно для
+        новой строки (`not idempotent`); задним числом ничего не переоценивается."""
+        return await write_derivative_pointer(db, source_id, decision)
 
     def _mode_policy(self, section: Any) -> ModePolicy:
         try:

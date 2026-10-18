@@ -36,8 +36,22 @@ Gate definitions (fixed here; see ADR-0005 for the operational run):
    distinct sessions via evidence / revisions / dependencies
    (threshold ≥0.25).
 6. ``due_stale_time_sensitive`` — of the current
-   ``temporal_fact`` claims, the share with freshness
-   ``due | stale`` (threshold <0.20, direction: at most).
+   ``temporal_fact`` claims that CAN become due (``reverify_after``
+   NOT NULL), the share whose freshness, evaluated at the
+   gate-computation instant by the §8.6/T3.7 rule
+   (``packages.memory.freshness.freshness_status`` over
+   ``reverify_after``, NOT the stored ``claims.freshness_status``
+   column), is ``due`` (``now >= reverify_after`` — T7.27, ADR-0014:
+   the gate measures the real state at computation time and does not
+   depend on whether a background reassessment/activation flip ever
+   ran). T7.32 (ADR-0017): the denominator counts ONLY claims with a
+   deadline — a NULL ``reverify_after`` is "no deadline by
+   construction" (a claim about a fixed point: explicit question date
+   or a dateless question with the model's as_of); such a claim can
+   never be due, and counting it would dilute the ratio with
+   composition instead of measuring freshness. Threshold <0.20,
+   direction: strictly below (``ratio < threshold`` — the spec
+   «<20%» is strict; T7.28, ADR-0015: exactly 20% is ``failed``).
 7. ``reassessment_slo`` — of the completed reassessment jobs, the
    share that completed within the fixed wall-clock SLO (``thresholds.
    reassessment_slo_seconds``; blocked jobs have an alert and are
@@ -98,7 +112,8 @@ ratios distorted) and the blind-gate per-claim queries raise
 from __future__ import annotations
 
 import math
-from typing import Any
+from datetime import UTC, datetime
+from typing import Any, Literal, get_args
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -114,15 +129,39 @@ _GRADE_CASE = (
     "WHEN 'E3' THEN 3 WHEN 'E4' THEN 4 ELSE 0 END"
 )
 
-#: direction of each ratio gate: "at_least" (pass when ratio >=
-#: threshold) or "at_most" (pass when ratio <= threshold)
-_GATE_DIRECTION: dict[str, str] = {
+#: the CLOSED set of §22.2 comparison directions (ARCHITECTURE.md:
+#: 2602–2611): "at_least" (pass when ratio >= threshold), "at_most"
+#: (pass when ratio <= threshold) or "below" (pass when ratio <
+#: threshold, STRICT). Closed at the type level — mypy strict rejects
+#: any other value statically — and ``_gate()`` additionally fails
+#: closed with ``ValueError`` at runtime for a value that reached it
+#: untyped: there is no silent "at_most" default (T7.28, ADR-0015:
+#: the class of boundary mismatch where a misspelled direction
+#: silently flips the boundary outcome).
+GateDirection = Literal["at_least", "at_most", "below"]
+
+#: the same three values as a runtime set (derived from the Literal via
+#: ``get_args`` — one source of truth). ``_gate()`` validates against
+#: this and fails
+#: closed with ``ValueError`` for a value that reached it untyped —
+#: the type-level closure is the primary guard (mypy strict rejects
+#: any other value statically at the call site); there is no silent
+#: "at_most" default (T7.28, ADR-0015).
+_GATE_DIRECTIONS: frozenset[str] = frozenset(get_args(GateDirection))
+
+#: direction of each ratio gate (one of ``GateDirection``). The spec
+#: wording decides the direction: ARCHITECTURE.md:2607 «due/stale
+#: time-sensitive claims <20%» is strictly less, so
+#: ``due_stale_time_sensitive`` is "below" (T7.28, ADR-0015:
+#: previously "at_most" — exactly 20% passed, changing the boundary
+#: outcome 6/30 from spec-failed to passed).
+_GATE_DIRECTION: dict[str, GateDirection] = {
     "new_supported_refuted_e2": "at_least",
     "external_temporal_e3": "at_least",
     "eligible_sessions_with_outcome": "at_least",
     "near_duplicate_questions": "at_most",
     "significant_claim_reuse": "at_least",
-    "due_stale_time_sensitive": "at_most",
+    "due_stale_time_sensitive": "below",
     "reassessment_slo": "at_least",
     "blind_provenance_path": "at_least",
     "blind_scope": "at_least",
@@ -130,16 +169,22 @@ _GATE_DIRECTION: dict[str, str] = {
 
 
 async def compute_gates(
-    db: AsyncSession, *, run: EvaluationRun
+    db: AsyncSession, *, run: EvaluationRun, now: datetime | None = None
 ) -> dict[str, dict[str, Any]]:
-    """Compute all 11 §22.2 gates for the run's session window."""
+    """Compute all 11 §22.2 gates for the run's session window.
+
+    ``now`` fixes the wall-clock instant the time-dependent gate
+    (``due_stale_time_sensitive``, the §8.6 freshness rule) is
+    evaluated at — a pure function of (domain data, ``now``); defaults
+    to the computation instant."""
+    ts = now or datetime.now(UTC)
     gates: dict[str, dict[str, Any]] = {}
     gates["new_supported_refuted_e2"] = await _gate_new_e2(db, run)
     gates["external_temporal_e3"] = await _gate_external_e3(db, run)
     gates["eligible_sessions_with_outcome"] = await _gate_sessions(db, run)
     gates["near_duplicate_questions"] = await _gate_near_dup(db, run)
     gates["significant_claim_reuse"] = await _gate_reuse(db, run)
-    gates["due_stale_time_sensitive"] = await _gate_due_stale(db, run)
+    gates["due_stale_time_sensitive"] = await _gate_due_stale(db, run, ts)
     gates["reassessment_slo"] = await _gate_slo(db, run)
     gates["current_pending_invalid_ancestor"] = await _gate_pending_ancestor(db)
     gates["high_severity_incidents"] = await _gate_incidents(db, run)
@@ -192,9 +237,26 @@ def _gate(
     numerator: int,
     denominator: int,
     threshold: float,
-    direction: str,
+    direction: GateDirection,
+    gate_name: str | None = None,
 ) -> dict[str, Any]:
-    """Apply the three-outcome rule to one ratio gate."""
+    """Apply the three-outcome rule to one ratio gate.
+
+    ``gate_name`` (the gate's key in ``_GATE_DIRECTION``) is reported
+    in the ``ValueError`` for an unknown direction. A well-typed
+    ``GateDirection`` can never be unknown — the runtime check fails
+    closed for a value that reached ``_gate`` untyped (no silent
+    "at_most" default; T7.28, ADR-0015)."""
+    if direction not in _GATE_DIRECTIONS:
+        # a well-typed GateDirection can never fail this check (mypy
+        # strict rejects any other value statically at the call site);
+        # the guard fails closed for a value that reached _gate
+        # untyped — it must NOT silently become a non-strict "at_most"
+        name = f"gate {gate_name!r}: " if gate_name is not None else ""
+        raise ValueError(
+            f"{name}unknown gate direction {direction!r} "
+            "(expected 'at_least', 'at_most' or 'below')"
+        )
     base: dict[str, Any] = {
         "numerator": numerator,
         "denominator": denominator,
@@ -206,7 +268,13 @@ def _gate(
     if denominator < MIN_SAMPLE:
         return {**base, "outcome": "insufficient_sample"}
     ratio = numerator / denominator
-    ok = ratio >= threshold if direction == "at_least" else ratio <= threshold
+    if direction == "at_least":
+        ok = ratio >= threshold
+    elif direction == "at_most":  # exactly at the threshold passes
+        ok = ratio <= threshold
+    else:  # "below" — the only remaining member of the closed set;
+        # strict: exactly at the threshold fails
+        ok = ratio < threshold
     return {**base, "ratio": round(ratio, 4), "outcome": "passed" if ok else "failed"}
 
 
@@ -246,6 +314,7 @@ async def _gate_new_e2(db: AsyncSession, run: EvaluationRun) -> dict[str, Any]:
         denominator=total,
         threshold=th,
         direction=_GATE_DIRECTION["new_supported_refuted_e2"],
+        gate_name="new_supported_refuted_e2",
     )
 
 
@@ -276,6 +345,7 @@ async def _gate_external_e3(db: AsyncSession, run: EvaluationRun) -> dict[str, A
         denominator=total,
         threshold=th,
         direction=_GATE_DIRECTION["external_temporal_e3"],
+        gate_name="external_temporal_e3",
     )
 
 
@@ -308,6 +378,7 @@ async def _gate_sessions(db: AsyncSession, run: EvaluationRun) -> dict[str, Any]
         denominator=total,
         threshold=th,
         direction=_GATE_DIRECTION["eligible_sessions_with_outcome"],
+        gate_name="eligible_sessions_with_outcome",
     )
 
 
@@ -330,10 +401,32 @@ async def _gate_near_dup(db: AsyncSession, run: EvaluationRun) -> dict[str, Any]
         denominator=selected,
         threshold=th,
         direction=_GATE_DIRECTION["near_duplicate_questions"],
+        gate_name="near_duplicate_questions",
     )
 
 
 async def _gate_reuse(db: AsyncSession, run: EvaluationRun) -> dict[str, Any]:
+    """§22.2 gate 5: ≥25% of significant claims are reused/REVERIFIED
+    across ≥2 distinct sessions. A claim is "touched" by a session via
+    one of five paths:
+
+    1. ``evidence.claim_id`` + ``evidence.created_in_session`` — the
+       session attached evidence to the claim (new or dedup-reused);
+    2. ``claim_revisions.claim_id`` + ``session_id`` — the session
+       revised the claim's value (dead in v1 — no writer, T7.33);
+    3. ``claim_dependencies.from_claim_id`` + ``created_in_session``;
+    4. ``claim_dependencies.to_claim_id`` + ``created_in_session``;
+    5. T7.34 (ADR-0018): ``claim_assessments.claim_id`` +
+       ``created_in_session`` — the REVERIFY path. The reverify of an
+       existing claim (a claim op carrying ``existing_claim_id``) is
+       recorded as a fresh assessment row bound to the reverifying
+       session (the verification moment, ADR-0017); the row exists
+       whether or not any evidence is new — a re-fetched identical
+       source collapses into the anchor's evidence row by identity
+       (§14.3), so the evidence path alone cannot see it. Only
+       session-created assessments are counted (worker/activation
+       rows have ``created_in_session IS NULL``).
+    """
     sql = f"""
         WITH cur AS (
           SELECT h.claim_id, a.effective_grade
@@ -363,6 +456,10 @@ async def _gate_reuse(db: AsyncSession, run: EvaluationRun) -> dict[str, Any]:
           SELECT to_claim_id, created_in_session FROM claim_dependencies
           WHERE to_claim_id IN (SELECT claim_id FROM significant)
             AND created_in_session IS NOT NULL
+          UNION
+          SELECT claim_id, created_in_session FROM claim_assessments
+          WHERE claim_id IN (SELECT claim_id FROM significant)
+            AND created_in_session IS NOT NULL
         ),
         per_claim AS (
           SELECT claim_id, count(DISTINCT created_in_session) AS n_sessions
@@ -378,26 +475,51 @@ async def _gate_reuse(db: AsyncSession, run: EvaluationRun) -> dict[str, Any]:
         denominator=total,
         threshold=th,
         direction=_GATE_DIRECTION["significant_claim_reuse"],
+        gate_name="significant_claim_reuse",
     )
 
 
-async def _gate_due_stale(db: AsyncSession, run: EvaluationRun) -> dict[str, Any]:
+async def _gate_due_stale(
+    db: AsyncSession, run: EvaluationRun, now: datetime
+) -> dict[str, Any]:
+    """T7.27 (ADR-0014): the §8.6/T3.7 freshness rule evaluated at the
+    gate-computation instant over ``reverify_after`` — the same rule as
+    ``packages.memory.freshness.freshness_status`` (``now <
+    reverify_after`` → fresh; ``now >= reverify_after`` → due; NULL →
+    no deadline by construction, T7.32/ADR-0017). T7.32 (ADR-0017):
+    the DENOMINATOR counts only the claims that CAN become due
+    (``reverify_after IS NOT NULL``) — a fixed-point claim (explicit
+    question date / dateless question with the model's as_of) has no
+    deadline and can never be due; including it would let the gate
+    pass by composition (more fixed-point claims) instead of by
+    freshness health. The stored ``claims.freshness_status`` column is
+    NOT read: it is a display cache updated only by write paths, and
+    the gate must not depend on whether a background reassessment
+    (triggered by an activation flip) ever ran (EVAL-4d: no flip, no
+    reassessment, the column stayed 'fresh' for 22/28 overdue claims
+    and the gate reported 0/28 passed)."""
     sql = f"""
-        SELECT count(*),
-               count(*) FILTER (WHERE c.freshness_status IN ('due', 'stale'))
+        SELECT count(*) FILTER (
+                 WHERE c.reverify_after IS NOT NULL
+             ),
+               count(*) FILTER (
+                 WHERE c.reverify_after IS NOT NULL
+                   AND c.reverify_after <= :now
+               )
         FROM claims c
         JOIN claim_assessment_heads h
           ON h.claim_id = c.id AND h.assessment_state = 'current'
              AND h.config_snapshot_id = {EFFECTIVE_SNAPSHOT_SQL}
         WHERE c.claim_type = 'temporal_fact'
     """
-    total, due_stale = await _two(db, sql, {})
+    total, due_stale = await _two(db, sql, {"now": now})
     th = float(run.thresholds.get("due_stale_time_sensitive", 0.20))
     return _gate(
         numerator=due_stale,
         denominator=total,
         threshold=th,
         direction=_GATE_DIRECTION["due_stale_time_sensitive"],
+        gate_name="due_stale_time_sensitive",
     )
 
 
@@ -430,6 +552,7 @@ async def _gate_slo(db: AsyncSession, run: EvaluationRun) -> dict[str, Any]:
         denominator=total,
         threshold=1.0,
         direction=_GATE_DIRECTION["reassessment_slo"],
+        gate_name="reassessment_slo",
     )
     gate["slo_seconds"] = float(slo)
     return gate
@@ -518,6 +641,7 @@ async def _gate_blind_provenance(
         denominator=len(blind),
         threshold=th,
         direction=_GATE_DIRECTION["blind_provenance_path"],
+        gate_name="blind_provenance_path",
     )
 
 
@@ -592,6 +716,7 @@ async def _gate_blind_scope(
         denominator=len(blind),
         threshold=th,
         direction=_GATE_DIRECTION["blind_scope"],
+        gate_name="blind_scope",
     )
 
 

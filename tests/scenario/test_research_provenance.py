@@ -329,6 +329,24 @@ async def test_rules_rejected_proposal_is_bounced_before_commit(
         executor=StubToolExecutor(tmp_path / "ws"),
         research_service=service,
     )
+    bad_answer = {
+        "content": {
+            "summary": "Утверждение о процессоре",
+            "claims": [
+                {
+                    "statement": "Страница утверждает квадратичный рост энергопотребления",
+                    # the EVAL-3b mistake: the claim type does not
+                    # allow source_assertion support evidence
+                    "claim_type": "local_observation",
+                    "scope": {"url": f"{origin.base}/page"},
+                }
+            ],
+            "evidence_links": [
+                {"evidence_index": 0, "claim_index": 0, "relation": "supports"}
+            ],
+            "new_questions": [],
+        }
+    }
     fake_llm.script(
         [
             {
@@ -347,24 +365,10 @@ async def test_rules_rejected_proposal_is_bounced_before_commit(
                     "decision": {"kind": "complete", "reason": "goal_reached"},
                 }
             },
-            {
-                "content": {
-                    "summary": "Утверждение о процессоре",
-                    "claims": [
-                        {
-                            "statement": "Страница утверждает квадратичный рост энергопотребления",
-                            # the EVAL-3b mistake: the claim type does not
-                            # allow source_assertion support evidence
-                            "claim_type": "local_observation",
-                            "scope": {"url": f"{origin.base}/page"},
-                        }
-                    ],
-                    "evidence_links": [
-                        {"evidence_index": 0, "claim_index": 0, "relation": "supports"}
-                    ],
-                    "new_questions": [],
-                }
-            },
+            bad_answer,
+            # T7.106 (ADR-0034 вариант C): ОДИН раунд исправления — идентичный ответ
+            # с той же запрещённой комбинацией отклоняется вторично
+            bad_answer,
         ]
     )
     try:
@@ -379,7 +383,7 @@ async def test_rules_rejected_proposal_is_bounced_before_commit(
     #    exact reason, before any staging op for it
     audit_row = await _row(
         scratch_url,
-        "SELECT payload->'curator_rejected_by_rules' FROM audit_events "
+        "SELECT payload->'curator_rejected_by_rules', payload ? 'correction_round' FROM audit_events "
         "WHERE type = :t AND payload->'curator_rejected_by_rules' IS NOT NULL "
         "AND session_id = (SELECT id FROM sessions ORDER BY created_at DESC LIMIT 1)",
         {"t": AuditEventType.SESSION_STATE_CHANGED.value},
@@ -388,6 +392,17 @@ async def test_rules_rejected_proposal_is_bounced_before_commit(
     reasons = audit_row[0]
     assert isinstance(reasons, list) and len(reasons) == 1
     assert "local_observation" in reasons[0] and "source_assertion" in reasons[0]
+
+    # T7.106: ровно один раунд исправления; финальный отказ несёт аддитивный ключ раунда
+    assert audit_row[1] is True
+    assert await _count(
+        scratch_url,
+        "SELECT count(*) FROM audit_events WHERE payload ? 'curator_correction_requested'",
+    ) == 1
+    assert (
+        sum(1 for r in fake_llm.requests() if "# Исправление предложения" in str(r.get("last_user", ""))) == 1
+    )
+    assert fake_llm.state()["queue_left"] == 0
 
     # 2) the commit boundary applied nothing: no claim, no head, no
     #    evidence — never a headless claim (the EVAL-3b poison)

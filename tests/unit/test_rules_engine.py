@@ -8,11 +8,15 @@ scopes keep the original key-by-key predicate."""
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 
-from packages.domain.models.enums import EffectiveGrade, EpistemicStatus
+from packages.domain.models.enums import (
+    ClaimDateAnchor,
+    EffectiveGrade,
+    EpistemicStatus,
+)
 from packages.memory.evidence import rules_hash
 from packages.memory.rules_engine import (
     ClaimTypeRule,
@@ -412,13 +416,43 @@ def test_rules_hash_is_stable_and_order_insensitive():
 
 
 def test_reverify_after_respects_volatility():
+    # T7.32 (ADR-0017): the deadline exists only for a claim about the
+    # PRESENT (anchor relative) and is the VERIFICATION MOMENT + the
+    # volatility window (never counted from as_of)
     rule_static = _rule(volatility="static")
     rule_config = _rule(volatility="configurable")
     now = datetime(2026, 9, 14, tzinfo=UTC)
     r_static = evaluate("computed_result", rule_static, {}, [_ev()], has_as_of=False)
     r_config = evaluate("computed_result", rule_config, {}, [_ev()], has_as_of=False)
-    assert reverify_after(r_static, None, now).day == 13  # 90 days
-    assert (reverify_after(r_static, None, now) - reverify_after(r_config, None, now)).days == 60
+    assert reverify_after(r_static, ClaimDateAnchor.RELATIVE, now).day == 13  # 90 days
+    assert (
+        reverify_after(r_static, ClaimDateAnchor.RELATIVE, now)
+        - reverify_after(r_config, ClaimDateAnchor.RELATIVE, now)
+    ).days == 60  # 90d vs 30d windows
+    # the base is the verification moment, not as_of: the same claim
+    # verified one day later gets a one-day-later deadline
+    assert (
+        reverify_after(r_config, ClaimDateAnchor.RELATIVE, now + timedelta(days=1))
+        - reverify_after(r_config, ClaimDateAnchor.RELATIVE, now)
+    ).days == 1
+
+
+def test_reverify_after_fixed_point_has_no_deadline():
+    # T7.32 (ADR-0017): a claim about a FIXED point (explicit question
+    # date / dateless question with the model's as_of) is immutable —
+    # later events cannot spoil it — so it has NO deadline (NULL,
+    # freshness evergreen), whatever the volatility. The "formal
+    # theorem stale after 90 days" and "Спутник 1957 due forever"
+    # classes are gone: no new volatility class is needed.
+    for anchor in (ClaimDateAnchor.EXPLICIT, ClaimDateAnchor.NONE):
+        for volatility in ("static", "configurable", "temporal"):
+            rule = _rule(volatility=volatility)
+            result = evaluate(
+                "computed_result", rule, {}, [_ev()], has_as_of=False
+            )
+            assert (
+                reverify_after(result, anchor, datetime(2026, 9, 14, tzinfo=UTC)) is None
+            )
 
 
 def test_attestation_is_not_an_input():

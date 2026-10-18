@@ -12,6 +12,7 @@ heads are not current evidence and not dependencies.
 
 from __future__ import annotations
 
+import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -58,7 +59,13 @@ from packages.memory.evidence import (
     session_environment_fields,
     source_assertion_identity,
 )
+from packages.memory.freshness import freshness_status
 from packages.memory.independence import registrable_domain
+from packages.memory.reverify import (
+    merge_reverify_scope,
+    resolve_reverify_reference,
+    reverify_as_of_audit,
+)
 from packages.memory.rules_engine import (
     ClaimTypeRule,
     EvaluatedEvidence,
@@ -66,7 +73,17 @@ from packages.memory.rules_engine import (
     evaluate,
     reverify_after,
 )
-from packages.memory.scope import derive_claim_scope, derive_evidence_scope
+from packages.memory.scope import (
+    EVIDENCE_SELF_PUBLICATION_KEY,
+    EVIDENCE_VALUE_ATTRIBUTION_KEY,
+    anchor_from_scope,
+    carry_value_attribution,
+    derive_claim_as_of,
+    derive_claim_scope,
+    derive_evidence_scope,
+    parse_self_publication,
+    parse_value_attribution,
+)
 from packages.memory.source_graph import build_source_independence_snapshot
 
 GLOBAL_SCOPE = "global"
@@ -76,6 +93,115 @@ def _dependency_dict(value: Any) -> JsonDict | None:
     """A JSONB element is native Python at runtime; guard non-dict values
     (a malformed staging payload must reject the edge, not raise)."""
     return value if isinstance(value, dict) else None
+
+
+#: T7.34 (ADR-0018): a hex prefix of a UUID — 8..31 chars (32+ without
+#: dashes is a full UUID; 7 or fewer is too short to be a reference).
+_CLAIM_REF_PREFIX_RE = re.compile(r"^[0-9a-f]{8,31}$")
+
+
+def _strip_claim_ref_pack(ref: str) -> str:
+    """T7.116 (часть в): снять хостовую упаковку ссылки на утверждение.
+
+    Формы конспекта контекст-пака — ``[c:<uuid>]`` и ``c:<uuid>`` — хост сам пишет
+    такие строки (``pack_claim_ids``), и оператор, передающий куратору
+    ``relied_claim_ids`` / ``existing_claim_id``, воспроизводит ровно их (стенд
+    53be7fd6: «unparseable claim reference» на «c:44bd1460-bb72-4521»). Снимаются
+    внешние скобки и метка ``c:`` (пробелы по краям — тоже); снимается ровно один
+    раз: «c:c:<uuid>» остаётся непарсируемым. Содержимое скобок без «c:» не
+    трогается — прежний отказ. После этого разбор прежний (T7.34): полный uuid или
+    однозначный hex-префикс; наборы ошибок и их тексты не изменены.
+    """
+
+    ref = ref.strip()
+    if ref.startswith("[") and ref.endswith("]"):
+        inner = ref[1:-1].strip()
+        if inner.lower().startswith("c:"):
+            return inner[2:].strip()
+        return ref
+    if ref.lower().startswith("c:"):
+        return ref[2:].strip()
+    return ref
+
+
+def resolve_claim_reference(
+    raw: str, visible_ids: list[uuid.UUID]
+) -> tuple[uuid.UUID | None, str | None]:
+    """T7.34 (ADR-0018): resolve the model's reference to an EXISTING
+    claim against the claims visible to the session.
+
+    ``raw`` is the model's free-form string (``ClaimProposal.
+    existing_claim_id``). The id is host-issued; the model only
+    REFERENCEs it (the invariant «id генерирует хост»). Resolution is
+    STRICT fail-closed — every failure returns a clear reason, never a
+    silent drop:
+
+    - a full UUID (canonical form, or 32 hex without dashes) is
+      accepted ONLY when it is in ``visible_ids``;
+    - a hex prefix (the model has truncated UUIDs — curator_error,
+      EVAL-4d pack 7) is accepted ONLY when it is UNAMBIGUOUS among
+      ``visible_ids`` (exactly one match); dashes in the reference are
+      ignored (a truncated canonical form keeps its dash);
+    - anything else → a parse problem.
+
+    ``visible_ids`` is the session's knowledge set at the resolution
+    point (curator boundary: the context pack's ``[c:<uuid>]`` lines;
+    commit boundary: the claims with a head in the session's snapshot —
+    the T7.9 dedup condition).
+
+    T7.116 (часть в): leading pack packaging ``c:`` / ``[c:…]`` is stripped before
+    parsing (see ``_strip_claim_ref_pack``); everything else about resolution is
+    unchanged.
+    """
+    ref = _strip_claim_ref_pack(str(raw)).lower()
+    nodash = ref.replace("-", "")
+    try:
+        full = uuid.UUID(ref)
+    except ValueError:
+        full = None
+    if full is not None:
+        if full in visible_ids:
+            return full, None
+        return None, f"claim {full} is not visible to the session"
+    if _CLAIM_REF_PREFIX_RE.match(nodash):
+        candidates = [c for c in visible_ids if str(c).replace("-", "").startswith(nodash)]
+        if len(candidates) == 1:
+            return candidates[0], None
+        if not candidates:
+            return None, f"no visible claim matches prefix {nodash[:16]}…"
+        return None, f"prefix {nodash[:16]}… is ambiguous among {len(candidates)} visible claims"
+    return None, f"unparseable claim reference {str(raw)[:20]!r}"
+
+
+async def _head_assessed_scope(
+    db: AsyncSession, claim_id: uuid.UUID, config_snapshot_id: uuid.UUID
+) -> JsonDict | None:
+    """The assessed scope of the claim's CURRENT head in this config
+    snapshot (T7.73, ADR-0018 уточнение): the persisted reference date and
+    its ``date_anchor`` — the same seam the reassessment worker reads when
+    there is no question to re-derive from (T7.32/ADR-0017).
+
+    None when the head has no current assessment (pending/invalid): there
+    is nothing to carry over, and the caller keeps the old behaviour."""
+    return (
+        (
+            await db.execute(
+                select(ORMClaimAssessment.assessed_scope)
+                .where(
+                    ORMClaimAssessment.id
+                    == (
+                        select(ORMClaimAssessmentHead.current_assessment_id)
+                        .where(
+                            ORMClaimAssessmentHead.claim_id == claim_id,
+                            ORMClaimAssessmentHead.config_snapshot_id == config_snapshot_id,
+                        )
+                        .scalar_subquery()
+                    )
+                )
+            )
+        )
+        .scalar_one_or_none()
+    )
 
 
 def find_evidential_cycles(
@@ -119,6 +245,9 @@ def find_evidential_cycles(
 class MemoryApplyResult:
     claims_created: int = 0
     claims_reused: int = 0
+    #: T7.34 (ADR-0018): existing claims reverified by id — no new row,
+    #: the record is the fresh assessment (the session's moment)
+    claims_reverified: int = 0
     evidence_added: int = 0
     evidence_deduped: int = 0
     assessments: int = 0
@@ -178,12 +307,9 @@ class MemoryService:
 
     def freshness_status(self, claim: ORMClaim, now: datetime) -> FreshnessStatus:
         """Expiry changes ONLY the freshness status (T3.7, §8.6) — never
-        the grade or confidence. valid_to=NULL means an open end."""
-        if claim.reverify_after is None:
-            return FreshnessStatus.UNKNOWN
-        if now < claim.reverify_after:
-            return FreshnessStatus.FRESH
-        return FreshnessStatus.DUE
+        the grade or confidence. Delegates to the pure rule
+        (``packages.memory.freshness``), the single source of truth."""
+        return freshness_status(claim.reverify_after, now)
 
     # ── T7.9: pre-commit proposal validation (EVAL-3b post-mortem P.2) ───
 
@@ -268,7 +394,16 @@ class MemoryService:
                         ORMStagingOp.op.in_(("claim", "evidence")),
                         ORMStagingOp.state == "recorded",
                     )
-                    .order_by(ORMStagingOp.created_at, ORMStagingOp.id)
+                    # T7.24 (EVAL-4 abort 2026-09-21): RECORDING order —
+                    # the claim_index of the evidence links is a position
+                    # in the curator proposal. created_at is the constant
+                    # start of the long phase-1 transaction (now()), so
+                    # (created_at, id) is random UUID order and silently
+                    # scrambled the claim→evidence mapping (a claim
+                    # received support evidence of a disallowed kind →
+                    # RuleValidationError in the fenced final tx, session
+                    # left committing with a prepared attempt).
+                    .order_by(ORMStagingOp.seq)
                 )
             )
             .scalars()
@@ -281,7 +416,14 @@ class MemoryService:
 
         now = datetime.now(UTC)
         problems: list[str] = []
-        counters = {"created": 0, "reused": 0, "added": 0, "deduped": 0, "assessments": 0}
+        counters = {
+            "created": 0,
+            "reused": 0,
+            "reverified": 0,
+            "added": 0,
+            "deduped": 0,
+            "assessments": 0,
+        }
 
         # T7.17 (§3.7, §11.2): the question the session answers is the
         # trusted scope anchor (host input). The model's free-form
@@ -299,6 +441,14 @@ class MemoryService:
         # covered by same-session evidence, and a session that crosses
         # midnight does not re-anchor the reference date behind the
         # evidence it already fetched.
+        # T7.30 (ADR-0016): the SAME host derivation is the base of
+        # the claim row's as_of (the base date of reverify_after,
+        # §8.6/§22.2) — not just of the scope. The model's typed
+        # as_of is an audit-only value (staging payload + audit)
+        # whenever the question carries a date anchor (explicit or
+        # relative); only a dateless question keeps the model's
+        # value (the fallback). One function (derive_claim_as_of) —
+        # the same rule, no copied logic.
         question_text: str | None = None
         if session.question_id is not None:
             question_row = await db.get(ORMQuestion, session.question_id)
@@ -325,21 +475,153 @@ class MemoryService:
         env_hash = manifest_content_hash(env_fields)
         env = await self._environment_manifest(db, env_hash, env_fields)
 
-        # 1. claims (exact statement+type dedup against the corpus)
-        claims: list[ORMClaim] = []
+        # 1. claims (exact statement+type dedup against the corpus;
+        #    T7.34/ADR-0018: + reverify of an existing claim by
+        #    host-issued id). A rejected op keeps its index in
+        #    ``claims`` as a None placeholder — the evidence-link
+        #    claim_index refers to the proposal's position, so the
+        #    indices must stay aligned (T7.24).
+        claims: list[ORMClaim | None] = []
         claim_scopes: dict[uuid.UUID, JsonDict] = {}
         claim_deps: list[tuple[ORMClaim, list[Any]]] = []
+        # T7.34 (ADR-0018): the reverify reference set at the commit
+        # boundary — the claims with a head in THIS session's snapshot
+        # (the T7.9 dedup condition). Fetched once, lazily.
+        reverify_visible: list[uuid.UUID] | None = None
         for row in claim_ops:
             payload = dict(row.payload)
             statement = str(payload.get("statement", ""))[:2000]
             claim_type = str(payload.get("claim_type", ""))
             if not statement or claim_type not in self._rules:
                 problems.append(f"claim staging rejected: bad statement/type ({row.id})")
+                claims.append(None)
+                continue
+            raw_ref = payload.get("existing_claim_id")
+            if raw_ref is not None:
+                if reverify_visible is None:
+                    reverify_visible = list(
+                        (
+                            await db.execute(
+                                select(ORMClaim.id).where(
+                                    exists(
+                                        select(ORMClaimAssessmentHead.claim_id).where(
+                                            ORMClaimAssessmentHead.claim_id == ORMClaim.id,
+                                            ORMClaimAssessmentHead.config_snapshot_id
+                                            == session.config_snapshot_id,
+                                        )
+                                    )
+                                )
+                            )
+                        )
+                        .scalars()
+                        .all()
+                    )
+                ref_id, ref_problem = resolve_claim_reference(
+                    str(raw_ref), reverify_visible
+                )
+                if ref_problem is not None:
+                    # fail-closed: a clear reason in the commit audit
+                    # (problems), never a silent drop
+                    problems.append(
+                        f"claim staging rejected: reverify reference {ref_problem} ({row.id})"
+                    )
+                    claims.append(None)
+                    continue
+                target_claim = await db.get(ORMClaim, ref_id)
+                if target_claim is None:
+                    problems.append(
+                        f"claim staging rejected: reverify target vanished ({row.id})"
+                    )
+                    claims.append(None)
+                    continue
+                # T7.34 (ADR-0018): the reverify attaches to the
+                # EXISTING claim — no new row, the statement/type are
+                # the anchor's (the model's restatement is audit-only,
+                # a revision of the value is claim_revisions, not this).
+                # The reverify RECORD is the fresh assessment row
+                # created in step 3 (created_in_session = this session
+                # — the verification moment); it exists whether or not
+                # any evidence is new (a re-fetched identical source
+                # reuses the anchor's evidence row by identity — the
+                # trap ADR-0018 documents, so the record must not be
+                # the evidence).
+                as_of_raw = payload.get("as_of")
+                model_as_of = datetime.fromisoformat(as_of_raw) if as_of_raw else None
+                # T7.73 (ADR-0018 уточнение): a reverify that carries no date of
+                # its own must NOT erase the anchor's established reference
+                # date — the old blind overwrite dropped an E3 supported claim
+                # to E1 with the single rules-engine reason "as_of_missing".
+                existing_as_of = target_claim.as_of
+                existing_scope = await _head_assessed_scope(
+                    db, target_claim.id, session.config_snapshot_id
+                )
+                reference = resolve_reverify_reference(
+                    question=question_text,
+                    proposal_as_of=model_as_of,
+                    session_date=session_date,
+                    existing_as_of=existing_as_of,
+                    existing_scope=existing_scope,
+                )
+                rv_deps = payload.get("dependencies")
+                rv_deps_list: list[Any] = list(rv_deps) if isinstance(rv_deps, list) else []
+                target_claim.as_of = reference.as_of
+                claim_scopes[target_claim.id] = merge_reverify_scope(
+                    question_scope=derive_claim_scope(
+                        question=question_text,
+                        as_of=model_as_of,
+                        session_date=session_date,
+                    ),
+                    existing_scope=existing_scope,
+                    reference=reference,
+                )
+                counters["reverified"] += 1
+                claim_deps.append((target_claim, rv_deps_list))
+                claims.append(target_claim)
+                await audit.record(
+                    AuditEventType.CLAIM_REVERIFIED,
+                    session_id=session.id,
+                    payload={
+                        "claim_id": str(target_claim.id),
+                        "reference": str(raw_ref)[:36],
+                        "resolved": str(ref_id),
+                        "statement": statement[:500],
+                        "as_of": (
+                            model_as_of.isoformat() if model_as_of is not None else None
+                        ),
+                        "assessed_as_of": (
+                            reference.as_of.isoformat()
+                            if reference.as_of is not None
+                            else None
+                        ),
+                        "date_anchor": reference.anchor.value,
+                        # T7.73: what happened to the anchor's own date —
+                        # kept, moved by the question, or proposed and refused
+                        **reverify_as_of_audit(reference, existing_as_of=existing_as_of),
+                    },
+                    public_summary=f"reverify: {statement[:120]}",
+                )
                 continue
             # T7.17: the model's free-form scope proposal (untrusted;
             # audit/staging only) vs the host-derived assessed scope
             model_scope = dict(payload.get("scope") or {})
+            # T7.30 (ADR-0016): the model's typed as_of (audit-only
+            # with a date anchor) vs the HOST-DERIVED reference
+            # datetime stored on the claim row. The derivation is the
+            # same function the claim scope uses (T7.17/T7.18,
+            # ADR-0007; ADR-0016): explicit question date > relative
+            # form → session start (host clock, UTC) > model's as_of
+            # (dateless question fallback). T7.32 (ADR-0017): the same
+            # function also returns the ANCHOR of the branch that won
+            # (explicit / relative / none) — one function, one source
+            # of truth; it decides whether the claim gets a reverify
+            # deadline at all (only ``relative`` does), and the anchor
+            # is persisted in the claim scope (``date_anchor``) so the
+            # reassessment worker can apply the same rule.
             as_of_raw = payload.get("as_of")
+            model_as_of = datetime.fromisoformat(as_of_raw) if as_of_raw else None
+            host_ref = derive_claim_as_of(
+                question=question_text, as_of=model_as_of, session_date=session_date
+            )
             deps = payload.get("dependencies")
             deps_list: list[Any] = list(deps) if isinstance(deps, list) else []
             # cross-lingual search index (ADR-0006 rev): host-trusted —
@@ -377,10 +659,39 @@ class MemoryService:
             )
             if existing_claim is not None:
                 claims.append(existing_claim)
-                claim_scopes[existing_claim.id] = derive_claim_scope(
+                # T7.30 (ADR-0016): the reference date of the claim
+                # row is RE-DERIVED from the CURRENT session's
+                # question on every commit — the same re-derivation
+                # the scope gets: the claim is asserted for the date
+                # THIS question anchors (the relative claim is
+                # "the state on THIS session's date", ADR-0007
+                # T7.18), so reverify_after (recomputed below from
+                # the question's date anchor, T7.32/ADR-0017) never
+                # rests on a stale or model value.
+                # T7.73 (ADR-0018 уточнение): re-derivation is not
+                # erasure. When this session carries no date of its own,
+                # the claim keeps the reference date it was established
+                # with (and its persisted date anchor) instead of being
+                # nulled into "as_of_missing".
+                reuse_scope = await _head_assessed_scope(
+                    db, existing_claim.id, session.config_snapshot_id
+                )
+                reuse_reference = resolve_reverify_reference(
                     question=question_text,
-                    as_of=existing_claim.as_of,
+                    proposal_as_of=model_as_of,
                     session_date=session_date,
+                    existing_as_of=existing_claim.as_of,
+                    existing_scope=reuse_scope,
+                )
+                existing_claim.as_of = reuse_reference.as_of
+                claim_scopes[existing_claim.id] = merge_reverify_scope(
+                    question_scope=derive_claim_scope(
+                        question=question_text,
+                        as_of=model_as_of,
+                        session_date=session_date,
+                    ),
+                    existing_scope=reuse_scope,
+                    reference=reuse_reference,
                 )
                 counters["reused"] += 1
                 claim_deps.append((existing_claim, deps_list))
@@ -390,7 +701,10 @@ class MemoryService:
                     statement=statement,
                     search_statements=search_statements,
                     claim_type=claim_type,
-                    as_of=datetime.fromisoformat(as_of_raw) if as_of_raw else None,
+                    # T7.30 (ADR-0016): the HOST-DERIVED reference
+                    # date — not the model's typed as_of (audit-only
+                    # with a date anchor; see above)
+                    as_of=host_ref.as_of,
                     observed_at=now,
                     created_in_session=session.id,
                 )
@@ -416,6 +730,19 @@ class MemoryService:
                         # host-derived scope the rules engine checks
                         "scope": model_scope,
                         "assessed_scope": claim_scopes[claim.id],
+                        # T7.30 (ADR-0016): the model's typed as_of
+                        # (audit-only) vs the host-derived reference
+                        # date stored on the claim row
+                        "as_of": model_as_of.isoformat() if model_as_of is not None else None,
+                        "assessed_as_of": (
+                            host_ref.as_of.isoformat()
+                            if host_ref.as_of is not None
+                            else None
+                        ),
+                        # T7.32 (ADR-0017): the anchor of the branch
+                        # that produced the reference date (the
+                        # deadline decision, audit-trail form)
+                        "date_anchor": host_ref.anchor.value,
                     },
                     public_summary=f"claim: {statement[:120]}",
                 )
@@ -548,7 +875,9 @@ class MemoryService:
                 )
 
         # 2. evidence (identity recomputed by the trusted host)
-        linked: dict[uuid.UUID, list[ORMEvidence]] = {c.id: [] for c in claims}
+        linked: dict[uuid.UUID, list[ORMEvidence]] = {
+            c.id: [] for c in claims if c is not None
+        }
         for row in evidence_ops:
             payload = dict(row.payload)
             index = int(payload.get("evidence_index", -1))
@@ -564,7 +893,16 @@ class MemoryService:
                 problems.append(f"evidence staging rejected: bad relation {relation!r} ({row.id})")
                 continue
             record = evidence_records[index]
-            claim = claims[claim_index]
+            linked_claim = claims[claim_index]
+            if linked_claim is None:
+                # T7.34 (ADR-0018): the claim op at this index was
+                # rejected (e.g. an unresolvable reverify reference) —
+                # its evidence links are rejected too, with a clear
+                # reason; the indices stay aligned with the proposal
+                problems.append(
+                    f"evidence staging rejected: claim op {claim_index} was rejected ({row.id})"
+                )
+                continue
             kind = str(record.kind.value)
             identity, artifact_id = await self._identity_for(db, record, kind, env_hash)
             if artifact_id is None and kind in (
@@ -575,11 +913,22 @@ class MemoryService:
             ):
                 problems.append(f"evidence staging rejected: no artifact for {kind} ({row.id})")
                 continue
+            # source provenance (source_assertion / quote_integrity):
+            # the host-verified sources row the assertion was read
+            # from — drives the source-independence groups (§11.3)
+            rec_source_id: uuid.UUID | None = None
+            if kind in ("source_assertion", "quote_integrity"):
+                raw_sid = getattr(record, "source_id", None)
+                if raw_sid:
+                    try:
+                        rec_source_id = uuid.UUID(str(raw_sid))
+                    except ValueError:
+                        rec_source_id = None
             existing_ev = (
                 (
                     await db.execute(
                         select(ORMEvidence).where(
-                            ORMEvidence.claim_id == claim.id,
+                            ORMEvidence.claim_id == linked_claim.id,
                             ORMEvidence.evidence_kind == kind,
                             ORMEvidence.identity_hash == identity,
                         )
@@ -591,35 +940,62 @@ class MemoryService:
             if existing_ev is not None:
                 ev: ORMEvidence = existing_ev
                 counters["deduped"] += 1
+                # T7.78 (ADR-0029): то же доказательство того же утверждения, перечитанное
+                # позже, может получить решение о происхождении значения — оно дописывается
+                # к уже существующей строке (дедуп не должен терять факт происхождения)
+                if rec_source_id is not None and parse_value_attribution(ev.scope) is None:
+                    decision = parse_value_attribution(payload)
+                    if (
+                        decision is not None
+                        and decision.parent_source_id != str(rec_source_id)
+                    ):
+                        merged = dict(ev.scope or {})
+                        merged[EVIDENCE_VALUE_ATTRIBUTION_KEY] = decision.as_scope()
+                        ev.scope = merged
+                    elif parse_self_publication(ev.scope) is None:
+                        # T7.104 (ADR-0035 §19 дополнение): то же дописывание для ключа
+                        # собственной публикации — существующая запись не перезаписывается,
+                        # два ключа на одной улике не соседствуют (решение детектора одно)
+                        publication = parse_self_publication(payload)
+                        if publication is not None:
+                            merged = dict(ev.scope or {})
+                            merged[EVIDENCE_SELF_PUBLICATION_KEY] = publication.as_scope()
+                            ev.scope = merged
             else:
-                # source provenance (source_assertion / quote_integrity):
-                # the host-verified sources row the assertion was read
-                # from — drives the source-independence groups (§11.3)
-                rec_source_id: uuid.UUID | None = None
-                if kind in ("source_assertion", "quote_integrity"):
-                    raw_sid = getattr(record, "source_id", None)
-                    if raw_sid:
-                        try:
-                            rec_source_id = uuid.UUID(str(raw_sid))
-                        except ValueError:
-                            rec_source_id = None
-                    if rec_source_id is None:
-                        problems.append(
-                            f"evidence staging rejected: no source provenance for {kind} ({row.id})"
-                        )
-                        continue
+                if kind in ("source_assertion", "quote_integrity") and rec_source_id is None:
+                    problems.append(
+                        f"evidence staging rejected: no source provenance for {kind} ({row.id})"
+                    )
+                    continue
+                # T7.17: the evidence scope is derived by the host from the row's
+                # provenance, not copied from the claim's (model) scope. T7.78 adds the
+                # host-authored origin of the VALUE (staging payload → scope); it is not
+                # part of the identity and is carried across later re-derivations.
+                ev_scope = await self._derive_evidence_scope(
+                    db, source_id=rec_source_id, fallback_at=now
+                )
+                decision = parse_value_attribution(payload)
+                if (
+                    decision is not None
+                    and rec_source_id is not None
+                    and decision.parent_source_id != str(rec_source_id)
+                ):
+                    ev_scope[EVIDENCE_VALUE_ATTRIBUTION_KEY] = decision.as_scope()
+                elif rec_source_id is not None:
+                    # T7.104 (ADR-0035 §19 дополнение): хостовое решение о собственной
+                    # публикации производителя переносится из staging-payload в скоуп улики
+                    # тем же способом, что value_attribution; строку источника не трогаем —
+                    # запись не склейка, группировка и оценки её не читают
+                    publication = parse_self_publication(payload)
+                    if publication is not None:
+                        ev_scope[EVIDENCE_SELF_PUBLICATION_KEY] = publication.as_scope()
                 ev = ORMEvidence(
                     id=uuid.uuid4(),
-                    claim_id=claim.id,
+                    claim_id=linked_claim.id,
                     relation=relation,
                     evidence_kind=kind,
                     identity_hash=identity,
-                    # T7.17: the evidence scope is derived by the host
-                    # from the row's provenance, not copied from the
-                    # claim's (model) scope
-                    scope=await self._derive_evidence_scope(
-                        db, source_id=rec_source_id, fallback_at=now
-                    ),
+                    scope=ev_scope,
                     source_id=rec_source_id,
                     chunk_id=getattr(record, "chunk_id", None),
                     observation_artifact_id=artifact_id,
@@ -630,14 +1006,30 @@ class MemoryService:
                 )
                 db.add(ev)
                 counters["added"] += 1
-            if ev not in linked[claim.id]:
-                linked[claim.id].append(ev)
+            if ev not in linked[linked_claim.id]:
+                linked[linked_claim.id].append(ev)
 
-        # 3. assessment per claim (rules engine is the only producer, §3.7)
-        for claim in claims:
+        # 3. assessment per claim (rules engine is the only producer,
+        # §3.7). T7.34 (ADR-0018): a reverified claim goes through the
+        # SAME path as a created/reused one — one fresh assessment row
+        # (created_in_session = this session) is the reverify record;
+        # the deadline rule (T7.32/ADR-0017) is the single
+        # ``reverify_after`` call in _assess — a confirmed reverify of
+        # a relative-anchored claim shifts it to this verification
+        # moment, an evergreen claim stays deadline-less (no copied
+        # logic). Rejected ops (None) are skipped; a claim reached by
+        # two ops (dedup + reverify of the same target) is assessed
+        # ONCE — one verification moment per claim per commit.
+        assessed_ids: set[uuid.UUID] = set()
+        for assess_claim in claims:
+            if assess_claim is None or assess_claim.id in assessed_ids:
+                continue
+            assessed_ids.add(assess_claim.id)
             all_evidence = list(
                 (
-                    await db.execute(select(ORMEvidence).where(ORMEvidence.claim_id == claim.id))
+                    await db.execute(
+                        select(ORMEvidence).where(ORMEvidence.claim_id == assess_claim.id)
+                    )
                 )
                 .scalars()
                 .all()
@@ -650,16 +1042,25 @@ class MemoryService:
             # coverage must not depend on which keys the model once
             # invented for the same subject and date
             for ev_row in all_evidence:
-                expected = await self._derive_evidence_scope(
-                    db,
-                    source_id=ev_row.source_id,
-                    fallback_at=ev_row.created_at or now,
+                expected = carry_value_attribution(
+                    ev_row.scope,
+                    await self._derive_evidence_scope(
+                        db,
+                        source_id=ev_row.source_id,
+                        fallback_at=ev_row.created_at or now,
+                    ),
                 )
                 if dict(ev_row.scope or {}) != expected:
                     ev_row.scope = expected
             try:
                 ok = await self._assess(
-                    db, audit, session, claim, claim_scopes.get(claim.id, {}), all_evidence, now
+                    db,
+                    audit,
+                    session,
+                    assess_claim,
+                    claim_scopes.get(assess_claim.id, {}),
+                    all_evidence,
+                    now,
                 )
             except RuleValidationError:
                 # T7.9 (EVAL-3b post-mortem P.2, §14.1): a rules engine
@@ -679,6 +1080,7 @@ class MemoryService:
         return MemoryApplyResult(
             claims_created=counters["created"],
             claims_reused=counters["reused"],
+            claims_reverified=counters["reverified"],
             evidence_added=counters["added"],
             evidence_deduped=counters["deduped"],
             assessments=counters["assessments"],
@@ -939,9 +1341,20 @@ class MemoryService:
             head.epistemic_status = result.epistemic_status.value
             head.prepared_by = "session"
 
-        # freshness: reverify_after is derived, not a mutable clock
-        claim.reverify_after = reverify_after(result, claim.as_of, now)
-        claim.freshness_status = FreshnessStatus.FRESH.value
+        # freshness: reverify_after is derived, not a mutable clock.
+        # T7.32 (ADR-0017): the deadline exists ONLY for a claim about
+        # the present — the question's date anchor (persisted in the
+        # claim scope as ``date_anchor`` by derive_claim_as_of, the
+        # same call that produced claim.as_of, T7.30/ADR-0016) is
+        # ``relative``; then reverify_after = the verification moment
+        # + the volatility window (never counted from as_of). A claim
+        # about a fixed point (explicit question date / dateless
+        # question with the model's as_of) is immutable: NULL
+        # reverify_after, freshness ``evergreen``. The stored status
+        # follows the §8.6/T3.7 rule (T7.27, ADR-0014: never an
+        # unconditional FRESH).
+        claim.reverify_after = reverify_after(result, anchor_from_scope(claim_scope), now)
+        claim.freshness_status = self.freshness_status(claim, now).value
 
         await db.flush()
         await audit.record(
@@ -955,6 +1368,8 @@ class MemoryService:
                 "confidence": result.confidence,
                 "reasons": list(result.reasons),
                 "rules_hash": self._rules_hash,
+                # T7.78 (ADR-0029): поуровневое происхождение значения этих улик
+                "value_attributions": _value_attribution_summary(all_evidence),
                 "environment_independence_snapshot_id": (
                     str(env_snapshot_id) if env_snapshot_id is not None else None
                 ),
@@ -1083,6 +1498,25 @@ class MemoryService:
             if claim is not None:
                 claims.append(claim)
         return claims
+
+
+def _value_attribution_summary(evidence: list[ORMEvidence]) -> list[JsonDict]:
+    """T7.78 (аддитивное поле аудита): по каким уликам этой оценки значение прочитано как
+    пересказ первоисточника. Детерминированно (сортировка), только уже записанные решения —
+    никаких новых типов событий и никакого влияния на оценку здесь нет."""
+    rows: list[JsonDict] = []
+    for e in evidence:
+        decision = parse_value_attribution(e.scope)
+        if decision is None or e.source_id is None:
+            continue
+        rows.append(
+            {
+                "source_id": str(e.source_id),
+                "primary_name": decision.primary_name,
+                "method": decision.method,
+            }
+        )
+    return sorted(rows, key=lambda row: (row["source_id"], row["primary_name"]))
 
 
 def _evidence_set_hash(evidence: list[ORMEvidence]) -> str:

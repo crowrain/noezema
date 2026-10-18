@@ -172,6 +172,21 @@ class LeaseHeartbeatGuard:
     advances at the step boundary. If a renewal is refused (phase deadline
     passed), ``LeaseLost`` is raised at guard exit and the caller aborts;
     the fenced commit / reconciler remain the final gate.
+
+    T7.47b (flake ``test_slow_llm_does_not_lose_commit_lease`` under xdist,
+    measured): the renewal runs in a CHILD task, and ``__aexit__`` DRAINS
+    an in-flight renewal to completion instead of cancelling it mid-
+    execute. A cancel landing inside the heartbeat's ``db.execute`` on the
+    caller's shared session leaves it needing a rollback the guard cannot
+    perform (the caller's transaction is in flight) — the caller then
+    trips ``PendingRollbackError`` on its next statement and the phase-1
+    transaction dies (reproduced deterministically: a mid-execute task
+    cancel on a shared ``AsyncSession`` always poisons it; CPU contention
+    under xdist only widens the ~ms execute window). Semantics unchanged:
+    same renewals, same ``LeaseLost`` at exit, fenced commit still the
+    gate; the exit may let one in-flight renewal finish (a lease
+    extension a few ms later — exactly what the next scheduled renewal
+    would have done).
     """
 
     def __init__(
@@ -187,6 +202,7 @@ class LeaseHeartbeatGuard:
         self._owner = owner
         self._interval = lease.ttl.total_seconds() / 3
         self._task: asyncio.Task[None] | None = None
+        self._renewal: asyncio.Task[None] | None = None
         self._lost = False
 
     async def __aenter__(self) -> LeaseHeartbeatGuard:
@@ -195,9 +211,22 @@ class LeaseHeartbeatGuard:
 
     async def __aexit__(self, exc_type: object, exc: object, tb: object) -> bool:
         assert self._task is not None
+        # T7.47b: canceling the LOOP task is safe (it only ever sleeps or
+        # waits on the detached renewal child); the in-flight renewal is
+        # then drained to completion on the shared session — never
+        # cancelled mid-execute (see class docstring).
         self._task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await self._task
+        renewal = self._renewal
+        self._renewal = None
+        if renewal is not None and not renewal.done():
+            try:
+                await renewal
+            except LeaseLost:
+                self._lost = True
+            except Exception:  # infra error: the fenced commit is the gate
+                pass
         self._task = None
         if self._lost:
             raise LeaseLost(f"lease lost during long operation for session {self._session_id}")
@@ -206,12 +235,25 @@ class LeaseHeartbeatGuard:
     async def _renew_loop(self) -> None:
         while True:
             await asyncio.sleep(self._interval)
+            # T7.47b: the heartbeat runs in a CHILD task (nobody cancels
+            # it): a cancel of the loop task must not land inside the
+            # heartbeat's execute on the caller's shared session — that
+            # would poison the session (PendingRollbackError for the
+            # caller). __aexit__ drains the child to completion.
+            renewal = asyncio.create_task(self._heartbeat_once())
+            self._renewal = renewal
             try:
-                # the guard task only runs while the main coroutine awaits
-                # the long operation — the session is not used concurrently
-                await self._lease.heartbeat(self._db, self._session_id, self._owner, progress=False)
+                await asyncio.shield(renewal)
+            except asyncio.CancelledError:
+                # the guard is stopping; __aexit__ drains the renewal
+                return
             except LeaseLost:
                 self._lost = True
                 return
             except Exception:  # infra error: keep trying; the fenced commit is the gate
                 continue
+
+    async def _heartbeat_once(self) -> None:
+        # the guard task only runs while the main coroutine awaits the
+        # long operation — the session is not used concurrently
+        await self._lease.heartbeat(self._db, self._session_id, self._owner, progress=False)

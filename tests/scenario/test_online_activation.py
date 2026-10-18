@@ -471,8 +471,13 @@ async def test_online_active_session_blocks_acquire(
             await _seed_session(db, state="exploring")
 
         payload = _rules_payload(computed_result={"min_grade_for_supported": "E3"})
+        # T7.26: an active session holds the drain — the activation waits
+        # the bounded drain (pinned small here), cancels the intent and
+        # fails; the slot is cleared and the candidate stays draft.
         with pytest.raises(act.ActivationError, match="active sessions"):
-            await _run_online(engine, payload)
+            await _run_online(
+                engine, payload, drain_wait_seconds=1, drain_poll_seconds=0.1
+            )
         assert (await _slot(engine))["activating"] is None
 
         async with factory() as db, db.begin():

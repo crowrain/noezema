@@ -227,10 +227,15 @@ async def test_invalid_plan_falls_back_to_template(
         {"t": AuditEventType.PLAN_FALLBACK.value, "s": str(outcome.session_id)},
     )
     assert fb is not None and fb[0] == "schema_invalid"
+    # T7.79: здесь единственный шаг — python.execute, улики не создаются, и хост отклоняет
+    # предложение куратора целиком (`evidence_link[0]: index 0 out of range`). Сессия при этом
+    # завершена успешно, но знание не применено: terminal вопроса больше не «verified» —
+    # прежнее expectation закрепляло как раз машину состояний, которая врёт при нуле утверждений.
+    assert outcome.claims_proposed == 0
     state = (
         await _scalar(scratch_url, "SELECT state FROM questions WHERE id = :id", {"id": str(qid)})
     )[0]
-    assert state == "verified"
+    assert state == "partially_answered"
 
 
 async def test_overbudget_plan_falls_back(

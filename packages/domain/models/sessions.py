@@ -75,6 +75,10 @@ class ORMModelRun(Base):
     context_manifest_hash: Mapped[str | None] = mapped_column(Text)
     context_manifest_artifact_id: Mapped[uuid.UUID | None] = mapped_column(Uuid)
     prompt_version: Mapped[str | None] = mapped_column(Text)
+    # T7.35 (ADR-0019): sha256 of the prompt file content actually sent
+    # to the model — the payload's content pin, recorded per call
+    # (prompt_version alone is a label, not the content).
+    prompt_sha256: Mapped[str | None] = mapped_column(Text)
     tool_schema_hash: Mapped[str | None] = mapped_column(Text)
     input_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     output_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

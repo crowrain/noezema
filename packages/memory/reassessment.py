@@ -61,7 +61,6 @@ from packages.domain.models.enums import (
     AssessmentState,
     AuditEventType,
     AuditVisibility,
-    FreshnessStatus,
     QuestionOrigin,
     ReassessmentJobStatus,
 )
@@ -81,6 +80,7 @@ from packages.memory.env_independence import (
     build_environment_independence_snapshot,
 )
 from packages.memory.evidence import rules_hash
+from packages.memory.freshness import freshness_status
 from packages.memory.rules_engine import (
     RULES_ENGINE_VERSION,
     EvaluatedEvidence,
@@ -88,6 +88,7 @@ from packages.memory.rules_engine import (
     evaluate,
     reverify_after,
 )
+from packages.memory.scope import anchor_from_scope
 from packages.memory.service import MemoryService, _evidence_set_hash
 from packages.memory.source_graph import build_source_independence_snapshot
 from packages.memory.writer_gate import (
@@ -154,12 +155,26 @@ def _as_uuid(raw: object) -> uuid.UUID:
 
 
 async def _head_row(db: AsyncSession) -> tuple[uuid.UUID, uuid.UUID | None] | None:
-    """Lock the global runtime head (first canonical row)."""
+    """Lock the global runtime head (first canonical row).
+
+    The returned ``activating`` is the EFFECTIVE slot (T7.26, ADR-0013):
+    a ``draft`` candidate with an EXPIRED lease is a crashed drain
+    intent — it no longer holds admission (the same lease-aware rule as
+    the scheduler and the session admission gate; the analogy of the
+    T7.20 sweep of expired admission records). A non-draft candidate
+    blocks regardless of the lease."""
     row = (
         await db.execute(
             text(
-                "SELECT active_config_snapshot_id, activating_config_snapshot_id "
-                "FROM runtime_config_heads WHERE scope = 'global' FOR UPDATE"
+                "SELECT h.active_config_snapshot_id, "
+                "CASE WHEN c.activation_state = 'draft' "
+                "AND h.activation_lease_expires_at IS NOT NULL "
+                "AND h.activation_lease_expires_at <= now() "
+                "THEN NULL ELSE h.activating_config_snapshot_id END "
+                "FROM runtime_config_heads h "
+                "LEFT JOIN config_snapshots c "
+                "ON c.id = h.activating_config_snapshot_id "
+                "WHERE h.scope = 'global' FOR UPDATE OF h"
             )
         )
     ).first()
@@ -560,12 +575,18 @@ async def _process_one_job(
     head_row.current_assessment_id = assessment.id
     head_row.epistemic_status = result.epistemic_status.value
     head_row.prepared_by = "reassessment_worker"
-    claim.reverify_after = reverify_after(result, claim.as_of, now)
-    claim.freshness_status = (
-        FreshnessStatus.FRESH.value
-        if now < claim.reverify_after
-        else FreshnessStatus.DUE.value
-    )
+    # T7.32 (ADR-0017): the deadline rule is the same as on the commit
+    # path, applied from the PERSISTED anchor (the claim scope's
+    # ``date_anchor``, carried by the stored assessments — the worker
+    # has no question to derive from): a claim about the present
+    # (relative) gets reverify_after = now + the volatility window
+    # (the deadline is REFRESHED by the re-verification moment); a
+    # claim about a fixed point (explicit / none) KEEPS no deadline
+    # (NULL, evergreen) — reassessment never returns a deadline to a
+    # fixed-point claim. Legacy scopes without the key default to
+    # relative (conservative: the deadline is kept, ADR-0017).
+    claim.reverify_after = reverify_after(result, anchor_from_scope(scope), now)
+    claim.freshness_status = freshness_status(claim.reverify_after, now).value
 
     job.status = ReassessmentJobStatus.COMPLETED.value
     job.completed_at = text("clock_timestamp()")  # type: ignore[assignment]

@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from packages.domain.models.enums import AuditEventType, AuditVisibility
 from packages.domain.models.events import ORMAuditEvent, ORMOutboxEvent
 from packages.domain.repositories.events import AuditEventRepository, OutboxRepository
+from packages.domain.sanitization import mask_nul, mask_nul_deep
 
 OUTBOX_TOPIC_AUDIT = "audit.events"
 
@@ -35,6 +36,18 @@ class AuditService:
         visibility: AuditVisibility = AuditVisibility.OPERATOR,
     ) -> ORMAuditEvent:
         """Record one event + its outbox twin (same transaction)."""
+        # T7.46a (SMOKE-V12-K2 §3.4): the AUDIT boundary — the last line
+        # of defense before the JSONB/TEXT code. A NUL byte anywhere in
+        # the payload (or the summary) made asyncpg encode the parameter
+        # with a ``\\u0000`` escape, which the server's JSONB parser
+        # rejects — and the error took down the WHOLE caller transaction
+        # (amplification: one NUL → all steps of the session lost). Mask
+        # it visibly here so any FUTURE NUL source (model text, a new
+        # payload field) cannot do that again.
+        if payload is not None:
+            payload = mask_nul_deep(payload)
+        if public_summary is not None:
+            public_summary = mask_nul(public_summary)
         # closed registry: reject unknown types (§14.4)
         resolved = event_type if isinstance(event_type, AuditEventType) else AuditEventType(event_type)
 

@@ -77,5 +77,10 @@ class ORMStagingOp(Base):
     payload: Mapped[JsonDict] = mapped_column(JSONB, nullable=False)
     payload_hash: Mapped[str] = mapped_column(Text, nullable=False)
     schema_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    # T7.24 (EVAL-4 abort 2026-09-21): the per-session RECORDING order —
+    # created_at is the constant start of the long phase-1 transaction
+    # (now()), so only a durable sequence preserves the proposal order
+    # the claim_index/evidence_index links refer to
+    seq: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     state: Mapped[str] = mapped_column(Text, nullable=False, default="recorded")
     created_at: Mapped[datetime] = created_at_column()

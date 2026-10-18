@@ -154,6 +154,8 @@ class _Seeder:
         evidence_source: bool = True,
         source_exists: bool = True,
         freshness: str = "fresh",
+        as_of: datetime | None = None,
+        reverify_after: datetime | None = None,
     ) -> uuid.UUID:
         cid = _uid(f"claim-{idx}")
         aid = _uid(f"assessment-{idx}")
@@ -169,14 +171,16 @@ class _Seeder:
             )
         await self._exec(
             "INSERT INTO claims (id, statement, claim_type, freshness_status, "
-            "created_in_session, observed_at) "
-            "VALUES (:id, :st, :ct, :f, :s, now())",
+            "created_in_session, observed_at, as_of, reverify_after) "
+            "VALUES (:id, :st, :ct, :f, :s, now(), :ao, :rv)",
             {
                 "id": cid,
                 "st": f"claim statement {idx}",
                 "ct": ctype,
                 "f": freshness,
                 "s": session,
+                "ao": as_of,
+                "rv": reverify_after,
             },
         )
         await self._exec(
@@ -263,6 +267,38 @@ class _Seeder:
             "INSERT INTO assessment_evidence (assessment_id, evidence_id, role) "
             "VALUES (:a, :e, 'support')",
             {"a": aid, "e": eid},
+        )
+
+    async def add_reverify_assessment(
+        self,
+        claim_idx: int,
+        session: uuid.UUID,
+        *,
+        worker: bool = False,
+    ) -> None:
+        """T7.34 (ADR-0018): the reverify RECORD — a fresh
+        ``claim_assessments`` row bound to the reverifying session,
+        WITHOUT any new evidence row (the re-fetched identical source
+        reuses the anchor's evidence row by identity — the trap the
+        record exists to survive). ``worker=True`` seeds the
+        reassessment-worker shape (``created_in_session IS NULL``),
+        which the gate must NOT count as a session touch."""
+        cid = _uid(f"claim-{claim_idx}")
+        await self._exec(
+            "INSERT INTO claim_assessments (id, claim_id, effective_grade, "
+            "epistemic_status, rules_version, rules_hash, evidence_set_hash, "
+            "assessed_scope, confidence, valid, created_in_session) "
+            "VALUES (:id, :c, :g, 'supported', 'rules-v1', :rh, :eh, "
+            "CAST(:sc AS jsonb), 0.9, true, :s)",
+            {
+                "id": _uid(f"reverify-{claim_idx}-{session}"),
+                "c": cid,
+                "g": "E3",
+                "rh": "0" * 64,
+                "eh": "2" * 64,
+                "sc": _json({"reverify": True}),
+                "s": None if worker else session,
+            },
         )
 
     async def add_job(
@@ -377,19 +413,31 @@ async def _seed_rich(engine: AsyncEngine) -> _Seeder:
             status="hypothesis",
             evidence_source=i >= 23,
         )
+    # T7.27 (ADR-0014): the gate evaluates the §8.6 rule over
+    # reverify_after, so the seeded rows are self-consistent with it —
+    # the stored freshness_status is the rule's output for the seeded
+    # reverify_after (the legacy rows set only the stored column).
+    gate_now = datetime.now(UTC)
     for i in range(24, 44):
         grade = "E3" if i < 43 else "E2"
         freshness = "fresh"
+        reverify: datetime | None
         if i in (40, 41):
             freshness = "due"
+            reverify = gate_now - timedelta(days=30)
         elif i == 42:
             freshness = "stale"
+            reverify = gate_now - timedelta(days=60)
+        else:
+            reverify = gate_now + timedelta(days=30)
         await s.add_claim(
             i,
             session=s.session_ids[i % 24],
             ctype="temporal_fact",
             grade=grade,
             freshness=freshness,
+            as_of=reverify - timedelta(days=30),
+            reverify_after=reverify,
         )
     # gate 5 (reuse): claims 0..12 get a second evidence from a
     # different session → 13/51 significant claims reused
@@ -546,6 +594,158 @@ async def test_gates_empty_db(migrated_db: tuple[str, AsyncEngine]) -> None:
 
 
 @pytest.mark.asyncio
+async def test_gates_due_stale_counts_expired_without_reassessment_or_flip(
+    migrated_db: tuple[str, AsyncEngine],
+) -> None:
+    """T7.27 (EVAL-4d, ADR-0014): the gate measures the §8.6/T3.7 rule
+    at the computation instant, from ``reverify_after`` — not the
+    stored ``freshness_status`` column.
+
+    The data state is exactly what EVAL-4d left behind: every current
+    temporal claim stores ``freshness_status='fresh'`` because the
+    v4→v5 flip never happened and no reassessment was ever triggered.
+    The gate must still count the expired claims — with NO
+    reassessment job in the queue and NO activation flip. A claim
+    stored 'due' whose deadline has not passed is NOT counted: the
+    gate follows the rule, never the display cache."""
+    _scratch, engine = migrated_db
+    run = await _mk_run(engine)  # default thresholds: due_stale 0.20
+    now = datetime(2026, 9, 22, 8, 0, tzinfo=UTC)
+    s = _Seeder(engine)
+    await s.setup()
+    # 17 within the deadline + 3 EXPIRED (the stored column says
+    # 'fresh' on all of them — the EVAL-4d state) + 1 stored 'due'
+    # but not yet expired + 1 WITHOUT a deadline (T7.32, ADR-0017: a
+    # fixed-point claim — no deadline by construction, evergreen; it
+    # cannot become due and is OUT of the denominator)
+    for i in range(17):
+        await s.add_claim(
+            i, session=None, ctype="temporal_fact",
+            as_of=now - timedelta(days=20), reverify_after=now + timedelta(days=10),
+        )
+    for i in range(17, 20):
+        await s.add_claim(
+            i, session=None, ctype="temporal_fact",
+            as_of=now - timedelta(days=50), reverify_after=now - timedelta(days=20),
+        )
+    await s.add_claim(
+        20, session=None, ctype="temporal_fact", freshness="due",
+        as_of=now - timedelta(days=20), reverify_after=now + timedelta(days=10),
+    )
+    await s.add_claim(
+        21, session=None, ctype="temporal_fact", freshness="evergreen",
+        as_of=None, reverify_after=None,
+    )
+    # the state under test: no reassessment jobs at all, no flip
+    factory = async_sessionmaker(engine)
+    async with factory() as db:
+        assert (
+            await db.execute(text("SELECT count(*) FROM reassessment_jobs"))
+        ).scalar_one() == 0
+        head = (
+            await db.execute(
+                text(
+                    "SELECT activating_config_snapshot_id FROM "
+                    "runtime_config_heads WHERE scope = 'global'"
+                )
+            )
+        ).scalar_one()
+        assert head is None
+        gates = await compute_gates(db, run=run, now=now)
+
+    g6 = gates["due_stale_time_sensitive"]
+    # 3 expired of 21 claims WITH a deadline (T7.32, ADR-0017: the
+    # deadline-less fixed-point claim is out of the denominator — it
+    # cannot become due) — counted from reverify_after alone,
+    # 3/21 = 0.1429 < 0.20
+    assert g6["denominator"] == 21 and g6["numerator"] == 3
+    assert g6["ratio"] == 0.1429
+    assert g6["outcome"] == "passed"
+
+
+@pytest.mark.asyncio
+async def test_gates_due_stale_eval4d_shape(migrated_db: tuple[str, AsyncEngine]) -> None:
+    """T7.27 regression, the EVAL-4d form on synthetic data: 28 current
+    ``temporal_fact`` claims, 22 with ``reverify_after`` already in the
+    past — all 28 stored ``freshness_status='fresh'`` (no flip, no
+    reassessment). The legacy gate reported 0/28 ``passed``; the
+    rule-based gate must report 22/28 (0.7857 >= 0.20) → ``failed``.
+    The threshold (0.20) and direction (at most) are unchanged."""
+    _scratch, engine = migrated_db
+    run = await _mk_run(engine)
+    now = datetime(2026, 9, 22, 8, 0, tzinfo=UTC)
+    s = _Seeder(engine)
+    await s.setup()
+    # the 22 overdue ones (EVAL-4d: 16 model as_of-artifacts + 6
+    # by-design old-as_of questions) and the 6 within the deadline
+    for i in range(22):
+        await s.add_claim(
+            i, session=None, ctype="temporal_fact",
+            as_of=now - timedelta(days=30 + i),
+            reverify_after=now - timedelta(days=100 - i),
+        )
+    for i in range(22, 28):
+        await s.add_claim(
+            i, session=None, ctype="temporal_fact",
+            as_of=now - timedelta(days=10),
+            reverify_after=now + timedelta(days=20),
+        )
+    factory = async_sessionmaker(engine)
+    async with factory() as db:
+        gates = await compute_gates(db, run=run, now=now)
+
+    g6 = gates["due_stale_time_sensitive"]
+    assert g6["denominator"] == 28 and g6["numerator"] == 22
+    assert g6["ratio"] == 0.7857
+    assert g6["threshold"] == 0.20
+    assert g6["outcome"] == "failed"
+    assert "ci95" in g6  # §22.2: the interval is published with the gate
+
+
+@pytest.mark.asyncio
+async def test_gate6_due_stale_mixed_deadline_and_fixed_point_claims(
+    migrated_db: tuple[str, AsyncEngine],
+) -> None:
+    """T7.32 (ADR-0017): gate 6 on a MIX of claims with a deadline
+    (relative anchor) and fixed-point claims without one (explicit /
+    dateless anchor — reverify_after NULL). The fixed-point claims
+    cannot become due, so they are OUT of the denominator — the gate
+    measures the freshness health of the claims that CAN become due,
+    and cannot be passed by composition (padding the corpus with
+    fixed-point claims). 5 due of 20 deadline-bearing claims →
+    5/20 = 0.25 → failed (the pre-T7.32 arithmetic 5/30 = 0.1667 would
+    have passed — the dilution the ADR removes)."""
+    _scratch, engine = migrated_db
+    run = await _mk_run(engine, thresholds={"due_stale_time_sensitive": 0.20})
+    now = datetime(2026, 9, 22, 8, 0, tzinfo=UTC)
+    s = _Seeder(engine)
+    await s.setup()
+    # 20 claims WITH a deadline: 5 due + 15 fresh (the MIN_SAMPLE = 20
+    # boundary is met on the NEW denominator)
+    for i in range(5):
+        await s.add_claim(
+            i, session=None, ctype="temporal_fact",
+            as_of=now - timedelta(days=60), reverify_after=now - timedelta(days=30 + i),
+        )
+    for i in range(5, 20):
+        await s.add_claim(
+            i, session=None, ctype="temporal_fact",
+            as_of=now - timedelta(days=10), reverify_after=now + timedelta(days=20),
+        )
+    # 10 FIXED-POINT claims: no deadline (evergreen) — they dilute the
+    # pre-T7.32 denominator but must not count at all under ADR-0017
+    for i in range(20, 30):
+        await s.add_claim(
+            i, session=None, ctype="temporal_fact", freshness="evergreen",
+            as_of=now - timedelta(days=3650), reverify_after=None,
+        )
+    g = (await _gates(engine, run, now=now))["due_stale_time_sensitive"]
+    assert (g["numerator"], g["denominator"]) == (5, 20)
+    assert g["ratio"] == 0.25
+    assert g["outcome"] == "failed"  # 0.25 >= 0.20, strictly-below gate
+
+
+@pytest.mark.asyncio
 async def test_blind_sample_deterministic(migrated_db: tuple[str, AsyncEngine]) -> None:
     """Same run row → same blind sample (seeded, stratified)."""
     from packages.evaluation.blind import blind_sample_claim_ids
@@ -561,3 +761,525 @@ async def test_blind_sample_deterministic(migrated_db: tuple[str, AsyncEngine]) 
     # only claims with a CURRENT head enter the sample: the pending/
     # invalid heads (claims 44..46) are excluded
     assert len(s1) == min(50, len(seeder.claim_ids) - 3)
+
+
+# ---------------------------------------------------------------------------
+# T7.28 (ADR-0015): boundary tests — EVERY ratio gate exactly at its
+# §22.2 threshold and just off it. The spec wording (ARCHITECTURE.md:
+# 2602–2611) fixes the comparison direction per gate:
+#   «≥ X%» (at_least)  → exactly at the threshold PASSES;
+#   «≤ X%» (at_most)   → exactly at the threshold PASSES;
+#   «< X%» (below, due_stale_time_sensitive) → exactly at the threshold
+#   FAILS (strict: 6/30 = 0.200 → failed, 6/31 = 0.1935 → passed).
+# The Wilson-95 interval is pinned in every assertion: it is
+# reporting-only (§22.2) and must not change with the direction fix.
+# ---------------------------------------------------------------------------
+
+
+async def _gates(
+    engine: AsyncEngine, run: EvaluationRun, now: datetime | None = None
+) -> dict[str, dict[str, Any]]:
+    factory = async_sessionmaker(engine)
+    async with factory() as db:
+        return await compute_gates(db, run=run, now=now)
+
+
+@pytest.mark.asyncio
+async def test_gate1_new_e2_exactly_at_threshold_passes(
+    migrated_db: tuple[str, AsyncEngine],
+) -> None:
+    """g1 (at_least, spec «≥80%»): 16/20 = 0.80 exactly → passed."""
+    _scratch, engine = migrated_db
+    run = await _mk_run(engine, thresholds={"new_supported_refuted_e2": 0.80})
+    s = _Seeder(engine)
+    await s.setup()
+    for i in range(20):
+        await s.add_session(i, state="succeeded")
+        await s.add_claim(i, session=s.session_ids[i], grade="E2" if i < 16 else "E1")
+    g = (await _gates(engine, run))["new_supported_refuted_e2"]
+    assert (g["numerator"], g["denominator"]) == (16, 20)
+    assert g["ratio"] == 0.8
+    assert g["outcome"] == "passed"
+    assert g["ci95"] == {"low": 0.584, "high": 0.9193}
+
+
+@pytest.mark.asyncio
+async def test_gate1_new_e2_below_threshold_fails(
+    migrated_db: tuple[str, AsyncEngine],
+) -> None:
+    """g1 (at_least): 15/20 = 0.75 < 0.80 → failed."""
+    _scratch, engine = migrated_db
+    run = await _mk_run(engine, thresholds={"new_supported_refuted_e2": 0.80})
+    s = _Seeder(engine)
+    await s.setup()
+    for i in range(20):
+        await s.add_session(i, state="succeeded")
+        await s.add_claim(i, session=s.session_ids[i], grade="E2" if i < 15 else "E1")
+    g = (await _gates(engine, run))["new_supported_refuted_e2"]
+    assert (g["numerator"], g["denominator"]) == (15, 20)
+    assert g["ratio"] == 0.75
+    assert g["outcome"] == "failed"
+    assert g["ci95"] == {"low": 0.5313, "high": 0.8881}
+
+
+@pytest.mark.asyncio
+async def test_gate2_external_e3_exactly_at_threshold_passes(
+    migrated_db: tuple[str, AsyncEngine],
+) -> None:
+    """g2 (at_least, spec «каждый … выполняет E3» = 100%): 20/20 =
+    1.00 exactly → passed."""
+    _scratch, engine = migrated_db
+    run = await _mk_run(engine, thresholds={"external_temporal_e3": 1.00})
+    s = _Seeder(engine)
+    await s.setup()
+    for i in range(20):
+        await s.add_session(i, state="succeeded")
+        await s.add_claim(i, session=s.session_ids[i], ctype="external_fact", grade="E3")
+    g = (await _gates(engine, run))["external_temporal_e3"]
+    assert (g["numerator"], g["denominator"]) == (20, 20)
+    assert g["ratio"] == 1.0
+    assert g["outcome"] == "passed"
+    assert g["ci95"] == {"low": 0.8389, "high": 1.0}
+
+
+@pytest.mark.asyncio
+async def test_gate2_external_e3_below_threshold_fails(
+    migrated_db: tuple[str, AsyncEngine],
+) -> None:
+    """g2 (at_least): 19/20 = 0.95 < 1.00 → failed."""
+    _scratch, engine = migrated_db
+    run = await _mk_run(engine, thresholds={"external_temporal_e3": 1.00})
+    s = _Seeder(engine)
+    await s.setup()
+    for i in range(20):
+        await s.add_session(i, state="succeeded")
+        await s.add_claim(
+            i, session=s.session_ids[i], ctype="external_fact",
+            grade="E3" if i < 19 else "E2",
+        )
+    g = (await _gates(engine, run))["external_temporal_e3"]
+    assert (g["numerator"], g["denominator"]) == (19, 20)
+    assert g["ratio"] == 0.95
+    assert g["outcome"] == "failed"
+    assert g["ci95"] == {"low": 0.7639, "high": 0.9911}
+
+
+@pytest.mark.asyncio
+async def test_gate3_sessions_exactly_at_threshold_passes(
+    migrated_db: tuple[str, AsyncEngine],
+) -> None:
+    """g3 (at_least, spec «≥60%»): 12/20 = 0.60 exactly → passed.
+    Outcome = the question moved out of candidate (no evidence/revision)."""
+    _scratch, engine = migrated_db
+    run = await _mk_run(engine, thresholds={"eligible_sessions_with_outcome": 0.60})
+    s = _Seeder(engine)
+    await s.setup()
+    for i in range(20):
+        await s.add_session(
+            i, state="succeeded", qstate="verified" if i < 12 else "candidate"
+        )
+    g = (await _gates(engine, run))["eligible_sessions_with_outcome"]
+    assert (g["numerator"], g["denominator"]) == (12, 20)
+    assert g["ratio"] == 0.6
+    assert g["outcome"] == "passed"
+    assert g["ci95"] == {"low": 0.3866, "high": 0.7812}
+
+
+@pytest.mark.asyncio
+async def test_gate3_sessions_below_threshold_fails(
+    migrated_db: tuple[str, AsyncEngine],
+) -> None:
+    """g3 (at_least): 11/20 = 0.55 < 0.60 → failed."""
+    _scratch, engine = migrated_db
+    run = await _mk_run(engine, thresholds={"eligible_sessions_with_outcome": 0.60})
+    s = _Seeder(engine)
+    await s.setup()
+    for i in range(20):
+        await s.add_session(
+            i, state="succeeded", qstate="verified" if i < 11 else "candidate"
+        )
+    g = (await _gates(engine, run))["eligible_sessions_with_outcome"]
+    assert (g["numerator"], g["denominator"]) == (11, 20)
+    assert g["ratio"] == 0.55
+    assert g["outcome"] == "failed"
+    assert g["ci95"] == {"low": 0.3421, "high": 0.7418}
+
+
+@pytest.mark.asyncio
+async def test_gate4_near_dup_exactly_at_threshold_passes(
+    migrated_db: tuple[str, AsyncEngine],
+) -> None:
+    """g4 (at_most, spec «≤15%»): 3/20 = 0.15 exactly → passed."""
+    _scratch, engine = migrated_db
+    run = await _mk_run(engine, thresholds={"near_duplicate_questions": 0.15})
+    s = _Seeder(engine)
+    await s.setup()
+    for i in range(20):
+        await s.add_session(i, state="succeeded")
+    for i in range(3):
+        await s.add_repeat_cycle(s.session_ids[i], s.question_ids[i])
+    g = (await _gates(engine, run))["near_duplicate_questions"]
+    assert (g["numerator"], g["denominator"]) == (3, 20)
+    assert g["ratio"] == 0.15
+    assert g["outcome"] == "passed"
+    assert g["ci95"] == {"low": 0.0524, "high": 0.3604}
+
+
+@pytest.mark.asyncio
+async def test_gate4_near_dup_above_threshold_fails(
+    migrated_db: tuple[str, AsyncEngine],
+) -> None:
+    """g4 (at_most): 4/20 = 0.20 > 0.15 → failed."""
+    _scratch, engine = migrated_db
+    run = await _mk_run(engine, thresholds={"near_duplicate_questions": 0.15})
+    s = _Seeder(engine)
+    await s.setup()
+    for i in range(20):
+        await s.add_session(i, state="succeeded")
+    for i in range(4):
+        await s.add_repeat_cycle(s.session_ids[i], s.question_ids[i])
+    g = (await _gates(engine, run))["near_duplicate_questions"]
+    assert (g["numerator"], g["denominator"]) == (4, 20)
+    assert g["ratio"] == 0.2
+    assert g["outcome"] == "failed"
+    assert g["ci95"] == {"low": 0.0807, "high": 0.416}
+
+
+@pytest.mark.asyncio
+async def test_gate5_reuse_exactly_at_threshold_passes(
+    migrated_db: tuple[str, AsyncEngine],
+) -> None:
+    """g5 (at_least, spec «≥25%»): 5/20 = 0.25 exactly → passed.
+    Reused = referenced by ≥2 distinct sessions (own evidence + one
+    second-evidence row from a different session)."""
+    _scratch, engine = migrated_db
+    run = await _mk_run(engine, thresholds={"significant_claim_reuse": 0.25})
+    s = _Seeder(engine)
+    await s.setup()
+    for i in range(20):
+        await s.add_session(i, state="succeeded")
+        await s.add_claim(i, session=s.session_ids[i], grade="E2")
+    for i in range(5):
+        await s.add_second_evidence(i, s.session_ids[i + 1])
+    g = (await _gates(engine, run))["significant_claim_reuse"]
+    assert (g["numerator"], g["denominator"]) == (5, 20)
+    assert g["ratio"] == 0.25
+    assert g["outcome"] == "passed"
+    assert g["ci95"] == {"low": 0.1119, "high": 0.4687}
+
+
+@pytest.mark.asyncio
+async def test_gate5_reuse_below_threshold_fails(
+    migrated_db: tuple[str, AsyncEngine],
+) -> None:
+    """g5 (at_least): 4/20 = 0.20 < 0.25 → failed."""
+    _scratch, engine = migrated_db
+    run = await _mk_run(engine, thresholds={"significant_claim_reuse": 0.25})
+    s = _Seeder(engine)
+    await s.setup()
+    for i in range(20):
+        await s.add_session(i, state="succeeded")
+        await s.add_claim(i, session=s.session_ids[i], grade="E2")
+    for i in range(4):
+        await s.add_second_evidence(i, s.session_ids[i + 1])
+    g = (await _gates(engine, run))["significant_claim_reuse"]
+    assert (g["numerator"], g["denominator"]) == (4, 20)
+    assert g["ratio"] == 0.2
+    assert g["outcome"] == "failed"
+    assert g["ci95"] == {"low": 0.0807, "high": 0.416}
+
+
+@pytest.mark.asyncio
+async def test_gate6_due_stale_exactly_at_threshold_fails(
+    migrated_db: tuple[str, AsyncEngine],
+) -> None:
+    """g6 (below, spec «<20%» — STRICT, ADR-0015): 6/30 = 0.200 exactly
+    → failed. Under the pre-T7.28 direction (at_most, `ratio <=
+    threshold`) this data reported passed — the boundary outcome
+    changed, the threshold (0.20) did not."""
+    _scratch, engine = migrated_db
+    run = await _mk_run(engine, thresholds={"due_stale_time_sensitive": 0.20})
+    now = datetime(2026, 9, 22, 8, 0, tzinfo=UTC)
+    s = _Seeder(engine)
+    await s.setup()
+    for i in range(30):
+        # the 6 by-design overdue (reverify_after in the past) and the
+        # 24 within the deadline
+        await s.add_claim(
+            i, session=None, ctype="temporal_fact",
+            as_of=now - timedelta(days=31) if i < 6 else now - timedelta(days=10),
+            reverify_after=now - timedelta(days=1) if i < 6 else now + timedelta(days=20),
+        )
+    g = (await _gates(engine, run, now=now))["due_stale_time_sensitive"]
+    assert (g["numerator"], g["denominator"]) == (6, 30)
+    assert g["ratio"] == 0.2
+    assert g["threshold"] == 0.20
+    assert g["outcome"] == "failed"  # 0.200 is NOT < 0.20
+    assert g["ci95"] == {"low": 0.0951, "high": 0.3731}
+
+
+@pytest.mark.asyncio
+async def test_gate6_due_stale_just_below_threshold_passes(
+    migrated_db: tuple[str, AsyncEngine],
+) -> None:
+    """g6 (below): 6/31 = 0.1935 < 0.20 → passed — one more temporal
+    claim in the denominator is enough (the corpus-v3 pre-registration
+    N ≥ 31, EVAL-4-freeze §3.1)."""
+    _scratch, engine = migrated_db
+    run = await _mk_run(engine, thresholds={"due_stale_time_sensitive": 0.20})
+    now = datetime(2026, 9, 22, 8, 0, tzinfo=UTC)
+    s = _Seeder(engine)
+    await s.setup()
+    for i in range(31):
+        await s.add_claim(
+            i, session=None, ctype="temporal_fact",
+            as_of=now - timedelta(days=31) if i < 6 else now - timedelta(days=10),
+            reverify_after=now - timedelta(days=1) if i < 6 else now + timedelta(days=20),
+        )
+    g = (await _gates(engine, run, now=now))["due_stale_time_sensitive"]
+    assert (g["numerator"], g["denominator"]) == (6, 31)
+    assert g["ratio"] == 0.1935
+    assert g["threshold"] == 0.20
+    assert g["outcome"] == "passed"  # 0.1935 < 0.20
+    assert g["ci95"] == {"low": 0.0919, "high": 0.3628}
+
+
+@pytest.mark.asyncio
+async def test_gate7_slo_exactly_at_threshold_passes(
+    migrated_db: tuple[str, AsyncEngine],
+) -> None:
+    """g7 (at_least, spec «укладываются в SLO» = all completed jobs,
+    threshold 1.0): 20/20 = 1.00 exactly → passed."""
+    _scratch, engine = migrated_db
+    run = await _mk_run(engine, thresholds={"reassessment_slo_seconds": 3600})
+    s = _Seeder(engine)
+    await s.setup()
+    for i in range(20):
+        await s.add_claim(i, session=None)
+        await s.add_job(i, within_slo=True, claim=s.claim_ids[i])
+    g = (await _gates(engine, run))["reassessment_slo"]
+    assert (g["numerator"], g["denominator"]) == (20, 20)
+    assert g["ratio"] == 1.0
+    assert g["outcome"] == "passed"
+    assert g["slo_seconds"] == 3600.0
+    assert g["ci95"] == {"low": 0.8389, "high": 1.0}
+
+
+@pytest.mark.asyncio
+async def test_gate7_slo_below_threshold_fails(
+    migrated_db: tuple[str, AsyncEngine],
+) -> None:
+    """g7 (at_least): 19/20 = 0.95 < 1.00 (one job outside the SLO) →
+    failed."""
+    _scratch, engine = migrated_db
+    run = await _mk_run(engine, thresholds={"reassessment_slo_seconds": 3600})
+    s = _Seeder(engine)
+    await s.setup()
+    for i in range(20):
+        await s.add_claim(i, session=None)
+        await s.add_job(i, within_slo=i < 19, claim=s.claim_ids[i])
+    g = (await _gates(engine, run))["reassessment_slo"]
+    assert (g["numerator"], g["denominator"]) == (19, 20)
+    assert g["ratio"] == 0.95
+    assert g["outcome"] == "failed"
+    assert g["ci95"] == {"low": 0.7639, "high": 0.9911}
+
+
+@pytest.mark.asyncio
+async def test_gate10_blind_provenance_exactly_at_threshold_passes(
+    migrated_db: tuple[str, AsyncEngine],
+) -> None:
+    """g10 (at_least, spec «≥90%»): 18/20 = 0.90 exactly → passed
+    (2 sampled claims with a missing source row)."""
+    _scratch, engine = migrated_db
+    run = await _mk_run(
+        engine, thresholds={"blind_provenance_path": 0.90}, size=100
+    )
+    s = _Seeder(engine)
+    await s.setup()
+    for i in range(20):
+        await s.add_claim(i, session=None, source_exists=i < 18)
+    g = (await _gates(engine, run))["blind_provenance_path"]
+    assert (g["numerator"], g["denominator"]) == (18, 20)
+    assert g["ratio"] == 0.9
+    assert g["outcome"] == "passed"
+    assert g["ci95"] == {"low": 0.699, "high": 0.9721}
+
+
+@pytest.mark.asyncio
+async def test_gate10_blind_provenance_below_threshold_fails(
+    migrated_db: tuple[str, AsyncEngine],
+) -> None:
+    """g10 (at_least): 17/20 = 0.85 < 0.90 → failed."""
+    _scratch, engine = migrated_db
+    run = await _mk_run(
+        engine, thresholds={"blind_provenance_path": 0.90}, size=100
+    )
+    s = _Seeder(engine)
+    await s.setup()
+    for i in range(20):
+        await s.add_claim(i, session=None, source_exists=i < 17)
+    g = (await _gates(engine, run))["blind_provenance_path"]
+    assert (g["numerator"], g["denominator"]) == (17, 20)
+    assert g["ratio"] == 0.85
+    assert g["outcome"] == "failed"
+    assert g["ci95"] == {"low": 0.6396, "high": 0.9476}
+
+
+@pytest.mark.asyncio
+async def test_gate11_blind_scope_exactly_at_threshold_passes(
+    migrated_db: tuple[str, AsyncEngine],
+) -> None:
+    """g11 (at_least, spec «≥80%»): 16/20 = 0.80 exactly → passed
+    (4 sampled claims with an empty assessed_scope)."""
+    _scratch, engine = migrated_db
+    run = await _mk_run(engine, thresholds={"blind_scope": 0.80}, size=100)
+    s = _Seeder(engine)
+    await s.setup()
+    for i in range(20):
+        await s.add_claim(i, session=None, scope={} if i >= 16 else None)
+    g = (await _gates(engine, run))["blind_scope"]
+    assert (g["numerator"], g["denominator"]) == (16, 20)
+    assert g["ratio"] == 0.8
+    assert g["outcome"] == "passed"
+    assert g["ci95"] == {"low": 0.584, "high": 0.9193}
+
+
+@pytest.mark.asyncio
+async def test_gate11_blind_scope_below_threshold_fails(
+    migrated_db: tuple[str, AsyncEngine],
+) -> None:
+    """g11 (at_least): 15/20 = 0.75 < 0.80 → failed."""
+    _scratch, engine = migrated_db
+    run = await _mk_run(engine, thresholds={"blind_scope": 0.80}, size=100)
+    s = _Seeder(engine)
+    await s.setup()
+    for i in range(20):
+        await s.add_claim(i, session=None, scope={} if i >= 15 else None)
+    g = (await _gates(engine, run))["blind_scope"]
+    assert (g["numerator"], g["denominator"]) == (15, 20)
+    assert g["ratio"] == 0.75
+    assert g["outcome"] == "failed"
+    assert g["ci95"] == {"low": 0.5313, "high": 0.8881}
+
+
+# ─── T7.34 (ADR-0018): the reverify path of gate 5, EVAL-4d form ────────────
+#
+# Fixture (NOT the evidence DB): the EVAL-4d §7.2 shape — 29 significant
+# claims (19 temporal_fact E3 + 6 external_fact E3 + 3 local_observation
+# E2 + 1 computed_result E2), each created in its own session, plus the
+# 13 follow-up re-verifies over 8 distinct claims. The reverify record
+# is the fresh assessment row bound to the reverifying session — with NO
+# new evidence row (the collapsed re-fetch trap: a naive evidence-only
+# path would count 0 of these).
+
+
+# EVAL-4d §7.2: follow-up session → anchor claim (fixture indices)
+_EVAL4D_REVERIFIES_FULL: dict[int, list[int]] = {
+    0: [100, 101],  # d3475eca ← 4d510a51, 848106dd
+    1: [102],  # 07d655cf ← 4dd12dfa
+    2: [103, 104],  # 70ff7a38 ← 7add23b6, 7871250d
+    3: [105, 106],  # 80c1908c ← 46bec75c, 8c370d7f (total collapse)
+    4: [107, 108],  # c701f374 ← 4d67e817, de3f809a
+    5: [109, 110],  # 426fe04a ← 70235790, 5cc41d0a
+    6: [111],  # 5a37ce68 ← c3537eb3
+    7: [112],  # 6cc8a0d8 ← 3b2a4a7d
+}
+# the strict variant: only the 5 re-verifies the model expressed BY ID
+_EVAL4D_REVERIFIES_STRICT: dict[int, list[int]] = {
+    0: [101],  # 848106dd → d3475eca (by id)
+    2: [104],  # 7871250d → 70ff7a38 (by id)
+    4: [108],  # de3f809a → c701f374 (by id)
+    5: [110],  # 5cc41d0a → 426fe04a (by id)
+    6: [111],  # c3537eb3 → 5a37ce68 (by id)
+}
+
+
+async def _seed_eval4d_reverify(
+    engine: AsyncEngine, reverifies: dict[int, list[int]]
+) -> _Seeder:
+    s = _Seeder(engine)
+    await s.setup()
+    # 29 anchor sessions + their significant claims (the EVAL-4d
+    # denominator composition, §7.3)
+    for i in range(29):
+        await s.add_session(i, state="succeeded")
+        ctype = "temporal_fact" if i < 19 else (
+            "external_fact" if i < 25 else (
+                "local_observation" if i < 28 else "computed_result"
+            )
+        )
+        grade = "E3" if i < 25 else "E2"
+        await s.add_claim(
+            i, session=s.session_ids[i], ctype=ctype, grade=grade
+        )
+    # the re-verify sessions + their records (assessment rows ONLY —
+    # no new evidence: the identical re-fetch collapses into the
+    # anchor's evidence row by identity). The session ROW is returned
+    # by add_session (the session_ids list is position-ordered, not
+    # keyed by idx).
+    for claim_idx, fu_idxs in sorted(reverifies.items()):
+        for fu in fu_idxs:
+            fu_sid = await s.add_session(fu, state="succeeded")
+            await s.add_reverify_assessment(claim_idx, fu_sid)
+    # a reassessment-worker assessment (created_in_session IS NULL) on
+    # claim 8: the gate must NOT count it as a second session
+    await s.add_reverify_assessment(8, _uid("worker"), worker=True)
+    return s
+
+
+@pytest.mark.asyncio
+async def test_gate5_reverify_eval4d_full_form_passes(
+    migrated_db: tuple[str, AsyncEngine],
+) -> None:
+    """T7.34 (ADR-0018): the EVAL-4d §7.2 full form — 13 re-verifies over
+    8 distinct claims, recorded ONLY as session-bound assessment rows
+    (no new evidence). Gate 5 must count them: 8/29 = 0.276 ≥ 0.25 →
+    passed (the saved EVAL-4d run reported 0/29 — the record did not
+    exist)."""
+    _scratch, engine = migrated_db
+    run = await _mk_run(engine, thresholds={"significant_claim_reuse": 0.25})
+    await _seed_eval4d_reverify(engine, _EVAL4D_REVERIFIES_FULL)
+    g = (await _gates(engine, run))["significant_claim_reuse"]
+    assert (g["numerator"], g["denominator"]) == (8, 29)
+    assert g["ratio"] == round(8 / 29, 4)  # 0.2759 (reported, 4 dp)
+    assert g["outcome"] == "passed"  # 0.2759 >= 0.25
+
+
+@pytest.mark.asyncio
+async def test_gate5_reverify_eval4d_strict_form_fails(
+    migrated_db: tuple[str, AsyncEngine],
+) -> None:
+    """T7.34 (ADR-0018): the strict form — only the 5 re-verifies the
+    model expressed BY ID (EVAL-4d §7.2). 5/29 = 0.172 < 0.25 → failed
+    (the pre-registration analysis: the reverify operation alone does
+    not turn the gate — the strict variant fails, the full form
+    passes; both are reported, the saved run is 0/29)."""
+    _scratch, engine = migrated_db
+    run = await _mk_run(engine, thresholds={"significant_claim_reuse": 0.25})
+    await _seed_eval4d_reverify(engine, _EVAL4D_REVERIFIES_STRICT)
+    g = (await _gates(engine, run))["significant_claim_reuse"]
+    assert (g["numerator"], g["denominator"]) == (5, 29)
+    assert g["ratio"] == round(5 / 29, 4)  # 0.1724 (reported, 4 dp)
+    assert g["outcome"] == "failed"  # 0.1724 < 0.25
+
+
+@pytest.mark.asyncio
+async def test_gate5_reverify_worker_rows_do_not_count(
+    migrated_db: tuple[str, AsyncEngine],
+) -> None:
+    """T7.34 (ADR-0018): only SESSION-created assessment rows count as
+    reverify records — reassessment-worker rows (created_in_session
+    IS NULL) must not make a claim 'two-session' (worker rows on every
+    non-reverified claim; the full form's numerator stays 8/29)."""
+    _scratch, engine = migrated_db
+    run = await _mk_run(engine, thresholds={"significant_claim_reuse": 0.25})
+    s = await _seed_eval4d_reverify(engine, _EVAL4D_REVERIFIES_FULL)
+    # worker rows on EVERY remaining non-reverified claim (9..28; claim
+    # 8's worker row comes from the fixture): without the
+    # created_in_session IS NOT NULL filter the numerator would jump to
+    # 29/29
+    for i in range(9, 29):
+        await s.add_reverify_assessment(i, _uid(f"worker-{i}"), worker=True)
+    g = (await _gates(engine, run))["significant_claim_reuse"]
+    assert (g["numerator"], g["denominator"]) == (8, 29)

@@ -48,6 +48,7 @@ from packages.domain.models.enums import AuditEventType, AuditVisibility, Sessio
 from packages.domain.models.wake import ORMWakeSchedulerState
 from packages.domain.services.audit import AuditService
 from packages.domain.services.config import ConfigService
+from packages.memory.activation import activation_slot_busy
 
 NODE_STATE_KEY = "node_state"
 NODE_OWNER_ENV = "NOEZEMA_NODE_OWNER"
@@ -64,6 +65,25 @@ REASON_REASSESSMENT_BACKLOG = "reassessment_backlog"
 REASON_REPAIR_BACKLOG = "repair_backlog"
 REASON_DISK_QUOTA = "disk_quota_exceeded"
 REASON_GPU = "gpu_unavailable"
+
+# T7.61(а) (§5.2.1): the wake was granted by the admission list, but another process of THIS node is
+# already inside a session. `decide` cannot see it — phase 1 keeps that session's row uncommitted until
+# COMMITTING, and `node_state='session_running'` is not an admission condition (only `paused` is, and a
+# leftover marker must stay non-blocking, T7.59(в)). So the entry point reports this reason itself after
+# it failed to take the node's session lock (`apps/orchestrator/node_guard.py`).
+REASON_SESSION_IN_PROGRESS = "session_in_progress"
+
+# Advisory-lock NAME of the node session lane. PostgreSQL hashes it (`pg_try_advisory_lock(hashtext(:n))`),
+# so the key is the same in every process of the node — web, tick, eval-run, manual entry. Python `hash()`
+# must never be used here: PYTHONHASHSEED salts it per process, so each systemd unit would take its own
+# lock and nothing would be excluded. Same convention as the writer gate (`packages/memory/cascade.py`)
+# and the offline-rules host lane (`hostctl/offline_rules.py`, ARCHITECTURE §8.7.2).
+NODE_SESSION_LOCK_PREFIX = "noezema:node_session"
+
+
+def node_session_lock_name(node_owner: str) -> str:
+    """The session-lane lock name of ONE node (T7.61(а)). Different owners → different lanes."""
+    return f"{NODE_SESSION_LOCK_PREFIX}:{node_owner}"
 
 # Schedule wait reasons (not audited: "not due yet" is not an event).
 WAIT_INTERVAL = "interval_not_elapsed"
@@ -84,6 +104,33 @@ def node_owner_from_env() -> str:
 
 def data_root_from_env() -> Path:
     return Path(os.environ.get(DATA_ROOT_ENV) or DEFAULT_DATA_ROOT)
+
+
+#: Session workspace directory relative to the data root. Every host session entry point puts its
+#: stub-executor workspace here — the wake tick (`root / WORKSPACE_SUBDIR`), the manual orchestrator
+#: entry (`python -m apps.orchestrator`) and the standalone web (apps/web/bind.py resolves the same
+#: layout). An unset env keeps the historical `/var/lib/noezema/workspace`; a node with its own data
+#: root (dev stand) gets its own instead of failing on a production path it cannot write (T7.59(в)).
+WORKSPACE_SUBDIR = "workspace"
+
+
+def workspace_root_from_env() -> Path:
+    """`<NOEZEMA_DATA_ROOT>/workspace` — the session workspace of THIS process (T7.59(в))."""
+    return data_root_from_env() / WORKSPACE_SUBDIR
+
+
+#: Artifact directory relative to the data root: the sibling of `WORKSPACE_SUBDIR`, so content-addressed
+#: artifacts always live beside the workspace of the same node (`<data root>/artifacts`). The orchestrator
+#: already builds its store from `workspace_root.parent`, and `noezemactl blind-sample` reads the same layout
+#: (`NOEZEMA_ARTIFACTS_ROOT` or data_root/artifacts). T7.61(б): the standalone research proxy hardcoded the
+#: production path instead, so a node with its own data root (dev stand) wrote artifacts outside that node's
+#: data. An unset env keeps the historical `/var/lib/noezema/artifacts`.
+ARTIFACTS_SUBDIR = "artifacts"
+
+
+def artifacts_root_from_env() -> Path:
+    """`<NOEZEMA_DATA_ROOT>/artifacts` — the artifact store of THIS process (T7.61(б))."""
+    return data_root_from_env() / ARTIFACTS_SUBDIR
 
 
 @dataclass(frozen=True)
@@ -455,15 +502,27 @@ class WakeScheduler:
         ).scalar_one()
         if int(unresolved) > 0:
             return False, REASON_UNRESOLVED_COMMIT
-        activating = (
+        # T7.26 (ADR-0013): the activation slot is lease-aware for a
+        # DRAFT candidate — a draft in the slot is a drain intent, and a
+        # crashed drain (expired lease) must not hold admission forever
+        # (the analogy of the T7.20 sweep of expired admission records).
+        # A non-draft candidate is the pipeline in flight and blocks
+        # regardless of the lease (recovery via the takeover, as before).
+        slot_row = (
             await self.db.execute(
                 text(
-                    "SELECT activating_config_snapshot_id FROM runtime_config_heads "
-                    "WHERE scope = 'global'"
+                    "SELECT h.activating_config_snapshot_id, c.activation_state, "
+                    "h.activation_lease_expires_at "
+                    "FROM runtime_config_heads h "
+                    "LEFT JOIN config_snapshots c "
+                    "ON c.id = h.activating_config_snapshot_id "
+                    "WHERE h.scope = 'global'"
                 )
             )
-        ).scalar_one_or_none()
-        if activating is not None:
+        ).first()
+        if slot_row is not None and slot_row[0] is not None and activation_slot_busy(
+            state=slot_row[1], lease=slot_row[2]
+        ):
             return False, REASON_ACTIVATION_SLOT
         # T4.4 (§5.9.1 liveness): the wake does not start while the oldest
         # runnable dependency-critical reassessment job is older than
@@ -569,6 +628,30 @@ class WakeScheduler:
                 )
                 return WakeDecision(action="skip", reason=reason, detail=state.paused_reason)
             return WakeDecision(action="wake", reason=None)
+
+    async def record_guard_skip(self, *, source: Literal["scheduled", "wake_now"], lock_name: str) -> None:
+        """Record a session-lane skip with its exact reason (§5.2.1, T7.61(а)).
+
+        This skip cannot come out of :meth:`decide`: the occupied lane is a live DB advisory lock held by
+        another process, not DB state `decide` could read. The entry point that found the lock busy calls
+        this so the skip still lands in the same `wake_skipped` audit shape as an admission skip — §5.2.1
+        insists on "the exact reason recorded", and a silent skip is what hid the stand race.
+        """
+        async with transaction(self.db):
+            state = await self._load_state()
+            audit = AuditService(self.db)
+            await audit.record(
+                AuditEventType.WAKE_SKIPPED,
+                payload={
+                    "source": source,
+                    "reason": REASON_SESSION_IN_PROGRESS,
+                    "paused_reason": state.paused_reason,
+                    "node_owner": self.node_owner,
+                    "lock": lock_name,
+                },
+                actor="wake-scheduler",
+                visibility=AuditVisibility.OPERATOR,
+            )
 
     # ── session outcome ──────────────────────────────────────────────────
 

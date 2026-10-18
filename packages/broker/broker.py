@@ -23,6 +23,7 @@ decision) and the one-shot container (which enforces isolation). It owns:
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,6 +34,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.domain.models.base import JsonDict
 from packages.domain.models.enums import ActionState, AuditEventType, IdempotencyClass
+from packages.domain.sanitization import mask_nul
 from packages.domain.schemas.observation import Observation
 from packages.policy.profiles import CapabilityProfile
 from packages.policy.tools import get_tool
@@ -40,6 +42,7 @@ from packages.sandbox.runtime import (
     ContainerSandboxRuntime,
     SandboxError,
     SandboxHandle,
+    SandboxHealthError,
 )
 
 # §5.7 retry policy: how many ADDITIONAL attempts after the first.
@@ -51,6 +54,41 @@ RETRY_POLICY: dict[IdempotencyClass, int] = {
 }
 
 MAX_OUTPUT = 10_000
+
+# T7.91: the engine flips the container state ASYNCHRONOUSLY. Measured on `.87`
+# (docker 29.8, probe script outside the repo): after `docker kill -s KILL` the
+# `docker exec` client returns with 137 BEFORE dockerd answers State.Running=false.
+# The gap from the exec return to the first "not running" answer: median 33 ms /
+# max 60 ms idle, median 70 ms / max 101 ms with six concurrent kills (the `-n auto`
+# profile). A fast unix-socket API client caught a stale `Running=true` right after
+# the exec return in 5/20 idle and 5/18 concurrent runs. The `docker inspect` CLI
+# costs 29–102 ms on this host, so locally the window usually hides behind the CLI's
+# own latency — which is exactly why only a CI runner tripped over it (run 38112342827).
+# A failed exec whose exit code is CONSISTENT with the container having been killed
+# therefore gets one bounded second look before it may be called a plain failure.
+# T7.92: the same window is reused for an ENGINE-level failure (SandboxError) of
+# shell.execute/python.execute — there too, "still running" is not conclusive.
+CONTAINER_DEATH_RECHECK_SECONDS = 1.0
+CONTAINER_DEATH_RECHECK_INTERVAL = 0.1
+
+# 125 = `docker exec` could not run/attach the command at all: that is a CLI-level
+# refusal, not an answer from the command — the container may have been killed while
+# the exec was starting.
+DOCKER_CLI_EXEC_FAILURE_EXIT = 125
+# exit > 128 means "killed by signal N-128": 137 = 128+SIGKILL, 143 = 128+SIGTERM —
+# precisely how a container kill reaches the exec'd process.
+FATAL_SIGNAL_EXIT_FLOOR = 128
+
+
+def exit_is_consistent_with_container_death(exit_code: int) -> bool:
+    """Could this failed exec have been caused by the container dying?
+
+    A container kill reaches the exec'd process as a fatal signal (137/143) or, if
+    the kill wins before the exec process starts, as a docker CLI refusal (125).
+    Any other nonzero code is the command's OWN answer: the command ran and reported,
+    so the outcome is known even if the container died a moment later.
+    """
+    return exit_code > FATAL_SIGNAL_EXIT_FLOOR or exit_code == DOCKER_CLI_EXEC_FAILURE_EXIT
 
 
 class StagingWriter(Protocol):
@@ -181,8 +219,22 @@ class SandboxToolBroker:
             container_gone = False
             if tool in ("shell.execute", "python.execute"):
                 try:
-                    container_gone = not await self.runtime.is_running(self.handle)
+                    if not await self.runtime.is_running(self.handle):
+                        # the T2.22 fast path: the engine already answers "gone" — no waiting
+                        container_gone = True
+                    elif not isinstance(exc, SandboxHealthError):
+                        # T7.92: an engine-level failure (engine command timeout) while docker
+                        # still answers "running" is NOT conclusive — the engine flips the
+                        # container state asynchronously (T7.91 window), and a wedged/half-dead
+                        # dockerd is exactly when that window widens. So the same bounded second
+                        # look applies, with the same rule: unknown only when the engine ITSELF
+                        # answers "not running". A health error is exempt from the wait: there the
+                        # engine cannot be asked anything at all, so a recheck could only repeat
+                        # the same failing command — the classification stays as before.
+                        container_gone = await self._await_container_death()
                 except Exception:
+                    # a state probe that itself failed proves nothing (unchanged behavior):
+                    # unknown is declared only on an actual "not running" answer
                     container_gone = False
             obs = Observation(
                 tool=tool,
@@ -230,10 +282,12 @@ class SandboxToolBroker:
         else:
             cmd = ["python3", "-I", "-c", str(arguments["code"])]
         result = await self.runtime.exec(self.handle, cmd)
+        # T7.46a: mask NUL at the capture (the SOURCE layer for the M2
+        # path, the same principle as the stub executor, SMOKE-V12-K2 §3)
         data: JsonDict = {
             "exit_code": result.exit_code,
-            "stdout": result.stdout[:MAX_OUTPUT],
-            "stderr": result.stderr[:MAX_OUTPUT],
+            "stdout": mask_nul(result.stdout)[:MAX_OUTPUT],
+            "stderr": mask_nul(result.stderr)[:MAX_OUTPUT],
         }
         if result.timed_out:
             return Observation(tool=tool, ok=False, data=data, error="timeout")
@@ -242,14 +296,45 @@ class SandboxToolBroker:
         # a failed exec where the CONTAINER IS GONE is not a result — the
         # command may have executed partially (T2.22 failpoint)
         if not await self.runtime.is_running(self.handle):
-            return Observation(
-                tool=tool,
-                ok=False,
-                data=data,
-                error="container gone mid-execution",
-                result_unknown=True,
-            )
+            return self._container_gone(tool, data)
+        # T7.91: "still running" straight after a signal death is NOT conclusive —
+        # the engine has not flipped State.Running yet (CONTAINER_DEATH_RECHECK_*).
+        # Only an exit code that a container kill can produce gets the bounded
+        # second look; a command killed from INSIDE a live container stays a plain
+        # failure carrying its real exit code.
+        if exit_is_consistent_with_container_death(result.exit_code) and await self._await_container_death():
+            return self._container_gone(tool, data)
         return Observation(tool=tool, ok=False, data=data, error=f"exit code {result.exit_code}")
+
+    def _container_gone(self, tool: str, data: JsonDict) -> Observation:
+        """Outcome unknown: the command may have run partially (T2.22)."""
+        return Observation(
+            tool=tool,
+            ok=False,
+            data=data,
+            error="container gone mid-execution",
+            result_unknown=True,
+        )
+
+    async def _await_container_death(self) -> bool:
+        """Re-check the container state for a bounded window (T7.91).
+
+        True as soon as the engine reports the container gone. This is a STATE
+        re-check, not a retry of the action: the command was executed exactly once
+        either way, and an unknown outcome is still never retried (RETRY_POLICY /
+        §5.7 untouched). The budget is a constant, so the wait cannot become a stall.
+
+        Two call sites share it: a kill-consistent failed exec (T7.91) and an
+        engine-level failure of shell.execute/python.execute (T7.92). A probe that
+        raises is NOT swallowed here — each caller decides what a failing probe means.
+        """
+        waited = 0.0
+        while waited < CONTAINER_DEATH_RECHECK_SECONDS:
+            await asyncio.sleep(CONTAINER_DEATH_RECHECK_INTERVAL)
+            waited += CONTAINER_DEATH_RECHECK_INTERVAL
+            if not await self.runtime.is_running(self.handle):
+                return True
+        return False
 
     def _workspace(self, tool: str, arguments: JsonDict) -> Observation:
         root = self.handle.workspace_dir.resolve()
@@ -275,7 +360,8 @@ class SandboxToolBroker:
                 path = resolve(str(arguments["path"]))
                 if not path.is_file():
                     return Observation(tool=tool, ok=False, error="not found")
-                content = path.read_bytes()[:MAX_OUTPUT].decode("utf-8", "replace")
+                # T7.46a: mask NUL at the capture (SOURCE layer)
+                content = mask_nul(path.read_bytes()[:MAX_OUTPUT].decode("utf-8", "replace"))
                 return Observation(
                 tool=tool, ok=True, data={"path": path.relative_to(root).as_posix(), "content": content}
             )
