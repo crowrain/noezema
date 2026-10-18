@@ -104,6 +104,8 @@ def fake_engine(monkeypatch: pytest.MonkeyPatch) -> None:
 def _payload() -> dict[str, Any]:
     payload = copy.deepcopy(_curated_payload())
     payload["research_proxy"]["rate_limit_max"] = 20
+    # T7.121a д5: гейт периода/даты прогноза включается конфигурацией — без ключа он молчит.
+    payload["session_limits"]["curator_record_gates"] = True
     return payload
 
 

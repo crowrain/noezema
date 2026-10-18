@@ -3654,36 +3654,51 @@ class Orchestrator:
                             reverify_anchor_types[claim_i] = relabel_type
                             claims_for_validation[claim_i]["claim_type"] = relabel_type
 
-        # T7.121 (части 2–3, ADR-0038): гейты честности формулировки — период и дата прогноза.
+        # T7.121 (части 2–3, ADR-0038) с дополнением T7.121a (дефекты пробы менеджера по всем
+        # 53 стендам, ADR-0038 §8): гейты честности формулировки — период и дата прогноза.
         # Каждый явный период формулировки операции-наблюдения (месяц+год, квартал,
         # полугодие, целевая фраза «по итогам / на конец / за N год», дата) обязан встречаться
         # в тексте той же связанной страницы (фрагмент улики `source_assertion` или сохранённый
         # полный текст), где стоит измеренное значение утверждения, в окне вето T7.113
         # (`PUBLICATION_WINDOW_CHARS` — новых порогов нет). «14 октября» (день+месяц) —
         # датировка страницы, а не период записи: на finmarket-6727171 «октября» рядом со
-        # значением «2,2» написана только так. Утверждение с маркером прогноза (закрытый
-        # список форм) обязано назвать дату самого прогноза — отличную от целевого периода —
-        # или писать «дата прогноза на странице не указана»; названная дата проверяется на
-        # странице так же, как период. Формулировка без периода и без маркера молчит: гейт
+        # значением «2,2» написана только так (T7.121a д1: датировочная строка подтверждает
+        # период только стоя в том же предложении строки, где написано значение). Год
+        # подтверждается страницей целиком, когда месяц уже подтверждён в окне значения и ни
+        # одно название того же месяца в окне не назвало другой год (д2). Дата после маркера
+        # даты документа («от…», «опубликовано…», «по состоянию на…») — не период значения:
+        # она обязана существовать на странице целиком, а не рядом со значением (д3).
+        # Утверждение с маркером прогноза (закрытый список форм; сравнение факта с чужим
+        # прогнозом маркером не считается — д4) обязано назвать дату самого прогноза —
+        # отличную от целевого периода — или писать «дата прогноза на странице не указана».
+        # Формулировка без периода и без маркера молчит: гейт
         # требует только названное. Гейт стоит ПОСЛЕ того, как гейт дублей определил вид
         # операции (перепроверку ведёт якорь, а не её формулировка), и ПОСЛЕ гейта значения
         # (тексты берутся из оставшихся `supports`-связей) — причины снятых операций уже
         # записаны, и в проверке as_of ниже они отфильтрованы тем же фильтром T7.105.
-        period_texts_by_claim: dict[int, list[str]] = {}
-        for k_link, link in enumerate(proposal.evidence_links):
-            if k_link in removed_links or link.relation.value != "supports":
-                continue  # опровержения и снятые связи — вне гейта (та же граница, что у T7.108)
-            texts = link_value_texts.get(k_link)
-            if texts is None:
-                continue  # улики не `source_assertion` — вне гейта
-            period_texts_by_claim.setdefault(link.claim_index, []).extend(
-                text for text in texts if text
+        # T7.121a (часть д5): гейты включаются конфигурацией — необязательный ключ
+        # `session_limits.curator_record_gates` (config-v28 = true); отсутствие ключа =
+        # гейт периода/даты прогноза/даты документа молчит, поведение payload'ов до v28
+        # прежнее. Гейты значения (T7.108), опорной as_of (T7.84) и дублей по значению
+        # (T7.83, T7.121 часть 4) от этого ключа НЕ зависят.
+        curator_gates_on = snapshot.session_limits.get("curator_record_gates") is True
+        period_drops: dict[int, str] = {}
+        if curator_gates_on:
+            period_texts_by_claim: dict[int, list[str]] = {}
+            for k_link, link in enumerate(proposal.evidence_links):
+                if k_link in removed_links or link.relation.value != "supports":
+                    continue  # опровержения и снятые связи — вне гейта (та же граница, что у T7.108)
+                texts = link_value_texts.get(k_link)
+                if texts is None:
+                    continue  # улики не `source_assertion` — вне гейта
+                period_texts_by_claim.setdefault(link.claim_index, []).extend(
+                    text for text in texts if text
+                )
+            period_drops = claim_period_rejections(
+                claims=staged_claims,
+                texts_by_claim=period_texts_by_claim,
+                already_dropped=dropped,
             )
-        period_drops = claim_period_rejections(
-            claims=staged_claims,
-            texts_by_claim=period_texts_by_claim,
-            already_dropped=dropped,
-        )
         dropped.update(period_drops)
         if period_drops and proposal.claims and len(dropped) == len(proposal.claims):
             # Сняты ВСЕ операции — отказ предложения целиком (тот же event, аддитивный

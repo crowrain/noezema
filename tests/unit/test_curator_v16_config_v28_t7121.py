@@ -1,8 +1,11 @@
 """Unit: curator-v16 и config-v28 — честность записей куратора в промпте (T7.121 часть 6–7).
 
 Три хостовых гейта T7.121 (период рядом со значением, дата у прогноза, склейка
-взаимных дублей) работают при любой конфигурации; промпт обязан объяснять моделью эти
-границы заранее — по образцу T7.108 (curator-v15 и гейт «значение на связи»).
+взаимных дублей) объясняются модели промптом — по образцу T7.108 (curator-v15 и гейт
+«значение на связи»). С дополнением T7.121a (часть д5) гейты периода/даты прогноза/даты
+документа включаются необязательным ключом `session_limits.curator_record_gates`
+(отсутствие = прежнее поведение payload'ов до v28); гейт склейки дублей — по-прежнему
+не зависит от конфигурации.
 
 Решение по шаблону ADR-0019: curator-v16 = curator-v15 байт в байт, кроме строки
 `version:`, дополнения к правилу 13 (гейт периода + отсылка к правилу 15) и трёх новых
@@ -11,10 +14,14 @@
 `relied_claim_ids`). Примеры новые — только вымышленные (Тармения, „Веер“); реальных
 значений, акторов и связок «значение + период» стенда в новом тексте нет.
 
-config-v28 = config-v27 ровно с одной правкой: пин `prompts.curator` → curator-v16
-(путь, sha256, version). config-v27 и прежние payload'ы не тронуты; дефолт bootstrap'а
-dev-стенда (config-v20) не изменён; активация config-v28 — решение менеджера, здесь она
-НЕ выполняется.
+config-v28 = config-v27 ровно с двумя правками (T7.121a д5): пин `prompts.curator` →
+curator-v16 (путь, sha256, version) и необязательный ключ
+`session_limits.curator_record_gates = true` (включение гейтов периода/даты прогноза;
+отсутствие ключа = гейты молчат). config-v27 и прежние payload'ы не тронуты; дефолт
+bootstrap'а dev-стенда (config-v20) не изменён; активация config-v28 — решение менеджера,
+здесь она НЕ выполняется. Промпт v16 дополнен правками д1–д4 T7.121a (предложение строки
+для датировочной строки, год уровня страницы, дата документа на странице целиком,
+сужение маркеров прогноза) — хеш v16 пересчитан, правила 1–12 и 14 прежние.
 """
 
 from __future__ import annotations
@@ -46,14 +53,14 @@ V28_PAYLOAD = REPO_ROOT / "docs" / "eval" / "config-v28-payload.json"
 
 #: curator-v15 заморожен (пин config-v25): его байты не меняются (ADR-0019)
 CURATOR_V15_SHA256 = "d229c3235424e98ac423aa400575fd646c84a9cea8f605e0b8e7f0513464920b"
-#: curator-v16 — новый файл (пин config-v28)
-CURATOR_V16_SHA256 = "9a32abf0e5d0b6e094ec5761d1de26b73f39cf8e84dd0087fe6dc34bd28a7d15"
+#: curator-v16 — новый файл (пин config-v28; правки д1–д4 T7.121a пересчитали хеш)
+CURATOR_V16_SHA256 = "8d9946e4b845556aa369556c7067f141f120ddf55d0ae977cb5311cf929003df"
 
-#: canonical payload'ов: v27 заморожен (эталон T7.119a), v28 закреплён (эталон T7.121)
+#: canonical payload'ов: v27 заморожен (эталон T7.119a), v28 закреплён (эталон T7.121a)
 V27_CANONICAL_SHA256 = "9d9ebba4937392da1b03156c9a39d2e5a9b244337720fee677148d1c29d8c83c"
-V28_CANONICAL_SHA256 = "2b77f24993edbe708b7cda97c6974e23af3798f4b7437460cce44f3058cc1cf5"
+V28_CANONICAL_SHA256 = "8db816eede41f44bde7c8cbb72791b27c1f4ad531f4034cbf9ebe964dc67e68b"
 #: хеш файла config-v28 (с каноническим сравнением не путать: байты файла — свой формат)
-V28_FILE_SHA256 = "c65a27bf53747eb736e0c2ba65b9c80ba13ff9136cba1669f083c349d761853c"
+V28_FILE_SHA256 = "82ffe53a1a667270428027a42f29240c4d719a90ff932bfe3addc7c9c89da3d2"
 
 #: реальные значения витрины запрещены новому тексту промпта в любом виде
 FORBIDDEN_LITERALS = ("5,59", "6,35", "6–7", "5–6", "14 октября")
@@ -159,7 +166,7 @@ def test_curator_v16_inherits_no_real_case_data() -> None:
 
 
 @pytest.mark.unit
-def test_config_v28_is_v27_with_only_the_curator_pin() -> None:
+def test_config_v28_is_v27_with_the_curator_pin_and_record_gates_key() -> None:
     v27 = json.loads(V27_PAYLOAD.read_text(encoding="utf-8"))
     v28 = json.loads(V28_PAYLOAD.read_text(encoding="utf-8"))
     assert canonical_sha256(v27) == V27_CANONICAL_SHA256, "canonical config-v27 изменился"
@@ -168,7 +175,7 @@ def test_config_v28_is_v27_with_only_the_curator_pin() -> None:
         hashlib.sha256(V28_PAYLOAD.read_bytes()).hexdigest() == V28_FILE_SHA256
     ), "байты файла config-v28-payload.json изменены не закреплённой правкой"
     assert v28["schema_version"] == v27["schema_version"]
-    untouched = {key for key in v27 if key != "prompts"}
+    untouched = {key for key in v27 if key not in {"prompts", "session_limits"}}
     for key in untouched:
         assert v28[key] == v27[key], f"config-v28 изменил раздел {key}"
     assert set(v28) == set(v27), "config-v28 изменил набор разделов"
@@ -182,6 +189,13 @@ def test_config_v28_is_v27_with_only_the_curator_pin() -> None:
     # на диске пин совпадает с байтами файла (content pinning, ADR-0019)
     disk = CURATOR_V16.read_bytes()
     assert hashlib.sha256(disk).hexdigest() == v28["prompts"]["curator"]["sha256"]
+    # T7.121a д5: в session_limits — ровно один новый ключ, включение гейтов записи;
+    # остальные ключи секции совпадают побайтово (V29 absent → True)
+    new_keys = {key for key in v28["session_limits"] if key not in v27["session_limits"]}
+    assert new_keys == {"curator_record_gates"}, new_keys
+    assert v28["session_limits"]["curator_record_gates"] is True
+    for key, value in v27["session_limits"].items():
+        assert v28["session_limits"][key] == value, f"config-v28 изменил ключ {key}"
 
 
 @pytest.mark.unit

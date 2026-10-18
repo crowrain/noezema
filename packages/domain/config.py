@@ -412,6 +412,9 @@ def activation_mode_name(mode: ActivationMode) -> str:
 # описывает форму секций, а форма `session_limits` — произвольный mapping уже сегодня.
 # Глубокую форму каталога проверяет потребитель (`apps/orchestrator/research_hints.py`), здесь —
 # примитивная проверка типов новых необязательных ключей.
+# Дополнение T7.121a: тот же путь — необязательный булев ключ `curator_record_gates` (гейты честности
+# записей куратора T7.121 включаются конфигурацией; отсутствие ключа = гейты молчат, поведение
+# pre-T7.121). Секция та же, `schema_version` тот же, миграции БД нет.
 
 
 def optional_session_limits_problems(session_limits: Any) -> list[str]:
@@ -432,4 +435,7 @@ def optional_session_limits_problems(session_limits: Any) -> list[str]:
     hints = session_limits.get("research_hints")
     if hints is not None and not isinstance(hints, dict):
         problems.append("session_limits.research_hints: должен быть словарём")
+    gates = session_limits.get("curator_record_gates")
+    if gates is not None and not isinstance(gates, bool):
+        problems.append("session_limits.curator_record_gates: должно быть булевым значением")
     return problems

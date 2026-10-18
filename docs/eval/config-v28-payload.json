@@ -190,7 +190,7 @@
   "prompts": {
     "curator": {
       "path": "prompts/curator/curator-v16.md",
-      "sha256": "9a32abf0e5d0b6e094ec5761d1de26b73f39cf8e84dd0087fe6dc34bd28a7d15",
+      "sha256": "8d9946e4b845556aa369556c7067f141f120ddf55d0ae977cb5311cf929003df",
       "version": "curator-v16"
     },
     "explorer": {
@@ -245,6 +245,7 @@
   },
   "schema_version": 1,
   "session_limits": {
+    "curator_record_gates": true,
     "max_claims_assessed_per_session": 32,
     "max_evidence_items_per_session": 64,
     "max_explorer_steps": 16,
