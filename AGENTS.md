@@ -1558,3 +1558,9 @@ Mutual-кластер дублей: внутри одной долгой phase-1
   `main`; пуш менеджера — `NOEZEMA_MANAGER_PUSH=1 git push origin <sha>:refs/heads/main` (хук
   `.git/hooks/pre-push` обновлён под эту цель). Исторические упоминания `impl/from-scratch` (ADR,
   архив STATUS, отчёты задач, раздел 6 этого файла эпохи T7.59) не правятся.
+- README для первочитающего (T7.122b, решение пользователя 2026-10-18): основная часть README —
+  общепонятным языком, внутренние имена только в разделах «Для разработчиков» и «Глоссарий»;
+  быстрый старт сверен с кодом (compose.dev.yaml, DEFAULT_DATABASE_URL, bind 127.0.0.1:8321,
+  NOEZEMA_LLM_BASE_URL; fake LLM даёт только тестовые сценарии, bootstrap-снапшот sealed). При
+  правках README проверять: существование относительных ссылок и GitHub-якорей, фактический путь
+  SSE `GET /api/v1/timeline/sse` (apps/web/api.py), бейдж-таблицу по apps/web/reliability.py.
