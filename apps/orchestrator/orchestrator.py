@@ -40,6 +40,12 @@ from apps.orchestrator.curator_correction import (
     CorrectionOverLimit,
     build_correction_section,
 )
+from apps.orchestrator.curator_declared_claims import (
+    CURATOR_REJECT_KIND_DECLARED_EMPTY,
+    DECLARED_EMPTY_PUBLIC_SUMMARY,
+    DECLARED_EMPTY_REASON,
+    summary_declares_new_claim,
+)
 from apps.orchestrator.curator_period_gate import claim_period_rejections_by_links
 from apps.orchestrator.curator_rejections import (
     claim_index_from_line,
@@ -3073,7 +3079,16 @@ class Orchestrator:
                 )
                 raise
             second_outcome = await self._curator_boundary(
-                db, session, ctx, snapshot, knowledge, second
+                db,
+                session,
+                ctx,
+                snapshot,
+                knowledge,
+                second,
+                # T7.123 (часть 3): ровно один раунд — пустое предложение с объявленным
+                # намерением повторно не отклоняется; принятый пустой ответ догоняет
+                # запасной путь опоры T7.115 из `c:`-ссылок финального ответа исследователя
+                declared_empty_check=False,
             )
             if isinstance(second_outcome, BoundaryRejected):
                 # Отказ ПОСЛЕ раунда — тот же event и прежние ключи для отказа ВТОРОГО
@@ -3325,6 +3340,8 @@ class Orchestrator:
         snapshot: ORMConfigSnapshot,
         knowledge: str,
         proposal: CuratorProposal,
+        *,
+        declared_empty_check: bool = True,
     ) -> BoundaryAccepted | BoundaryRejected:
         """Граничная проверка кураторского предложения до staging (T7.105,
         ADR-0034 вариант B; метод вынесен в T7.106 ради варианта C). Порядок и тексты
@@ -3339,6 +3356,12 @@ class Orchestrator:
         перепроверки и кандидатов гейта дублей; записи model_runs относятся к самим
         LLM-вызовам (_curator_chat), не к этой проверке. Ни одна staging-операция не
         исполняется, пока весь исход проверки не определён.
+
+        T7.123 (часть 3): пустое предложение (`claims` пуст, опоры нет) с объявленным в
+        сводке намерением записать утверждение — отказ ЦЕЛИКОМ с аддитивным
+        `curator_reject_kind` = "claims_empty_declared_in_summary"; проверка выполняется
+        только на первом вызове (`declared_empty_check`), второй вызов после раунда
+        исправления проходит без неё: ровно один раунд (ADR-0034 вариант C).
         """
         max_questions = int(snapshot.session_limits.get("max_new_questions_per_session", 4))
         # T7.84 (часть B, ADR-0033 §8): первым — только то, чему безразлично, каким ВИДОМ
@@ -3368,6 +3391,29 @@ class Orchestrator:
                 },
                 public_summary="curator proposal rejected by host validation",
                 reasons=problems[:10],
+            )
+
+        # T7.123 (часть 3, ADR-0038 дополнение): пустое предложение с объявленным намерением.
+        # Модель написала в сводке, что создаёт новое утверждение, и при этом вернула пустые
+        # `claims` без опоры (стенд b7e93ff6): это дефект ответа, а не честный отказ —
+        # предложение отклоняется целиком (тот же event, аддитивный `curator_reject_kind`)
+        # и догоняется ровно одним раундом исправления варианта C. На втором вызове
+        # (`declared_empty_check=False`) проверка молчит: если claims пусты и после раунда,
+        # предложение принимается прежним пустым, и работает запасной путь опоры T7.115.
+        if (
+            declared_empty_check
+            and not proposal.claims
+            and not proposal.relied_claim_ids
+            and summary_declares_new_claim(proposal.summary)
+        ):
+            return BoundaryRejected(
+                payload={
+                    "curator_rejected": [DECLARED_EMPTY_REASON],
+                    "curator_reject_kind": CURATOR_REJECT_KIND_DECLARED_EMPTY,
+                    "rejected_proposal": rejected_proposal_digest(proposal),
+                },
+                public_summary=DECLARED_EMPTY_PUBLIC_SUMMARY,
+                reasons=[DECLARED_EMPTY_REASON],
             )
 
         # T7.34 (ADR-0018): reverify references — resolved BEFORE the
