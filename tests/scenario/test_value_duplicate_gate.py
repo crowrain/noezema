@@ -79,7 +79,11 @@ OFFICIAL_AS_OF = "2026-01-21T00:00:00"
 
 _PAGES: dict[str, str] = {
     "http://alpha.example/cpi": (
-        "Annual consumer price growth in Russia for 2025 (December to December) was 5.59 percent."
+        # T7.121 (ADR-0038): CANDIDATE_OFFICIAL цитирует «декабрь 2025 к декабрю 2024» и
+        # «16–21 января 2026 г.» — периоды обязаны стоять на связанной странице рядом со
+        # значением, иначе гейт честности формулировки снимает утверждение. Ожидания теста не изменены.
+        "Annual consumer price growth in Russia for 2025 (December to December) was 5.59 percent. "
+        "Период наблюдения: декабрь 2025 к декабрю 2024. Отчёт опубликован 21 января 2026 года."
     ),
     "http://beta.example/cbr": (
         "Central bank report: yearly inflation in Russia came out at 5.59 percent for 2025."
@@ -91,15 +95,21 @@ _PAGES: dict[str, str] = {
         "Independent review of official figures: consumer prices rose by 5.59 percent in 2025."
     ),
     "http://epsilon.example/survey": (
-        "infOM survey: observed annual inflation in December 2025 — 13.1 and 15.6 percent."
+        # T7.121: период CANDIDATE_OBSERVED («в декабре 2025 года») у его значения 13,1/15,6
+        "infOM survey: observed annual inflation in December 2025 — 13.1 and 15.6 percent. "
+        "Опрос проведён в декабре 2025 года."
     ),
     "http://zeta.example/expectations": (
-        "Bank of Russia expectations survey for December 2025: observed inflation 14.5 percent."
+        # T7.121: период NEW_OBSERVED_CLAIM («в декабре 2025 года») у значения 14,5
+        "Bank of Russia expectations survey for December 2025: observed inflation 14.5 percent. "
+        "Опрос инФОМ проведён в декабре 2025 года."
     ),
     # пересказ официальных данных («по данным Росстата») — как garant.ru в фикстуре
     "http://eta.example/obzor": (
+        # T7.121: DUP_CLAIM цитирует «декабрь 2025 к декабрю 2024» — пересказ обязан нести
+        # тот же период рядом со значением
         "По\xa0данным Росстата, годовая инфляция в России по итогам 2025 года "
-        "(декабрь к декабрю) составила 5,59 процента."
+        "(декабрь 2025 к декабрю 2024) составила 5,59 процента."
     ),
 }
 
@@ -614,7 +624,9 @@ _PAGES.update(
             "Central bank decision record: the average key rate for 2025 was 13.7 percent."
         ),
         "http://iota.example/expectations": (
-            "Opinion poll of household inflation expectations, December 2025: 13.7 percent."
+            # T7.121: EXPECTATIONS_CLAIM («в декабре 2025 года, 13,7%») — период у значения
+            "Opinion poll of household inflation expectations, December 2025: 13.7 percent. "
+            "Опрос населения проведён в декабре 2025 года."
         ),
     }
 )

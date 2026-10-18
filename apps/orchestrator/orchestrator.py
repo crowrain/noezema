@@ -40,6 +40,7 @@ from apps.orchestrator.curator_correction import (
     CorrectionOverLimit,
     build_correction_section,
 )
+from apps.orchestrator.curator_period_gate import claim_period_rejections
 from apps.orchestrator.curator_rejections import (
     claim_index_from_line,
     links_without_claim_value,
@@ -3649,6 +3650,55 @@ class Orchestrator:
                         if relabel_type is not None:
                             reverify_anchor_types[claim_i] = relabel_type
                             claims_for_validation[claim_i]["claim_type"] = relabel_type
+
+        # T7.121 (части 2–3, ADR-0038): гейты честности формулировки — период и дата прогноза.
+        # Каждый явный период формулировки операции-наблюдения (месяц+год, квартал,
+        # полугодие, целевая фраза «по итогам / на конец / за N год», дата) обязан встречаться
+        # в тексте той же связанной страницы (фрагмент улики `source_assertion` или сохранённый
+        # полный текст), где стоит измеренное значение утверждения, в окне вето T7.113
+        # (`PUBLICATION_WINDOW_CHARS` — новых порогов нет). «14 октября» (день+месяц) —
+        # датировка страницы, а не период записи: на finmarket-6727171 «октября» рядом со
+        # значением «2,2» написана только так. Утверждение с маркером прогноза (закрытый
+        # список форм) обязано назвать дату самого прогноза — отличную от целевого периода —
+        # или писать «дата прогноза на странице не указана»; названная дата проверяется на
+        # странице так же, как период. Формулировка без периода и без маркера молчит: гейт
+        # требует только названное. Гейт стоит ПОСЛЕ того, как гейт дублей определил вид
+        # операции (перепроверку ведёт якорь, а не её формулировка), и ПОСЛЕ гейта значения
+        # (тексты берутся из оставшихся `supports`-связей) — причины снятых операций уже
+        # записаны, и в проверке as_of ниже они отфильтрованы тем же фильтром T7.105.
+        period_texts_by_claim: dict[int, list[str]] = {}
+        for k_link, link in enumerate(proposal.evidence_links):
+            if k_link in removed_links or link.relation.value != "supports":
+                continue  # опровержения и снятые связи — вне гейта (та же граница, что у T7.108)
+            texts = link_value_texts.get(k_link)
+            if texts is None:
+                continue  # улики не `source_assertion` — вне гейта
+            period_texts_by_claim.setdefault(link.claim_index, []).extend(
+                text for text in texts if text
+            )
+        period_drops = claim_period_rejections(
+            claims=staged_claims,
+            texts_by_claim=period_texts_by_claim,
+            already_dropped=dropped,
+        )
+        dropped.update(period_drops)
+        if period_drops and proposal.claims and len(dropped) == len(proposal.claims):
+            # Сняты ВСЕ операции — отказ предложения целиком (тот же event, аддитивный
+            # `curator_reject_kind` = "claim_period_not_near_value") -> вариант C догоняет
+            # один раунд исправления (гейт действует и на втором предложении).
+            return BoundaryRejected(
+                payload={
+                    "curator_rejected": list(dropped.values())[:10],
+                    "curator_reject_kind": "claim_period_not_near_value",
+                    "rejected_proposal": rejected_proposal_digest(proposal),
+                    **({"value_duplicates": value_duplicates} if value_duplicates else {}),
+                    **({"rejected_links": rejected_links_all} if rejected_links_all else {}),
+                },
+                public_summary=(
+                    "curator proposal rejected: claim period not found near the value on the linked page"
+                ),
+                reasons=list(dropped.values())[:10],
+            )
 
         # T7.84 (часть B, ADR-0033 §8): проверка опорной даты `temporal_fact` — отдельным
         # шагом СРАЗУ ПОСЛЕ того, как хост окончательно определил вид каждой операции:

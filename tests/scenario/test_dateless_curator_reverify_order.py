@@ -74,7 +74,12 @@ OBSERVED_AS_OF = "2025-12-31T00:00:00"
 
 _PAGES: dict[str, str] = {
     "http://alpha.example/cpi": (
-        "Annual consumer price growth in Russia for 2025 (December to December) was 5.59 percent."
+        # T7.121 (ADR-0038): страница обязана нести периоды, которые цитирует CANDIDATE_OFFICIAL
+        # («декабрь 2025 к декабрю 2024» и «21 января 2026» из «16–21 января 2026 г.») — иначе
+        # гейт честности формулировки законно снимает утверждение, а предмет теста (порядок
+        # проверок) перестаёт проверяться. Ожидания теста не изменены.
+        "Annual consumer price growth in Russia for 2025 (December to December) was 5.59 percent. "
+        "Период наблюдения: декабрь 2025 к декабрю 2024. Отчёт опубликован 21 января 2026 года."
     ),
     "http://beta.example/cbr": (
         "Central bank report: yearly inflation in Russia came out at 5.59 percent for 2025."
@@ -86,8 +91,10 @@ _PAGES: dict[str, str] = {
         "Independent review of official figures: consumer prices rose by 5.59 percent in 2025."
     ),
     "http://epsilon.example/survey": (
+        # T7.121: период «декабрь 2025» обязан стоять рядом со значением (CANDIDATE_OBSERVED
+        # и RESTATED_OBSERVED ссылаются на эту страницу)
         "infOM survey published by the central bank: observed annual inflation in December 2025 "
-        "was 14.5 percent."
+        "was 14.5 percent. Опрос проведён в декабре 2025 года."
     ),
     "http://zeta.example/obzor": (
         "По\xa0данным Росстата, годовая инфляция в России по итогам 2025 года (декабрь к декабрю) "
