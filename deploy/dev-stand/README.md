@@ -32,7 +32,7 @@
 
 ```bash
 ssh <user>@192.168.1.92
-git clone -b impl/from-scratch <repo> ~/noezema && cd ~/noezema
+git clone -b main <repo> ~/noezema && cd ~/noezema
 ./deploy/dev-stand/bootstrap.sh --dry-run     # план: что будет сделано, ничего не меняется
 sudo ./deploy/dev-stand/bootstrap.sh          # фактическая установка (скрипт сам добавит sudo где нужно)
 systemctl start noezema-dev.target            # web + unit-state и maint (тик-таймер по умолчанию выключен)
@@ -332,7 +332,8 @@ git pull                                   # пакет с prompts/curator/curat
   --payload docs/eval/config-v14-payload.json --reason "откат T7.73" --drain-wait-seconds 120
 ```
 
-Верификация после активации (вопрос задаёт оператор, например через `noezemactl ask`): перепроверка уже
+Верификация после активации (вопрос задаёт оператор, например через
+`.venv/bin/python -m hostctl.cli ask`): перепроверка уже
 подтверждённого временного факта **без даты в формулировке** — «Перепроверь по независимому источнику
 <https://…>: <тот же текст утверждения>?». Ожидаемый исход: та же голова и та же оценка (или выше), в
 журнале `claim_reverified` с `anchor_kept`, карточка не показала понижения; если причина оценки всё-таки
