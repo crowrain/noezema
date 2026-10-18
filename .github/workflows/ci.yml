@@ -7,9 +7,9 @@ name: CI
 
 on:
   push:
-    branches: [main, develop, impl/from-scratch]
+    branches: [main]
   pull_request:
-    branches: [main, impl/from-scratch]
+    branches: [main]
 
 jobs:
   lint:
