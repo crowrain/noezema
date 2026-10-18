@@ -85,8 +85,10 @@ import re
 import unicodedata
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from fractions import Fraction
 
+from apps.orchestrator.curator_period_gate import named_month_numbers
 from packages.domain.models.base import JsonDict
 
 #: decimal value token: maximal run of digits joined by ',' or '.', with digit
@@ -638,7 +640,10 @@ class ValueDuplicateCandidate:
 
     `relied` is T7.83a's hard condition for a merge: the curator declared this claim
     in `relied_claim_ids`. `metric` — the label stored with the claim (from the current
-    head's assessed_scope; empty for host-scope-v1, see `SCOPE_METRIC_KEYS`)."""
+    head's assessed_scope; empty for host-scope-v1, see `SCOPE_METRIC_KEYS`).
+    `created_at` (T7.121 часть 4) — момент записи кандидата: нужен только чтобы выбрать
+    якорь взаимно-дублирующегося кластера (ранейшая запись); None — хост не знает даты,
+    такой кандидат идёт после известных (выбор остаётся детерминированным по claim_id)."""
 
     claim_id: str
     statement: str
@@ -646,6 +651,7 @@ class ValueDuplicateCandidate:
     as_of_year: int | None
     relied: bool = False
     metric: str | None = None
+    created_at: datetime | None = None
 
 
 def _period(
@@ -655,6 +661,74 @@ def _period(
     if as_of_year is not None:
         years.add(as_of_year)
     return frozenset(years)
+
+
+# ── T7.121 (часть 4, ADR-0038 §4): guard названных месяцев и mutual-кластер ─────────
+#
+# Стендовой случай с3: в контекст-паке ДВЕ уже записанные формулировки одного факта
+# («5,59 % по итогам 2025 года», разный пересказ), предложение куратора совпадает с обеими,
+# `relied_claim_ids` не объявлен ни один — гейт T7.83a объявлял ambiguous и писал ТРЕТЬЮ
+# запись того же числа. Спор «какой из двух кандидатов тот же» испаряется, когда кандидаты
+# являются дублями ДРУГ ДРУГА: склейка с любым из них записывает значение в тот же самый
+# факт. Тогда хост берёт якорем ранейшую запись (детерминированно), а не отказывает.
+# Ограничения conservative-политики сохранены: ветка только для `not relied_strict`
+# (объявленная опора по-прежнему решает, ≥2 relied-кандидатов — прежний ambiguous);
+# взаимность проверяется предикатом витрины T7.99 в хронологическом направлении
+# (поздний кандидат склеивается в ранейший; при неизвестной дате — в обе стороны), сам
+# предикат НЕ изменяется — его тесты закреплены; плюс guard названных месяцев: «август 2026» и
+# «июль 2026» одного числа — наблюдения РАЗНЫХ периодов, взаимного кластера нет.
+# Тот же guard добавлен в строгую выборку кандидатов: месяц, названный операцией, обязан
+# пересекаться с месяцем кандидата, если месяцы названы обеими сторонами (годовой фильтр
+# T7.83 не ослаблен; стороны без названного месяца — прежняя тишина).
+
+
+def _months_conflict(op_months: frozenset[int], candidate_months: frozenset[int]) -> bool:
+    """Несовместимость названных месяцев (T7.121 часть 4). Месяцы смотрятся ТОЛЬКО когда
+    их называют обе стороны; конфликт — только при непересекающихся множествах
+    («декабрь 2025» {12} против «декабрьского опроса 2025» {12} — совместимы;
+    «август 2026» {8} против «июль 2026» {7} — конфликт). Датировочные строки
+    («опубликовано 21 января») добавляют здесь лишний месяц: консервативное направление —
+    лишний месяц ослабляет вето, но не создаёт его."""
+    return bool(op_months) and bool(candidate_months) and not (op_months & candidate_months)
+
+
+def _cluster_anchor(members: Sequence[ValueDuplicateCandidate]) -> ValueDuplicateCandidate:
+    """Якорь взаимного кластера — ранейшая запись по `created_at`. Равенство created_at
+    внутри одной phase-1 транзакции (ловушка AGENTS §7) разрешается порядком `claim_id`;
+    кандидат без известной даты идёт после известных."""
+    dated = [member for member in members if member.created_at is not None]
+    if dated:
+        return min(dated, key=lambda member: (member.created_at, member.claim_id))
+    return min(members, key=lambda member: member.claim_id)
+
+
+def _cluster_pair(anchor: ValueDuplicateCandidate, member: ValueDuplicateCandidate) -> bool:
+    """Кандидат `member` — дубль якоря `anchor` (T7.121 часть 4). Направление проверки —
+    хронологическое, ровно как у предиката витрины T7.99 `value_duplicate_pair` (поздняя
+    запись склеивается в ранейшую; «опубликовано …» добавляет кандидату годы и покрытию
+    не мешает). Если хронология неизвестна (у одного из кандидатов нет `created_at` —
+    так устроены старые unit-фикстуры) — консервативно требуется полное взаимное покрытие
+    в обе стороны: без известной даты хост не вправе придумывать порядок записей."""
+    if _months_conflict(named_month_numbers(anchor.statement), named_month_numbers(member.statement)):
+        return False
+
+    def _merge_into(candidate: ValueDuplicateCandidate, target: ValueDuplicateCandidate) -> bool:
+        return value_duplicate_pair(
+            op_claim_type=candidate.claim_type,
+            op_statement=candidate.statement,
+            op_as_of_year=candidate.as_of_year,
+            candidate_claim_type=target.claim_type,
+            candidate_statement=target.statement,
+            candidate_as_of_year=target.as_of_year,
+            op_metric=candidate.metric,
+            candidate_metric=target.metric,
+        )
+
+    if anchor.created_at is None or member.created_at is None:
+        return _merge_into(member, anchor) and _merge_into(anchor, member)
+    if anchor.created_at <= member.created_at:
+        return _merge_into(member, anchor)
+    return _merge_into(anchor, member)
 
 
 def _entry(
@@ -795,6 +869,7 @@ def find_value_duplicates(
         if not new_values:
             continue  # integers/years only — conservative silence (T7.9 owns byte-exact dups)
         new_period = _period(claim.statement, claim.as_of_year)
+        new_months = named_month_numbers(claim.statement)
         suspects = [
             candidate
             for candidate in ordered_candidates
@@ -803,61 +878,109 @@ def find_value_duplicates(
         ]
         if not suspects:
             continue
-        strict = [
-            candidate
-            for candidate in suspects
-            if new_period and new_period <= _period(candidate.statement, candidate.as_of_year)
-        ]
+        strict: list[ValueDuplicateCandidate] = []
+        month_vetoed: list[ValueDuplicateCandidate] = []
+        for candidate in suspects:
+            if not (new_period and new_period <= _period(candidate.statement, candidate.as_of_year)):
+                continue
+            if _months_conflict(new_months, named_month_numbers(candidate.statement)):
+                # T7.121 (часть 4): годы покрыты, но названный месяц операции противоречит
+                # названному месяцу кандидата — наблюдение другого периода, кандидат
+                # уходит из строгой выборки (годовой фильтр T7.83 при этом не ослаблен).
+                month_vetoed.append(candidate)
+            else:
+                strict.append(candidate)
         if not strict:
+            if month_vetoed:
+                veto_detail = "; ".join(
+                    f"candidate {candidate.claim_id} names months "
+                    f"{sorted(named_month_numbers(candidate.statement))}, the op names "
+                    f"{sorted(new_months)}"
+                    for candidate in month_vetoed
+                )
+                reason = (
+                    f"value {sorted(new_values)} matches candidate(s) "
+                    f"{', '.join(candidate.claim_id for candidate in suspects)} by type and "
+                    f"values, but the period {sorted(new_period)} is not covered — named months "
+                    f"do not overlap ({veto_detail}); left as proposed"
+                )
+            else:
+                reason = (
+                    f"value {sorted(new_values)} matches candidate(s) "
+                    f"{', '.join(candidate.claim_id for candidate in suspects)} by type and "
+                    f"values, but the period {sorted(new_period)} is not covered — left as proposed"
+                )
             decisions.append(
                 _entry(
                     claim,
                     action="kept",
                     target=None,
-                    reason=(
-                        f"value {sorted(new_values)} matches candidate(s) "
-                        f"{', '.join(candidate.claim_id for candidate in suspects)} by type and "
-                        f"values, but the period {sorted(new_period)} is not covered — left as proposed"
-                    ),
+                    reason=reason,
                 )
             )
             continue
         relied_strict = [candidate for candidate in strict if candidate.relied]
-        if not relied_strict:
+        cluster_merged: list[ValueDuplicateCandidate] = []
+        if relied_strict:
+            if len(relied_strict) >= 2:
+                decisions.append(
+                    _entry(
+                        claim,
+                        action="kept",
+                        target=None,
+                        reason=(
+                            "ambiguous value duplicate: "
+                            f"{len(relied_strict)} candidates share type, values and period "
+                            f"({', '.join(candidate.claim_id for candidate in relied_strict)}) — "
+                            "the op is left as proposed"
+                        ),
+                    )
+                )
+                continue
+            target = relied_strict[0]
+        elif len(strict) >= 2:
             # T7.83a: value+type+period совпали, но куратор НЕ объявил ни одного из
             # этих claims опорой своего ответа — хост не имеет права решать за него.
+            # Исключение (T7.121 часть 4, ADR-0038 §4): если строгие кандидаты являются
+            # дублями ДРУГ ДРУГА (предикат витрины в хронологическом направлении — см.
+            # `_cluster_pair` — плюс guard месяцев), спор
+            # «какой из них тот же» испаряется — любой вариант склейки записывает значение
+            # в тот же уже записанный факт; хост берёт якорем ранейшую запись.
             shared = ", ".join(candidate.claim_id for candidate in strict)
-            if len(strict) >= 2:
-                reason = (
-                    f"ambiguous value duplicate: {len(strict)} candidates share type, values "
-                    f"and period ({shared}) and none of them is declared in relied_claim_ids "
-                    "— the op is left as proposed"
-                )
+            anchor = _cluster_anchor(strict)
+            others = [candidate for candidate in strict if candidate.claim_id != anchor.claim_id]
+            if all(_cluster_pair(anchor, candidate) for candidate in others):
+                target = anchor
+                cluster_merged = [anchor, *others]
             else:
-                reason = (
-                    f"value {sorted(new_values)} matches candidate {strict[0].claim_id} by type, "
-                    f"values and period, but that candidate is not in relied_claim_ids — only a "
-                    "candidate the curator declared as the support of this answer may be merged; "
-                    "left as proposed"
+                decisions.append(
+                    _entry(
+                        claim,
+                        action="kept",
+                        target=None,
+                        reason=(
+                            f"ambiguous value duplicate: {len(strict)} candidates share type, values "
+                            f"and period ({shared}) and none of them is declared in relied_claim_ids "
+                            "— the op is left as proposed"
+                        ),
+                    )
                 )
-            decisions.append(_entry(claim, action="kept", target=None, reason=reason))
-            continue
-        if len(relied_strict) >= 2:
+                continue
+        else:
             decisions.append(
                 _entry(
                     claim,
                     action="kept",
                     target=None,
                     reason=(
-                        "ambiguous value duplicate: "
-                        f"{len(relied_strict)} candidates share type, values and period "
-                        f"({', '.join(candidate.claim_id for candidate in relied_strict)}) — "
-                        "the op is left as proposed"
+                        f"value {sorted(new_values)} matches candidate {strict[0].claim_id} by type, "
+                        f"values and period, but that candidate is not in relied_claim_ids — only a "
+                        "candidate the curator declared as the support of this answer may be merged; "
+                        "left as proposed"
                     ),
                 )
             )
             continue
-        target = relied_strict[0]
         check = indicator_check(claim.statement, target.statement, claim.metric, target.metric)
         if not check.matched:
             # T7.83a defect shape: то же десятичное число и тот же период у ДРУГОГО
@@ -902,6 +1025,17 @@ def find_value_duplicates(
                 )
             )
             continue
+        if cluster_merged:
+            reliance_note = (
+                f"none of the {len(cluster_merged)} candidates sharing type, values and period "
+                f"({', '.join(candidate.claim_id for candidate in cluster_merged)}) is declared in "
+                "relied_claim_ids, but they are mutual value duplicates of each other "
+                "(T7.121 часть 4, ADR-0038 §4): any merge writes the value into the same "
+                f"already-recorded fact, so the earliest record {target.claim_id} is the anchor — "
+                "a third copy is not written"
+            )
+        else:
+            reliance_note = "the candidate is declared in relied_claim_ids"
         decisions.append(
             _entry(
                 claim,
@@ -911,7 +1045,7 @@ def find_value_duplicates(
                     f"value duplicate of {target.claim_id}: same claim type "
                     f"({claim.claim_type}), same value set {sorted(new_values)}, period "
                     f"{sorted(new_period)} covered by the candidate and the same indicator "
-                    f"({check.detail}); the candidate is declared in relied_claim_ids — "
+                    f"({check.detail}); {reliance_note} — "
                     "converted to a reverify so the value is written once"
                 ),
             )

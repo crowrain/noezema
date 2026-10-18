@@ -3563,7 +3563,7 @@ class Orchestrator:
                 (
                     await db.execute(
                         text(
-                            "SELECT c.id::text AS id, c.statement, c.claim_type, c.as_of, "
+                            "SELECT c.id::text AS id, c.statement, c.claim_type, c.as_of, c.created_at, "
                             # метка показателя кандидата: единственный scope, который хост
                             # реально видит у строки знания — assessed_scope текущей головы
                             # этого снапшота (тот же источник, что у перепроверки T7.73).
@@ -3593,6 +3593,9 @@ class Orchestrator:
                         as_of_year=(row["as_of"].year if row["as_of"] is not None else None),
                         relied=(str(row["id"]) in relied_set),
                         metric=declared_scope_metric(row["head_scope"]),
+                        # T7.121 (часть 4): момент записи кандидата — нужен только чтобы
+                        # детерминированно выбрать якорь mutual-кластера (ранейшая запись)
+                        created_at=row["created_at"],
                     )
                     for row in candidate_rows
                 ]
