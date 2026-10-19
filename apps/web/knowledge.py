@@ -197,6 +197,88 @@ def current_assessment_evidence_joins(claim_ref: str, evidence_ref: str, source_
     """
 
 
+#: Колонки действующего отзыва записанной связи улики (остаток ADR-0039 §6, закрыт в T7.126
+#: части в): витрина обязана назвать отзыв и его причину, а не молчать о нём.
+LINK_REVOCATION_FACT_COLUMNS: Final[str] = (
+    "rev.id AS revocation_id, rev.reason AS revocation_reason, "
+    "rev.actor AS revocation_actor, rev.created_at AS revoked_at"
+)
+
+#: Формат строки витрины об отозванной связи (решение пользователя T7.126): причина отзыва и
+#: оба идентификатора — строка отзыва и дата, когда оператор её записал.
+REVOKED_LINK_LEAD: Final = "связь отозвана оператором"
+
+
+def link_revocation_join(evidence_ref: str) -> str:
+    """JOIN действующего отзыва записанной связи улики (T7.125, миграция 0026).
+
+    `evidence_ref` — как вызывающий запрос обозвал строку улики: карточка утверждения,
+    «происхождение» и карточка ответа пользуются одним текстом, чтобы нигде на витрине
+    отозванная связь не читалась обычной уликой. Действующий отзыв — `cancelled_at IS NULL`:
+    ровно тот же признак, по которому оценка и группы уже сняли эту связь (тот же смысл, что
+    `packages.memory.source_graph.active_link_revocation_exclusion`). Отменённый отзыв —
+    вторая запись истории: связь снова улика, строка отзыва в журнале остаётся, и витрина
+    про неё не утверждает.
+    """
+    return f"""
+            LEFT JOIN LATERAL (
+                SELECT r.id, r.reason, r.actor, r.created_at
+                FROM evidence_link_revocations r
+                WHERE r.evidence_id = {evidence_ref} AND r.cancelled_at IS NULL
+            ) rev ON TRUE
+    """
+
+
+def link_revocation_view(row: Any) -> JsonDict | None:
+    """Записанный отзыв этой связи или None: только строки `evidence_link_revocations`.
+
+    Никакой оценки: витрина называет то, что записал оператор (причину, автора и дату записи),
+    и ничего не добавляет от себя. None — с этой связью никто ничего не снимал.
+    """
+    if not isinstance(row, Mapping) or row.get("revocation_id") is None:
+        return None
+    view: JsonDict = {
+        "revocation_id": _uuid(row["revocation_id"]),
+        "reason": str(row["revocation_reason"] or ""),
+        "actor": str(row["revocation_actor"] or ""),
+        "revoked_at": _iso(row["revoked_at"]),
+    }
+    # Строку витрины несёт та же функция, что и карточки: JS печатает серверный текст,
+    # а не составляет его заново.
+    view["note"] = revoked_link_note(view)
+    return view
+
+
+def revoked_link_note(revocation: Mapping[str, Any] | None) -> str | None:
+    """Человеческая строка об отозванной связи: «связь отозвана оператором: … (отзыв …, …)».
+
+    Строку составляет сервер, карточка её только печатает (тот же порядок, что у истории
+    перепроверки T7.74 и у подписей оценок T7.87): текст одинаков на карточке утверждения,
+    в «происхождении» и на карточке ответа.
+    """
+    if revocation is None:
+        return None
+    reason = str(revocation.get("reason") or "").strip() or "причина не названа"
+    revoked_at = str(revocation.get("revoked_at") or "")[:10]
+    revocation_id = str(revocation.get("revocation_id") or "")
+    return f"{REVOKED_LINK_LEAD}: {reason} (отзыв {revocation_id}, {revoked_at})"
+
+
+def revoked_link_notes(rows: Iterable[Any]) -> list[str]:
+    """Строки витрины об отозванных связях одного утверждения (в порядке самих улик)."""
+    notes: list[str] = []
+    for row in rows:
+        note = revoked_link_note(link_revocation_view(row))
+        if note is not None:
+            notes.append(note)
+    return notes
+
+
+def link_is_revoked(row: Any) -> bool:
+    """True, если связь снята действующим отзывом оператора: витрина не считает её уликой."""
+    return isinstance(row, Mapping) and row.get("revocation_id") is not None
+
+
 def _assessment_explanations(
     fact_rows: Iterable[Any],
     reasons_by_assessment: Mapping[str, Sequence[str]],
@@ -213,6 +295,10 @@ def _assessment_explanations(
     assessment_of: dict[str, str] = {}
     for row in fact_rows:
         if not isinstance(row, Mapping) or row.get("claim_id") is None:
+            continue
+        # T7.126 часть в: связь, снятую действующим отзывом оператора, витрина не считает
+        # уликой ни в правиле производителя, ни в подсчёте подтверждений (остаток ADR-0039 §6).
+        if link_is_revoked(row):
             continue
         claim_id = str(row["claim_id"])
         grouped.setdefault(claim_id, []).append(row)
@@ -262,12 +348,14 @@ async def current_assessment_explanation(
                            cur_a.current_assessment_id AS assessment_id,
                            {CURRENT_ASSESSMENT_FACT_COLUMNS},
                            e.scope, s.parent_source_id, ps.canonical_uri AS parent_uri,
-                           c.statement AS claim_statement
+                           c.statement AS claim_statement,
+                           {LINK_REVOCATION_FACT_COLUMNS}
                     FROM evidence e
                     JOIN claims c ON c.id = e.claim_id
                     LEFT JOIN sources s ON s.id = e.source_id
                     LEFT JOIN sources ps ON ps.id = s.parent_source_id
                     {current_assessment_evidence_joins("e.claim_id", "e.id", "e.source_id")}
+                    {link_revocation_join("e.id")}
                     WHERE e.claim_id IN ({clause})
                     ORDER BY e.claim_id, e.created_at, e.id
                     """
@@ -520,12 +608,14 @@ async def claim_detail(db: AsyncSession, claim_id: uuid.UUID) -> JsonDict:
                            s.parent_source_id, ps.canonical_uri AS parent_uri,
                            ar.sha256 AS artifact_sha256,
                            cur_a.current_assessment_id AS assessment_id,
-                           {CURRENT_ASSESSMENT_FACT_COLUMNS}
+                           {CURRENT_ASSESSMENT_FACT_COLUMNS},
+                           {LINK_REVOCATION_FACT_COLUMNS}
                     FROM evidence e
                     LEFT JOIN sources s ON s.id = e.source_id
                     LEFT JOIN sources ps ON ps.id = s.parent_source_id
                     LEFT JOIN artifacts ar ON ar.id = e.observation_artifact_id
                     {current_assessment_evidence_joins("e.claim_id", "e.id", "e.source_id")}
+                    {link_revocation_join("e.id")}
                     WHERE e.claim_id = :id
                     ORDER BY e.created_at, e.id
                     """
@@ -624,6 +714,9 @@ async def claim_detail(db: AsyncSession, claim_id: uuid.UUID) -> JsonDict:
                 "source_content_hash": e["content_hash"],
                 "artifact_sha256": e["artifact_sha256"],
                 "created_at": _iso(e["created_at"]),
+                # T7.126 часть в: строка отзыва видна на самой улике — витрина не прячет то,
+                # что оператор снял эту связь (остаток ADR-0039 §6).
+                "link_revocation": link_revocation_view(e),
             }
             for e in evidence
         ],
@@ -646,7 +739,11 @@ async def claim_detail(db: AsyncSession, claim_id: uuid.UUID) -> JsonDict:
     # причинами и тем же правилом про производителя, что карточка ответа и список знаний:
     # один источник фактов (`current_assessment_evidence_joins`) и одна функция подписи.
     explanation = _assessment_explanations(
-        evidence,
+        # T7.126 часть в: правило витрины читает только живые связи. Связь, снятую
+        # действующим отзывом оператора, витрина не считает уликой ни в подписи производителя,
+        # ни в подсчётах подтверждений (сама оценка сняла её раньше — здесь витрина просто
+        # не противоречит тому, что уже записано).
+        [e for e in evidence if not link_is_revoked(e)],
         await assessment_reason_rows(
             db,
             sorted({str(e["assessment_id"]) for e in evidence if e["assessment_id"] is not None}),
@@ -670,7 +767,13 @@ async def claim_detail(db: AsyncSession, claim_id: uuid.UUID) -> JsonDict:
     detail["grade_reasons"] = grade_reason_view(reasons)
     detail["grade_reason_lines"] = assessment_reason_lines(reasons)
     # «как проверено» — только из реально переданных полей доказательств.
-    detail["verification"] = describe_verification(detail["evidence"])
+    # T7.126 часть в (остаток ADR-0039 §6): связь, снятую оператором, карточка называет
+    # отдельной строкой с причиной, а в «как проверено» она не входит: она больше ни улика,
+    # ни участник группы независимости (оценка и группы сняли её раньше, при пересчёте).
+    detail["revoked_links"] = revoked_link_notes(evidence)
+    detail["verification"] = describe_verification(
+        [item for item in detail["evidence"] if item["link_revocation"] is None]
+    )
     return detail
 
 
@@ -691,7 +794,7 @@ async def claim_provenance(db: AsyncSession, claim_id: uuid.UUID) -> JsonDict:
         (
             await db.execute(
                 text(
-                    """
+                    f"""
                     SELECT e.id, e.relation, e.evidence_kind, e.identity_hash,
                            e.source_id, e.chunk_id,
                            e.observation_artifact_id, e.environment_manifest_id,
@@ -701,12 +804,14 @@ async def claim_provenance(db: AsyncSession, claim_id: uuid.UUID) -> JsonDict:
                            ps.content_hash AS parent_content_hash,
                            ar.sha256 AS artifact_sha256, ar.size AS artifact_size,
                            ar.trust_class, ar.origin AS artifact_origin,
-                           em.protocol_hash AS env_protocol_hash
+                           em.protocol_hash AS env_protocol_hash,
+                           {LINK_REVOCATION_FACT_COLUMNS}
                     FROM evidence e
                     LEFT JOIN sources s ON s.id = e.source_id
                     LEFT JOIN sources ps ON ps.id = s.parent_source_id
                     LEFT JOIN artifacts ar ON ar.id = e.observation_artifact_id
                     LEFT JOIN environment_manifests em ON em.id = e.environment_manifest_id
+                    {link_revocation_join("e.id")}
                     WHERE e.claim_id = :id
                     ORDER BY e.created_at, e.id
                     """
@@ -875,6 +980,8 @@ async def claim_provenance(db: AsyncSession, claim_id: uuid.UUID) -> JsonDict:
                 ),
                 "environment_manifest_id": _uuid(e["environment_manifest_id"]),
                 "environment_protocol_hash": e["env_protocol_hash"],
+                # T7.126 часть в: «происхождение» называет отзыв той же связи, что и карточка.
+                "link_revocation": link_revocation_view(e),
             }
             for e in evidence
     ]
@@ -897,10 +1004,15 @@ async def claim_provenance(db: AsyncSession, claim_id: uuid.UUID) -> JsonDict:
         # только уже записанные строки коррекции + причина из журнала; view ничего
         # не оценивает и действующую оценку не прячет.
         "operator_corrections": await claim_source_corrections(db, claim_id),
+        # T7.126 часть в (остаток ADR-0039 §6): здесь те же строки об отзыве, что на карточке
+        # утверждения и на карточке ответа: связь названа, её причина и дата записи названы.
+        "revoked_links": revoked_link_notes(evidence),
         # «как проверено»: независимость групп источников упоминается только
         # когда эти группы действительно зафиксированы действующей оценкой.
         "verification": describe_verification(
-            evidence_items, source_groups=source_groups, environment_groups=env_groups
+            [item for item in evidence_items if item["link_revocation"] is None],
+            source_groups=source_groups,
+            environment_groups=env_groups,
         ),
     }
 

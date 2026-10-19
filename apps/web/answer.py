@@ -44,12 +44,16 @@ from apps.web.knowledge import (
     ASSESSMENT_EVENT_TYPES_SQL,
     CURRENT_ASSESSMENT_FACT_COLUMNS,
     EFFECTIVE_SNAPSHOT_SQL,
+    LINK_REVOCATION_FACT_COLUMNS,
     assessment_reason_lines,
     assessment_reason_rows,
     assessment_view,
     current_assessment_evidence_joins,
     effective_claim_rules,
     grade_reason_view,
+    link_is_revoked,
+    link_revocation_join,
+    revoked_link_notes,
 )
 from apps.web.producer_view import ProducerPublication, evidence_producer_names, producer_publication_case
 from apps.web.reliability import LEVEL_VERIFIED, describe_verification
@@ -471,10 +475,17 @@ def build_answer_result(
 
 
 def evidence_kind_counts(rows: Iterable[Mapping[str, Any]]) -> dict[str, int]:
-    """Сколько каких свидетельств подкрепляет ответ (учитываются только supports)."""
+    """Сколько каких свидетельств подкрепляет ответ (учитываются только supports).
+
+    T7.126 часть в: связь, снятую действующей записью отзыва (`evidence_link_revocations`),
+    карточка не считает подтверждением: она называется отдельной строкой, а в счётчик не входит.
+    Строки без колонки отзыва (другие вызовы) считаются как раньше.
+    """
     counts: dict[str, int] = {}
     for row in rows:
         if not isinstance(row, Mapping) or row.get("relation") != "supports":
+            continue
+        if link_is_revoked(row):
             continue
         kind = row.get("evidence_kind")
         if isinstance(kind, str):
@@ -1252,12 +1263,14 @@ async def question_answer(db: AsyncSession, question_id: uuid.UUID) -> JsonDict 
                                    s.source_type, s.canonical_uri, ar.sha256 AS artifact_sha256,
                                    s.parent_source_id, ps.canonical_uri AS parent_uri,
                                    cur_a.current_assessment_id AS assessment_id,
-                                   {CURRENT_ASSESSMENT_FACT_COLUMNS}
+                                   {CURRENT_ASSESSMENT_FACT_COLUMNS},
+                                   {LINK_REVOCATION_FACT_COLUMNS}
                             FROM evidence e
                             LEFT JOIN sources s ON s.id = e.source_id
                             LEFT JOIN sources ps ON ps.id = s.parent_source_id
                             LEFT JOIN artifacts ar ON ar.id = e.observation_artifact_id
                             {current_assessment_evidence_joins("e.claim_id", "e.id", "e.source_id")}
+                            {link_revocation_join("e.id")}
                             WHERE e.claim_id IN ({evidence_clause})
                             ORDER BY e.created_at, e.id
                             """
@@ -1310,7 +1323,9 @@ async def question_answer(db: AsyncSession, question_id: uuid.UUID) -> JsonDict 
         publication_by_claim: dict[str, ProducerPublication] = {}
         for claim_id, rows in by_claim.items():
             case = producer_publication_case(
-                rows,
+                # T7.126 часть в: связь, снятую действующим отзывом оператора, карточка не
+                # считает уликой и не подставляет её в правило производителя.
+                [row for row in rows if not link_is_revoked(row)],
                 reasons=reason_by_assessment.get(assessment_id_by_claim.get(claim_id, ""), ()),
                 claim_statement=statement_by_claim.get(claim_id),
             )
@@ -1357,7 +1372,13 @@ async def question_answer(db: AsyncSession, question_id: uuid.UUID) -> JsonDict 
                     producer_supports=publication.supports if publication is not None else None,
                 )
             )
-            item["verification"] = describe_verification(by_claim.get(claim_id, []))
+            item["verification"] = describe_verification(
+                [row for row in by_claim.get(claim_id, []) if not link_is_revoked(row)]
+            )
+            # T7.126 часть в (остаток ADR-0039 §6): карточка ответа называет отозванную связь
+            # той же строкой, что карточка утверждения: молчать о решении оператора витрина
+            # не может, а считать её подтверждением — тоже.
+            item["revoked_links"] = revoked_link_notes(by_claim.get(claim_id, []))
             # T7.73 (ADR-0018): текущая оценка объяснена — карточка показывает
             # причины, записанные rules engine (только подписи, без пересчёта).
             item["grade_reasons"] = grade_reason_view(reasons)
@@ -1412,7 +1433,13 @@ async def question_answer(db: AsyncSession, question_id: uuid.UUID) -> JsonDict 
                     producer_supports=publication.supports if publication is not None else None,
                 )
             )
-            item["verification"] = describe_verification(by_claim.get(claim_id, []))
+            item["verification"] = describe_verification(
+                [row for row in by_claim.get(claim_id, []) if not link_is_revoked(row)]
+            )
+            # T7.126 часть в (остаток ADR-0039 §6): карточка ответа называет отозванную связь
+            # той же строкой, что карточка утверждения: молчать о решении оператора витрина
+            # не может, а считать её подтверждением — тоже.
+            item["revoked_links"] = revoked_link_notes(by_claim.get(claim_id, []))
             # T7.87: «использовано из знаний» подписывается теми же причинами и тем же
             # правилом про производителя, что и записанные выводы этого вопроса.
             item["grade_reasons"] = grade_reason_view(reasons)

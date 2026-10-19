@@ -621,6 +621,14 @@ function renderClaim(claim,inactive){
     const lead = claim.verification_lead||'чем подтверждено';
     checked.textContent = lead+': '+lines.join('; '); row.appendChild(checked);
   }
+  // T7.126 часть в (остаток ADR-0039 §6): связь, снятую оператором, карточка называет
+  // отдельной строкой с причиной, отзывом и датой — строку целиком составляет сервер,
+  // JS только печатает. В «чем подтверждено» её нет: она больше ни улика, ни группа.
+  for(const note of (claim.revoked_links||[])){
+    if(!note) continue;
+    const line=document.createElement('div'); line.className='warn';
+    line.textContent=note; row.appendChild(line);
+  }
   // T7.87 (ADR-0035 §6.1): почему оценка именно такая. Всю строку составляет сервер
   // («причина: …» + подпись rules engine), JS только печатает то, что пришло.
   for(const reason of (claim.grade_reason_lines||[])){
@@ -880,6 +888,14 @@ async function tick(){
       for(const reason of reasons) h += `<li>${esc(reason)}</li>`;
       h += '</ul></div>';
     }
+    // T7.126 часть в (остаток ADR-0039 §6): карточка утверждает не только подтверждённое:
+    // снятую оператором связь она называет отдельной строкой (текст строки — серверный).
+    const revoked = (d.revoked_links || []).filter(Boolean);
+    if(revoked.length){
+      h += '<div class="card"><b>Отозванные связи:</b><ul>';
+      for(const note of revoked) h += `<li class="warn">${esc(note)}</li>`;
+      h += '</ul></div>';
+    }
     h += '<div class="card"><b>Зависимости:</b><ul>';
     for(const x of d.depends_on)
       h += `<li>зависит от: <a href="/claim/${x.claim_id}">${esc(x.statement.slice(0,80))}</a> (${x.kind})</li>`;
@@ -898,6 +914,10 @@ async function tick(){
         h += `<li>${e.relation}/${e.evidence_kind}: source: ${src}; artifact: ${art}`;
         for(const r of p.assessment_evidence_roles.filter(r => r.evidence_id === e.id))
           h += ` · role: ${r.role}`;
+        // T7.126 часть в: у отозванной связи роли действующей оценки нет — есть строка отзыва,
+        // и её составляет сервер («связь отозвана оператором: … (отзыв …, …)»).
+        if(e.link_revocation && e.link_revocation.note)
+          h += ` · <span class="warn">${esc(e.link_revocation.note)}</span>`;
         h += '</li>';
       }
       if(p.source_groups.length){
@@ -963,6 +983,9 @@ function disputeCard(p){
 function sourceUris(p){
   const seen = new Set(); const out = [];
   for(const e of p.evidence || []){
+    // T7.126 часть в: связь, снятую оператором, карточка не считает уликой — её адрес не
+    // подставляется в форму первоисточника.
+    if(e.link_revocation) continue;
     const u = e.source && e.source.canonical_uri;
     if(u && !seen.has(u)){ seen.add(u); out.push(u); }
   }
