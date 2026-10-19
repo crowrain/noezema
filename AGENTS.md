@@ -466,6 +466,40 @@ Mutual-кластер дублей: внутри одной долгой phase-1
 `tests/scenario/test_link_audit_t7124.py`, `tests/unit/test_stand_fixture_link_verdicts_t7124.py`
 (фикстуру 53 стендов читать `.split` по переводу строки — сырой U+2028, пункт T7.121a; посев
 «уже записанных» связей — staging плюс `apply_claim_staging`, а не UPDATE доменной таблицы).
+Этот пункт остаётся верным про аудит (read-only) и про прежний набор механизмов; про «`--apply`
+нет» — см. следующий пункт: решение пользователя получено в T7.125.
+- Дополнение к предыдущим пунктам (T7.125, ADR-0039): снятие уже записанной связи получило честный
+механизм — `noezemactl link-audit --apply --evidence <uuid,…> --reason "<причина>"` и `noezemactl
+link-audit-cancel --revocation <uuid,…> --reason "<причина>"` (`hostctl/cli.py:555`, `:901`; API —
+`apply_link_revocations` / `cancel_link_revocations`, `apps/orchestrator/link_audit.py:992`, `:1316`).
+Append-only таблица `evidence_link_revocations` (миграция 0026) по образцу
+`counterevidence_resolutions`: действующий отзыв один на улику (частичный unique), причина
+непустая, `basis` несёт вердикт гейта и хэш сохранённой страницы, отмена — вторая append-запись
+(колонки `cancelled_at`/`cancelled_by`/`cancel_reason` живут только вместе, CHECK). Предикат «нет
+действующего отзыва» — `active_link_revocation_exclusion` (`packages/memory/source_graph.py:62`),
+применён ровно НА ВХОДЕ: сборка улик переоценки (`packages/memory/reassessment.py:405-416`) и вход
+группировщика вместе с записанными родителями значения (`packages/memory/source_graph.py:206-217`,
+`:91-107`). Пороги, `claim_type_rules`, алгоритм группировки, промпты и конфиги не тронуты: НЕ
+переносить фильтр в движок правил, не заводить вторую копию предиката и не «чинить» отзыв
+подменой relation/scope/roles (прежний стоп-критерий в силе). Каскад — голова `pending` (оба
+current-признака NULL) плюс ровно одна durable-задача `reassessment_jobs` (причина
+`link_revocation_change`, `prepared_by = 'system:link_revocation'`), затем батч
+`run_reassessment_batch`; отзыв оценку не назначает (§3). Применения «по вердиктам» нет только по
+причине фактических данных, а не осторожности: на стендовых связях пакет снял бы те, что значение
+несут (ADR-0039 §4), поэтому нужен явный перечень id. Ловушки: (а) расширение закрытого CHECK
+`claim_assessment_heads_prepared_by_check` обязано перечислить ВСЕ прежние значения — 0022 добавила
+`commit_carryover`, и её потеря красит существующий `tests/scenario/test_quiesce_race.py::
+test_commit_after_flip_carries_claims_to_active_snapshot` (guard — сравнение множеств значений в
+`tests/scenario/test_link_revocations_migration_t7125.py`); (б) новое значение `AuditEventType`
+обязано получить подпись витрины в `apps/web/labels.py`, иначе краснеют полнотные тесты
+`tests/unit/test_web_labels.py`; у `audit_events.type` CHECK нет, поэтому второй миграции не нужно
+(закреплено тестом как отсутствие); (в) CLI-команда обязана закрыть engine после последней сессии
+(обёртка `_closed()` в `link-audit` и `link-audit-cancel`), иначе teardown фикстуры сообщает о
+живом соединении scratch-БД; (г) витрина отдельной строки об отзыве НЕ делает — это остаток
+ADR-0039 §6, и обещать «строку в карточке» в текстах нельзя. Откат 0026 при живой голове
+`system:link_revocation` падает честно (тот же предел, что 0012). Тесты:
+`tests/scenario/test_link_revocations_t7125.py`,
+`tests/scenario/test_link_revocations_migration_t7125.py`.
 - Eval/wake/smoke исполняют инструменты через `StubToolExecutor` (dev-подставка, хост .87 без изоляции —
   риск python.execute осознанный DEV ONLY); sandboxed ToolBroker — только в тестах. Из списка инструментов
   снапшота при этом живут и неисполнимые в stub: shell.execute → Observation `tool_not_supported:` (T7.57(b),

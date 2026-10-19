@@ -2719,3 +2719,117 @@ staging плюс `MemoryService.apply_claim_staging` (тот же commit-boundar
 границы куратора T7.108/T7.123 такие связи сегодня не пропустили бы. Остаток после прогонов:
 контейнеров 41 (норма), БД `noezema_mig_*` 40, `noezema_tpl_*` 0. Ни миграций, ни нового
 AuditEventType, ни правок правил/порогов/группировки, ни изменения промптов и конфигов.
+
+## T7.125 (2026-10-19): отзыв уже записанной связи улики — `evidence_link_revocations`, предикат на входе оценки и группировки, `link-audit --apply` и `link-audit-cancel` (миграция 0026; ADR-0039; ADR-0038 §14)
+
+**Решение пользователя получено.** T7.124 закончил половину: план есть, применения нет, потому что
+«снятие уже записанной связи — отдельное решение пользователя» (ADR-0038 §13.4 требовал миграции и
+этого решения). Постановка T7.125 («отзыв связи улики») и есть это решение; строки T7.125 в
+`docs/PLAN_FROM_SCRATCH.md` нет — нумерация продолжается за пределами написанного плана (как
+T7.121a…T7.124). Прежний вывод о нечестности подмен (`relation`, `scope`, `roles`) остаётся в силе:
+реализован ровно вариант §13.4 — таблица отзывов плюс предикат на входе, а не правка фактов.
+
+**Часть 1 (миграция 0026 и модель).** `migrations/versions/0026_link_revocations.py`:
+`evidence_link_revocations` по образцу `counterevidence_resolutions` (миграция 0012) — `evidence_id`
+и `claim_id` с `ON DELETE CASCADE`, непустая `reason` (CHECK), машиночитаемый `basis jsonb`,
+`actor`, `rules_version`, `created_at`, колонки отмены `cancelled_at`/`cancelled_by`/`cancel_reason`
+(CHECK тройки: живут только вместе, `cancel_reason` непустая); действующий отзыв один на улику —
+частичный unique `uq_link_revocations_active (evidence_id) WHERE cancelled_at IS NULL`
+(:88), индексы по улике и по утверждению. ORM — `ORMLinkRevocation`
+(`packages/domain/models/memory.py:353`). Два новых значения `AuditEventType`
+(`LINK_REVOCATION_CREATED`, `LINK_REVOCATION_CANCELLED`, `packages/domain/models/enums.py:555-556`):
+у `audit_events.type` CHECK в схеме нет, поэтому второй миграции не потребовалось (закреплено
+тестом как отсутствие ограничения); подписи витрины — `apps/web/labels.py:1097` («связь улики
+отозвана») и `:1103` («отзыв связи улики отменён»). Закрытый CHECK
+`claim_assessment_heads_prepared_by_check` расширен новым значением `system:link_revocation` — той
+же процедурой, что 0007/0011/0012/**0022** (DROP плюс ADD со всем прежним перечнем).
+
+**Часть 2 (предикат ровно на ВХОДЕ).** `active_link_revocation_exclusion(column)`
+(`packages/memory/source_graph.py:62-75`) — `NOT EXISTS` по действующему отзыву; применён в двух
+местах сборки оценки: селект улик для переоценки (`packages/memory/reassessment.py:405-416`) и вход
+группировщика (`packages/memory/source_graph.py:213` — источные улики утверждения) вместе с
+записанными родителями значения (`:101`). Пороги, `claim_type_rules`, шкала оценок, алгоритм
+группировки и его пороги склейки, промпты и конфиги не изменены ни на байт; второй копии предиката
+нет; строки `evidence` не UPDATE-ятся и не DELETE-ятся, новой колонки у `evidence` нет. Окружной
+снимок независимости (`packages/memory/env_independence.py:169-189`) не фильтрован осознанно: он
+считает группы по `environment_manifest_id`, а host-связи чтения этого признака не несут (в
+`apps/orchestrator/evidence.py` его присваивания нет) — отзывов, которых там можно было бы не
+учесть, для связей чтения нет.
+
+**Часть 3 (применение, отмена, команды).** `apps/orchestrator/link_audit.py:822-1418` —
+`apply_link_revocations` (:992) и `cancel_link_revocations` (:1316): одна транзакция, аудит в той же
+транзакции (§3), перед записью — проверка всех перечисленных улик, любой отказ отменяет весь вызов
+(`LinkRevocationError` со списком именованных отказов :834-842: нет улики; нет утверждения; вне
+юрисдикции гейта; «значение на странице есть»; «текста нет»; нет измеренного значения; под
+коррекцией оператора ADR-0031; нет действующей головы; «не останется ни одной улики» — только с
+явным `--allow-empty`). `basis` строит основание тем же чистым гейтом записи
+(`link_value_gate`/`statement_value_profile`, `apps/orchestrator/curator_rejections.py:198-234`) по
+целой сохранённой странице: вердикт, профиль значения, `relation`, `evidence_kind`, canonical URI,
+`page_sha256`, `config_snapshot_id` и его хэш, версия движка правил. Каскад `_revocation_cascade_claim`
+(:934-978) — механизм ADR-0029 §22: голова `pending` с `current_assessment_id`/`epistemic_status`
+NULL (§3 Lifecycle) с `AND assessment_state = 'current' RETURNING`, ровно одна durable-задача
+`reassessment_jobs` (причина `link_revocation_change`), `prepared_by = 'system:link_revocation'`;
+доменные ревизии не повышаются, оценку назначает не отзыв, а батч `run_reassessment_batch`
+(`packages/memory/reassessment.py:776`), который вызывает вызывающая сторона.
+`hostctl/cli.py:555` (`link-audit`) получил `--apply --evidence <uuid,…> --reason "…"` плюс
+`--allow-empty`, `hostctl/cli.py:901` — новая команда `link-audit-cancel --revocation <uuid,…>
+--reason "…"`; обе заканчиваются закрытием engine (`_closed()`), иначе teardown фикстуры сообщает о
+живом соединении scratch-БД. Read-only поведение T7.124 не изменено: без `--apply` по-прежнему
+только план и ни одной записи; план теперь показывает уже отозванные связи (`LinkAuditRow.revoked_links`
+:210-215, `LinkAuditReport.links_revoked` :266-269) отдельной строкой с причиной и актором, новых
+вердикт-строк нет — прежние утверждения T7.124 про план истинны. План по-прежнему не пишет ничего.
+
+**Репроигрывание 83e7a1c8 (было → стало после применения).** Было: `E3 supported` 0.75, две группы
+независимости (SberCIB, HR-Ratings). Отзыв двух связей к странице ключевой ставки (`--allow-empty`
+не нужен: связь на hr-ratings остаётся) → каскад «снятых голов: 1; задач переоценки заведено: 1» →
+рабочий батч: `E1 hypothesis` 0.15, одна группа `{hr-ratings…}`; строки `evidence` побайтно прежние
+(`assertion_text`, `scope`, `source_id`, `chunk_id`, `created_at`), `assessment_evidence` прежней
+оценки не тронуты, аудит — `link_revocation_created`. Повторный отзыв тех же улик: «уже отозвано
+связей: 2», каскад (0, 0), записей нет. Отмена отзывов возвращает `E3 supported` и обе группы;
+отмена при уже `pending` голове и живой задаче даёт (0, 0) — второй задачи заводить нечем, батч
+после неё всё равно восстанавливает оценку.
+
+**Найденное по дороге (свои же красноты полной проверки).** Первая полная проверка §6 провалилась в
+трёх тестах, и оба класса — следствия этого коммита, а не чужие дефекты: (а) новые `AuditEventType`
+не получили подписей витрины → `tests/unit/test_web_labels.py::test_every_source_value_has_a_label`
+и `::test_audit_event_labels_cover_every_audit_type` («значения без подписи»); (б) первая версия
+миграции 0026 перечислила прежние значения CHECK `prepared_by` **без `commit_carryover`** (его
+добавила миграция 0022, им пользуется `packages/domain/services/commit.py:320`) → красный
+`tests/scenario/test_quiesce_race.py::test_commit_after_flip_carries_claims_to_active_snapshot`
+(`CheckViolationError`). Исправлено: полный прежний перечень плюс guard-тест, сравнивающий множества
+значений CHECK до и после миграции и пробующий записать голову на каждом прежнем значении.
+
+**Ограничения, закреплённые тестами как факты (не правятся).** Откат `downgrade -1` падает
+`CheckViolationError`, если в базе живёт голова, подготовленная отзывом: миграция возвращает прежний
+CHECK и Postgres проверяет его по существующим строкам; тест называет отказ и проходит откат дальше
+только после снятия голов (тот же предел, что у миграции 0012).
+
+**Красность на базе `b005dbf`** (временный detached worktree `/home/denis/dsh1/.wt7125`, удалён):
+поведенческий файл красный на сборе — `ImportError: cannot import name 'REFUSAL_LAST_EVIDENCE' from
+'apps.orchestrator.link_audit'`; файл миграции — `5 failed, 1 passed`
+(`UndefinedTableError: relation "evidence_link_revocations" does not exist`); тот один зелёный на
+базе тест документирует отсутствие CHECK у `audit_events.type`, а не работу новой механики.
+
+**§6:** baseline базы 3120 passed + 12 skipped (+ timing 4 passed, 3132 deselected) → после
+реализации 3139 passed, 12 skipped (`-n auto -m "not timing"`, 292.83 с; пересчёт после
+документационной правки — 296.71 с) + timing 4 passed, 3151 deselected (48.05 с / 47.90 с); добавлено 19 тестов: 13 scenario
+(`tests/scenario/test_link_revocations_t7125.py` — репроигрывание 83e7a1c8, все отказы, повтор,
+«последняя улика» с `--allow-empty` и её итог `insufficient_data`, отзыв/отмена на входе
+`load_source_graph_assembly`, три CliRunner-теста) и 6 scenario
+(`tests/scenario/test_link_revocations_migration_t7125.py` — up/down/up с побайтовой схемой,
+расширение CHECK плюс guard множеств и честный отказ отката, частичный unique и повторный отзыв
+после отмены, тройка колонок отмены, `ON DELETE CASCADE`, отсутствие CHECK у `audit_events.type`).
+Тест T7.124 переименован (`test_cli_link_audit_offers_no_apply_and_rejects_bad_parameters` →
+`test_cli_link_audit_is_read_only_by_default_and_rejects_bad_parameters`) с HISTORY-пометкой: прежняя
+формулировка «применения нет намеренно» с T7.125 неистинна, assertions (неполное `--apply` → отказ с
+названной причиной, записей нет; кривые `--since`/`--claims` → `EXIT_USAGE_ERROR`) те же и зелёные.
+Остаток после прогонов: контейнеров 41 (норма), БД `noezema_mig_*` 40, `noezema_tpl_*` 0.
+
+**Остаток (названо, не сделано).** Витрина отдельной строки об отзыве НЕ сообщает: карточка
+утверждения перечисляет все его улики как факты журнала и берёт оценку из головы, которая отзыва не
+содержит; отдельной строки «связь отозвана, причина …» и счётчика отзывов в API нет — это решение о
+представлении, отдельно от решения об отзыве (ADR-0039 §6). Пакетного снятия по вердиктам нет по
+причине фактических данных (ADR-0039 §4), ограничения проверки ADR-0038 §13.6 не исправлены,
+отзывом снимается только `supports`-связь `source_assertion` (для опровержений есть
+`counterevidence_resolutions`). Правил, порогов, промптов и конфигов этот коммит не касается;
+миграция 0026 — единственная.
