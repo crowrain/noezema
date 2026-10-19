@@ -67,7 +67,7 @@ from __future__ import annotations
 import re
 from collections import Counter
 from collections.abc import Mapping
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 from apps.orchestrator.rejected_proposal import _claim_entry, _link_entry
 from apps.research_proxy.value_attribution import (
@@ -186,6 +186,54 @@ def rejected_operation_entries(
 # и её связи остаются названными её записью (отдельной записью связи не дублируются).
 
 
+# ─── T7.124 (часть 2): тот же предикат для ОДНОЙ связи --------------------------
+#
+# Профиль значения и читатель текстов вынесены в чистую функцию без изменения поведения:
+# гейт предложения (`links_without_claim_value` ниже) и аудит уже записанных связей
+# (`apps/orchestrator/link_audit.py`, `hostctl link-audit`) обязаны решать одним кодом —
+# иначе «план» называл бы снятой связь, которую живой гейт оставил бы (ADR-0038 §13).
+# Исходов три: утверждение без числового профиля (вне проверки), значение найдено,
+# значения нет. Строки причин и пороги не изменились.
+
+VALUE_GATE_UNCHECKED: Final = "unchecked"
+VALUE_GATE_PRESENT: Final = "present"
+VALUE_GATE_ABSENT: Final = "absent"
+
+
+def link_value_gate(
+    *, statement: str, texts: tuple[str | None, str | None]
+) -> str:
+    """Исход гейта «значение на связи» для одной связи: `VALUE_GATE_*`.
+
+    `texts` — (фрагмент улики, полный текст страницы); `None` — текста нет. Утверждение без
+    измеренного значения и без «голых» чисел — вне проверки (T7.108, T7.120, T7.123)."""
+    values = frozenset(claim_value_numbers(statement))
+    match_values = claim_match_values(statement)
+    bare = frozenset() if match_values else _claim_bare_values(statement)
+    if not values and not match_values and not bare:
+        return VALUE_GATE_UNCHECKED  # утверждение без числового профиля не проверяется
+    # T7.113 (часть 2): диапазоны утверждения подтверждают связь только целиком (один
+    # диапазон как значение либо оба конца отдельными числами); одиночные значения —
+    # прежний читатель текстовых форм T7.108a, его поведение не изменено
+    ranges = claim_range_tokens(match_values)
+    singles = (match_values - ranges) | bare
+    if claim_values_found_in_texts(values=singles, texts=texts):
+        return VALUE_GATE_PRESENT
+    if ranges and claim_ranges_found_in_texts(ranges=ranges, texts=texts):
+        return VALUE_GATE_PRESENT
+    return VALUE_GATE_ABSENT
+
+
+def statement_value_profile(statement: str) -> tuple[str, ...]:
+    """Какие числовые токены утверждения гейт ищет на тексте связи (для отчёта T7.124).
+
+    Тот же профиль, что у `link_value_gate`: измеренные значения и диапазоны целиком,
+    а когда их нет — «голые» десятичные числа. Пусто — утверждение вне проверки."""
+    match_values = claim_match_values(statement)
+    bare = frozenset() if match_values else _claim_bare_values(statement)
+    return tuple(sorted(match_values | bare))
+
+
 def links_without_claim_value(
     *,
     proposal: CuratorProposal,
@@ -228,20 +276,11 @@ def links_without_claim_value(
             # собственная строка операции есть пересказ, audit-only), профиль значения берётся
             # из неё; при отсутствии цели откатываемся на собственную строку
             statement = str(statement_overrides.get(claim_index) or "").strip() or statement
-        values = frozenset(claim_value_numbers(statement))
-        match_values = claim_match_values(statement)
-        bare = frozenset() if match_values else _claim_bare_values(statement)
-        if not values and not match_values and not bare:
-            continue  # утверждение без числового профиля не проверяется (T7.108, T7.120)
-        # T7.113 (часть 2): диапазоны утверждения подтверждают связь только целиком (один
-        # диапазон как значение либо оба конца отдельными числами); одиночные значения —
-        # прежний читатель текстовых форм T7.108a, его поведение не изменено
-        ranges = claim_range_tokens(match_values)
-        singles = (match_values - ranges) | bare
-        if claim_values_found_in_texts(values=singles, texts=texts):
-            continue
-        if ranges and claim_ranges_found_in_texts(ranges=ranges, texts=texts):
-            continue
+        gate = link_value_gate(statement=statement, texts=texts)
+        # T7.108, T7.120: утверждение без числового профиля не проверяется; T7.113 (часть 2)
+        # и T7.108a (читатель диапазонов и текстовых форм) — внутри `link_value_gate`
+        if gate != VALUE_GATE_ABSENT:
+            continue  # вне проверки или значение на тексте связи есть
         removed[k] = (
             f"evidence_link[{k}]: evidence {link.evidence_index} "
             f"does not contain the value of claim {claim_index}"

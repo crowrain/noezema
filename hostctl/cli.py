@@ -552,6 +552,176 @@ def independence_preview(apply: bool) -> None:
     sys.exit(asyncio.run(_run()))
 
 
+@main.command("link-audit")
+@click.option(
+    "--since",
+    default="",
+    help=(
+        "Окно по дате связи в ISO (например 2026-10-07T14:30:00+00:00 или …Z): проверяются "
+        "утверждения, у которых есть связь, записанная не раньше этой даты."
+    ),
+)
+@click.option(
+    "--claims",
+    default="",
+    help="Только перечисленные утверждения: uuid через запятую (полные id, как в dispute).",
+)
+def link_audit(since: str, claims: str) -> None:
+    """Аудит «значение на связи» у УЖЕ записанных связей (T7.124, ADR-0038 §13): только чтение.
+
+    Для каждого утверждения с действующей головой effective-снапшота берёт каждую его
+    `supports`-связь с уликой `source_assertion` и применяет к ней тот же профиль значения
+    (измеренные значения, диапазоны целиком, «голые» десятичные числа) и тот же читатель
+    текстов, что гейт записи (T7.108, T7.113, T7.123) — по сохранённому нормализованному
+    тексту страницы (`sources.metadata->>'normalized_sha256'`, запасной путь — payload
+    существующего `research_fetch_completed`). Проверяется вся страница: фрагмент улики есть
+    окно этого же текста, поэтому связь, которую живой гейт оставил бы, снятой не называется.
+    Опровержения (`counters`) и улики других видов вне проверки. Если текста страницы нет или
+    он не читается — связь НЕ включается в пересчёт и называется отдельно: «текста нет» — это
+    не «значения нет». Утверждения, чьи источники покрыты действующей коррекцией оператора
+    (ADR-0031), выводятся отдельной строкой «под коррекцией оператора — не трогаем».
+
+    Для каждого затронутого утверждения показан пересчёт «было → стало»: группы независимости
+    тем же чистым группировщиком (`load_source_graph_assembly` + `group_source_graph`) и оценка
+    тем же чистым `evaluate` (единственный производитель оценок) при снятии проваливших связей.
+
+    Команда ничего не пишет и не применяет: существующего честного пути снять уже записанную
+    связь нет — у `evidence` нет признака «не участвует в оценке», движок правил исключает
+    улику только по известным ему признакам, а `resolved` живёт только у опровержений
+    (`counterevidence_resolutions`). Честное снятие потребовало бы новой долговременной
+    сущности и предиката на входе оценки — миграция БД плюс правка сборки оценки, то есть
+    отдельная задача с решением пользователя (варианты — ADR-0038 §13). Поэтому «стало» здесь
+    — прогноз, а не действие. Идемпотентно: повторный прогон даёт тот же план.
+
+    exit 0  -> план напечатан (или пуст: все связи проходят ту же проверку)
+    exit 2  -> NOEZEMA_DATABASE_URL не задан, --since не ISO, --claims не uuid,
+               нет effective-снапшота (fail-closed, §3)
+    """
+    import asyncio
+    import os
+
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    url = os.environ.get("NOEZEMA_DATABASE_URL", "")
+    if not url:
+        click.echo("NOEZEMA_DATABASE_URL is not set", err=True)
+        sys.exit(EXIT_USAGE_ERROR)
+
+    from apps.orchestrator.link_audit import (
+        LinkAuditError,
+        LinkAuditReport,
+        LinkAuditRow,
+        audit_recorded_links,
+        parse_claim_ids,
+        parse_since,
+    )
+    from apps.orchestrator.scheduler import artifacts_root_from_env
+    from packages.artifacts.store import FilesystemArtifactStore
+
+    try:
+        since_ts = parse_since(since) if since else None
+        selected = parse_claim_ids(claims) if claims else None
+    except LinkAuditError as exc:
+        click.echo(str(exc), err=True)
+        sys.exit(EXIT_USAGE_ERROR)
+
+    try:
+        store = FilesystemArtifactStore(artifacts_root_from_env())
+    except OSError as exc:
+        click.echo(f"каталог артефактов недоступен ({artifacts_root_from_env()}): {exc}", err=True)
+        sys.exit(EXIT_USAGE_ERROR)
+
+    engine = create_async_engine(url)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    def _fmt_partition(partition: tuple[tuple[str, ...], ...]) -> str:
+        if not partition:
+            return "нет источных улик"
+        return " | ".join("«" + ", ".join(items) + "»" for items in partition)
+
+    def _shorten(text: str) -> str:
+        cleaned = " ".join(text.split())
+        return cleaned if len(cleaned) <= 90 else cleaned[:89] + "…"
+
+    def _print_row(row: LinkAuditRow) -> None:
+        click.echo(f"утверждение {str(row.claim_id)[:8]} · {row.claim_type}")
+        click.echo(f"    утверждение: {_shorten(row.statement)}")
+        for link in row.links:
+            if link.canonical_uri:
+                where = link.canonical_uri
+            elif link.source_id is not None:
+                where = f"источник {str(link.source_id)[:8]}"
+            else:
+                where = "источник не записан"
+            session = str(link.session_id)[:8] if link.session_id else "—"
+            click.echo(
+                f"    связь {where} (улика {str(link.evidence_id)[:8]}, сессия {session}): {link.verdict}"
+            )
+            click.echo(f"        {link.note}")
+        if row.excluded_source_uris:
+            click.echo("    уходили бы из участников групп: " + ", ".join(row.excluded_source_uris))
+        if row.groups_changed:
+            click.echo(f"    группы было ({len(row.old_groups)}): {_fmt_partition(row.old_groups)}")
+            click.echo(f"    группы стало ({len(row.new_groups)}): {_fmt_partition(row.new_groups)}")
+        else:
+            click.echo("    группы не изменились")
+        if row.evaluation_computed:
+            click.echo(
+                f"    оценка было: {row.persisted_grade} {row.persisted_status} "
+                f"({row.persisted_confidence:.2f}) → стало: {row.new_grade} {row.new_status} "
+                f"({(row.new_confidence or 0.0):.2f})"
+            )
+        else:
+            click.echo(
+                f"    оценка было: {row.persisted_grade} {row.persisted_status} "
+                f"({row.persisted_confidence:.2f}); {row.evaluation_note or ''}"
+            )
+
+    def _print_totals(report: LinkAuditReport) -> None:
+        click.echo(
+            f"итог: утверждений с провалившими связями: {report.claims_with_absent_links}; "
+            f"связей без значения: {report.links_without_value}; без текста: {report.links_missing_text}; "
+            f"утверждений с изменением групп: {report.groups_changed_count}; "
+            f"с изменением оценки: {report.assessment_changed_count}; "
+            f"проверено утверждений: {report.claims_checked}; проверено связей: {report.links_checked}"
+        )
+
+    async def _run() -> int:
+        try:
+            async with factory() as db:
+                report = await audit_recorded_links(db, store, since=since_ts, claim_ids=selected)
+        except LinkAuditError as exc:
+            click.echo(f"link-audit: отказ — {exc}", err=True)
+            return 2
+        finally:
+            # пул закрываем в том же event loop, где были соединения (ловушка CliRunner-тестов)
+            await engine.dispose()
+
+        snap = str(report.config_snapshot_id)[:8] if report.config_snapshot_id else "—"
+        click.echo(
+            f"link-audit: только чтение (снимок правил {snap}); затронутых утверждений: {len(report.rows)}"
+        )
+        for row in report.rows:
+            _print_row(row)
+        for skipped in report.skipped:
+            click.echo(
+                f"утверждение {str(skipped.claim_id)[:8]}: под коррекцией оператора — не трогаем "
+                f"({_shorten(skipped.reason)})"
+            )
+        if not report.rows:
+            click.echo(
+                "(изменений не предлагается: каждая проверенная связь проходит тот же гейт значения)"
+            )
+        _print_totals(report)
+        click.echo(
+            "запись не выполнена: существующего пути снять уже записанную связь нет — "
+            "варианты и цена каждого в ADR-0038 §13 (нужно отдельное решение)"
+        )
+        return 0
+
+    sys.exit(asyncio.run(_run()))
+
+
 @main.command("research-reattribute")
 @click.option(
     "--since",
