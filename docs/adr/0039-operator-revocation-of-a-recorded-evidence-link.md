@@ -27,8 +27,8 @@
 2. **Предикат входа** `active_link_revocation_exclusion(column)`
    (`packages/memory/source_graph.py:62-75`) — «улика не отозвана действующим отзывом»
    (`cancelled_at IS NULL`). Он применён ровно там, где оценка берёт улики:
-   сборка улик для переоценки (`packages/memory/reassessment.py:405-416`) и вход группировщика
-   (`packages/memory/source_graph.py:206-217` — источные улики утверждения; `:91-107` — записанные
+   сборка улик для переоценки (`packages/memory/reassessment.py:406-416`) и вход группировщика
+   (`packages/memory/source_graph.py:206-217` — источные улики утверждения; `:91-109` — записанные
    родители значения T7.78). Всё остальное — пороги, `claim_type_rules`, шкала оценок, алгоритм
    группировки и его пороги склейки, промпты и конфиги — не изменено ни на байт: предикат
    фильтрует ВХОД, а не вводит новое правило.
@@ -37,14 +37,14 @@
    становится `pending` с `current_assessment_id = NULL` и `epistemic_status = NULL` (§3
    Lifecycle), для `(claim_id, config_snapshot_id)` заводится ровно одна durable-задача
    `reassessment_jobs` (причина `link_revocation_change`), `prepared_by = 'system:link_revocation'`.
-   Реализация — `_revocation_cascade_claim` (`apps/orchestrator/link_audit.py:934-978`). Оценка
+   Реализация — `_revocation_cascade_claim` (`apps/orchestrator/link_audit.py:935-979`). Оценка
    при этом не назначается: grade заново вычисляет rules engine в рабочем батче
-   `run_reassessment_batch` (`packages/memory/reassessment.py:776`), который вызывает вызывающая
+   `run_reassessment_batch` (`packages/memory/reassessment.py:777`), который вызывает вызывающая
    сторона. Доменные ревизии не повышаются: знание меняется переоценкой, а не правкой строк.
 4. **Отзыв и отмена — команды оператора** (`hostctl/cli.py:555` — `link-audit` с `--apply`,
-   `hostctl/cli.py:901` — `link-audit-cancel`; в документах `noezemactl …`). API модуля —
-   `apply_link_revocations` и `cancel_link_revocations` (`apps/orchestrator/link_audit.py:992` и
-   `:1316`): одна транзакция, audit-событие в той же транзакции (§3 «Audit + outbox»).
+   `hostctl/cli.py:902` — `link-audit-cancel`; в документах `noezemactl …`). API модуля —
+   `apply_link_revocations` и `cancel_link_revocations` (`apps/orchestrator/link_audit.py:993` и
+   `:1317`): одна транзакция, audit-событие в той же транзакции (§3 «Audit + outbox»).
 
 ## 2. Почему именно так, а не иначе
 
@@ -61,7 +61,7 @@
   (в `apps/orchestrator/evidence.py` его присваивания нет вовсе), то есть отзыва там просто нет
   чего снимать. Это названо, потому что иначе выглядело бы упущением.
 - **Основание отзыва записывается проверяемым.** `basis` несёт метод (`REVOCATION_METHOD`,
-  `apps/orchestrator/link_audit.py:831`), вердикт гейта значения, измеренный профиль утверждения,
+  `apps/orchestrator/link_audit.py:832`), вердикт гейта значения, измеренный профиль утверждения,
   `relation`, `evidence_kind`, canonical URI источника, `page_sha256` сохранённой страницы,
   `config_snapshot_id` и `config_snapshot_sha256` снапшота правил, версию движка правил. Проверка
   вызывается тем же чистым гейтом записи (`link_value_gate` / `statement_value_profile`,
@@ -82,7 +82,7 @@
 
 `apply_link_revocations` проверяет всё до первой записи; при любой неудаче не записывается
 ничего (`LinkRevocationError` со списком отказов). Именованные отказы
-(`apps/orchestrator/link_audit.py:834-842`): нет такой улики; нет такого утверждения; связь вне
+(`apps/orchestrator/link_audit.py:835-843`): нет такой улики; нет такого утверждения; связь вне
 юрисдикции гейта; **значение на странице есть** (снимать связь, которая несёт значение, нельзя —
 даже по просьбе); текста страницы нет («текста нет» не притворяется «значения нет», ADR-0038 §13.5);
 утверждение без измеренного значения; под коррекцией оператора (ADR-0031 — решение оператора без

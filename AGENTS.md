@@ -470,16 +470,16 @@ Mutual-кластер дублей: внутри одной долгой phase-1
 нет» — см. следующий пункт: решение пользователя получено в T7.125.
 - Дополнение к предыдущим пунктам (T7.125, ADR-0039): снятие уже записанной связи получило честный
 механизм — `noezemactl link-audit --apply --evidence <uuid,…> --reason "<причина>"` и `noezemactl
-link-audit-cancel --revocation <uuid,…> --reason "<причина>"` (`hostctl/cli.py:555`, `:901`; API —
-`apply_link_revocations` / `cancel_link_revocations`, `apps/orchestrator/link_audit.py:992`, `:1316`).
+link-audit-cancel --revocation <uuid,…> --reason "<причина>"` (`hostctl/cli.py:555`, `:902`; API —
+`apply_link_revocations` / `cancel_link_revocations`, `apps/orchestrator/link_audit.py:993`, `:1317`).
 Append-only таблица `evidence_link_revocations` (миграция 0026) по образцу
 `counterevidence_resolutions`: действующий отзыв один на улику (частичный unique), причина
 непустая, `basis` несёт вердикт гейта и хэш сохранённой страницы, отмена — вторая append-запись
 (колонки `cancelled_at`/`cancelled_by`/`cancel_reason` живут только вместе, CHECK). Предикат «нет
 действующего отзыва» — `active_link_revocation_exclusion` (`packages/memory/source_graph.py:62`),
-применён ровно НА ВХОДЕ: сборка улик переоценки (`packages/memory/reassessment.py:405-416`) и вход
+применён ровно НА ВХОДЕ: сборка улик переоценки (`packages/memory/reassessment.py:406-416`) и вход
 группировщика вместе с записанными родителями значения (`packages/memory/source_graph.py:206-217`,
-`:91-107`). Пороги, `claim_type_rules`, алгоритм группировки, промпты и конфиги не тронуты: НЕ
+`:91-109`). Пороги, `claim_type_rules`, алгоритм группировки, промпты и конфиги не тронуты: НЕ
 переносить фильтр в движок правил, не заводить вторую копию предиката и не «чинить» отзыв
 подменой relation/scope/roles (прежний стоп-критерий в силе). Каскад — голова `pending` (оба
 current-признака NULL) плюс ровно одна durable-задача `reassessment_jobs` (причина

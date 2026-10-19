@@ -2746,7 +2746,7 @@ T7.121a…T7.124). Прежний вывод о нечестности подм�
 
 **Часть 2 (предикат ровно на ВХОДЕ).** `active_link_revocation_exclusion(column)`
 (`packages/memory/source_graph.py:62-75`) — `NOT EXISTS` по действующему отзыву; применён в двух
-местах сборки оценки: селект улик для переоценки (`packages/memory/reassessment.py:405-416`) и вход
+местах сборки оценки: селект улик для переоценки (`packages/memory/reassessment.py:406-416`) и вход
 группировщика (`packages/memory/source_graph.py:213` — источные улики утверждения) вместе с
 записанными родителями значения (`:101`). Пороги, `claim_type_rules`, шкала оценок, алгоритм
 группировки и его пороги склейки, промпты и конфиги не изменены ни на байт; второй копии предиката
@@ -2756,27 +2756,27 @@ T7.121a…T7.124). Прежний вывод о нечестности подм�
 `apps/orchestrator/evidence.py` его присваивания нет) — отзывов, которых там можно было бы не
 учесть, для связей чтения нет.
 
-**Часть 3 (применение, отмена, команды).** `apps/orchestrator/link_audit.py:822-1418` —
-`apply_link_revocations` (:992) и `cancel_link_revocations` (:1316): одна транзакция, аудит в той же
+**Часть 3 (применение, отмена, команды).** `apps/orchestrator/link_audit.py:823-1419` —
+`apply_link_revocations` (:993) и `cancel_link_revocations` (:1317): одна транзакция, аудит в той же
 транзакции (§3), перед записью — проверка всех перечисленных улик, любой отказ отменяет весь вызов
-(`LinkRevocationError` со списком именованных отказов :834-842: нет улики; нет утверждения; вне
+(`LinkRevocationError` со списком именованных отказов :835-843: нет улики; нет утверждения; вне
 юрисдикции гейта; «значение на странице есть»; «текста нет»; нет измеренного значения; под
 коррекцией оператора ADR-0031; нет действующей головы; «не останется ни одной улики» — только с
 явным `--allow-empty`). `basis` строит основание тем же чистым гейтом записи
 (`link_value_gate`/`statement_value_profile`, `apps/orchestrator/curator_rejections.py:198-234`) по
 целой сохранённой странице: вердикт, профиль значения, `relation`, `evidence_kind`, canonical URI,
 `page_sha256`, `config_snapshot_id` и его хэш, версия движка правил. Каскад `_revocation_cascade_claim`
-(:934-978) — механизм ADR-0029 §22: голова `pending` с `current_assessment_id`/`epistemic_status`
+(:935-979) — механизм ADR-0029 §22: голова `pending` с `current_assessment_id`/`epistemic_status`
 NULL (§3 Lifecycle) с `AND assessment_state = 'current' RETURNING`, ровно одна durable-задача
 `reassessment_jobs` (причина `link_revocation_change`), `prepared_by = 'system:link_revocation'`;
 доменные ревизии не повышаются, оценку назначает не отзыв, а батч `run_reassessment_batch`
-(`packages/memory/reassessment.py:776`), который вызывает вызывающая сторона.
+(`packages/memory/reassessment.py:777`), который вызывает вызывающая сторона.
 `hostctl/cli.py:555` (`link-audit`) получил `--apply --evidence <uuid,…> --reason "…"` плюс
-`--allow-empty`, `hostctl/cli.py:901` — новая команда `link-audit-cancel --revocation <uuid,…>
+`--allow-empty`, `hostctl/cli.py:902` — новая команда `link-audit-cancel --revocation <uuid,…>
 --reason "…"`; обе заканчиваются закрытием engine (`_closed()`), иначе teardown фикстуры сообщает о
 живом соединении scratch-БД. Read-only поведение T7.124 не изменено: без `--apply` по-прежнему
 только план и ни одной записи; план теперь показывает уже отозванные связи (`LinkAuditRow.revoked_links`
-:210-215, `LinkAuditReport.links_revoked` :266-269) отдельной строкой с причиной и актором, новых
+:212-216, `LinkAuditReport.links_revoked` :267-270) отдельной строкой с причиной и актором, новых
 вердикт-строк нет — прежние утверждения T7.124 про план истинны. План по-прежнему не пишет ничего.
 
 **Репроигрывание 83e7a1c8 (было → стало после применения).** Было: `E3 supported` 0.75, две группы
