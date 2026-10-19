@@ -524,19 +524,23 @@ async def test_explicit_reverify_reference_is_left_to_the_existing_gate(
     assert dict(rev[0]["payload"])["resolved"] == str(official_id)
 
 
-# ── T7.83a: кандидат вне relied_claim_ids не склеивается, даже при идеальном совпадении
+# ── T7.126 (часть б): одиночный кандидат вне relied_claim_ids склеивается без опоры
 
 
 @pytest.mark.asyncio
-async def test_value_duplicate_of_an_unrelied_candidate_is_left_as_proposed(
+async def test_value_duplicate_of_an_unrelied_candidate_is_merged_as_the_only_candidate(
     migrated_db: tuple[str, Any],
     fake_llm: FakeLLM,
     fake_fetch: None,
     tmp_path: Path,
 ) -> None:
-    """Тот же дубль, что и в главном сценарии, но куратор объявил опорой только
-    наблюдение 14,5%: хост не решает за модель, к какому утверждению относится вывод,
-    и оставляет операцию как предложено — кандидат не тронут ни на байт."""
+    """Тот же дубль, что и в главном сценарии, но куратор объявил опорой только наблюдение
+    14,5%. Было (T7.83a): хост не решал за модель и оставлял операцию как предложено —
+    коммит писал ВТОРУЮ строку того же числа рядом с E4-кандидатом (ровно форма дефекта
+    стенда .92: b262da08 «hh-индекс … 8,7» рядом с 5538afc2 «…8,7 … (6,1)»).
+    Стало (решение пользователя 2026-10-19): кандидатов ровно один — выбирать не из чего,
+    и операция конвертируется в перепроверку кандидата. Монотонность та же, что у главного
+    сценария: дата кандидата сохранена, оценка не понижена, улики только добавились."""
     scratch_url, engine = migrated_db
     activation = await _run_online(engine, _payload())
     assert activation.state == "active"
@@ -558,49 +562,58 @@ async def test_value_duplicate_of_an_unrelied_candidate_is_left_as_proposed(
     assert outcome.final_state.value == "succeeded"
     session_id = outcome.session_id
 
-    # (а) дубль записан как новое утверждение: он не был пристёгнут к кандидату
+    # (а) второй строки того же числа нет: дубль не создан, утверждений три
     dup_count = await _scalar(
         scratch_url, "SELECT count(*) FROM claims WHERE statement = :t", {"t": DUP_CLAIM}
     )
-    assert dup_count is not None and dup_count[0] == 1
+    assert dup_count is not None and dup_count[0] == 0
     rows = await _all(scratch_url, "SELECT id::text, statement FROM claims")
-    assert len(rows) == 4
+    assert len(rows) == 3
 
-    # (б) перепроверки нет, кандидат не тронут этой сессией: дата, оценка, улики прежние
-    rev = await _all(
+    # (б) операция проведена перепроверкой кандидата; якорь и дата сохранены
+    ops = await _all(
         scratch_url,
-        "SELECT id FROM audit_events WHERE session_id = :s AND type = 'claim_reverified'",
+        "SELECT payload->>'existing_claim_id' AS ref FROM session_staging "
+        "WHERE session_id = :s AND op = 'claim' ORDER BY seq",
         {"s": str(session_id)},
     )
-    assert rev == []
-    assessments = await _scalar(
+    assert [row["ref"] for row in ops] == [None, str(official_id)]
+    rev = await _all(
         scratch_url,
-        "SELECT count(*) FROM claim_assessments WHERE claim_id = :c AND created_in_session = :s",
-        {"c": str(official_id), "s": str(session_id)},
+        "SELECT payload FROM audit_events WHERE session_id = :s AND type = 'claim_reverified'",
+        {"s": str(session_id)},
     )
-    assert assessments is not None and assessments[0] == 0
+    assert len(rev) == 1
+    rv_payload = dict(rev[0]["payload"])
+    assert rv_payload["resolved"] == str(official_id)
+    assert rv_payload["anchor_kept"] is True
+
+    # (в) оценка кандидата не понижена (monotone union), улика добавлена
     after = await _scalar(
         scratch_url,
-        "SELECT c.as_of::text, a.effective_grade, a.epistemic_status, a.confidence::text "
-        "FROM claims c JOIN claim_assessment_heads h ON h.claim_id = c.id "
+        "SELECT a.effective_grade, a.epistemic_status, a.confidence::text FROM claims c "
+        "JOIN claim_assessment_heads h ON h.claim_id = c.id "
         "JOIN claim_assessments a ON a.id = h.current_assessment_id WHERE c.id = :c",
         {"c": str(official_id)},
     )
-    assert after == before  # байт в байт: ни даты, ни бейджа не сдвинулись
+    assert after is not None and (after[0], after[1]) == ("E4", "supported")
+    assert float(after[2]) >= float(before[3])
     ev_count = await _scalar(
         scratch_url, "SELECT count(*) FROM evidence WHERE claim_id = :c", {"c": str(official_id)}
     )
-    assert ev_count is not None and ev_count[0] == 4  # чужая улика к нему не добавлена
+    assert ev_count is not None and ev_count[0] == 5  # 4 прежних + пересказ этой сессии
 
-    # (в) честная причина в payload уже существующего события
+    # (г) честная причина в payload уже существующего события: опора названа отсутствующей,
+    #     и названо, почему хост всё равно склеил — кандидат один
     payload = await _curator_event_payload(scratch_url, session_id)
     decisions = payload.get("value_duplicates")
     assert decisions is not None and len(decisions) == 1
     entry = decisions[0]
     assert entry["claim_index"] == 1
-    assert entry["target"] is None
-    assert entry["action"] == "kept"
-    assert "relied_claim_ids" in entry["reason"]
+    assert entry["target"] == str(official_id)
+    assert entry["action"] == "reverified"
+    assert "not declared in relied_claim_ids" in entry["reason"]
+    assert "ONLY candidate" in entry["reason"]
 
 
 # ── T7.83a: то же число ДРУГОГО показателя — склейки нет (дефект приёмки) ─────

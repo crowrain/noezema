@@ -195,8 +195,11 @@ def test_gate_does_not_call_the_showcase_predicate() -> None:
 
 
 def test_predicate_matches_gate_when_relied_is_absent() -> None:
-    """Пара живых карт: гейт без опоры молчит (нет решения), витрина сворачивает —
-    ровно это и есть «критерий гейта минус relied» на поведении, а не на словах."""
+    """Пара живых карт без объявленной опоры. Было (T7.99): гейт отказывал по опоре («kept»),
+    витрина сворачивала — «критерий гейта минус relied». Стало (T7.126 часть б): одиночный
+    кандидат склеивается и без опоры, поэтому разница с витриной держится на OTHER условиях
+    записи — их проверяет следующий тест. Здесь закреплено, что гейт и витрина дают одинаковый
+    ответ по числовому критерию (type+values+period+indicator)."""
     op = _row("e189c80d-8544-443f-b295-681c0d1b6ed4")
     cand = _row("9266248e-2433-4a12-a3f7-b51ff10ad803")
     claim = ValueDuplicateClaim(
@@ -206,9 +209,32 @@ def test_predicate_matches_gate_when_relied_is_absent() -> None:
     candidate = ValueDuplicateCandidate(
         claim_id=cand[0], statement=cand[3], claim_type=cand[1], as_of_year=None, relied=False
     )
-    kept = find_value_duplicates([claim], [candidate])
-    # гейт без опоры не склеивает: решение есть, но это «kept» (запись остаётся отдельной)
-    assert kept and kept[0]["action"] == "kept", kept
+    decision = find_value_duplicates([claim], [candidate])
+    assert decision and decision[0]["action"] == "reverified", decision
+    assert decision[0]["target"] == cand[0]
+    assert "ONLY candidate" in decision[0]["reason"]
+    assert value_duplicate_pair(
+        op_claim_type=op[1], op_statement=op[3], op_as_of_year=None,
+        candidate_claim_type=cand[1], candidate_statement=cand[3], candidate_as_of_year=None,
+    ) is True
+
+
+def test_showcase_has_no_evidence_conditions_unlike_the_gate() -> None:
+    """Настоящая граница витрины после T7.126: та же пара, но у операции нет поддерживающей
+    улики — гейт отказывает (кандидату нечего добавить), витрина сворачивает: она ничего не
+    записывает и условий улик не знает."""
+    op = _row("e189c80d-8544-443f-b295-681c0d1b6ed4")
+    cand = _row("9266248e-2433-4a12-a3f7-b51ff10ad803")
+    claim = ValueDuplicateClaim(
+        index=0, statement=op[3], claim_type=op[1], as_of_year=None,
+        has_support_link=False, has_counter_link=False,
+    )
+    candidate = ValueDuplicateCandidate(
+        claim_id=cand[0], statement=cand[3], claim_type=cand[1], as_of_year=None, relied=False
+    )
+    decision = find_value_duplicates([claim], [candidate])
+    assert decision and decision[0]["action"] == "kept", decision
+    assert "no supporting evidence" in decision[0]["reason"]
     assert value_duplicate_pair(
         op_claim_type=op[1], op_statement=op[3], op_as_of_year=None,
         candidate_claim_type=cand[1], candidate_statement=cand[3], candidate_as_of_year=None,

@@ -54,7 +54,7 @@ from tests.scenario.test_research_evidence import (
 pytestmark = [pytest.mark.scenario]
 
 SINCE_ISO = "2000-01-01T00:00:00+00:00"
-CURRENT_VALUE_METHOD = "host-value-attribution-v15"
+CURRENT_VALUE_METHOD = "host-value-attribution-v16"
 VALUE_SCHEMA = "host-value-attribution-v1"
 PAIRING_STRICT = "value_and_primary_in_fragment"
 PAIRING_NEW = "known_producer_mentioned"

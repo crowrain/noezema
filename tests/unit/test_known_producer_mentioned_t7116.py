@@ -462,8 +462,9 @@ def test_bibliography_pairing_still_gives_no_key_to_collectors() -> None:
 
 def test_value_method_version_bumped_page_method_untouched() -> None:
     """Смена поведения видна переатрибуции только через подъём версии метода значений:
-    v12 → v13; страничный детектор не тронут (его версия не поднимается)."""
-    assert VALUE_ATTRIBUTION_METHOD_VERSION == "host-value-attribution-v15"
+    прежняя → текущая (сейчас v15 → v16, T7.126 часть а); страничный детектор не тронут
+    (его версия не поднимается)."""
+    assert VALUE_ATTRIBUTION_METHOD_VERSION == "host-value-attribution-v16"
     assert ATTRIBUTION_METHOD_VERSION == "host-source-attribution-v10"
 
 

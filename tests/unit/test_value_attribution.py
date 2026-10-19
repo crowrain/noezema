@@ -112,7 +112,7 @@ def test_decision_is_not_the_page_status() -> None:
     сокращён) плюс третий pairing-режим `bibliography_known_producer`: строка-список источников,
     называющая производителя, уже записанного для того же утверждения другой уликой (строгий режим
     или режим публикации); без цепочек. Строгий режим и режим публикации правкой не расширены."""
-    assert VALUE_ATTRIBUTION_METHOD_VERSION == "host-value-attribution-v15"
+    assert VALUE_ATTRIBUTION_METHOD_VERSION == "host-value-attribution-v16"
 
 
 # ── границы консервативности ────────────────────────────────────────────────────────────────

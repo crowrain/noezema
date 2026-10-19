@@ -41,10 +41,21 @@ from tests.scenario.test_scope_coverage import _all, _scalar, _seed_question
 pytestmark = pytest.mark.scenario
 
 # ── вымышленная фикстура с3: две Mutual-записи одного факта ───────────────────────
+#
+# Фикстура перестроена под дополнение T7.126 (часть б). Две ОТДЕЛЬНЫЕ сид-сессии больше не
+# дают_pair взаимных дублей: вторая сессия принесла бы операцию, чьи значения и период
+# покрываются первой записью, и гейт склеил бы её в перепроверку — ровно то новое поведение,
+# ради которого задача и делалась. Поэтому пара записывается ОДНОЙ сессией (две операции одного
+# предложения: гейт сравнивает операцию только с уже записанными кандидатами, а не операции между
+# собой) — это честная модель «строк, записанных до правила» (стендовая форма с3).
+# Обе формулировки называют ОДИНАКОВЫЙ годовой период и одно значение, поэтому mutual-покрытие
+# выполняется в обе стороны и якорь не зависит от того, какая из строк оказалась ранейшей:
+# при равных created_at одной phase-1 транзакции (ловушка AGENTS §7) он детерминирован по
+# claim_id — тест вычисляет его так же, а не угадывает.
 
 CLUSTER_OLD = (
     "Годовая инфляция в Тармении по итогам 2029 года (декабрь 2029 к декабрю 2028) "
-    "составила 4,7% (обзорная группа и ведомство, опубликовано 21 января 2030 г.)."
+    "составила 4,7% (обзорная группа и ведомство)."
 )
 CLUSTER_NEW = (
     "Годовая инфляция в Тармении по итогам 2029 года (декабрь 2029 к декабрю 2028) "
@@ -54,6 +65,8 @@ DUP_OP = (
     "Годовая инфляция в Тармении по итогам 2029 года (декабрь 2029 к декабрю 2028) "
     "составила 4,7% (итог сессии по данным обзорной группы)."
 )
+SEED_AS_OF = "2029-11-30T00:00:00"  # обе сид-записи: якорь хранит эту дату
+OP_AS_OF = "2029-12-31T00:00:00"  # предложение позже якоря → as_of_conflict
 
 _MONTH_PAGES: dict[str, str] = {
     "http://alpha.example/old": (
@@ -152,11 +165,72 @@ async def _seed_one(
     return uuid.UUID(rows[0]["id"])
 
 
+async def _seed_pair(
+    scratch_url: str,
+    fake_llm: FakeLLM,
+    tmp_path: Path,
+    *,
+    question: str,
+) -> tuple[uuid.UUID, uuid.UUID]:
+    """Две формулировки одного факта записаны ОДНОЙ сессией (две операции одного предложения).
+    Гейт дублей сравнивает операцию только с уже записанными кандидатами контекст-пака, поэтому
+    такая пара законна и ровно так выглядели стендовые строки, записанные до правила T7.126:
+    отдельная вторая сессия сегодня написала бы не новую строку, а перепроверку первой.
+    Обе строки рождены в одной phase-1 транзакции → `created_at` равны (ловушка AGENTS §7),
+    якорь кластера детерминирован по claim_id."""
+    qid = await _seed_question(scratch_url, question)
+    fake_llm.script(
+        [
+            _fetch("http://alpha.example/old"),
+            _fetch("http://beta.example/new"),
+            _COMPLETE,
+            {
+                "content": {
+                    "summary": "Запись вымышленной статистики Тармении: две формулировки.",
+                    "claims": [
+                        {
+                            "statement": CLUSTER_OLD,
+                            "claim_type": "temporal_fact",
+                            "as_of": SEED_AS_OF,
+                            "scope": {},
+                        },
+                        {
+                            "statement": CLUSTER_NEW,
+                            "claim_type": "temporal_fact",
+                            "as_of": SEED_AS_OF,
+                            "scope": {},
+                        },
+                    ],
+                    "evidence_links": [
+                        {"evidence_index": 0, "claim_index": 0, "relation": "supports"},
+                        {"evidence_index": 1, "claim_index": 1, "relation": "supports"},
+                    ],
+                    "new_questions": [],
+                }
+            },
+        ]
+    )
+    outcome = await _run_session(
+        scratch_url, fake_llm, tmp_path / "ws-pair", tmp_path / "art-pair", qid
+    )
+    assert outcome.final_state.value == "succeeded"
+    rows = await _all(
+        scratch_url,
+        "SELECT id::text, statement FROM claims WHERE statement IN (:old, :new)",
+        {"old": CLUSTER_OLD, "new": CLUSTER_NEW},
+    )
+    assert len(rows) == 2, rows
+    return (
+        uuid.UUID(rows[0]["id"]) if rows[0]["statement"] == CLUSTER_OLD else uuid.UUID(rows[1]["id"]),
+        uuid.UUID(rows[1]["id"]) if rows[0]["statement"] == CLUSTER_OLD else uuid.UUID(rows[0]["id"]),
+    )
+
+
 # ── т3: две Mutual-записи + третье предложение без опоры → перепроверка в якорь ──
 
 
 @pytest.mark.asyncio
-async def test_mutual_duplicate_pair_absorbs_third_proposal_into_earliest_record(
+async def test_mutual_duplicate_pair_absorbs_third_proposal_into_the_anchor_record(
     migrated_db: tuple[str, Any],
     fake_llm: FakeLLM,
     fake_fetch: None,
@@ -164,37 +238,33 @@ async def test_mutual_duplicate_pair_absorbs_third_proposal_into_earliest_record
 ) -> None:
     """Было (6372138): «ambiguous ... left as proposed» → третья строка того же числа
     рядом с двумя уже записанными. Стало: кандидаты — дубли друг друга, хост перепроверяет
-    операцию в ранейшую запись; строк в claims по-прежнему две."""
+    операцию в якорную запись (ранейшую по `created_at`, при равенстве дат — по claim_id,
+    ловушка AGENTS §7); строк в claims по-прежнему две. Якорь тест вычисляет тем же правилом,
+    каким его выбирает гейт, а не предполагает заранее."""
     scratch_url, engine = migrated_db
     activation = await _run_online(engine, _payload())
     assert activation.state == "active"
 
-    old_id = await _seed_one(
+    old_id, new_id = await _seed_pair(
         scratch_url,
         fake_llm,
         tmp_path,
-        tag="old",
         question=(
-            "Годовая инфляция в Тармении по итогам 2029 года (ведомственный обзор): "
-            "приведи цифру и первоисточник. Источники: http://alpha.example/old"
+            "Годовая инфляция в Тармении по итогам 2029 года (обзорная группа и ведомственный "
+            "обзор): приведи цифру и первоисточник. Источники: http://alpha.example/old, "
+            "http://beta.example/new"
         ),
-        url="http://alpha.example/old",
-        statement=CLUSTER_OLD,
-        as_of="2030-01-21T00:00:00",
     )
-    new_id = await _seed_one(
+    # ожидание якоря — то же правило, что у `_cluster_anchor`: минимум по (created_at, claim_id)
+    seed_rows = await _all(
         scratch_url,
-        fake_llm,
-        tmp_path,
-        tag="new",
-        question=(
-            "Годовая инфляция в Тармении по итогам 2029 года (обзорная группа): "
-            "приведи цифру и первоисточник. Источники: http://beta.example/new"
-        ),
-        url="http://beta.example/new",
-        statement=CLUSTER_NEW,
-        as_of="2029-12-31T00:00:00",
+        "SELECT id::text, created_at::text AS created FROM claims "
+        "WHERE statement IN (:old, :new) ORDER BY id::text",
+        {"old": CLUSTER_OLD, "new": CLUSTER_NEW},
     )
+    assert len(seed_rows) == 2, seed_rows
+    anchor_id = min(seed_rows, key=lambda row: (row["created"], row["id"]))["id"]
+    other_id = new_id if anchor_id == str(old_id) else old_id
 
     qid = await _seed_question(
         scratch_url,
@@ -233,16 +303,17 @@ async def test_mutual_duplicate_pair_absorbs_third_proposal_into_earliest_record
     assert len(rows) == 2, rows
     assert {row["statement"] for row in rows} == {CLUSTER_OLD, CLUSTER_NEW}
 
-    # (б) staging: операция проведена перепроверкой ЯКОРЯ — ранейшей записи
+    # (б) staging: операция проведена перепроверкой ЯКОРЯ — той самой записи, которую
+    # выбрал `_cluster_anchor` (минимум по (created_at, claim_id))
     ops = await _all(
         scratch_url,
         "SELECT payload->>'existing_claim_id' AS ref FROM session_staging "
         "WHERE session_id = :s AND op = 'claim' ORDER BY seq",
         {"s": str(session_id)},
     )
-    assert [row["ref"] for row in ops] == [str(old_id)]
+    assert [row["ref"] for row in ops] == [anchor_id]
 
-    # (в) перепроверка сохранила якорь: дата anchor-записи не сдвинута, предложенная refused
+    # (в) перепроверка сохранила якорь: дата якорной записи не сдвинута, предложенная refused
     rev = await _all(
         scratch_url,
         "SELECT payload FROM audit_events WHERE session_id = :s AND type = 'claim_reverified'",
@@ -250,18 +321,18 @@ async def test_mutual_duplicate_pair_absorbs_third_proposal_into_earliest_record
     )
     assert len(rev) == 1
     rv_payload = dict(rev[0]["payload"])
-    assert rv_payload["resolved"] == str(old_id)
+    assert rv_payload["resolved"] == anchor_id
     assert rv_payload["anchor_kept"] is True
-    assert str(rv_payload["stored_as_of"]).startswith("2030-01-21")
+    assert str(rv_payload["stored_as_of"]).startswith("2029-11-30")
     assert "as_of_conflict" in rv_payload
 
     # (г) union-улика добавлена к якорю: 1 прежняя + свежий пересказ; вторая запись не тронута
     ev_anchor = await _scalar(
-        scratch_url, "SELECT count(*) FROM evidence WHERE claim_id = :c", {"c": str(old_id)}
+        scratch_url, "SELECT count(*) FROM evidence WHERE claim_id = :c", {"c": anchor_id}
     )
     assert ev_anchor is not None and ev_anchor[0] == 2
     ev_other = await _scalar(
-        scratch_url, "SELECT count(*) FROM evidence WHERE claim_id = :c", {"c": str(new_id)}
+        scratch_url, "SELECT count(*) FROM evidence WHERE claim_id = :c", {"c": str(other_id)}
     )
     assert ev_other is not None and ev_other[0] == 1
 
@@ -278,7 +349,7 @@ async def test_mutual_duplicate_pair_absorbs_third_proposal_into_earliest_record
     assert decisions is not None and len(decisions) == 1
     entry = decisions[0]
     assert entry["claim_index"] == 0
-    assert entry["target"] == str(old_id)
+    assert entry["target"] == anchor_id
     assert entry["action"] == "reverified"
     assert "mutual value duplicates" in entry["reason"]
     assert "relied_claim_ids" in entry["reason"]

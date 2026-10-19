@@ -17,9 +17,15 @@ Guard месяцев (тот же стенд, консервативная гр�
 а взаимного кластера такие кандидаты не образуют. Сторона без названного месяца — молчание.
 
 Закреплены и прежние решения (консервативные замки, поведение НЕ меняется): ≥2 relied
-кандидатов — прежний ambiguous; отсутствие опоры у единственного кандидата — прежний
-отказ; counters и индикаторное вето применяются уже ПОСЛЕ выбора якоря кластера и
-по-прежнему снимают склейку. `value_duplicate_pair` (витрина T7.99) не изменяется.
+кандидатов — прежний ambiguous; ≥2 строгих необъявленных кандидатов без взаимного кластера —
+прежний ambiguous; counters и индикаторное вето применяются уже ПОСЛЕ выбора якоря кластера и
+по-прежнему снимают склейку.
+
+Дополнение T7.126 (часть б) правит ровно одно решение этого файла: одиночный необъявленный
+кандидат больше НЕ отказ — «отказ по опоре» был придуман защищать хоста от ВЫБОРА между
+кандидатами, а выбирать не из чего. Витринный предикат `value_duplicate_pair` (T7.99) тоже
+изменён T7.126: значения операции обязаны быть ПОДМНОЖЕСТВОМ значений кандидата; прежнее
+равенство — частный случай.
 
 Все формулировки и числа в тесте — вымышленные (Тармения); создатели строк дат —
 фиктивные моменты времени.
@@ -202,9 +208,12 @@ CAND_JUL = "Инфляция в Тармении в июле 2029 года со�
 
 
 def test_month_conflicting_candidate_leaves_strict_even_when_relied() -> None:
-    """Было: candidate c-jul объявлен опорой → reverified в НЕНАЗВАННЫЙ месяц операции.
+    """Было (T7.121): candidate c-jul объявлен опорой → reverified в НЕНАЗВАННЫЙ месяц операции.
     Стало: месяц операции («август») противоречит месяцу кандидата («июль») — кандидат
-    уходит из строгой выборки; остаётся необъявленный c-aug → прежний отказ по опоре."""
+    уходит из строгой выборки даже будучи объявленным опорой. Дополнение T7.126 (часть б):
+    оставшийся необъявленный c-aug — ЕДИНСТВЕННЫЙ кандидат, и он становится целью перепроверки
+    (прежний отказ «not in relied_claim_ids» для одного кандидата снят). Guard месяцев не
+    ослаблен: c-jul по-прежнему не получает ни чужого месяца, ни чужой улики."""
     decisions = find_value_duplicates(
         [_claim(OP_AUG)],
         [
@@ -212,9 +221,9 @@ def test_month_conflicting_candidate_leaves_strict_even_when_relied() -> None:
             _candidate("c-jul", CAND_JUL, relied=True),
         ],
     )
-    assert decisions[0]["action"] == "kept", decisions
-    assert "not in relied_claim_ids" in decisions[0]["reason"]
-    assert "left as proposed" in decisions[0]["reason"]
+    assert decisions[0]["action"] == "reverified", decisions
+    assert decisions[0]["target"] == "c-aug"
+    assert "c-jul" not in decisions[0]["reason"]
 
 
 def test_all_candidates_month_conflicting_reason_names_months() -> None:
@@ -288,12 +297,14 @@ def test_two_relied_mutual_candidates_stay_ambiguous() -> None:
     assert "ambiguous value duplicate" in decisions[0]["reason"]
 
 
-def test_single_not_relied_candidate_keeps_previous_refusal() -> None:
-    """Одиночный необъявленный кандидат — прежний отказ без исключений (взаимность
-    кластера здесь проверять не с чем)."""
+def test_single_not_relied_candidate_is_merged_by_the_t7126_rule() -> None:
+    """Одиночный необъявленный кандидат (T7.126 часть б). Было: «kept … not in relied_claim_ids»
+    и коммит писал ВТОРУЮ строку того же числа. Стало: выбирать не из чего — перепроверка.
+    Замки на месте: индикаторное вето и counters проверяются и здесь (тесты выше)."""
     decisions = find_value_duplicates([_claim(OP_CLAIM)], [_candidate("c-old", CAND_OLD)])
-    assert decisions[0]["action"] == "kept"
-    assert "not in relied_claim_ids" in decisions[0]["reason"]
+    assert decisions[0]["action"] == "reverified"
+    assert decisions[0]["target"] == "c-old"
+    assert "ONLY candidate" in decisions[0]["reason"]
 
 
 # ── т5: разбор названных месяцев (общие closed-основы гейта периода) ─────────────

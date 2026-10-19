@@ -42,6 +42,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Final
@@ -260,7 +261,12 @@ from packages.memory.scope import (
 #: записи эпохи v14 (в том числе ложную запись 83e7a1c8: при отказе свежего метода запись,
 #: не проходящую pairing-гейт по своему основанию, снимается — см. `record_pairing_gate_passes`
 #: и `apps/research_proxy/reattribution.py`).
-VALUE_ATTRIBUTION_METHOD_VERSION: Final = "host-value-attribution-v15"
+#: T7.126 (часть а), ADR-0029 дополнение: v16 — пара «значение + производитель» внутри фрагмента
+#: засчитывается только тогда, когда фрагмент совместим с показателем утверждения (то же измерение
+#: числа или общая значимая основа показателя). Переатрибуция обязана пересмотреть записи v15,
+#: где то же число стояло в чужом показателе (стенд .92, сессия 8181a76a: hh-индекс 8,7 записан
+#: как «Опубликовано производителем (Росстат)» по фрагменту про рост реальных доходов).
+VALUE_ATTRIBUTION_METHOD_VERSION: Final = "host-value-attribution-v16"
 
 #: честный отказ этого детектора: первоисточник в основании назван, но значение там другое — не то,
 #: на котором стоит утверждение. Отличие от `no_value_attribution` (атрибуции нет вовсе) нужно,
@@ -300,6 +306,42 @@ _UNIT_SCAN: Final = re.compile(
 #: сколько символов после числа рассматривается как единица: единица может содержать пробел
 #  внутри («п. п.»), поэтому окно чуть шире самой короткой единицы
 _UNIT_TAIL_CHARS: Final = 8
+
+# ─── T7.126 (часть а): размерность единицы у числа (ADR-0029 дополнение) ───────────────────
+#
+#: разные правописания одной размерности — одна размерность: «2,2%» и «2,2 процента»,
+#: «1,5 млн» и «1,5 млн.». Разные размерности — разные: «8,7» без единицы и «8,7%»,
+#: «1,5 руб.» и «1,5 долл.» (валюты не сливаются: смешанная пара решается основой показателя,
+#: а не разрешением pairing). Знак размерности — латинский технический ярлык, в решение не выходит.
+_UNIT_DIMENSION_STEMS: Final[tuple[tuple[str, str], ...]] = (
+    ("процент", "percent"),
+    ("percent", "percent"),
+    ("%", "percent"),
+    ("пп", "pp"),
+    ("млрд", "billion"),
+    ("млн", "million"),
+    ("тыс", "thousand"),
+    ("рубл", "ruble"),
+    ("доллар", "dollar"),
+    ("евро", "euro"),
+    ("point", "points"),
+)
+
+
+def _unit_dimension(unit: str) -> str:
+    """Размерность единицы измерения по её основе: «%», « %», «процента», «процентов» — одно."""
+    normalized = re.sub(r"[\s\u00a0.]+", "", unit.lower())
+    for stem, dimension in _UNIT_DIMENSION_STEMS:
+        if normalized.startswith(stem):
+            return dimension
+    return normalized  # неизвестная форма сравнивается как есть (новая единица — не «то же»)
+
+
+def _unit_dimension_after(text: str, end: int) -> str | None:
+    """Размерность единицы, стоящей вплотную после числа (`_UNIT_SCAN`, тот же измеритель, что у
+    `_measured_value_tokens`); None — число стоит без единицы («голое» значение T7.120)."""
+    match = _UNIT_SCAN.match(text[end : end + _UNIT_TAIL_CHARS])
+    return _unit_dimension(match.group(1)) if match else None
 
 #: T7.85: второй, более узкий режим pairing — «атрибуция публикации». Страница нередко объявляет
 #: источник всех приводимых чисел одним указанием на публикацию первоисточника («…следует из
@@ -633,6 +675,31 @@ def _measured_value_tokens(text: str) -> frozenset[str]:
             continue  # конец диапазона: не самостоятельный замер (T7.109a)
         values.add(_canonical_number(match.group()))
     return frozenset(values)
+
+
+def _text_value_units(text: str) -> dict[str, set[str | None]]:
+    """Размерности каждого числа текста: значение -> множество размерностей его вхождений
+    (T7.126 часть а).
+
+    Тот же измеритель чисел, что у `_measured_value_tokens` (диапазон — составной токен, его концы
+    самостоятельными числами не становятся), плюс «голые» десятичные числа T7.120. Множество, а не
+    одна метка: одно и то же значение может стоять в тексте и с единицей, и без неё."""
+    ranges = _range_value_spans(text)
+    units: dict[str, set[str | None]] = {}
+    for _start, end, token in ranges:
+        units.setdefault(token, set()).add(_unit_dimension_after(text, end))
+    for match in VALUE_NUMBER_PATTERN.finditer(text):
+        if any(start <= match.start() and match.end() <= end for start, end, _token in ranges):
+            continue  # конец диапазона: не самостоятельное число (T7.109a)
+        measured = _UNIT_SCAN.match(text[match.end() : match.end() + _UNIT_TAIL_CHARS])
+        if not measured and not _BARE_DECIMAL_TOKEN.fullmatch(
+            re.sub(r"[\s\u00a0]+", "", match.group())
+        ):
+            continue  # целое (год, номер, «в 2 раза») — не значение (T7.120)
+        units.setdefault(_canonical_number(match.group()), set()).add(
+            _unit_dimension(measured.group(1)) if measured else None
+        )
+    return units
 
 
 def claim_match_values(claim_statement: str | None) -> frozenset[str]:
@@ -1688,11 +1755,177 @@ def _nearest_primary_decision(
     )
 
 
+# ─── T7.126 (часть а): словарь значимых основ показателя (перенесён из гейта дублей) ───────
+#
+# Основы показателя собраны здесь и не удваиваются: правило совместимости фрагмента с
+# утверждением (ниже) и гейт «почти-дубликата» (ADR-0033 §7.2) обязаны читать один и тот же
+# словарь, иначе два модуля проекта имели бы два разных мнения о том, что такое «тот же
+# показатель». `apps/orchestrator/value_duplicate.py` импортирует этот блок (направление
+# импорта прежнее: оркестратор читает research_proxy, обратного импорта нет — он и сейчас
+# идёт в ResearchProxy через `curator_period_gate`).
+#
+#: основа слова: нижний регистр + ПРЕФИКС ФИКСИРОВАННОЙ ДЛИНЫ. Пять знаков —
+#: минимальная длина, которая (а) переживает падеж и род русско/англоязычного
+#: показателя («инфляция/инфляции/инфляцией», «ставка/ставки», «средняя/среднее» →
+#: один стем) и (б) ещё достаточно длинна, чтобы не сводить разные показатели к
+#: одному стему. Сравнение по началу слова, а не по окончанию, выбрано специально:
+#: окончания в русском меняются сильнее, чем начала слов.
+INDICATOR_STEM_LEN: Final = 5
+
+#: служебные слова: СРАВНИВАЮТСЯ ТОЧНО (иначе предлог «в» убьёт слово «вклада»,
+#: «на» — «население», «и» — «инфляция»). Короткие предлоги и связки.
+_STOP_WORDS: Final[frozenset[str]] = frozenset(
+    {
+        "в", "во", "со", "с", "у", "к", "по", "за", "на", "из", "от", "до", "для",
+        "при", "о", "об", "и", "или", "не", "как", "это", "этот", "эта", "эти", "их",
+        "его", "её", "ее", "что", "все", "всех", "более", "менее", "около", "примерно",
+        "же", "ли", "бы", "а", "no", "of", "the", "a", "in", "for", "and", "or", "to",
+        "at", "by", "was", "is",
+    }
+)
+
+#: служебные основы: сравниваются как ПРЕФИКСЫ по цельным корням служебных слов.
+#: «составил*», «год*», «итог*», «данн*» и т. п. из задачи — плюс периодные и
+#: атрибутивные маркеры: они описывают значение, период и источник, но не то,
+#: КАКОЙ показатель измеряется. Кратчайшая основа — «год» (единственная трёхзначная):
+#: иначе «годовая/году» остались бы показателем; она же снимает «город…» — название
+#: города показателем не является. Предлоги и связки в этот список не входят: для них
+#: есть `_STOP_WORDS`, где сравнение точное (префиксным «в» убило бы «вклада»).
+#: «банк» и «росстат» сюда НЕ входят осознанно:
+#: «ключевая ставка Банка России» — часть имени показателя.
+_STOP_STEMS: Final[frozenset[str]] = frozenset(
+    {
+        # связка «значение = N» и её синонимы (T7.98: «повысил/понизил прогноз до N» —
+        # та же связка со знаком изменения; основа снимает и «повышение/понижение» —
+        # по образцу «увелич», которое уже снимает «увеличение»; знак изменения решает
+        # словарь значений, а не словарь показателя)
+        "составил", "составля", "составит", "достиг", "превысил", "увелич", "снизил",
+        "вырос", "упал", "изменил", "показал", "оценка", "оценк",
+        "повыс", "пониз", "пониж",
+        # период и его маркеры (годовая/годовые/году — один показатель периода)
+        "год", "месяц", "квартал", "период", "итог", "данн", "датир", "число", "дата",
+        # отсылка к источнику как таковая
+        "опубликов", "сообща", "сообщил", "источник", "согласно", "показател", "значени",
+    }
+)
+
+#: названия месяцев (в любой форме: декабрь/декабря/декабрю/декабре) — маркеры
+#: периода, а не показателя.
+_MONTH_PREFIXES: Final[tuple[str, ...]] = (
+    "январ", "феврал", "март", "апрел", "мая", "мае", "июн", "июл", "август",
+    "сентябр", "октябр", "ноев", "декабр",
+)
+
+_WORD_RE: Final = re.compile(r"[^\W\d_]+", re.UNICODE)
+
+
+def _normalize_text(statement: str) -> str:
+    """Типографика формулировки перед разбором основ (T7.77): NBSP/узкий пробел → обычный пробел,
+    софт-гифен убирается, ё→е (иначе «ставка» и «ставка» — разные слова).
+
+    От `normalize_scan_text` (типографика СТРАНИЦЫ, где перевод строки — граница блока) отличается
+    сознательно: формулировка утверждения — одна строка, перенос строки в ней границей не считается.
+    Оба скана живут в этом модуле ровно по одному экземпляру."""
+    text = statement.replace("\u00a0", " ").replace("\u202f", " ").replace("\u00ad", "")
+    text = unicodedata.normalize("NFKC", text)
+    return text.replace("ё", "е")
+
+
+def _indicator_tokens(statement: str) -> list[str]:
+    """Значимые слова формулировки: только буквы, без чисел/годов/месяцев/дат и
+    без служебных слов (см. `_STOP_WORDS`, `_STOP_STEMS`, `_MONTH_PREFIXES`)."""
+    tokens: list[str] = []
+    for raw in _WORD_RE.findall(_normalize_text(statement)):
+        word = raw.lower()
+        if len(word) < 3 or word in _STOP_WORDS:
+            continue
+        if any(word.startswith(stem) for stem in _STOP_STEMS):
+            continue
+        if any(word.startswith(month) for month in _MONTH_PREFIXES):
+            continue
+        tokens.append(word)
+    return tokens
+
+
+def statement_indicator_words(statement: str) -> frozenset[str]:
+    """Словарь показателя формулировки: основы значимых слов (`INDICATOR_STEM_LEN`)."""
+    return frozenset(token[:INDICATOR_STEM_LEN] for token in _indicator_tokens(statement))
+
+
+# ─── T7.126 (часть а): совместимость фрагмента pairing с показателем утверждения ───────────
+#
+# Стендовый дефект (.92, сессия 8181a76a, утверждение b262da08 «По данным hh.ru, в августе 2026
+# года hh-индекс (конкуренция соискателей на вакансию) составил 8,7.»): страница rambler.ru несёт и
+# абзац Росстата о реальных располагаемых доходах («…выросли … лишь на 1,5% год к году — против
+# 8,7% за тот же период 2025 года»), и абзац hh.ru про hh-индекс («…hh-индекс застыл на отметке
+# 8,7 — … год назад … 6,1»). Значение утверждения — «голое» 8,7 без единицы измерения (T7.120), и
+# строгий режим собрал пару «Росстат + фрагмент про доходы», где то же число 8,7 написано как
+# «8,7%» про ДРУГОЙ показатель. Запись «Опубликовано производителем (Росстат)» — ложная склейка:
+# первоисточник назван, значение названо, а показателя утверждения во фрагменте нет.
+#
+# Правило (решение пользователя 2026-10-19): пара «значение + производитель» внутри одного
+# фрагмента засчитывается только если фрагмент совместим с утверждением по показателю:
+#   (а) значение стоит с той же единицей измерения («2,2%» ↔ «2,2%», «2,2%» ↔ «2,2 процента»;
+#       «8,7» без единицы ↔ «8,7» без единицы) — совместимость есть всегда, даже если слова
+#       показателя вокруг числа разные;
+#   (б) если совпадение только по числу (единицы разные либо у одной из сторон единицы нет),
+#       фрагмент обязан называть хотя бы одну значимую основу показателя утверждения — тот же
+#       словарь основ, что у гейта почти-дубликатов (`statement_indicator_words`, ADR-0033 §7.2).
+#
+# Правило только снимает пары и никогда не добавляет (ADR-0029 «Риски»: ложная склейка дороже
+# ложного пропуска): прежние pairing-режимы не ослаблены ни на пункт, окно публикации, ближайший
+# первоисточник, bibliography и упоминание известного производителя вызываются ровно там же, где
+# вызывались. Следствие названо открыто: фрагмент, снятый этим правилом, перестаёт и «называть
+# первоисточника» для разночтения (`attributed`), поэтому разночтение двух алиасов разрешается в
+# пользу единственного совместимого — прежний одиночный отказ становится честной атрибуцией там,
+# где вторая пара была ложной.
+
+@dataclass(frozen=True)
+class _IndicatorProfile:
+    """Профиль показателя утверждения для правила совместимости: размерности его значений
+    (`_text_value_units` по формулировке) и основы показателя (`statement_indicator_words`)."""
+
+    units: dict[str, frozenset[str | None]]
+    words: frozenset[str]
+
+
+def claim_indicator_profile(claim_statement: str | None) -> _IndicatorProfile | None:
+    """None — когда формулировки утверждения нет: правилу не на что опереться, поведение прежнее."""
+    if not claim_statement:
+        return None
+    scanned = normalize_scan_text(claim_statement)
+    return _IndicatorProfile(
+        units={
+            value: frozenset(dimensions)
+            for value, dimensions in _text_value_units(scanned).items()
+        },
+        words=statement_indicator_words(scanned),
+    )
+
+
+def _fragment_confirms_indicator(
+    profile: _IndicatorProfile | None, fragment: str, shared_values: frozenset[str]
+) -> bool:
+    """Совместим ли фрагмент pairing с показателем утверждения (T7.126 часть а, ADR-0029).
+
+    `shared_values` — значения утверждения, которые фрагмент и так назвал (их выбирает прежний
+    числовой фильтр `match_values` / `bare_values`: он не тронут). Проверка добавляется ПОСЛЕ него
+    и может только снять пару."""
+    if profile is None:
+        return True  # формулировки утверждения нет — прежние режимы решают как решали
+    fragment_units = _text_value_units(fragment)
+    for value in shared_values:
+        if profile.units.get(value, frozenset()) & fragment_units.get(value, set()):
+            return True  # (а) то же измерение числа: совместимость без слов показателя
+    return bool(profile.words & statement_indicator_words(fragment))  # (б) общая основа показателя
+
+
 def _pairing_maps(
     scanned: str,
     values: tuple[str, ...],
     match_values: frozenset[str],
     bare_values: frozenset[str] = frozenset(),
+    indicator_profile: _IndicatorProfile | None = None,
 ) -> tuple[dict[str, str], dict[str, str]]:
     """Пары фрагментов: `attributed` — фрагменты, где названа атрибуция (независимо от значения),
     `matched` — пары «первоисточник → фрагмент» про значение утверждения. Вынесено из
@@ -1704,7 +1937,10 @@ def _pairing_maps(
     С T7.120 тот же фильтр работает и когда измеренного профиля нет: у утверждения с «голым»
     десятичным значением (`_claim_bare_values`) фрагмент обязан подтвердить эту форму числа
     текстовой формой T7.108a с гвардом одиночности T7.109a. Фильтр только снимает пары и никогда
-    их не добавляет; для утверждений без голого числа поведение прежнее ни на пункт не изменено."""
+    их не добавляет; для утверждений без голого числа поведение прежнее ни на пункт не изменено.
+    С T7.126 (часть а) после числового фильтра стоит второй, «показательный»: фрагмент, назвавший
+    число утверждения, обязан быть совместим с его показателем (`_fragment_confirms_indicator`).
+    Он тоже только снимает пары; `attributed` (первоисточники основания) он не трогает."""
     attributed: dict[str, str] = {}
     matched: dict[str, str] = {}
     for fragment in _fragments(scanned):
@@ -1734,6 +1970,13 @@ def _pairing_maps(
             if relay and values
             else relay
         )
+        if indicator_profile is not None and not _fragment_confirms_indicator(
+            indicator_profile,
+            fragment,
+            (_measured_value_tokens(fragment) & match_values) if match_values else bare_values,
+        ):
+            # T7.126 (часть а): то же число в чужом показателе — не пара «значение + производитель»
+            continue
         matched.update(dict.fromkeys({**relay_value, **keys}, fragment))
     return attributed, matched
 
@@ -1749,6 +1992,9 @@ def record_pairing_gate_passes(
     стоять в нём текстовой формой с гвардом одиночности (T7.120). Запись, которая не проходит
     гейт по своему же фрагменту, логически невозможна для текущего метода — это ложное знание
     прежней эпохи, и переатрибуция её снимает (тот же путь записи, что снятие указателя T7.98).
+    С T7.126 (часть а) гейт требует и совместимости фрагмента с показателем утверждения: запись
+    v15, где то же число стояло в чужом показателе (стенд .92: hh-индекс 8,7 приписан Росстату по
+    фрагменту про рост реальных доходов), снимается тем же путём.
 
     Честные границы проверки:
     - режимы bibliography и упоминания известного производителя не обещают наличие значения
@@ -1762,12 +2008,18 @@ def record_pairing_gate_passes(
     if len(basis_fragment) >= BASIS_FRAGMENT_CHARS:
         return True  # основание обрезано: отсутствие числа не доказано — не удаляем
     match_values = claim_match_values(claim_statement)
+    profile = claim_indicator_profile(claim_statement)
     if not match_values:
         bare_values = _claim_bare_values(claim_statement)
         if not bare_values:
             return True  # числового значения в утверждении нет — проверять нечего
-        return _single_values_found_standalone(basis_fragment, bare_values)
-    return bool(_measured_value_tokens(basis_fragment) & match_values)
+        if not _single_values_found_standalone(basis_fragment, bare_values):
+            return False
+        return _fragment_confirms_indicator(profile, basis_fragment, bare_values)
+    found = _measured_value_tokens(basis_fragment) & match_values
+    if not found:
+        return False
+    return _fragment_confirms_indicator(profile, basis_fragment, found)
 
 
 def attribute_value_in_fragment(
@@ -1817,7 +2069,13 @@ def attribute_value_in_fragment(
         # своя оценка/альтернативный расчёт рядом со значением утверждения: склеивать нельзя
         return ValueAttributionDecision(status=STATUS_OWN_ASSESSMENT, claim_values=values)
 
-    attributed, matched = _pairing_maps(scanned, values, match_values, bare_values)
+    attributed, matched = _pairing_maps(
+        scanned,
+        values,
+        match_values,
+        bare_values,
+        indicator_profile=claim_indicator_profile(claim_statement),
+    )
 
     def fallback(refusal: ValueAttributionDecision) -> ValueAttributionDecision:
         """Честный отказ строгого режима ещё не значит «пересказа нет»: страница могла объявить
@@ -2005,7 +2263,13 @@ def self_publication_candidate(
     claim_match = claim_match_values(claim_statement)
     # T7.120: тот же pairing, что решил `self_primary`, — с тем же голодным фильтром значения
     claim_bare = frozenset() if claim_match else _claim_bare_values(claim_statement)
-    _, matched = _pairing_maps(scanned, decision.claim_values, claim_match, claim_bare)
+    _, matched = _pairing_maps(
+        scanned,
+        decision.claim_values,
+        claim_match,
+        claim_bare,
+        indicator_profile=claim_indicator_profile(claim_statement),
+    )
     if not matched:
         return None  # защита: `self_primary` без pairing не бывает, но и проверка не на слепке
     # T7.120a (ADR-0029 §24): семья решается под именем корня — страница cbr.ru с упоминанием

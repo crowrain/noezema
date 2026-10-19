@@ -244,15 +244,53 @@ OBSERVED_BELARUS = "Наблюдаемая населением инфляция
 OBSERVED_EXPECTATIONS_14_5 = "Инфляционные ожидания населения России в декабре 2025 года составили 14,5%."
 
 
-def test_perfect_value_match_outside_relied_claim_ids_is_left_as_proposed() -> None:
-    """Т7.83a: тип, значения и период совпали идеально — этого мало. Куратор не объявил
-    кандидата опорой своего ответа, значит хост не имеет права решать за модель, к какому
-    из видимых утверждений относится её вывод."""
+def test_perfect_value_match_outside_relied_claim_ids_is_merged_when_it_is_the_only_candidate() -> None:
+    """Т7.126 (часть б) — правка решения T7.83a. Было: идеальное совпадение типа, значений и
+    периода при необъявленном кандидате — «kept … not in relied_claim_ids», и коммит писал
+    вторую строку того же числа (стенд .92: b262da08 рядом с 5538afc2). Стало: когда кандидат
+    РОВНО ОДИН, фильтру опоры защищать нечего — выбирать не из чего; склейка в перепроверку.
+    Фильтр опоры остаётся в силе для двух и больше кандидатов (тесты ниже и
+    `test_value_duplicate_t7121.py`)."""
     decisions = find_value_duplicates([_claim(DUP_CLAIM)], [_candidate("c-1", relied=False)])
     assert len(decisions) == 1
-    assert decisions[0]["action"] == "kept"
-    assert decisions[0]["target"] is None
+    assert decisions[0]["action"] == "reverified"
+    assert decisions[0]["target"] == "c-1"
     assert "relied_claim_ids" in decisions[0]["reason"]
+    assert "ONLY candidate" in decisions[0]["reason"]
+
+
+def test_subset_of_the_candidates_values_is_a_suspect() -> None:
+    """Т7.126 (часть б): значения операции ⊆ значений кандидата — кандидат подозрительен.
+    Стендовая форма 5538afc2 {8,7 и 6,1} против b262da08 {8,7}: прежнее равенство множеств
+    не склеивало пару из-за числа сравнения в более ранней формулировке."""
+    candidate = (
+        "По данным hh.ru, hh-индекс в августе 2026 года составил 8,7 (конкуренция соискателей "
+        "на вакансию), что выше показателя год назад (6,1)."
+    )
+    op = (
+        "По данным hh.ru, в августе 2026 года hh-индекс (конкуренция соискателей на вакансию) "
+        "составил 8,7."
+    )
+    decisions = find_value_duplicates(
+        [_claim(op, claim_type="external_fact", as_of_year=2026)],
+        [_candidate("c-hh", candidate, claim_type="external_fact", as_of_year=2026, relied=True)],
+    )
+    assert len(decisions) == 1
+    assert decisions[0]["action"] == "reverified"
+    assert decisions[0]["target"] == "c-hh"
+    assert "are contained in the candidate's values" in decisions[0]["reason"]
+
+
+def test_op_with_a_number_the_candidate_does_not_name_stays_silent() -> None:
+    """Обратное направление запрещено: операция приносит число, которого у кандидата нет —
+    это другое наблюдение, а не пересказ (значения операции НЕ подмножество)."""
+    assert (
+        find_value_duplicates(
+            [_claim("Инфляция в России по итогам 2025 года составила 5,59% и 6,1%.")],
+            [_candidate("c-1")],
+        )
+        == []
+    )
 
 
 def test_ambiguity_is_counted_after_the_relied_filter() -> None:
@@ -295,7 +333,12 @@ def test_two_relied_candidates_stay_ambiguous() -> None:
 @pytest.mark.parametrize("relied", [True, False])
 def test_inflation_expectations_are_not_the_key_rate(relied: bool) -> None:
     """Дефект приёмки T7.83 ровно в той формулировке, в которой он был найден:
-    13,7% ожиданий населения ≠ 13,7% средней ключевой ставки."""
+    13,7% ожиданий населения ≠ 13,7% средней ключевой ставки.
+
+    T7.126 (часть б): при одном необъявленном кандидате прежняя ветка опоры отказывала РАНЬШЕ,
+    чем хост успевал сверить показатель, и причина была «not in relied_claim_ids». Теперь
+    кандидат выбирается, и отказ называет настоящую причину — вето показателя. Отказ остался
+    отказом: `kept`, цели нет, склейки нет."""
     decisions = find_value_duplicates(
         [_claim(EXPECTATIONS_CLAIM)],
         [_candidate("aaaa-keyrate", KEYRATE_CANDIDATE, as_of_year=2025, relied=relied)],
@@ -304,10 +347,7 @@ def test_inflation_expectations_are_not_the_key_rate(relied: bool) -> None:
     assert decisions[0]["action"] == "kept"
     assert decisions[0]["target"] is None
     reason = decisions[0]["reason"]
-    if relied:
-        assert "indicator does not match" in reason
-    else:
-        assert "relied_claim_ids" in reason
+    assert "indicator does not match" in reason
 
 
 def test_unemployment_and_gdp_with_the_same_number_are_different_indicators() -> None:
