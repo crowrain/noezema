@@ -50,6 +50,39 @@ systemctl start noezema-dev.target            # web + unit-state и maint (ти�
 пишет об этом («пароль БД НЕ ротирован: он закреплён в томе»). Новый пароль возможен только после
 осознанного удаления контейнера и тома (`docker rm -f noezema-dev-db && docker volume rm noezema-dev-pgdata`).
 
+### Обновление кода на стенде (бандл, а не `git pull`)
+
+Первичная доставка кода — клонирование при деплое (команда выше). Дальнейшие обновления стенд
+`git pull` не делает: пуш в `main` делает только менеджер (AGENTS §4), а обновлённый код на стенд
+приносит тот же менеджер файлом git-бандла с машины разработки. Ниже по этому файлу «обновить код
+на стенде» — это ровно эти два шага, они не повторяются в каждом разделе.
+
+На машине разработки (после `git fetch origin`):
+
+```bash
+cd ~/noezema-src
+git bundle create /tmp/noezema.bundle refs/remotes/origin/main
+scp /tmp/noezema.bundle <user>@192.168.1.92:/tmp/
+```
+
+На стенде:
+
+```bash
+cd ~/noezema
+git fetch /tmp/noezema.bundle refs/remotes/origin/main:refs/remotes/bundle/main
+git merge --ff-only bundle/main
+```
+
+- fetch идёт по файлу, поэтому remote `origin` стенду для обновления не нужен; `bundle/main` —
+  локальная ссылка на доставленный `origin/main`;
+- бандл несёт весь `refs/remotes/origin/main` (для этого репозитория — около 7 МБ). Проверка
+  доставленного коммита: `git bundle verify /tmp/noezema.bundle` печатает его sha; он же и есть
+  ожидаемый `git rev-parse HEAD` на стенде после мерджа. Нужен только промежуток от текущего head
+  стенда `<sha>` — бандл собирается инкрементно:
+  `git bundle create /tmp/noezema.bundle <sha>..refs/remotes/origin/main`;
+- `merge --ff-only` отказывается (выход 128, рабочее дерево не тронуто), если история стенда
+  разошлась с `origin/main`: правок на стенде быть не должно, расхождение решает менеджер, а не мердж.
+
 ## Что где лежит и какие порты
 
 | | |
@@ -316,8 +349,8 @@ cd ~/noezema
 Узел, уже работавший на v14, переводится одной онлайн-активацией:
 
 ```bash
-cd ~/noezema
-git pull                                   # пакет с prompts/curator/curator-v8.md и prompts/explorer/explorer-v7.md
+cd ~/noezema                       # код обновлён бандлом: «Обновление кода на стенде» (не git pull)
+# пакет этого шага: prompts/curator/curator-v8.md и prompts/explorer/explorer-v7.md
 .venv/bin/python -m hostctl.cli activate-online \
   --payload docs/eval/config-v15-payload.json \
   --reason "T7.73: curator-v8 (перепроверка хранит якорную дату) + explorer-v7 (первоисточник vs пересказ)" \
@@ -364,8 +397,8 @@ git pull                                   # пакет с prompts/curator/curat
 Узел, уже работавший на v15, переводится одной онлайн-активацией:
 
 ```bash
-cd ~/noezema
-git pull                                   # пакет с prompts/explorer/explorer-v8.md
+cd ~/noezema                       # код обновлён бандлом: «Обновление кода на стенде» (не git pull)
+# пакет этого шага: prompts/explorer/explorer-v8.md
 .venv/bin/python -m hostctl.cli activate-online \
   --payload docs/eval/config-v16-payload.json \
   --reason "T7.76: explorer-v8 (двусторонний поиск) + max_explorer_steps 16" \
@@ -404,8 +437,8 @@ curator-v8, окна модели, `research_proxy` и список инстру
 Узел, уже работавший на v16, переводится одной онлайн-активацией:
 
 ```bash
-cd ~/noezema
-git pull                                   # пакет с prompts/explorer/explorer-v9.md
+cd ~/noezema                       # код обновлён бандлом: «Обновление кода на стенде» (не git pull)
+# пакет этого шага: prompts/explorer/explorer-v9.md
 .venv/bin/python -m hostctl.cli activate-online \
   --payload docs/eval/config-v17-payload.json \
   --reason "T7.77: explorer-v9 (прогноз — не оценка состоявшегося)" \
@@ -464,8 +497,8 @@ JSON — она лишь переезжает. Проверено тестом �
 Активация (делает менеджер; узел, уже работавший на v17):
 
 ```bash
-cd ~/noezema
-git pull                                    # пакет с docs/eval/config-v18-payload.json
+cd ~/noezema                       # код обновлён бандлом: «Обновление кода на стенде» (не git pull)
+# пакет этого шага: docs/eval/config-v18-payload.json
 # одна строка в /etc/noezema/dev.env (0600): значение — по фактическому движку стенда.
 # если строка уже есть с другим значением — править её вручную, не добавлять вторую
 grep -q '^NOEZEMA_LLM_REASONING_PROFILE=' /etc/noezema/dev.env \
@@ -516,7 +549,8 @@ sudo systemctl restart noezema-dev-web.service noezema-dev-tick.service noezema-
 юнитов правка не требует (промпт читается из снапшота):
 
 ```bash
-cd ~/noezema && git pull            # пакет с docs/eval/config-v19-payload.json и prompts/curator/curator-v9.md
+cd ~/noezema                       # код обновлён бандлом: «Обновление кода на стенде» (не git pull)
+# пакет этого шага: docs/eval/config-v19-payload.json и prompts/curator/curator-v9.md
 .venv/bin/python -m hostctl.cli activate-online \
   --payload docs/eval/config-v19-payload.json \
   --reason "T7.82(б): curator-v9 pin — relied_claim_ids (reliance on already-recorded claims, no reverify)" \
@@ -554,7 +588,7 @@ cd ~/noezema && git pull            # пакет с docs/eval/config-v19-payload
 сравнивает новые кураторские операции с утверждениями контекст-пака (тот же тип, равное непустое
 множество десятичных значений формулировок, покрытый период). Ровно один кандидат и все связи
 `supports` → операция честной склейкой становится перепроверкой: значение на карточке остаётся
-один раз, свежее evidence усиливает уже записанное утверждение (monotонно по группам независимости,
+один раз, свежее evidence усиливает уже записанное утверждение (монотонно по группам независимости,
 якорная дата сохраняется), оценка не может ни понизиться, ни подделаться. Кандидатов несколько,
 есть counterevidence или период не покрыт → операция остаётся как предложена: спор остаётся
 спором. Решение записывается ключом `value_duplicates` в payload уже существующего события
@@ -564,7 +598,8 @@ cd ~/noezema && git pull            # пакет с docs/eval/config-v19-payload
 юнитов правка не требует (промпт читается из снапшота):
 
 ```bash
-cd ~/noezema && git pull            # пакет с docs/eval/config-v20-payload.json и prompts/curator/curator-v10.md
+cd ~/noezema                       # код обновлён бандлом: «Обновление кода на стенде» (не git pull)
+# пакет этого шага: docs/eval/config-v20-payload.json и prompts/curator/curator-v10.md
 .venv/bin/python -m hostctl.cli activate-online \
   --payload docs/eval/config-v20-payload.json \
   --reason "T7.83(б): curator-v10 pin — value-duplicate reverify (same value of the same indicator for the same period, ADR-0033)" \
@@ -739,13 +774,14 @@ pending никогда не подаётся как действующий от�
 
 ## Переатрибуция уже записанного знания (T7.85): сначала dry-run, apply — только по решению менеджера
 
-Миграций нет: достаточно `git pull` и перезапуска сервисов (`systemctl restart noezema-dev.target` или
+Миграций нет: достаточно обновления кода бандлом (подсекция «Обновление кода на стенде») и перезапуска
+сервисов (`systemctl restart noezema-dev.target` или
 перезапуск юнитов группы), снапшот правил не меняется — версии детекторов живут в коде.
 
 ### Шаг 1. Сухой прогон (ничего не пишет)
 
 ```bash
-cd ~/noezema && git pull --ff-only
+cd ~/noezema                       # код обновлён бандлом: «Обновление кода на стенде» (не git pull)
 set -a; . /etc/noezema/dev.env; set +a
 .venv/bin/python -m hostctl.cli research-reattribute \
   --since 2026-01-01T00:00:00+00:00 --evidence-level --dry-run
@@ -818,7 +854,7 @@ ADR-0038 §12). Отзыв (`link-audit --apply` и `link-audit-cancel`) тре�
 команда, что в разделе «Миграции» выше:
 
 ```bash
-cd ~/noezema && git pull --ff-only
+cd ~/noezema                       # код обновлён бандлом: «Обновление кода на стенде» (не git pull)
 set -a; . /etc/noezema/dev.env; set +a      # URL базы уже в env-файле
 .venv/bin/python -m alembic upgrade head    # 0026_link_revocations
 ```
@@ -830,7 +866,7 @@ ADR-0039.
 ### Шаг 1. План
 
 ```bash
-cd ~/noezema && git pull --ff-only
+cd ~/noezema                       # код обновлён бандлом: «Обновление кода на стенде» (не git pull)
 set -a; . /etc/noezema/dev.env; set +a
 .venv/bin/python -m hostctl.cli link-audit --since 2026-01-01T00:00:00+00:00
 ```
@@ -996,8 +1032,8 @@ for note in d.get("revoked_links") or []:
 остаётся config-v20):
 
 ```bash
-cd ~/noezema
-git pull                                    # пакет с docs/eval/config-v27-payload.json
+cd ~/noezema                       # код обновлён бандлом: «Обновление кода на стенде» (не git pull)
+# пакет этого шага: docs/eval/config-v27-payload.json
 .venv/bin/python -m hostctl.cli activate-online \
   --payload docs/eval/config-v27-payload.json \
   --reason "T7.119: config-v27 (official+independent step cap 20, independent-source hints, timeouts 2400/2700)" \
@@ -1056,8 +1092,8 @@ bootstrap — config-v20).
 Активация (делает менеджер; узел может работать на v27 и дальше):
 
 ```bash
-cd ~/noezema
-git pull                                    # пакет с docs/eval/config-v28-payload.json и prompts/curator/curator-v16.md
+cd ~/noezema                       # код обновлён бандлом: «Обновление кода на стенде» (не git pull)
+# пакет этого шага: docs/eval/config-v28-payload.json и prompts/curator/curator-v16.md
 .venv/bin/python -m hostctl.cli activate-online \
   --payload docs/eval/config-v28-payload.json \
   --reason "T7.121: config-v28 (curator-v16 pin + curator_record_gates — period near value, forecast date, honest relied-only answer)" \

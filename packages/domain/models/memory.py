@@ -371,7 +371,7 @@ class ORMLinkRevocation(Base):
         ForeignKey("claims.id", ondelete="CASCADE"), nullable=False
     )
     reason: Mapped[str] = mapped_column(Text, nullable=False)
-    #: верifiable basis отзыва: вердикт гейта значения, профиль значения, хеш сохранённого
+    #: проверяемое основание отзыва: вердикт гейта значения, профиль значения, хеш сохранённого
     #: текста страницы, метод и версия правил (записываются в момент отзыва)
     basis: Mapped[JsonDict] = mapped_column(JSONB, nullable=False, default=dict)
     actor: Mapped[str] = mapped_column(Text, nullable=False)
