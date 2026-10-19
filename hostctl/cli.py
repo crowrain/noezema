@@ -566,35 +566,68 @@ def independence_preview(apply: bool) -> None:
     default="",
     help="Только перечисленные утверждения: uuid через запятую (полные id, как в dispute).",
 )
-def link_audit(since: str, claims: str) -> None:
-    """Аудит «значение на связи» у УЖЕ записанных связей (T7.124, ADR-0038 §13): только чтение.
+@click.option(
+    "--apply",
+    is_flag=True,
+    default=False,
+    help=(
+        "Записать отзыв ПЕРЕЧИСЛЕННЫХ улик (--evidence) с причиной (--reason), затем каскад "
+        "переоценки и один рабочий батч. Требует обоих параметров; без них — отказ."
+    ),
+)
+@click.option(
+    "--evidence",
+    default="",
+    help="T7.125: uuid улик через запятую. Пакетного отзыва «все, где гейт сказал нет значения» нет.",
+)
+@click.option(
+    "--reason",
+    default="",
+    help="T7.125: причина отзыва (обязательна при --apply, непустой текст; пишется в отзыв и в карточку).",
+)
+@click.option(
+    "--allow-empty",
+    is_flag=True,
+    default=False,
+    help=(
+        "Разрешить отзыв, после которого у утверждения не остаётся ни одной улики: голова уйдёт "
+        "в invalid и будет поставлен исследовательский вопрос (§5.9.1)."
+    ),
+)
+def link_audit(since: str, claims: str, apply: bool, evidence: str, reason: str, allow_empty: bool) -> None:
+    """Аудит «значение на связи» у УЖЕ записанных связей (T7.124, ADR-0038 §13; применение — T7.125, ADR-0039).
 
-    Для каждого утверждения с действующей головой effective-снапшота берёт каждую его
-    `supports`-связь с уликой `source_assertion` и применяет к ней тот же профиль значения
-    (измеренные значения, диапазоны целиком, «голые» десятичные числа) и тот же читатель
-    текстов, что гейт записи (T7.108, T7.113, T7.123) — по сохранённому нормализованному
-    тексту страницы (`sources.metadata->>'normalized_sha256'`, запасной путь — payload
-    существующего `research_fetch_completed`). Проверяется вся страница: фрагмент улики есть
-    окно этого же текста, поэтому связь, которую живой гейт оставил бы, снятой не называется.
-    Опровержения (`counters`) и улики других видов вне проверки. Если текста страницы нет или
-    он не читается — связь НЕ включается в пересчёт и называется отдельно: «текста нет» — это
-    не «значения нет». Утверждения, чьи источники покрыты действующей коррекцией оператора
-    (ADR-0031), выводятся отдельной строкой «под коррекцией оператора — не трогаем».
+    План (без `--apply`, как в T7.124): для каждого утверждения с действующей головой
+    effective-снапшота берётся каждая его `supports`-связь с уликой `source_assertion` и к ней
+    применяется тот же профиль значения (измеренные значения, диапазоны целиком, «голые»
+    десятичные числа) и тот же читатель текстов, что у гейта записи (T7.108, T7.113, T7.123) —
+    по сохранённому нормализованному тексту страницы (`sources.metadata->>'normalized_sha256'`,
+    запасной путь — payload существующего `research_fetch_completed`). Проверяется вся страница:
+    фрагмент улики есть окно этого же текста, поэтому связь, которую живой гейт оставил бы,
+    снятой не называется. Опровержения (`counters`) и улики других видов вне проверки. Если текста
+    страницы нет или он не читается — связь НЕ включается в пересчёт и называется отдельно:
+    «текста нет» — это не «значения нет». Утверждения, чьи источники покрыты действующей
+    коррекцией оператора (ADR-0031), выводятся отдельной строкой «под коррекцией оператора — не
+    трогаем». Уже отозванные связи помечаются прямо в плане: «связь отозвана оператором …» с
+    причиной отзыва. Для каждого затронутого утверждения показан пересчёт «было → стало»: группы
+    независимости тем же чистым группировщиком, оценка тем же чистым `evaluate` (единственный
+    производитель оценок).
 
-    Для каждого затронутого утверждения показан пересчёт «было → стало»: группы независимости
-    тем же чистым группировщиком (`load_source_graph_assembly` + `group_source_graph`) и оценка
-    тем же чистым `evaluate` (единственный производитель оценок) при снятии проваливших связей.
+    Применение (`--apply --evidence <uuid,…> --reason "<причина>"`, ADR-0039): записывается
+    append-only отзыв связи в `evidence_link_revocations` (миграция 0026), голова утверждения
+    становится pending и заводится одна durable-задача переоценки, затем выполняется один рабочий
+    батч `run_reassessment_batch`, после чего печатается состояние «стало». `evidence` не меняется
+    ни на байт: отозванная связь остаётся в журнале и отдельной строкой называется в плане и в
+    выводе команды (витрина такой строки пока не делает — остаток ADR-0039 §8). Отказ
+    (exit 2) — если улики нет, она вне юрисдикции гейта, её исход не «нет
+    значения» («значение есть», «текста нет», «нет измеренного значения»), источник под коррекцией
+    оператора, у утверждения нет действующей оценки, причина не названа или у утверждения не
+    останется ни одной улики (тогда нужен явный `--allow-empty`). Идемпотентно: повторный отзыв
+    той же улики ничего не записывает («уже отозвана»).
 
-    Команда ничего не пишет и не применяет: существующего честного пути снять уже записанную
-    связь нет — у `evidence` нет признака «не участвует в оценке», движок правил исключает
-    улику только по известным ему признакам, а `resolved` живёт только у опровержений
-    (`counterevidence_resolutions`). Честное снятие потребовало бы новой долговременной
-    сущности и предиката на входе оценки — миграция БД плюс правка сборки оценки, то есть
-    отдельная задача с решением пользователя (варианты — ADR-0038 §13). Поэтому «стало» здесь
-    — прогноз, а не действие. Идемпотентно: повторный прогон даёт тот же план.
-
-    exit 0  -> план напечатан (или пуст: все связи проходят ту же проверку)
-    exit 2  -> NOEZEMA_DATABASE_URL не задан, --since не ISO, --claims не uuid,
+    exit 0  -> план напечатан (или пуст) / отзыв записан и переоценка выполнена
+    exit 2  -> NOEZEMA_DATABASE_URL не задан, --since не ISO, --claims не uuid, --apply без
+               --evidence/--reason, --evidence без --apply, отказ проверки отзыва,
                нет effective-снапшота (fail-closed, §3)
     """
     import asyncio
@@ -608,21 +641,53 @@ def link_audit(since: str, claims: str) -> None:
         sys.exit(EXIT_USAGE_ERROR)
 
     from apps.orchestrator.link_audit import (
+        REVOCATION_JOB_REASON,
+        REVOCATION_PREPARED_BY,
         LinkAuditError,
         LinkAuditReport,
         LinkAuditRow,
+        LinkRevocationError,
+        apply_link_revocations,
         audit_recorded_links,
+        claims_of_evidence,
         parse_claim_ids,
+        parse_evidence_ids,
         parse_since,
     )
     from apps.orchestrator.scheduler import artifacts_root_from_env
     from packages.artifacts.store import FilesystemArtifactStore
+    from packages.domain.db.uow import transaction
+    from packages.domain.services.audit import AuditService
 
     try:
         since_ts = parse_since(since) if since else None
         selected = parse_claim_ids(claims) if claims else None
+        evidence_ids = parse_evidence_ids(evidence) if evidence else None
     except LinkAuditError as exc:
         click.echo(str(exc), err=True)
+        sys.exit(EXIT_USAGE_ERROR)
+
+    if apply:
+        if evidence_ids is None:
+            click.echo(
+                "link-audit --apply: отказ — нужен --evidence <uuid,…>: отзыв записывается только "
+                "по явно перечисленным уликам, пакетного отзыва по вердикту гейта нет",
+                err=True,
+            )
+            sys.exit(EXIT_USAGE_ERROR)
+        if not reason.strip():
+            click.echo(
+                "link-audit --apply: отказ — нужен --reason: отзыв связи без названной причины "
+                "не записывается",
+                err=True,
+            )
+            sys.exit(EXIT_USAGE_ERROR)
+    elif evidence_ids is not None or allow_empty:
+        click.echo(
+            "link-audit: отказ — --evidence и --allow-empty работают только вместе с --apply "
+            "(без --apply команда остаётся планом на чтение)",
+            err=True,
+        )
         sys.exit(EXIT_USAGE_ERROR)
 
     try:
@@ -658,6 +723,12 @@ def link_audit(since: str, claims: str) -> None:
                 f"    связь {where} (улика {str(link.evidence_id)[:8]}, сессия {session}): {link.verdict}"
             )
             click.echo(f"        {link.note}")
+            if link.revoked:
+                click.echo(
+                    f"        связь отозвана оператором (отзыв {str(link.revocation_id)[:8]}, "
+                    f"{link.revocation_actor}): {link.revocation_reason} — она вне оценки и вне "
+                    "групп независимости, но осталась в журнале"
+                )
         if row.excluded_source_uris:
             click.echo("    уходили бы из участников групп: " + ", ".join(row.excluded_source_uris))
         if row.groups_changed:
@@ -681,6 +752,7 @@ def link_audit(since: str, claims: str) -> None:
         click.echo(
             f"итог: утверждений с провалившими связями: {report.claims_with_absent_links}; "
             f"связей без значения: {report.links_without_value}; без текста: {report.links_missing_text}; "
+            f"уже отозвано связей: {report.links_revoked}; "
             f"утверждений с изменением групп: {report.groups_changed_count}; "
             f"с изменением оценки: {report.assessment_changed_count}; "
             f"проверено утверждений: {report.claims_checked}; проверено связей: {report.links_checked}"
@@ -689,18 +761,35 @@ def link_audit(since: str, claims: str) -> None:
     async def _run() -> int:
         try:
             async with factory() as db:
-                report = await audit_recorded_links(db, store, since=since_ts, claim_ids=selected)
+                apply_scope: tuple[uuid.UUID, ...] | None = None
+                if apply and evidence_ids is not None:
+                    apply_scope = await claims_of_evidence(db, evidence_ids)
+                    if not apply_scope:
+                        click.echo(
+                            "link-audit --apply: отказ — ни одной из перечисленных улик в журнале нет",
+                            err=True,
+                        )
+                        return EXIT_USAGE_ERROR
+                report = await audit_recorded_links(
+                    db,
+                    store,
+                    since=None if apply else since_ts,
+                    claim_ids=apply_scope if apply_scope is not None else selected,
+                )
         except LinkAuditError as exc:
             click.echo(f"link-audit: отказ — {exc}", err=True)
-            return 2
-        finally:
-            # пул закрываем в том же event loop, где были соединения (ловушка CliRunner-тестов)
-            await engine.dispose()
+            return EXIT_USAGE_ERROR
 
         snap = str(report.config_snapshot_id)[:8] if report.config_snapshot_id else "—"
-        click.echo(
-            f"link-audit: только чтение (снимок правил {snap}); затронутых утверждений: {len(report.rows)}"
-        )
+        if apply:
+            click.echo(
+                f"link-audit --apply: план перед записью (снимок правил {snap}); "
+                f"затронутых утверждений: {len(report.rows)}"
+            )
+        else:
+            click.echo(
+                f"link-audit: только чтение (снимок правил {snap}); затронутых утверждений: {len(report.rows)}"
+            )
         for row in report.rows:
             _print_row(row)
         for skipped in report.skipped:
@@ -710,16 +799,210 @@ def link_audit(since: str, claims: str) -> None:
             )
         if not report.rows:
             click.echo(
-                "(изменений не предлагается: каждая проверенная связь проходит тот же гейт значения)"
+                "(изменений не предлагается: каждая проверенная связь проходит тот же гейт значения "
+                "или уже отозвана)"
             )
         _print_totals(report)
+
+        if not apply:
+            click.echo(
+                "запись не выполнена: это план. применить — link-audit --apply --evidence <uuid,…> "
+                "--reason \"<причина>\" (T7.125, ADR-0039); снятая связь не удаляется: она остаётся "
+                "в журнале и отдельной строкой в этом плане"
+            )
+            return 0
+
+        from packages.memory.dispute import ACTOR_HOSTCTL
+
+        try:
+            async with factory() as db, transaction(db):
+                result = await apply_link_revocations(
+                    db,
+                    AuditService(db),
+                    store,
+                    evidence_ids=evidence_ids or (),
+                    reason=reason,
+                    actor=ACTOR_HOSTCTL,
+                    allow_empty=allow_empty,
+                )
+        except LinkRevocationError as exc:
+            click.echo(f"link-audit --apply: отказ — {exc}", err=True)
+            for refusal in exc.refusals:
+                named = f"улика {str(refusal.evidence_id)[:8]}" if refusal.evidence_id else "утверждение"
+                if refusal.evidence_id and refusal.claim_id:
+                    named = (
+                        f"улика {str(refusal.evidence_id)[:8]} "
+                        f"(утверждение {str(refusal.claim_id)[:8]})"
+                    )
+                where = f" ({refusal.canonical_uri})" if refusal.canonical_uri else ""
+                click.echo(f"    отказ [{refusal.code}] {named}{where}: {refusal.detail}", err=True)
+            return EXIT_USAGE_ERROR
+        except LinkAuditError as exc:
+            click.echo(f"link-audit --apply: отказ — {exc}", err=True)
+            return EXIT_USAGE_ERROR
+
+        for item in result.written:
+            where = f" ({item.canonical_uri})" if item.canonical_uri else ""
+            click.echo(
+                f"записан отзыв {str(item.revocation_id)[:8]}: улика "
+                f"{str(item.evidence_id)[:8]} (утверждение {str(item.claim_id)[:8]}){where}: "
+                f"{item.verdict} — причина: {item.reason}"
+            )
+        for already in result.already_revoked:
+            click.echo(
+                f"улика {str(already.evidence_id)[:8]}: связь уже отозвана (отзыв "
+                f"{str(already.revocation_id)[:8]}, {already.actor}): {already.reason} — повтор ничего не пишет"
+            )
         click.echo(
-            "запись не выполнена: существующего пути снять уже записанную связь нет — "
-            "варианты и цена каждого в ADR-0038 §13 (нужно отдельное решение)"
+            f"каскад переоценки: утверждений затронуто: {len(result.claims_affected)}; "
+            f"снятых голов: {result.heads_invalidated}; задач переоценки заведено: {result.jobs_created} "
+            f"(причина задачи: {REVOCATION_JOB_REASON}, голова подготовлена: {REVOCATION_PREPARED_BY})"
+        )
+        for claim_id in result.claims_without_source_links:
+            click.echo(
+                f"    утверждение {str(claim_id)[:8]}: источных улик не останется — групп независимости "
+                "у него больше нет; оценка пересчитается по оставшимся уликам другого вида"
+            )
+        for claim_id in result.heads_to_invalid:
+            click.echo(
+                f"    утверждение {str(claim_id)[:8]}: улик не останется вовсе — рабочий батч по §5.9.1 "
+                "переведёт голову в invalid и поставит исследовательский вопрос (--allow-empty)"
+            )
+
+        outcome = await _run_reassessment_batch(factory)
+        click.echo(
+            f"рабочий переоценки: processed={outcome.processed} completed={outcome.completed} "
+            f"retried={outcome.retried} blocked={outcome.blocked} deferred={outcome.deferred}"
+        )
+        async with factory() as db:
+            after = await audit_recorded_links(db, store, claim_ids=result.claims_affected)
+        click.echo("link-audit --apply: состояние после рабочего батча")
+        for row in after.rows:
+            _print_row(row)
+        return 0
+
+    async def _closed() -> int:
+        try:
+            return await _run()
+        finally:
+            # пул закрываем в том же event loop, где были соединения (ловушка CliRunner-тестов)
+            await engine.dispose()
+
+    sys.exit(asyncio.run(_closed()))
+
+
+async def _run_reassessment_batch(factory: Any) -> Any:
+    """Один рабочий батч переоценки тем же `run_reassessment_batch`, что у maintenance-юнита."""
+    from packages.memory.reassessment import run_reassessment_batch
+
+    async with factory() as db:
+        return await run_reassessment_batch(db)
+
+
+@main.command("link-audit-cancel")
+@click.option(
+    "--revocation",
+    default="",
+    help="id отзыва связи (uuid через запятую). Только перечисленные отзывы; пакетной отмены нет.",
+)
+@click.option("--reason", default="", help="Почему отзыв отменён (обязательно, непустой текст).")
+def link_audit_cancel(revocation: str, reason: str) -> None:
+    """Отменить отзыв записанной связи (T7.125, ADR-0039) — связь возвращается в оценку.
+
+    История не правится: строка `evidence_link_revocations` остаётся навсегда, у неё
+    заполняются колонки отмены (`cancelled_at`, `cancelled_by`, `cancel_reason`) — ровно как
+    `valid=false` у коррекций оператора (ADR-0031) и разрешений спорных улик (ADR-0021).
+    Далее — тот же каскад переоценки и один рабочий батч: grade заново вычислит rules engine.
+    Повтор той же отмены ничего не записывает («уже отменена»).
+
+    exit 0  -> отмена записана (или повтор), рабочий батч выполнен
+    exit 2  -> NOEZEMA_DATABASE_URL не задан, --revocation не uuid или пуст, --reason пуст,
+               отзыва с таким id нет, нет effective-снапшота (fail-closed, §3)
+    """
+    import asyncio
+    import os
+
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    url = os.environ.get("NOEZEMA_DATABASE_URL", "")
+    if not url:
+        click.echo("NOEZEMA_DATABASE_URL is not set", err=True)
+        sys.exit(EXIT_USAGE_ERROR)
+
+    from apps.orchestrator.link_audit import (
+        REVOCATION_JOB_REASON,
+        LinkAuditError,
+        LinkRevocationError,
+        cancel_link_revocations,
+        parse_revocation_ids,
+    )
+    from packages.domain.db.uow import transaction
+    from packages.domain.services.audit import AuditService
+    from packages.memory.dispute import ACTOR_HOSTCTL
+    from packages.memory.reassessment import run_reassessment_batch
+
+    try:
+        revocation_ids = parse_revocation_ids(revocation)
+    except LinkAuditError as exc:
+        click.echo(str(exc), err=True)
+        sys.exit(EXIT_USAGE_ERROR)
+    if not reason.strip():
+        click.echo(
+            "link-audit-cancel: отказ — --reason обязателен: отмена отзыва без причины не записывается",
+            err=True,
+        )
+        sys.exit(EXIT_USAGE_ERROR)
+
+    engine = create_async_engine(url)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    async def _run() -> int:
+        try:
+            async with factory() as db, transaction(db):
+                result = await cancel_link_revocations(
+                    db,
+                    AuditService(db),
+                    revocation_ids=revocation_ids,
+                    reason=reason,
+                    actor=ACTOR_HOSTCTL,
+                )
+        except LinkRevocationError as exc:
+            click.echo(f"link-audit-cancel: отказ — {exc}", err=True)
+            for refusal in exc.refusals:
+                click.echo(f"    отказ [{refusal.code}]: {refusal.detail}", err=True)
+            return EXIT_USAGE_ERROR
+        except LinkAuditError as exc:
+            click.echo(f"link-audit-cancel: отказ — {exc}", err=True)
+            return EXIT_USAGE_ERROR
+
+        for revocation_id in result.cancelled:
+            click.echo(
+                f"отменён отзыв {str(revocation_id)[:8]}: связь снова участвует в оценке "
+                f"(причина отмены: {reason.strip()})"
+            )
+        for revocation_id in result.already_cancelled:
+            click.echo(f"отзыв {str(revocation_id)[:8]}: уже отменён — повтор ничего не пишет")
+        click.echo(
+            f"каскад переоценки: утверждений затронуто: {len(result.claims_affected)}; "
+            f"снятых голов: {result.heads_invalidated}; задач переоценки заведено: {result.jobs_created} "
+            f"(причина задачи: {REVOCATION_JOB_REASON})"
+        )
+        async with factory() as db:
+            outcome = await run_reassessment_batch(db)
+        click.echo(
+            f"рабочий переоценки: processed={outcome.processed} completed={outcome.completed} "
+            f"retried={outcome.retried} blocked={outcome.blocked} deferred={outcome.deferred}"
         )
         return 0
 
-    sys.exit(asyncio.run(_run()))
+    async def _closed() -> int:
+        try:
+            return await _run()
+        finally:
+            # пул закрываем в том же event loop, где были соединения (ловушка CliRunner-тестов)
+            await engine.dispose()
+
+    sys.exit(asyncio.run(_closed()))
 
 
 @main.command("research-reattribute")

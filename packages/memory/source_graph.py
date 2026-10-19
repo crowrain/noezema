@@ -55,6 +55,26 @@ class SourceGraphChangeResult:
     revision: int
 
 
+#: таблица отзывов записанных связей улики (миграция 0026, ADR-0039)
+LINK_REVOCATIONS_TABLE = "evidence_link_revocations"
+
+
+def active_link_revocation_exclusion(column: str) -> str:
+    """T7.125 (ADR-0039, минимальный честный вариант — ADR-0038 §13.4): SQL-предикат
+    «улика не отозвана действующим отзывом» для столбца `column` с id улики.
+
+    Это ФИЛЬТР ВХОДА, а не новое правило: пороги, правила, шкала оценок и алгоритм
+    группировки не изменились — улика, связь которой оператор отозвал явной командой,
+    просто не доходит ни до движка правил, ни до участников групп независимости.
+    Отменённый отзыв силы не имеет (`cancelled_at IS NOT NULL`): строка отзыва остаётся
+    в истории навсегда, но перестает исключать что-либо.
+    """
+    return (
+        f"NOT EXISTS (SELECT 1 FROM {LINK_REVOCATIONS_TABLE} r "
+        f"WHERE r.evidence_id = {column} AND r.cancelled_at IS NULL)"
+    )
+
+
 async def _value_attribution_parents(
     db: AsyncSession, *, claim_id: uuid.UUID
 ) -> dict[uuid.UUID, set[uuid.UUID]]:
@@ -76,6 +96,9 @@ async def _value_attribution_parents(
                     " scope -> 'value_attribution' ->> 'parent_source_id' AS parent_id"
                     " FROM evidence"
                     " WHERE claim_id = :c AND source_id IS NOT NULL"
+                    # T7.125: запись отозванной связи не приводит родителя в граф этого
+                    # утверждения — вместе с самой уликой она вне входа группировщика
+                    f" AND {active_link_revocation_exclusion('evidence.id')}"
                     " AND jsonb_typeof(scope -> 'value_attribution') = 'object'"
                     " AND scope -> 'value_attribution' ->> 'schema' = :schema"
                 ),
@@ -174,7 +197,12 @@ async def load_source_graph_assembly(
 ) -> SourceGraphAssembly | None:
     """Read-only load of the graph facts for one claim (§11.3 input; T7.117).
 
-    Returns ``None`` when the claim has no source-based evidence."""
+    Returns ``None`` when the claim has no source-based evidence.
+
+    T7.125 (ADR-0039): ВХОД группировщика — источные улики БЕЗ действующего отзыва связи
+    (`evidence_link_revocations.cancelled_at IS NULL`). Это только фильтр входа: алгоритм
+    группировки, его пороги и основание склейки не тронуты, отозванная связь просто не
+    становится участником группы (ADR-0038 §13.4)."""
     source_ids = [
         row[0]
         for row in (
@@ -182,6 +210,7 @@ async def load_source_graph_assembly(
                 text(
                     "SELECT DISTINCT source_id FROM evidence "
                     "WHERE claim_id = :c AND source_id IS NOT NULL "
+                    f"AND {active_link_revocation_exclusion('evidence.id')} "
                     "ORDER BY source_id"
                 ),
                 {"c": claim_id},

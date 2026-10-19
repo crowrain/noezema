@@ -549,6 +549,11 @@ class AuditEventType(StrEnum):
     # T7.5 (stage 7, §22.2): the evaluation run lifecycle
     EVALUATION_RUN_STARTED = "evaluation_run_started"
     EVALUATION_RUN_FINISHED = "evaluation_run_finished"
+    # T7.125 (ADR-0039, ADR-0038 §13.4): отзыв записанной связи улики и его отмена.
+    # Колонка `audit_events.type` — text без CHECK (миграция 0002:140-150), поэтому новое
+    # значение не требует миграции: оно добавляется только в это перечисление.
+    LINK_REVOCATION_CREATED = "link_revocation_created"
+    LINK_REVOCATION_CANCELLED = "link_revocation_cancelled"
 
 
 class AuditVisibility(StrEnum):

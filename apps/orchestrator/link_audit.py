@@ -1,4 +1,4 @@
-"""T7.124 (часть 2): аудит «значение на связи» для УЖЕ записанных связей — только чтение.
+"""Аудит «значение на связи» для УЖЕ записанных связей (T7.124) и честный отзыв связи (T7.125).
 
 Гейт значения (T7.108, ADR-0034 §10; профили T7.113 и T7.123) ведёт КАЖДУЮ новую
 `supports`-связь с уликой `source_assertion` и снимает её при записи. Ранее записанные связи
@@ -10,8 +10,9 @@
 теми же чистыми функциями, что у рабочего переоценки и у `independence-preview`
 (`load_source_graph_assembly` + `group_source_graph` + `evaluate`) — БЕЗ ЕДИНОЙ ЗАПИСИ.
 
-Почему здесь нет `--apply` (остановка по стоп-критерию задачи, разбор — ADR-0038 §13).
-В существующей схеме нет признака «улика не участвует в оценке»:
+Почему в T7.124 применения не было и чем оно стало в T7.125 (остановка той задачи по
+стоп-критерию; разбор вариантов — ADR-0038 §13.2, принятое решение — ADR-0039). В прежней схеме
+не было признака «улика не участвует в оценке»:
 
 * `evidence` (миграция 0004:74–99) не имеет колонки состояния: `relation` закрыт CHECK'ом
   `('supports','counters')`, `evidence_kind` — закрытым перечислением, `scope` носит keys
@@ -33,11 +34,14 @@
 * снять покрытие области, чтобы улика перестала подтверждать (`scope_not_covered`), — ровно
   тот «нечестный downgrade через другую дверь», от которого защищён `packages/memory/reverify.py:40-44`.
 
-Следствие: честное снятие уже записанной связи требует новой долговременной сущности
-(таблица отзывов связей по образцу `counterevidence_resolutions`) и предиката исключения на
-входе оценки — миграция БД плюс правка сборки оценки, то есть отдельная задача с решением
-пользователя. Заглушку «применить», которая всегда отказывает, AGENTS §4 запрещает. Поэтому
-команда отдаёт план и ничего не меняет; варианты — в ADR-0038 §13 и в отчёте.
+Следствие (решение пользователя 2026-10-19, ADR-0039 — минимальный честный вариант ADR-0038
+§13.4): отзыв уже записанной связи — отдельная append-only сущность `evidence_link_revocations`
+(миграция 0026) по образцу `counterevidence_resolutions` плюс предикат «нет действующего отзыва»
+на входе сборки оценки (`reassessment.py`) и на входе группировщика (`source_graph.py`). Строки
+`evidence` при этом не меняются никогда: отозванная связь остаётся в журнале и отдельной
+строкой называется в плане и в выводе команды; витрина отдельной строки об отзыве пока не
+делает (остаток ADR-0039 §8). Запись делает `apply_link_revocations` (и отмену —
+`cancel_link_revocations`); план `audit_recorded_links` по-прежнему не пишет ни одной строки.
 
 Что модуль читает и чем пользуется: `runtime_config_heads` → `config_snapshots`
 (fail-closed, §3), действующие головы оценок effective-снапшота, строки `evidence` и
@@ -57,9 +61,14 @@
 коррекцией оператора, пропускаются (как в `research-reattribute`: решение оператора без
 журнала отменять нельзя). Идемпотентность: повторный прогон даёт тот же план — менять нечего.
 
-Модуль не пишет ни одной строки и не вызывает ни одного сервиса записи: ни audit, ни staging,
-ни каскада `apply_source_graph_change`. Оценку он не назначает — пересчитывает чистым
-`evaluate` (единственный производитель оценок, §3) и называет результат прогнозом.
+План (`audit_recorded_links`) не пишет ни одной строки и не вызывает ни одного сервиса записи.
+Запись появляется только в `apply_link_revocations` / `cancel_link_revocations`: append-only
+строка отзыва (или колонки отмены у существующей), audit-событие `link_revocation_created` /
+`link_revocation_cancelled` и каскад §11.3/§8.6 `heads → pending` + одна durable-задача
+переоценки — тот же путь, что у коррекций графа источников и разрешений спорных улик; рабочий
+`run_reassessment_batch` вызывает вызывающая сторона. Оценку ни план, ни отзыв не назначают:
+план пересчитывает чистым `evaluate` (единственный производитель оценок, §3) и называет результат
+прогнозом, а новую действующую оценку пишет rules engine в рабочем батче.
 """
 
 from __future__ import annotations
@@ -70,7 +79,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Final
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.orchestrator.curator_rejections import (
@@ -80,7 +89,9 @@ from apps.orchestrator.curator_rejections import (
 )
 from apps.research_proxy.reattribution import OPERATOR_ACTOR_PREFIX
 from packages.artifacts.store import ArtifactStore, ArtifactStoreError
+from packages.domain.models.base import JsonDict
 from packages.domain.models.config import ORMConfigSnapshot
+from packages.domain.models.enums import AuditEventType, ReassessmentJobStatus
 from packages.domain.models.events import ORMAuditEvent
 from packages.domain.models.memory import (
     ORMClaim,
@@ -89,14 +100,17 @@ from packages.domain.models.memory import (
     ORMCounterevidenceResolution,
     ORMEnvironmentIndependenceMember,
     ORMEvidence,
+    ORMLinkRevocation,
+    ORMReassessmentJob,
     ORMSource,
     ORMSourceGraphCorrection,
     ORMSourceIndependenceMember,
 )
+from packages.domain.services.audit import AuditService
 from packages.domain.services.config import ConfigError, ConfigService
 from packages.memory.env_independence import UNTRACKED_GROUP
 from packages.memory.independence import group_source_graph
-from packages.memory.rules_engine import EvaluatedEvidence, evaluate
+from packages.memory.rules_engine import RULES_ENGINE_VERSION, EvaluatedEvidence, evaluate
 from packages.memory.service import MemoryService
 from packages.memory.source_graph import (
     GraphNode,
@@ -138,6 +152,13 @@ class LinkAuditLink:
     value_tokens: tuple[str, ...]
     #: почему именно такой исход (для строки отчёта)
     note: str
+    #: T7.125 (ADR-0039): действующий отзыв этой связи (id записи и причина оператора);
+    #: None — отзыва нет. План без `--apply` обязан показывать уже отозванные связи.
+    revocation_id: uuid.UUID | None = None
+    revocation_reason: str | None = None
+    revocation_actor: str | None = None
+    #: сохранённый нормализованный текст страницы, по которому измерен исход (для basis отзыва)
+    page_sha256: str | None = None
 
     @property
     def would_be_excluded(self) -> bool:
@@ -146,6 +167,11 @@ class LinkAuditLink:
     @property
     def text_missing(self) -> bool:
         return self.verdict == VERDICT_NO_TEXT
+
+    @property
+    def revoked(self) -> bool:
+        """Связь уже снята действующим отзывом оператора: она вне оценки и вне групп."""
+        return self.revocation_id is not None
 
 
 @dataclass(frozen=True)
@@ -182,6 +208,12 @@ class LinkAuditRow:
     @property
     def out_of_scope_links(self) -> tuple[LinkAuditLink, ...]:
         return tuple(link for link in self.links if link.verdict == VERDICT_OUT_OF_SCOPE)
+
+    @property
+    def revoked_links(self) -> tuple[LinkAuditLink, ...]:
+        """Связи, уже снятые действующим отзывом оператора (T7.125): они не участвуют ни
+        в оценке, ни в группах — но остаются в плане с причиной отзыва."""
+        return tuple(link for link in self.links if link.revoked)
 
     @property
     def assessment_changed(self) -> bool:
@@ -231,6 +263,12 @@ class LinkAuditReport:
     def assessment_changed_count(self) -> int:
         return sum(1 for row in self.rows if row.assessment_changed)
 
+    @property
+    def links_revoked(self) -> int:
+        """Связей, уже снятых действующим отзывом оператора (T7.125): они учтены в пересчёте
+        («стало» совпадает с записанным), но названы в плане отдельной строкой."""
+        return sum(len(row.revoked_links) for row in self.rows)
+
 
 def parse_since(raw: str) -> datetime:
     """ISO-дата начала окна (`--since`), как в `research-reattribute`: принимает и «Z»."""
@@ -246,6 +284,10 @@ def parse_since(raw: str) -> datetime:
 
 def parse_claim_ids(raw: str) -> tuple[uuid.UUID, ...]:
     """Список `--claims`: uuid через запятую (как в `dispute` — только полный id)."""
+    return _parse_uuid_list(raw, option="--claims")
+
+
+def _parse_uuid_list(raw: str, *, option: str) -> tuple[uuid.UUID, ...]:
     ids: list[uuid.UUID] = []
     for part in raw.split(","):
         piece = part.strip()
@@ -254,10 +296,39 @@ def parse_claim_ids(raw: str) -> tuple[uuid.UUID, ...]:
         try:
             ids.append(uuid.UUID(piece))
         except ValueError as exc:
-            raise LinkAuditError(f"--claims: не uuid ({piece!r}): {exc}") from exc
+            raise LinkAuditError(f"{option}: не uuid ({piece!r}): {exc}") from exc
     if not ids:
-        raise LinkAuditError("--claims: пустой список")
+        raise LinkAuditError(f"{option}: пустой список")
     return tuple(ids)
+
+
+def parse_evidence_ids(raw: str) -> tuple[uuid.UUID, ...]:
+    """Список `--evidence` (T7.125): uuid улик через запятую — только перечисленные улики
+    получают отзыв; пакетного отзыва «все, где гейт сказал нет значения» нет намеренно."""
+    return _parse_uuid_list(raw, option="--evidence")
+
+
+def parse_revocation_ids(raw: str) -> tuple[uuid.UUID, ...]:
+    """Список `--revocation` (T7.125): uuid записей отзыва через запятую."""
+    return _parse_uuid_list(raw, option="--revocation")
+
+
+async def claims_of_evidence(db: AsyncSession, evidence_ids: Sequence[uuid.UUID]) -> tuple[uuid.UUID, ...]:
+    """Утверждения перечисленных улик — область плана при `--apply` (чтобы оператор видел
+    «было → стало» именно по тем связкам, которые собирается отозвать)."""
+    if not evidence_ids:
+        return ()
+    return tuple(
+        row[0]
+        for row in (
+            await db.execute(
+                select(ORMEvidence.claim_id)
+                .where(ORMEvidence.id.in_(list(evidence_ids)))
+                .distinct()
+                .order_by(ORMEvidence.claim_id)
+            )
+        ).all()
+    )
 
 
 async def _operator_corrected_source_ids(db: AsyncSession) -> frozenset[uuid.UUID]:
@@ -425,6 +496,9 @@ async def _links_of(
         uris = {source.id: source.canonical_uri for source in sources}
     shas = await _normalized_shas(db, source_ids)
     tokens = statement_value_profile(claim.statement)
+    #: T7.125: план обязан показывать уже отозванные связи (они вне оценки и вне групп,
+    #: но остаются в отчёте — «исключено» не значит «стёрто»)
+    revocations = await _active_revocations(db, [row.id for row in evidence_rows])
     text_cache: dict[str, str | None] = {}
     links: list[LinkAuditLink] = []
     for row in evidence_rows:
@@ -452,6 +526,7 @@ async def _links_of(
             else:
                 verdict = VERDICT_VALUE_PRESENT
                 note = f"значение {', '.join(tokens)} на сохранённом тексте страницы есть"
+        existing = revocations.get(row.id)
         links.append(
             LinkAuditLink(
                 evidence_id=row.id,
@@ -462,6 +537,10 @@ async def _links_of(
                 verdict=verdict,
                 value_tokens=tokens,
                 note=note,
+                page_sha256=sha,
+                revocation_id=existing.id if existing is not None else None,
+                revocation_reason=existing.reason if existing is not None else None,
+                revocation_actor=existing.actor if existing is not None else None,
             )
         )
     return links, uris
@@ -739,3 +818,602 @@ async def _latest_assessed_scope(db: AsyncSession, claim_id: uuid.UUID) -> dict[
     if row is None or row[0] is None:
         return {}
     return dict(row[0])
+
+
+# ─── T7.125 (ADR-0039, ADR-0038 §13.4): отзыв связи и его отмена ──────────────────
+
+#: причина durable-задачи переоценки после отзыва или отмены (тот же образец, что
+#: `JOB_REASON` у разрешений спорных улик, `packages/memory/resolutions.py:50`)
+REVOCATION_JOB_REASON: Final = "link_revocation_change"
+#: система, подготовившая голову в состоянии pending (перечисление расширено CHECK'ом
+#: миграции 0026 — тот же путь, что 0007/0011/0012)
+REVOCATION_PREPARED_BY: Final = "system:link_revocation"
+#: чем именно установлен отзыв (пишется в basis и печатается в выводе)
+REVOCATION_METHOD: Final = "link-audit --apply: гейт значения T7.108/T7.123 по сохранённой странице"
+
+#: коды отказа отзыва; отказ относится ко ВСЕМУ вызову: ни одной записи при отказе нет
+REFUSAL_UNKNOWN_EVIDENCE: Final = "нет такой улики"
+REFUSAL_UNKNOWN_CLAIM: Final = "нет такого утверждения"
+REFUSAL_OUT_OF_SCOPE: Final = "вне юрисдикции гейта"
+REFUSAL_VALUE_PRESENT: Final = "значение на странице есть"
+REFUSAL_TEXT_MISSING: Final = "текста страницы нет"
+REFUSAL_NO_PROFILE: Final = "утверждение без измеренного значения"
+REFUSAL_OPERATOR_CORRECTION: Final = "под коррекцией оператора"
+REFUSAL_NO_CURRENT_HEAD: Final = "нет действующей оценки"
+REFUSAL_LAST_EVIDENCE: Final = "у утверждения не останется ни одной улики"
+
+
+class LinkRevocationError(RuntimeError):
+    """Отзыв связи не выполнен: проверка не пройдена или не названа причина.
+
+    `refusals` — поимённый перечень того, что не прошло (улика, утверждение, адрес,
+    причина). Ни одна строка при отказе не записывается: вызов отказывает целиком."""
+
+    def __init__(self, detail: str, *, refusals: Sequence[LinkRevocationRefusal] = ()) -> None:
+        super().__init__(detail)
+        self.refusals: tuple[LinkRevocationRefusal, ...] = tuple(refusals)
+
+
+@dataclass(frozen=True)
+class LinkRevocationRefusal:
+    code: str
+    evidence_id: uuid.UUID | None
+    claim_id: uuid.UUID | None
+    canonical_uri: str | None
+    detail: str
+
+
+@dataclass(frozen=True)
+class LinkRevocationWrite:
+    """Что записано этим вызовом: id отзыва, улика, утверждение, адрес, причина, исход."""
+
+    revocation_id: uuid.UUID
+    evidence_id: uuid.UUID
+    claim_id: uuid.UUID
+    canonical_uri: str | None
+    reason: str
+    verdict: str
+    value_tokens: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class LinkRevocationAlready:
+    """Связь уже отозвана действующим отзывом: повтор ничего не записывает (идемпотентность)."""
+
+    revocation_id: uuid.UUID
+    evidence_id: uuid.UUID
+    claim_id: uuid.UUID
+    canonical_uri: str | None
+    reason: str
+    actor: str
+
+
+@dataclass(frozen=True)
+class LinkRevocationResult:
+    written: tuple[LinkRevocationWrite, ...]
+    already_revoked: tuple[LinkRevocationAlready, ...]
+    claims_affected: tuple[uuid.UUID, ...]
+    heads_invalidated: int
+    jobs_created: int
+    #: утверждения, у которых после отзыва не остаётся НИ ОДНОЙ улики: рабочий батч
+    #: переведёт голову в invalid и поставит исследовательский вопрос (§5.9.1). Без
+    #: `--allow-empty` такой отзыв не записывается.
+    heads_to_invalid: tuple[uuid.UUID, ...]
+    #: утверждения, у которых не остаётся ИСТОЧНЫХ улик (групп независимости больше нет),
+    #: но улики другого вида остались: это законно и печатается отдельной строкой
+    claims_without_source_links: tuple[uuid.UUID, ...]
+
+
+@dataclass(frozen=True)
+class LinkRevocationCancelResult:
+    cancelled: tuple[uuid.UUID, ...]
+    already_cancelled: tuple[uuid.UUID, ...]
+    claims_affected: tuple[uuid.UUID, ...]
+    heads_invalidated: int
+    jobs_created: int
+
+
+async def _active_revocations(
+    db: AsyncSession, evidence_ids: Sequence[uuid.UUID]
+) -> dict[uuid.UUID, ORMLinkRevocation]:
+    """Действующие отзывы перечисленных улик (partial unique 0026 — не больше одного)."""
+    if not evidence_ids:
+        return {}
+    rows = (
+        await db.execute(
+            select(ORMLinkRevocation)
+            .where(
+                ORMLinkRevocation.evidence_id.in_(list(evidence_ids)),
+                ORMLinkRevocation.cancelled_at.is_(None),
+            )
+            .order_by(ORMLinkRevocation.evidence_id)
+        )
+    ).scalars().all()
+    return {row.evidence_id: row for row in rows}
+
+
+async def _revocation_cascade_claim(
+    db: AsyncSession, *, claim_id: uuid.UUID, snapshot_id: uuid.UUID
+) -> tuple[int, int]:
+    """Тот же каскад §11.3/§8.6, что у коррекций графа и у разрешений спорных улик: голова
+    действующей оценки становится pending (оба признака current — NULL, §3 Lifecycle), для
+    (утверждение, снимок) заводится ровно одна durable-задача переоценки (partial unique
+    делает повтор идемпотентным). Рабочий `run_reassessment_batch` вызывает вызывающая
+    сторона отдельно. Возвращает (снятых голов, созданных задач)."""
+    res = await db.execute(
+        text(
+            "UPDATE claim_assessment_heads SET assessment_state = 'pending', "
+            "current_assessment_id = NULL, epistemic_status = NULL, "
+            "prepared_by = :p, updated_at = clock_timestamp() "
+            "WHERE claim_id = :c AND config_snapshot_id = :s "
+            "AND assessment_state = 'current' RETURNING 1"
+        ),
+        {"c": claim_id, "s": snapshot_id, "p": REVOCATION_PREPARED_BY},
+    )
+    if res.first() is None:
+        return (0, 0)
+    exists = (
+        (
+            await db.execute(
+                text(
+                    "SELECT 1 FROM reassessment_jobs "
+                    "WHERE claim_id = :c AND target_config_snapshot_id = :s "
+                    "AND status IN ('queued','leased','retry')"
+                ),
+                {"c": claim_id, "s": snapshot_id},
+            )
+        ).scalar_one_or_none()
+    )
+    if exists is not None:
+        return (1, 0)
+    db.add(
+        ORMReassessmentJob(
+            id=uuid.uuid4(),
+            claim_id=claim_id,
+            target_config_snapshot_id=snapshot_id,
+            status=ReassessmentJobStatus.QUEUED.value,
+            reason=REVOCATION_JOB_REASON,
+        )
+    )
+    await db.flush()
+    return (1, 1)
+
+
+def _dedup(ids: Sequence[uuid.UUID]) -> list[uuid.UUID]:
+    """Порядок оператора сохранён, повторы убраны (повторный uuid — не вторая запись)."""
+    out: list[uuid.UUID] = []
+    seen: set[uuid.UUID] = set()
+    for raw in ids:
+        if raw not in seen:
+            seen.add(raw)
+            out.append(raw)
+    return out
+
+
+async def apply_link_revocations(
+    db: AsyncSession,
+    audit: AuditService,
+    store: ArtifactStore,
+    *,
+    evidence_ids: Sequence[uuid.UUID],
+    reason: str,
+    actor: str,
+    allow_empty: bool = False,
+) -> LinkRevocationResult:
+    """Записать отзыв перечисленных оператором связей + каскад переоценки (одна транзакция).
+
+    Проверки (каждая названа; при любой неудаче отказывается весь вызов, записей нет):
+
+    1. `--reason` обязан быть непустым: отзыв без причины — не решение, а след;
+    2. улика существует и находится в юрисдикции гейта (`supports` + `source_assertion`);
+    3. её действующего отзыва нет (повтор — «уже отозвана», ничего не записывается);
+    4. verdict того же гейта значения — ровно «нет значения»: «значение есть», «текста нет»
+       и «вне проверки» (утверждение без измеренного числового профиля) — отказ;
+    5. источник улики не покрыт действующей коррекцией оператора (ADR-0031): решение
+       оператора без журнала отменять нельзя;
+    6. у утверждения есть действующая голова effective-снапшота (перезаписывать нечего —
+       иначе отзыв был бы записью без последствий);
+    7. после отзыва у утверждения остаётся хоть одна улика, иначе нужен явный `--allow-empty`
+       (рабочий батч по §5.9.1 переведёт голову в invalid и поставит вопрос).
+
+    Оценку функция не назначает: она снимает голову с действующей оценки и заводит задачу,
+    grade заново вычислит rules engine в рабочем батче (§3.7).
+    """
+    clean_reason = reason.strip()
+    if not clean_reason:
+        raise LinkRevocationError("--reason обязателен: отзыв связи без названной причины не записывается")
+    wanted = _dedup(evidence_ids)
+    if not wanted:
+        raise LinkRevocationError(
+            "--evidence обязателен: отзыв записывается только по явно перечисленным уликам"
+        )
+
+    try:
+        snapshot: ORMConfigSnapshot = await ConfigService.get_effective(db)
+    except ConfigError as exc:
+        raise LinkAuditError(f"effective config: {exc}") from exc
+
+    rows = (
+        (await db.execute(select(ORMEvidence).where(ORMEvidence.id.in_(wanted))))
+        .scalars()
+        .all()
+    )
+    row_by_id = {row.id: row for row in rows}
+    claim_ids = sorted({row.claim_id for row in rows}, key=lambda value: str(value))
+
+    claims: dict[uuid.UUID, ORMClaim] = {}
+    for claim_id in claim_ids:
+        claim = await db.get(ORMClaim, claim_id)
+        if claim is not None:
+            claims[claim_id] = claim
+    evidence_by_claim: dict[uuid.UUID, list[ORMEvidence]] = {}
+    links_by_claim: dict[uuid.UUID, dict[uuid.UUID, LinkAuditLink]] = {}
+    uris_by_claim: dict[uuid.UUID, dict[uuid.UUID, str | None]] = {}
+    for claim_id in claim_ids:
+        claim = claims.get(claim_id)
+        if claim is None:
+            continue
+        evidence_rows = list(
+            (
+                await db.execute(
+                    select(ORMEvidence).where(ORMEvidence.claim_id == claim_id).order_by(ORMEvidence.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        links, uris = await _links_of(db, store, claim=claim, evidence_rows=evidence_rows)
+        evidence_by_claim[claim_id] = evidence_rows
+        links_by_claim[claim_id] = {link.evidence_id: link for link in links}
+        uris_by_claim[claim_id] = uris
+
+    revocations = await _active_revocations(db, wanted)
+    corrected = await _operator_corrected_source_ids(db)
+    head_state = {
+        head.claim_id: head.assessment_state
+        for head in (
+            await db.execute(
+                select(ORMClaimAssessmentHead).where(
+                    ORMClaimAssessmentHead.config_snapshot_id == snapshot.id,
+                    ORMClaimAssessmentHead.claim_id.in_(claim_ids),
+                )
+            )
+        ).scalars().all()
+    }
+
+    refusals: list[LinkRevocationRefusal] = []
+    already: list[LinkRevocationAlready] = []
+    candidates: list[tuple[ORMEvidence, LinkAuditLink]] = []
+    for evidence_id in wanted:
+        row = row_by_id.get(evidence_id)
+        if row is None:
+            refusals.append(
+                LinkRevocationRefusal(
+                    code=REFUSAL_UNKNOWN_EVIDENCE,
+                    evidence_id=evidence_id,
+                    claim_id=None,
+                    canonical_uri=None,
+                    detail="улики с таким id в журнале нет",
+                )
+            )
+            continue
+        claim = claims.get(row.claim_id)
+        if claim is None:
+            refusals.append(
+                LinkRevocationRefusal(
+                    code=REFUSAL_UNKNOWN_CLAIM,
+                    evidence_id=evidence_id,
+                    claim_id=row.claim_id,
+                    canonical_uri=None,
+                    detail="утверждения этой улики в журнале нет",
+                )
+            )
+            continue
+        uri = _uri_of(row.source_id, uris_by_claim.get(row.claim_id, {}))
+        link = links_by_claim.get(row.claim_id, {}).get(evidence_id)
+        existing = revocations.get(evidence_id)
+        if existing is not None:
+            already.append(
+                LinkRevocationAlready(
+                    revocation_id=existing.id,
+                    evidence_id=evidence_id,
+                    claim_id=row.claim_id,
+                    canonical_uri=link.canonical_uri if link is not None else None,
+                    reason=existing.reason,
+                    actor=existing.actor,
+                )
+            )
+            continue
+        if link is None:
+            refusals.append(
+                LinkRevocationRefusal(
+                    code=REFUSAL_OUT_OF_SCOPE,
+                    evidence_id=evidence_id,
+                    claim_id=row.claim_id,
+                    canonical_uri=uri,
+                    detail=(
+                        f"связь не проходит юрисдикцию гейта (relation={row.relation!r}, "
+                        f"evidence_kind={row.evidence_kind!r}): отзыв разрешён только для "
+                        "`supports`-связей улики `source_assertion`"
+                    ),
+                )
+            )
+            continue
+        if row.source_id is not None and row.source_id in corrected:
+            refusals.append(
+                LinkRevocationRefusal(
+                    code=REFUSAL_OPERATOR_CORRECTION,
+                    evidence_id=evidence_id,
+                    claim_id=row.claim_id,
+                    canonical_uri=link.canonical_uri,
+                    detail=(
+                        "источник связи покрыт действующей коррекцией оператора (ADR-0031): "
+                        "такое решение этой командой не отменяется"
+                    ),
+                )
+            )
+            continue
+        if head_state.get(row.claim_id) != "current":
+            refusals.append(
+                LinkRevocationRefusal(
+                    code=REFUSAL_NO_CURRENT_HEAD,
+                    evidence_id=evidence_id,
+                    claim_id=row.claim_id,
+                    canonical_uri=link.canonical_uri,
+                    detail=(
+                        f"у утверждения нет действующей оценки effective-снапшота "
+                        f"(состояние головы: {head_state.get(row.claim_id) or 'нет головы'}): "
+                        "пересчитывать нечего"
+                    ),
+                )
+            )
+            continue
+        if link.verdict != VERDICT_VALUE_ABSENT:
+            code = {
+                VERDICT_VALUE_PRESENT: REFUSAL_VALUE_PRESENT,
+                VERDICT_NO_TEXT: REFUSAL_TEXT_MISSING,
+            }.get(link.verdict, REFUSAL_NO_PROFILE)
+            refusals.append(
+                LinkRevocationRefusal(
+                    code=code,
+                    evidence_id=evidence_id,
+                    claim_id=row.claim_id,
+                    canonical_uri=link.canonical_uri,
+                    detail=(
+                        f"исход той же проверки значения — «{link.verdict}»: {link.note}. "
+                        "Отзыв разрешён только при «нет значения»"
+                    ),
+                )
+            )
+            continue
+        candidates.append((row, link))
+
+    if refusals:
+        raise LinkRevocationError(
+            f"отзыв не записан: проверок не прошли {len(refusals)} из {len(wanted)} улик",
+            refusals=refusals,
+        )
+
+    # последствие для утверждения считается по ВСЕМ действующим отзывам (и прежним, и новым)
+    active_ids_by_claim: dict[uuid.UUID, set[uuid.UUID]] = {}
+    for claim_id, evidence_rows in evidence_by_claim.items():
+        active_ids_by_claim[claim_id] = {
+            row.id
+            for row in evidence_rows
+            if row.id in revocations or any(row.id == cand[0].id for cand in candidates)
+        }
+    heads_to_invalid: list[uuid.UUID] = []
+    no_source_links: list[uuid.UUID] = []
+    affected_claims = sorted({row.claim_id for row, _link in candidates}, key=lambda value: str(value))
+    for claim_id in affected_claims:
+        remaining = [
+            row
+            for row in evidence_by_claim.get(claim_id, [])
+            if row.id not in active_ids_by_claim.get(claim_id, set())
+        ]
+        if not remaining:
+            heads_to_invalid.append(claim_id)
+        elif not [row for row in remaining if row.source_id is not None]:
+            no_source_links.append(claim_id)
+    if heads_to_invalid and not allow_empty:
+        raise LinkRevocationError(
+            "отзыв не записан: после него у утверждения "
+            + ", ".join(str(claim_id)[:8] for claim_id in heads_to_invalid)
+            + " не останется ни одной улики. переоценка по §5.9.1 переведёт голову в invalid "
+            "и поставит исследовательский вопрос. это отдельное решение: нужен --allow-empty",
+            refusals=[
+                LinkRevocationRefusal(
+                    code=REFUSAL_LAST_EVIDENCE,
+                    evidence_id=None,
+                    claim_id=claim_id,
+                    canonical_uri=None,
+                    detail=(
+                        "это единственная связь утверждения: без улик голова уходит в invalid, "
+                        "оценки не будет (--allow-empty)"
+                    ),
+                )
+                for claim_id in heads_to_invalid
+            ],
+        )
+
+    written: list[LinkRevocationWrite] = []
+    for row, link in candidates:
+        basis: JsonDict = {
+            "method": REVOCATION_METHOD,
+            "verdict": link.verdict,
+            "note": link.note,
+            "value_tokens": list(link.value_tokens),
+            "relation": row.relation,
+            "evidence_kind": row.evidence_kind,
+            "source_uri": link.canonical_uri,
+            "page_sha256": link.page_sha256,
+            "config_snapshot_id": str(snapshot.id),
+            "config_snapshot_sha256": snapshot.sha256,
+            "rules_engine_version": RULES_ENGINE_VERSION,
+        }
+        revocation = ORMLinkRevocation(
+            id=uuid.uuid4(),
+            evidence_id=row.id,
+            claim_id=row.claim_id,
+            reason=clean_reason,
+            basis=basis,
+            actor=actor,
+            rules_version=RULES_ENGINE_VERSION,
+        )
+        db.add(revocation)
+        await db.flush()
+        written.append(
+            LinkRevocationWrite(
+                revocation_id=revocation.id,
+                evidence_id=row.id,
+                claim_id=row.claim_id,
+                canonical_uri=link.canonical_uri,
+                reason=clean_reason,
+                verdict=link.verdict,
+                value_tokens=link.value_tokens,
+            )
+        )
+
+    invalidated = 0
+    jobs_created = 0
+    for claim_id in affected_claims:
+        removed, jobs = await _revocation_cascade_claim(
+            db, claim_id=claim_id, snapshot_id=snapshot.id
+        )
+        invalidated += removed
+        jobs_created += jobs
+
+    for item in written:
+        await audit.record(
+            AuditEventType.LINK_REVOCATION_CREATED,
+            actor=actor,
+            payload={
+                "revocation_id": str(item.revocation_id),
+                "evidence_id": str(item.evidence_id),
+                "claim_id": str(item.claim_id),
+                "reason": item.reason,
+                "verdict": item.verdict,
+                "method": REVOCATION_METHOD,
+                "config_snapshot_id": str(snapshot.id),
+                "heads_invalidated": invalidated,
+                "jobs_created": jobs_created,
+            },
+            public_summary=(
+                f"связь улики {str(item.evidence_id)[:8]} отозвана оператором: {item.reason}"
+            ),
+        )
+
+    return LinkRevocationResult(
+        written=tuple(written),
+        already_revoked=tuple(already),
+        claims_affected=tuple(affected_claims),
+        heads_invalidated=invalidated,
+        jobs_created=jobs_created,
+        heads_to_invalid=tuple(heads_to_invalid),
+        claims_without_source_links=tuple(no_source_links),
+    )
+
+
+async def cancel_link_revocations(
+    db: AsyncSession,
+    audit: AuditService,
+    *,
+    revocation_ids: Sequence[uuid.UUID],
+    reason: str,
+    actor: str,
+) -> LinkRevocationCancelResult:
+    """Отменить отзыв (связь возвращается в оценку) + тот же каскад переоценки.
+
+    История не правится: строка отзыва остаётся навсегда, у неё заполняются колонки отмены
+    (`cancelled_at`, `cancelled_by`, `cancel_reason`) — ровно как `valid=false` у коррекций
+    оператора и разрешений спорных улик. Повтор — «уже отменена», записей нет."""
+    clean_reason = reason.strip()
+    if not clean_reason:
+        raise LinkRevocationError(
+            "--reason обязателен: отмена отзыва без названной причины не записывается"
+        )
+    wanted = _dedup(revocation_ids)
+    if not wanted:
+        raise LinkRevocationError("--revocation обязателен: перечислите id отзывов")
+
+    rows = (
+        (await db.execute(select(ORMLinkRevocation).where(ORMLinkRevocation.id.in_(wanted))))
+        .scalars()
+        .all()
+    )
+    found = {row.id: row for row in rows}
+    refusals = [
+        LinkRevocationRefusal(
+            code="нет такого отзыва",
+            evidence_id=None,
+            claim_id=None,
+            canonical_uri=None,
+            detail=f"отзыва связи с id {str(missing)[:8]} в журнале нет",
+        )
+        for missing in wanted
+        if missing not in found
+    ]
+    if refusals:
+        raise LinkRevocationError(
+            f"отмена не записана: {len(refusals)} из {len(wanted)} отзывов не найдены",
+            refusals=refusals,
+        )
+
+    try:
+        snapshot: ORMConfigSnapshot = await ConfigService.get_effective(db)
+    except ConfigError as exc:
+        raise LinkAuditError(f"effective config: {exc}") from exc
+
+    cancelled: list[uuid.UUID] = []
+    already_cancelled: list[uuid.UUID] = []
+    for revocation_id in wanted:
+        row = found[revocation_id]
+        if row.cancelled_at is not None:
+            already_cancelled.append(revocation_id)
+            continue
+        row.cancelled_at = datetime.now(UTC)
+        row.cancelled_by = actor
+        row.cancel_reason = clean_reason
+        await db.flush()
+        cancelled.append(revocation_id)
+
+    affected_claims = sorted(
+        {found[revocation_id].claim_id for revocation_id in cancelled},
+        key=lambda value: str(value),
+    )
+    invalidated = 0
+    jobs_created = 0
+    for claim_id in affected_claims:
+        removed, jobs = await _revocation_cascade_claim(
+            db, claim_id=claim_id, snapshot_id=snapshot.id
+        )
+        invalidated += removed
+        jobs_created += jobs
+
+    for revocation_id in cancelled:
+        row = found[revocation_id]
+        await audit.record(
+            AuditEventType.LINK_REVOCATION_CANCELLED,
+            actor=actor,
+            payload={
+                "revocation_id": str(revocation_id),
+                "evidence_id": str(row.evidence_id),
+                "claim_id": str(row.claim_id),
+                "cancel_reason": clean_reason,
+                "revocation_reason": row.reason,
+                "config_snapshot_id": str(snapshot.id),
+                "heads_invalidated": invalidated,
+                "jobs_created": jobs_created,
+            },
+            public_summary=(
+                f"отзыв связи {str(revocation_id)[:8]} отменён оператором: {clean_reason}"
+            ),
+        )
+
+    return LinkRevocationCancelResult(
+        cancelled=tuple(cancelled),
+        already_cancelled=tuple(already_cancelled),
+        claims_affected=tuple(affected_claims),
+        heads_invalidated=invalidated,
+        jobs_created=jobs_created,
+    )

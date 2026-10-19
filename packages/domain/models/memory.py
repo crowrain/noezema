@@ -350,6 +350,50 @@ class ORMCounterevidenceResolution(Base):
     )
 
 
+class ORMLinkRevocation(Base):
+    """Отзыв ОДНОЙ записанной связи улики (T7.125, ADR-0039, миграция 0026).
+
+    Append-only сущность по образцу ``ORMCounterevidenceResolution``: она называет, кто и
+    почему снял улику с оценки, вместо того чтобы править ``evidence`` (у той нет признака
+    «исключена из оценки» — ADR-0038 §13.2). Отзыв действующий, пока ``cancelled_at IS
+    NULL``; ровно один действующий на улику (partial unique миграции 0026). Отмена — вторая
+    запись истории, а не правка первой: строка отзыва остаётся навсегда.
+    ``claim_id`` — копия ``evidence.claim_id`` для чтения по утверждению; равенство
+    проверяет сервис, как 0012 проверяет свои basis-строки."""
+
+    __tablename__ = "evidence_link_revocations"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    evidence_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("evidence.id", ondelete="CASCADE"), nullable=False
+    )
+    claim_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("claims.id", ondelete="CASCADE"), nullable=False
+    )
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    #: верifiable basis отзыва: вердикт гейта значения, профиль значения, хеш сохранённого
+    #: текста страницы, метод и версия правил (записываются в момент отзыва)
+    basis: Mapped[JsonDict] = mapped_column(JSONB, nullable=False, default=dict)
+    actor: Mapped[str] = mapped_column(Text, nullable=False)
+    rules_version: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = created_at_column()
+    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cancelled_by: Mapped[str | None] = mapped_column(Text)
+    cancel_reason: Mapped[str | None] = mapped_column(Text)
+
+    __table_args__ = (
+        CheckConstraint(
+            "(cancelled_at IS NULL AND cancelled_by IS NULL AND cancel_reason IS NULL) "
+            "OR (cancelled_at IS NOT NULL AND cancelled_by IS NOT NULL "
+            "AND cancel_reason IS NOT NULL AND btrim(cancel_reason) <> '')",
+            name="evidence_link_revocations_cancel_columns_check",
+        ),
+        CheckConstraint(
+            "btrim(reason) <> ''", name="evidence_link_revocations_reason_not_blank_check"
+        ),
+    )
+
+
 class ORMCheckpoint(Base):
     __tablename__ = "checkpoints"
 

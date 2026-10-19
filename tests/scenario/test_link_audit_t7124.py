@@ -576,12 +576,17 @@ def test_cli_link_audit_prints_the_plan_and_writes_nothing(
     assert filtered.exit_code == 0 and "затронутых утверждений: 0" in filtered.output
 
 
-def test_cli_link_audit_offers_no_apply_and_rejects_bad_parameters(
+def test_cli_link_audit_is_read_only_by_default_and_rejects_bad_parameters(
     migrated_db: tuple[str, Any], tmp_path: Path, live_fetch: None
 ) -> None:
-    """Применения у команды нет намеренно (стоп-критерий T7.124: честного существующего пути
-    снять уже записанную связь нет — ADR-0038 §13), и заглушки `--apply`, которая всегда
-    отказывает, тоже нет: опция отклоняется как неизвестная."""
+    """Без `--apply` команда — только план, и она не пишет ничего; неполное `--apply`
+    (без `--evidence`) отклоняется как отказ с названной причиной, тоже без записей.
+
+    HISTORY (T7.124): тогда `--apply` не было вовсе, и опция отклонялась как неизвестная —
+    заглушки, которая всегда отказывает, AGENTS §4 запрещает. С T7.125 (ADR-0039) применение
+    есть, но только по явному перечню улик; сам путь применения и его отказы закреплены в
+    `tests/scenario/test_link_revocations_t7125.py`, а здесь остаётся проверка того, что
+    read-only режим остался read-only."""
 
     scratch_url, _engine = migrated_db
     store = FilesystemArtifactStore(tmp_path / "artifacts")

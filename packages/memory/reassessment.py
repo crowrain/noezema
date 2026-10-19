@@ -90,7 +90,10 @@ from packages.memory.rules_engine import (
 )
 from packages.memory.scope import anchor_from_scope
 from packages.memory.service import MemoryService, _evidence_set_hash
-from packages.memory.source_graph import build_source_independence_snapshot
+from packages.memory.source_graph import (
+    active_link_revocation_exclusion,
+    build_source_independence_snapshot,
+)
 from packages.memory.writer_gate import (
     GATE_PRIORITY_WORKER,
     OWNER_WORKER,
@@ -393,9 +396,20 @@ async def _process_one_job(
         return "blocked"
 
     service = MemoryService(snapshot)
+    # T7.125 (ADR-0039, ADR-0038 §13.4): сборка улик для оценки НЕ включает улики с
+    # действующим отзывом связи (`evidence_link_revocations.cancelled_at IS NULL`).
+    # Строки `evidence` при этом остаются в журнале нетронутыми, а план `link-audit` и
+    # вывод команд называют отозванную связь отдельной строкой с причиной — «исключено» не
+    # значит «стёрто» (витрина такой строки пока не делает — остаток ADR-0039 §8). Пороги,
+    # правила и алгоритм группировки не изменены: предикат фильтрует только ВХОД.
+    # Отменённый отзыв ничего не исключает.
     evidence = (
         (
-            await db.execute(select(ORMEvidence).where(ORMEvidence.claim_id == claim.id))
+            await db.execute(
+                select(ORMEvidence)
+                .where(ORMEvidence.claim_id == claim.id)
+                .where(text(active_link_revocation_exclusion("evidence.id")))
+            )
         )
         .scalars()
         .all()
