@@ -59,7 +59,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Final
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -70,6 +70,9 @@ from packages.memory.scope import parse_self_publication, parse_value_attributio
 from packages.memory.source_graph import load_source_graph_assembly
 
 #: Стабильная схема JSON-выхода. Меняется только при осознанном изменении формы отчёта.
+#: Аддитивные метрики (T7.127: `searches_rate_limited`) версию НЕ поднимают специально:
+#: baseline прежней формы обязан читаться и показывать по новой метрике «нет данных», а не
+#: отказывать — поднятие версии лишило бы сравнения все прежние прогоны стоек.
 SCHEMA_VERSION: Final = "t7118-honesty-report-v1"
 
 #: Суффикс контрольного прогона (часть 3): тексты вопросов заканчиваются на него,
@@ -114,6 +117,11 @@ MAX_QUESTIONS: Final = 100
 MAX_SESSIONS: Final = 400
 MAX_CLAIMS: Final = 400
 MAX_AUDIT_ROWS_PER_SESSION: Final = 8000
+
+#: Причина отказа поиска по лимиту поиска узла в журнале прокси (T7.127). Строка та же, какую
+#: пишет `apps/research_proxy/service.py`; нового AuditEventType не заводилось, поэтому
+#: привязка отказа к сессии — по интервалу её жизни и тексту запроса (см. `_session_steps`).
+RATE_LIMIT_REJECTION_REASON: Final = "upstream_rate_limit_exceeded"
 
 _TEXT_HEAD_CHARS: Final = 120
 _STATEMENT_HEAD_CHARS: Final = 160
@@ -472,6 +480,9 @@ class SessionSteps:
     searches_total: int = 0
     searches_official: int = 0
     searches_other: int = 0
+    #: поиски, отклонённые ЛИМИТОМ ПОИСКА УЗЛА (T7.127): узел не спросил движок, поэтому
+    #: такой поиск не может быть «пустым» — он не доходил до поисковика
+    searches_rate_limited: int = 0
     wasted_searches: int = 0
     fetch_ok_total: int = 0
     fetch_ok_official: int = 0
@@ -593,16 +604,112 @@ def _control_suffix(control_tag: str) -> str:
 # ─── шаги исследователя: лента → счётчики (реплики правил менеджера и ворот T7.111/T7.12) ──
 
 
+def search_query_from_upstream_url(url: str) -> str | None:
+    """По upstream-адресу отказа лимита восстановить запрос поиска (T7.127).
+
+    Журнал отказов прокси (`research_fetch_rejected`) хранит только адрес обращённого запроса
+    (`upstream_request_url` прокси: `...?format=json&q=<запрос>`), поэтому запрос достаётся из
+    адресной строки. Адрес без параметра `q` (чужая строка журнала) — None: такой отказ ни к
+    одному поиску сессии не привязывается.
+    """
+    if not url:
+        return None
+    values = parse_qs(urlsplit(url).query).get("q") or []
+    return str(values[0]) if values else None
+
+
+def attribute_rate_limited_searches(
+    refused_search_queries: Sequence[tuple[str, str]],
+    rejection_queries: Sequence[str],
+) -> set[str]:
+    """Какие отказавшие `web.search` отклонены ЛИМИТОМ ПОИСКА УЗЛА (чистая функция, T7.127).
+
+    Вход: `refused_search_queries` — пары (action_id, запрос) поисков этой сессии, дошедших до
+    прокси и получивших `action_failed` (воротные отказы в этот список не попадают), в порядке
+    ленты; `rejection_queries` — запросы строк журнала отказов лимита, уже отобранных по
+    интервалу жизни сессии, в хронологическом порядке журнала.
+
+    Правило сопоставления: точное равенство текста запроса и ОДНОКРАТНОЕ потребление строки
+    журнала — одна запись журнала не даёт два отказа двум вызовам, один вызов не расходует две
+    записи. Строка журнала без распознанного запроса остаётся неучтённой.
+    """
+    remaining = list(rejection_queries)
+    matched: set[str] = set()
+    for action_id, query in refused_search_queries:
+        if not query or not remaining:
+            continue
+        for index, rejected in enumerate(remaining):
+            if rejected == query:
+                matched.add(action_id)
+                del remaining[index]
+                break
+    return matched
+
+
+async def _rate_limit_rejection_queries(
+    db: AsyncSession, *, started_at: Any, finished_at: Any
+) -> list[str]:
+    """Запросы отказов лимита из журнала прокси (read-only) внутри интервала жизни сессии.
+
+    Строки `research_fetch_rejected` пишутся без session_id (их пишет сам прокси, сессии не
+    зная), поэтому единственная граница, отделяющая чужие отказы, — время жизни этой сессии;
+    нового AuditEventType и новой колонки задача не заводила. Ограничение честно: если два
+    пересекающихся по времени окна сессий содержат ОДИНАКОВЫЙ запрос, неотличимо, какой именно
+    сессии принадлежит отказ — но суммарное число отказов от этого не двоится (строка журнала
+    потребляется один раз).
+    """
+    if started_at is None:
+        return []
+    conditions = ["type = :t", "payload->>'reason' = :reason", "occurred_at >= :from_ts"]
+    params: dict[str, Any] = {
+        "t": AuditEventType.RESEARCH_FETCH_REJECTED.value,
+        "reason": RATE_LIMIT_REJECTION_REASON,
+        "from_ts": started_at,
+    }
+    if finished_at is not None:
+        conditions.append("occurred_at <= :to_ts")
+        params["to_ts"] = finished_at
+    rows = (
+        (
+            await db.execute(
+                text(
+                    f"SELECT payload FROM audit_events WHERE {' AND '.join(conditions)} "
+                    "ORDER BY occurred_at, sequence LIMIT :cap"
+                ),
+                {**params, "cap": MAX_AUDIT_ROWS_PER_SESSION},
+            )
+        )
+        .mappings()
+        .all()
+    )
+    queries: list[str] = []
+    for row in rows:
+        payload = row["payload"] if isinstance(row["payload"], dict) else {}
+        query = search_query_from_upstream_url(str(payload.get("url") or ""))
+        if query is not None:
+            queries.append(query)
+    return queries
+
+
 async def _session_steps(
-    db: AsyncSession, session_id: uuid.UUID, globally_bad_hosts: set[str]
+    db: AsyncSession,
+    session_id: uuid.UUID,
+    globally_bad_hosts: set[str],
+    *,
+    started_at: Any = None,
+    finished_at: Any = None,
 ) -> tuple[SessionSteps, set[str]]:
     """Счётчики шагов одной сессии по ленте `audit_events` (порядок — только `sequence`).
 
     Отражённые счётчики и их определения (сознательные реплики правил, а не новые смыслы):
     * `searches_*` — выполненные `web.search` (получившие `action_started`); отбор по хост-
       константе модуля делает `search_query_official`;
+    * `searches_rate_limited` (T7.127) — из них отклонённые ЛИМИТОМ ПОИСКА УЗЛА: узел не спросил
+      движок, поэтому такой поиск не может считаться «пустым»; привязка отказа к сессии —
+      `_rate_limit_rejection_queries` + `attribute_rate_limited_searches`;
     * `wasted_searches` — «поиск без последующего чтения»: зеркало паса 2 менеджера
-      (`step_budget.py`): следующее ВЫПОЛНЕННОЕ действие сессии — не `research.fetch`;
+      (`step_budget.py`) c поправкой T7.127: отказа лимита среди следующих действий не считать
+      пустым поиском (у отклонённого поиска результатов нет, и читать после него нечего);
     * `fetch_failures_by_host` — отказы выполненных `research.fetch`, сгруппированные по
       хосту; вид отказа — зеркало `classify_fetch_error` (401/403/429/timeout) либо None;
     * `repeated_failed_host_fetches` — fetch к хосту, который уже отказывал этим видом в
@@ -699,6 +806,20 @@ async def _session_steps(
     steps.gate_host_unavailable = gate_counts["host_unavailable_in_session"]
     steps.gate_tool_repeated = gate_counts["tool_call_repeated"]
 
+    # T7.127: поиски, отклонённые лимитом поиска узла. Журнал отказов прокси пишется без
+    # session_id, поэтому привязка — интервал жизни сессии + текст запроса (однократное
+    # потребление строки журнала). Хронология ленты не используется: у строк одной
+    # phase-1-транзакции `occurred_at` совпадают (AGENTS §7), порядок держит `sequence`.
+    refused: list[tuple[str, str]] = []
+    for action_id in order:
+        tool, args = started[action_id]
+        if tool == "web.search" and action_id not in completed and action_id in failed:
+            refused.append((action_id, str(args.get("query") or "")))
+    rejection_queries = await _rate_limit_rejection_queries(
+        db, started_at=started_at, finished_at=finished_at
+    )
+    rate_limited_ids = attribute_rate_limited_searches(refused, rejection_queries)
+
     session_bad_hosts: dict[str, str] = {}
     seen_urls: set[str] = set()
     seen_shas: set[str] = set()
@@ -711,6 +832,9 @@ async def _session_steps(
                 steps.searches_official += 1
             else:
                 steps.searches_other += 1
+            if action_id in rate_limited_ids:
+                steps.searches_rate_limited += 1
+                continue
             next_tool = started[order[index + 1]][0] if index + 1 < len(order) else None
             if next_tool != "research.fetch":
                 steps.wasted_searches += 1
@@ -1153,10 +1277,16 @@ async def collect_honesty_report(
         sessions_report: list[ReportSession] = []
         for s_row in session_rows:
             session_id = uuid.UUID(str(s_row["id"]))
-            steps, bad_hosts = await _session_steps(db, session_id, globally_bad_hosts)
-            globally_bad_hosts |= bad_hosts
             started_at = s_row["started_at"]
             finished_at = s_row["finished_at"]
+            steps, bad_hosts = await _session_steps(
+                db,
+                session_id,
+                globally_bad_hosts,
+                started_at=started_at,
+                finished_at=finished_at,
+            )
+            globally_bad_hosts |= bad_hosts
             duration: float | None = None
             if started_at is not None and finished_at is not None:
                 duration = (finished_at - started_at).total_seconds()
@@ -1428,6 +1558,7 @@ def _compute_totals(questions: Sequence[QuestionReport]) -> dict[str, float]:
         "searches_total": 0,
         "searches_official": 0,
         "searches_other": 0,
+        "searches_rate_limited": 0,
         "wasted_searches": 0,
         "fetch_ok_total": 0,
         "fetch_ok_official": 0,
@@ -1459,7 +1590,8 @@ def _compute_totals(questions: Sequence[QuestionReport]) -> dict[str, float]:
             sums["model_input_tokens"] += session.input_tokens
             sums["model_output_tokens"] += session.output_tokens
             step_fields = (
-                "searches_total", "searches_official", "searches_other", "wasted_searches",
+                "searches_total", "searches_official", "searches_other",
+                "searches_rate_limited", "wasted_searches",
                 "fetch_ok_total", "fetch_ok_official", "fetch_ok_other", "fetch_fail_total",
                 "repeated_failed_host_fetches", "fetch_known_bad_host", "repeated_reads",
                 "gate_near_duplicate", "gate_host_unavailable", "gate_tool_repeated",
@@ -1483,7 +1615,12 @@ def _compute_totals(questions: Sequence[QuestionReport]) -> dict[str, float]:
         return round(numerator / denominator, 4) if denominator else 0.0
 
     totals: dict[str, float] = {key: float(value) for key, value in sums.items()}
-    totals["share_wasted_searches"] = share(sums["wasted_searches"], sums["searches_total"])
+    # T7.127: доля «пустых» поисков считается от поисков, ДОШЕДШИХ до поискового движка. Отказ
+    # лимита поиска узла не даёт исследователю никаких результатов, и называть такой поиск
+    # «поиском без последующего чтения» — приписывать ему то, чего прочесть было нельзя:
+    # wasted_searches / (searches_total - searches_rate_limited).
+    reached_engine = sums["searches_total"] - sums["searches_rate_limited"]
+    totals["share_wasted_searches"] = share(sums["wasted_searches"], reached_engine)
     totals["share_fetch_fail"] = share(sums["fetch_fail_total"], sums["fetch_ok_total"] + sums["fetch_fail_total"])
     totals["share_reused_claims"] = share(
         sums["claims_reused"] + sums["claims_reverified"],
@@ -1546,7 +1683,8 @@ def render_markdown(report: HonestyReport, baseline: Mapping[str, Any] | None = 
             )
             lines.append(
                 f"- поиски: {steps.searches_total} (официальных {steps.searches_official}, "
-                f"прочих {steps.searches_other}), без последующего чтения: {steps.wasted_searches}"
+                f"прочих {steps.searches_other}), без последующего чтения: {steps.wasted_searches}, "
+                f"отклонено лимитом поиска узла: {steps.searches_rate_limited}"
             )
             failures = ", ".join(
                 f"{item['host']} ({item['kind'] or 'другая причина'})×{item['count']}"
@@ -1612,7 +1750,10 @@ def render_markdown(report: HonestyReport, baseline: Mapping[str, Any] | None = 
     )
     lines.append(
         f"- поисков {int(totals['searches_total'])} (официальных {_fmt_share(totals['share_official_searches'])}), "
-        f"без последующего чтения {int(totals['wasted_searches'])} ({_fmt_share(totals['share_wasted_searches'])})"
+        f"отклонено лимитом поиска узла {int(totals['searches_rate_limited'])}, "
+        f"без последующего чтения {int(totals['wasted_searches'])} "
+        f"({_fmt_share(totals['share_wasted_searches'])} — доля считается от поисков, дошедших до движка: "
+        "wasted_searches / (searches_total - searches_rate_limited))"
     )
     ok_share = _fmt_share(totals["share_official_fetches"])
     fail_share = _fmt_share(totals["share_fetch_fail"])
@@ -1651,7 +1792,11 @@ def render_markdown(report: HonestyReport, baseline: Mapping[str, Any] | None = 
         baseline_totals: Mapping[str, Any] = raw_totals if isinstance(raw_totals, Mapping) else {}
         for key in sorted(totals):
             old_raw = baseline_totals.get(key)
-            if not isinstance(old_raw, (int, float)):
+            if not isinstance(old_raw, (int, float)) or isinstance(old_raw, bool):
+                # T7.127: в baseline прежней формы аддитивной метрики просто нет — сравнивать не
+                # с чем, и это «нет данных», а не 0: нулём отсутствующая метрика притворяться не
+                # должна, а тихая потеря строки прякала бы изменение шкалы от читателя.
+                lines.append(f"| {key} | нет данных | {totals[key]:g} | — |")
                 continue
             new_value = totals[key]
             lines.append(

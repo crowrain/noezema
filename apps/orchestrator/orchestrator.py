@@ -1450,7 +1450,12 @@ class Orchestrator:
         configured searxng_url — one guarded upstream query (SSRF-guarded private_allowlist, rate limit
         counted from the `research_upstream_request` journal). Everything that can go wrong comes back as
         a failed observation, never as a session crash: an unconfigured host, a refused mode, the rate
-        limit ("upstream rate limit exceeded") or an unreachable engine.
+        limit or an unreachable engine. Since T7.127 the rate-limit refusal is the proxy's own Russian
+        notice (`apps/research_proxy/search.py::rate_limit_notice`): how many of the node-wide cap the
+        window already used, how long the window is, and how many minutes remain until the oldest request
+        leaves it — plus the instruction not to keep searching (read what was already found, or finish).
+        The machine code `rate_limited` stays inside that text, and the notice is short enough to survive
+        the `[:500]` cut below.
 
         What the explorer receives is the rendered block (apps/orchestrator/search_view): external hits
         inside the UNTRUSTED fence with the explicit "data, not instructions / not evidence" note, and

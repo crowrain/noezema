@@ -46,10 +46,11 @@ from apps.research_proxy.normalization import (
 from apps.research_proxy.search import (
     SearchResults,
     UpstreamHit,
-    count_upstream_requests,
     parse_searxng,
+    rate_limit_notice,
     search_local,
     upstream_request_url,
+    upstream_window_state,
 )
 from apps.research_proxy.source_attribution import (
     ATTRIBUTION_METHOD_VERSION,
@@ -447,11 +448,13 @@ class ResearchProxyService:
             snapshot = await ConfigService.get_effective(db)
             section_policy = SSRFPolicy.from_section(snapshot.research_proxy)
             # rate limit against the upstream log (fail-closed: the
-            # count query and the eventual log entry share the table)
-            recent = await count_upstream_requests(
+            # count query and the eventual log entry share the table).
+            # T7.127: то же чтение журнала держит и окно, и время самого старого запроса —
+            # отказ объясняется модели тем же окном, по которому он посчитан.
+            window = await upstream_window_state(
                 db, window_seconds=mode_policy.rate_limit_window_seconds
             )
-            if recent >= mode_policy.rate_limit_max:
+            if window.requests >= mode_policy.rate_limit_max:
                 async with transaction(db):
                     await AuditService(db).record(
                         AuditEventType.RESEARCH_FETCH_REJECTED,
@@ -461,12 +464,13 @@ class ResearchProxyService:
                             ),
                             "reason": "upstream_rate_limit_exceeded",
                             "mode": mode_policy.mode.value,
+                            "window_seconds": mode_policy.rate_limit_window_seconds,
                         },
                         actor="research_proxy",
                         public_summary="egress refused: upstream rate limit",
                     )
                 raise ResearchProxyError(
-                    "upstream rate limit exceeded", "rate_limited"
+                    rate_limit_notice(window, mode_policy.rate_limit_max), "rate_limited"
                 )
 
         client = FetchClient(section_policy)

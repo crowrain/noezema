@@ -402,12 +402,24 @@ async def test_upstream_rate_limit_turns_into_an_explained_action_failure(
         "SELECT error_code FROM actions WHERE tool = :t AND state = 'failed'",
         {"t": "web.search"},
     )
-    assert len(failed) == 1 and "rate limit" in (failed[0][0] or "")
+    # T7.127 было→стало: было `assert len(failed) == 1 and "rate limit" in (failed[0][0] or "")` —
+    # английский текст прокси, по которому исследователь не понимал ни лимита, ни срока. Теперь
+    # отказ объяснен по-русски и держит в тексте машинный код `rate_limited`.
+    assert len(failed) == 1
+    notice = failed[0][0] or ""
+    assert "rate_limited" in notice
+    assert "1 из 1 запрос" in notice
+    assert "3600 с" in notice
+    assert "мин" in notice
 
     # модель получила отказ текстом, а не молчаливую подмену: без fence-а, с причиной
     ctxs = [r["last_user"] for r in fake_llm.requests() if "цена стойки в дата-центре 2026" in r["last_user"]]
     assert ctxs
-    assert "upstream rate limit exceeded" in max(ctxs, key=len)
+    # T7.127 было→стало: было `assert "upstream rate limit exceeded" in max(ctxs, key=len)` —
+    # прежняя английская строка; та же проверка над русским объяснением с кодом отказа.
+    assert "upstream rate limit exceeded" not in max(ctxs, key=len)
+    assert "лимит поиска узла исчерпан" in max(ctxs, key=len)
+    assert "rate_limited" in max(ctxs, key=len)
 
     # лимит не отменил первый успешный запрос
     ok = await _rows(
