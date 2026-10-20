@@ -84,7 +84,10 @@ from packages.memory.scope import (
     parse_self_publication,
     parse_value_attribution,
 )
-from packages.memory.source_graph import build_source_independence_snapshot
+from packages.memory.source_graph import (
+    build_source_independence_snapshot,
+    claim_evidence_for_assessment,
+)
 
 GLOBAL_SCOPE = "global"
 
@@ -1025,15 +1028,17 @@ class MemoryService:
             if assess_claim is None or assess_claim.id in assessed_ids:
                 continue
             assessed_ids.add(assess_claim.id)
-            all_evidence = list(
-                (
-                    await db.execute(
-                        select(ORMEvidence).where(ORMEvidence.claim_id == assess_claim.id)
-                    )
-                )
-                .scalars()
-                .all()
-            )
+            # T7.126b (дополнение ADR-0039): ВХОД оценки при коммите берётся из общей точки
+            # `claim_evidence_for_assessment` — улики утверждения БЕЗ действующего отзыва
+            # связи (`evidence_link_revocations.cancelled_at IS NULL`). Прежняя сборка брала
+            # ВСЕ строки `evidence`, и на живом пути коммита отозванная связь возвращалась в
+            # оценку: она не входит в группы (её источник исключён из входа группировщика
+            # T7.125), поэтому получала вторую «независимую» группу `UNTRACKED_GROUP` и
+            # поднимала оценку — переутверждение или перепроверка утверждения с отозванной
+            # связью обходили бы отзыв оператора. Улики, записанные ЭТОЙ ЖЕ транзакцией,
+            # отзыва не имеют и остаются во входе (autoflush перед выборкой). Отменённый
+            # отзыв ничего не исключает; пороги, правила и `evaluate` не изменены.
+            all_evidence = await claim_evidence_for_assessment(db, claim_id=assess_claim.id)
             # T7.17: the scope of EVERY evidence row of the claim is a
             # function of its durable provenance, recomputed by the
             # trusted host (idempotent): rows created under the old

@@ -69,7 +69,6 @@ from packages.domain.models.memory import (
     ORMClaim,
     ORMClaimAssessment,
     ORMClaimAssessmentHead,
-    ORMEvidence,
     ORMReassessmentJob,
 )
 from packages.domain.models.questions import ORMQuestion
@@ -91,8 +90,8 @@ from packages.memory.rules_engine import (
 from packages.memory.scope import anchor_from_scope
 from packages.memory.service import MemoryService, _evidence_set_hash
 from packages.memory.source_graph import (
-    active_link_revocation_exclusion,
     build_source_independence_snapshot,
+    claim_evidence_for_assessment,
 )
 from packages.memory.writer_gate import (
     GATE_PRIORITY_WORKER,
@@ -396,24 +395,15 @@ async def _process_one_job(
         return "blocked"
 
     service = MemoryService(snapshot)
-    # T7.125 (ADR-0039, ADR-0038 §13.4): сборка улик для оценки НЕ включает улики с
-    # действующим отзывом связи (`evidence_link_revocations.cancelled_at IS NULL`).
-    # Строки `evidence` при этом остаются в журнале нетронутыми, а план `link-audit` и
-    # вывод команд называют отозванную связь отдельной строкой с причиной — «исключено» не
-    # значит «стёрто» (витрина такой строки пока не делает — остаток ADR-0039 §6). Пороги,
-    # правила и алгоритм группировки не изменены: предикат фильтрует только ВХОД.
-    # Отменённый отзыв ничего не исключает.
-    evidence = (
-        (
-            await db.execute(
-                select(ORMEvidence)
-                .where(ORMEvidence.claim_id == claim.id)
-                .where(text(active_link_revocation_exclusion("evidence.id")))
-            )
-        )
-        .scalars()
-        .all()
-    )
+    # T7.125 (ADR-0039, ADR-0038 §13.4) / T7.126b: сборка улик для оценки НЕ включает улики с
+    # действующим отзывом связи (`evidence_link_revocations.cancelled_at IS NULL`) и читается
+    # из ОДНОЙ общей точки `claim_evidence_for_assessment` — так же, как её читают
+    # группировщик, предпросмотр независимости и коммит сессии. Строки `evidence` при этом
+    # остаются в журнале нетронутыми, а план `link-audit` и вывод команд называют отозванную
+    # связь отдельной строкой с причиной — «исключено» не значит «стёрто». Пороги, правила и
+    # алгоритм группировки не изменены: предикат фильтрует только ВХОД. Отменённый отзыв
+    # ничего не исключает.
+    evidence = await claim_evidence_for_assessment(db, claim_id=claim.id)
     scope = await _latest_assessed_scope(db, claim.id, effective)
     now = datetime.now(UTC)
 

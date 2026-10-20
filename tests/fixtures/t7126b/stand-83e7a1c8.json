@@ -1,0 +1,87 @@
+{
+  "note": "Срез стенда .92 (noezema-b00b5f8c, config-v28, rules-v2) по утверждению 83e7a1c8 — скопирован из /home/denis/dsh1/fixtures-t7126b/claim-83e7a1c8.json в части, которую воспроизводит тест T7.126b: те же uri, форма «пересказ → объявленный первоисточник» (sbercib → cbr), те же relation/kind/role значимых полей и те числа оценки. Id стенда (uuid строк журнала) здесь не перенесены: в тесте они свои, идентификаторы записей не являются предметом проверки.",
+  "exported_from": "noezema-b00b5f8c @ b6e1602 / config-v28",
+  "claim": {
+    "statement": "По данным HR-Ratings, hh-индекс в России в 2026 году составил 9,6.",
+    "claim_type": "external_fact"
+  },
+  "evidence": [
+    {
+      "role_in_current_assessment": "support",
+      "relation": "supports",
+      "evidence_kind": "source_assertion",
+      "source_uri": "https://hr-ratings.com/analytics/rynok-truda-bolshoj-krizis-v-istorii-rossii",
+      "source_type": "external_url",
+      "revoked": false,
+      "scope_keys": ["value_attribution"]
+    },
+    {
+      "role_in_current_assessment": null,
+      "relation": "supports",
+      "evidence_kind": "source_assertion",
+      "source_uri": "https://www.sbercib.ru/publication/reshenie-banka-rossii-po-klyuchevoi-stavke-ot-11-sentyabrya-2026-goda",
+      "source_type": "external_url",
+      "revoked": true,
+      "parent_source_uri": "https://cbr.ru/analytics/dkp/dinamic/CPD_2026-9/",
+      "parent_source_type": "external_url",
+      "parent_content_hash": null,
+      "scope_keys": ["value_attribution"]
+    },
+    {
+      "role_in_current_assessment": null,
+      "relation": "supports",
+      "evidence_kind": "source_assertion",
+      "source_uri": "https://www.sbercib.ru/publication/reshenie-banka-rossii-po-klyuchevoi-stavke-ot-11-sentyabrya-2026-goda",
+      "source_type": "external_url",
+      "revoked": true,
+      "parent_source_uri": "https://cbr.ru/analytics/dkp/dinamic/CPD_2026-9/",
+      "parent_source_type": "external_url",
+      "parent_content_hash": null,
+      "scope_keys": ["value_attribution"]
+    }
+  ],
+  "link_revocations": [
+    {
+      "cancelled_at": null,
+      "actor": "hostctl",
+      "reason": "на странице «решение ЦБ по ключевой ставке» значения hh-индекса нет",
+      "basis_method": "value-gate-T7.123",
+      "basis_verdict": "нет значения",
+      "basis_source_uri": "https://www.sbercib.ru/publication/reshenie-banka-rossii-po-klyuchevoi-stavke-ot-11-sentyabrya-2026-goda",
+      "basis_value_tokens": ["9.6"],
+      "rules_version": "rules-v2"
+    },
+    {
+      "cancelled_at": null,
+      "actor": "hostctl",
+      "reason": "на странице «решение ЦБ по ключевой ставке» значения hh-индекса нет",
+      "basis_method": "value-gate-T7.123",
+      "basis_verdict": "нет значения",
+      "basis_source_uri": "https://www.sbercib.ru/publication/reshenie-banka-rossii-po-klyuchevoi-stavke-ot-11-sentyabrya-2026-goda",
+      "basis_value_tokens": ["9.6"],
+      "rules_version": "rules-v2"
+    }
+  ],
+  "assessment_head": {
+    "config_generation": 28,
+    "assessment_state": "current",
+    "epistemic_status": "hypothesis",
+    "prepared_by": "reassessment_worker"
+  },
+  "current_assessment": {
+    "effective_grade": "E1",
+    "epistemic_status": "hypothesis",
+    "confidence": 0.15,
+    "rules_version": "rules-v2"
+  },
+  "source_independence_members": [
+    {
+      "group_id": "g0",
+      "canonical_uri": "https://hr-ratings.com/analytics/rynok-truda-bolshoj-krizis-v-istorii-rossii"
+    }
+  ],
+  "expected_defect_before_fix": {
+    "independence_preview": "было: E1 hypothesis (0.15) → стало: E3 supported (0.75), группы не изменились",
+    "why": "отзыв применён к ВХОДУ группировщика, но не к сборке улик для evaluate: отозванная связь вне групп получает резервную группу UNTRACKED_GROUP и вторую «независимую» группу"
+  }
+}

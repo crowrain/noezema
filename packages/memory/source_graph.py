@@ -30,6 +30,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.domain.models.enums import AuditEventType, ReassessmentJobStatus
 from packages.domain.models.memory import (
+    ORMEvidence,
     ORMReassessmentJob,
     ORMSource,
     ORMSourceDependencyEdge,
@@ -72,6 +73,38 @@ def active_link_revocation_exclusion(column: str) -> str:
     return (
         f"NOT EXISTS (SELECT 1 FROM {LINK_REVOCATIONS_TABLE} r "
         f"WHERE r.evidence_id = {column} AND r.cancelled_at IS NULL)"
+    )
+
+
+async def claim_evidence_for_assessment(
+    db: AsyncSession, *, claim_id: uuid.UUID
+) -> list[ORMEvidence]:
+    """T7.126b (дополнение ADR-0039): ОДНА точка сборки улик утверждения для ВХОДА оценки.
+
+    Прежний разбор ADR-0039 §2 обещал, что предикат стоит «ровно там, где оценка берёт
+    улики», по факту он стоял в двух сборках из четырёх: группировщик (`load_source_graph_assembly`)
+    и рабочий переоценки (`reassessment.py`) фильтровали, а предпросмотр независимости
+    (`independence_preview.py`) и коммит сессии (`MemoryService._assess`) брали ВСЕ улики
+    утверждения. Отсюда стендовый дефект: отозванная связь не входит в группы, поэтому получала
+    вторую «независимую» группу `UNTRACKED_GROUP` и поднимала оценку (83e7a1c8: E1 hypothesis
+    0.15 → E3 supported 0.75). Теперь ВСЕ сборки входа оценки читают улики отсюда.
+
+    Это только фильтр ВХОДА: пороги, `claim_type_rules`, шкала оценок, алгоритм группировки и
+    `evaluate` не изменены ни на байт. Отменённый отзыв (`cancelled_at IS NOT NULL`) ничего не
+    исключает — строка отзыва остаётся в истории. Улики, записанные этой же транзакцией,
+    отзыва не имеют и остаются во входе (выборка идёт после их flush в той же транзакции).
+    """
+    return list(
+        (
+            await db.execute(
+                select(ORMEvidence)
+                .where(ORMEvidence.claim_id == claim_id)
+                .where(text(active_link_revocation_exclusion("evidence.id")))
+                .order_by(ORMEvidence.id)
+            )
+        )
+        .scalars()
+        .all()
     )
 
 

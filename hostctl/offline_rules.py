@@ -41,6 +41,7 @@ from packages.memory.rules_engine import (
     EvaluatedEvidence,
     evaluate,
 )
+from packages.memory.source_graph import claim_evidence_for_assessment
 
 GLOBAL_SCOPE = "global"
 
@@ -223,24 +224,18 @@ async def prepare_shadow_heads(db: AsyncSession, *, candidate: ORMConfigSnapshot
     count = 0
     for claim in claims:
         rule = rules.get(claim.claim_type)
-        evs = (
-            (
-                await db.execute(
-                    text(
-                        "SELECT identity_hash, evidence_kind, relation, scope FROM evidence "
-                        "WHERE claim_id=:c ORDER BY id"
-                    ),
-                    {"c": str(claim.id)},
-                )
-            )
-            .mappings()
-            .all()
-        )
+        # T7.126b (дополнение ADR-0039): ВХОД оценки кандидата правил — та же общая точка,
+        # что у рабочего переоценки, предпросмотра независимости и коммита сессии: улики
+        # утверждения БЕЗ действующего отзыва связи. Прежняя выборка брала ВСЕ строки
+        # `evidence`, и теневая голова под нового кандидата считала отозванную связь
+        # подтверждением (и её scope — частью области утверждения). Пороги, сами правила и
+        # `evaluate` не изменены: фильтруется только ВХОД.
+        evs = await claim_evidence_for_assessment(db, claim_id=claim.id)
         # the claim's scope is derived from its evidence (the claim row
         # does not persist a scope of its own)
         merged_scope: dict[str, Any] = {}
         for e in evs:
-            for k, v in (e["scope"] or {}).items():
+            for k, v in (e.scope or {}).items():
                 merged_scope.setdefault(k, v)
         if rule is None:
             # unknown type under the new rules -> the claim cannot be
@@ -249,10 +244,10 @@ async def prepare_shadow_heads(db: AsyncSession, *, candidate: ORMConfigSnapshot
         else:
             ev_list = [
                 EvaluatedEvidence(
-                    identity_hash=e["identity_hash"],
-                    kind=e["evidence_kind"],
-                    relation=e["relation"],
-                    scope=dict(e["scope"] or {}),
+                    identity_hash=e.identity_hash,
+                    kind=e.evidence_kind,
+                    relation=e.relation,
+                    scope=dict(e.scope or {}),
                     independence_group="shadow",
                 )
                 for e in evs
@@ -291,7 +286,7 @@ async def prepare_shadow_heads(db: AsyncSession, *, candidate: ORMConfigSnapshot
                 rules_version="rules-v1",
                 rules_hash=rules_hash,
                 evidence_set_hash=canonical_sha256(
-                    sorted(f"{e['evidence_kind']}:{e['relation']}:{e['identity_hash']}" for e in evs)
+                    sorted(f"{e.evidence_kind}:{e.relation}:{e.identity_hash}" for e in evs)
                 ),
                 assessed_scope={},
                 confidence=conf or 0.0,

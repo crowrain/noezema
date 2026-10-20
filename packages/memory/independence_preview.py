@@ -58,6 +58,7 @@ from packages.memory.service import MemoryService
 from packages.memory.source_graph import (
     SourceGraphChangeResult,
     apply_source_graph_change,
+    claim_evidence_for_assessment,
     grouping_arguments,
     load_source_graph_assembly,
 )
@@ -276,11 +277,14 @@ async def preview_independence_changes(db: AsyncSession) -> IndependencePreviewR
         note: str | None = None
         try:
             rule = service.rule(claim.claim_type)
-            evidence_rows = (
-                (await db.execute(select(ORMEvidence).where(ORMEvidence.claim_id == claim_id)))
-                .scalars()
-                .all()
-            )
+            # T7.126b (дополнение ADR-0039): ВХОД оценки «стало» — из общей точки
+            # `claim_evidence_for_assessment`, то есть улики утверждения БЕЗ действующего
+            # отзыва связи. Прежняя сборка брала ВСЕ улики: отозванная связь не входит в
+            # группы (её источник исключён из входа группировщика), поэтому получала вторую
+            # «независимую» группу `UNTRACKED_GROUP` и поднимала оценку — предпросмотр и
+            # `--apply` записывали бы ложное «Проверено» (стендовый случай 83e7a1c8:
+            # E1 hypothesis 0.15 → E3 supported 0.75).
+            evidence_rows = await claim_evidence_for_assessment(db, claim_id=claim_id)
             env_groups: dict[uuid.UUID, str] = {}
             env_relations: dict[uuid.UUID, str] = {}
             if assessment.environment_independence_snapshot_id is not None:

@@ -643,14 +643,28 @@ async def _recompute(
     Ничего не записывается: сборка и `evaluate` живут только в памяти процесса. «Было» —
     записанный снимок независимости действующей головы (тот же источник, что у preview)."""
     claim_id = claim.id
-    excluded_ids = {link.evidence_id for link in absent}
+    # T7.126b (дополнение ADR-0039): пересчёт «стало» не подставляет уже отозванные связи.
+    # Они названы в плане отдельной строкой (`revoked_links`) и остаются в нём — «исключено»
+    # не значит «стёрто», — но в ВХОД оценки и групп они не входят с момента отзыва: их
+    # источник исключён из входа группировщика, а значит подстановка вернула бы им вторую
+    # «независимую» группу `UNTRACKED_GROUP` и нарисовала бы подъём оценки, которого запись
+    # не даёт. `absent` (исход той же проверки значения) для отозванной связи остаётся в
+    # отчёте: план обязан назвать её как провалившую, но снимать нечего — снято записью.
+    revoked_ids = {link.evidence_id for link in links if link.revoked}
+    excluded_ids = {link.evidence_id for link in absent} - revoked_ids
     remaining_sources = {
-        row.source_id for row in evidence_rows if row.source_id is not None and row.id not in excluded_ids
+        row.source_id
+        for row in evidence_rows
+        if row.source_id is not None
+        and row.id not in excluded_ids
+        and row.id not in revoked_ids
     }
     excluded_sources = {
         row.source_id
         for row in evidence_rows
-        if row.source_id is not None and row.id in excluded_ids and row.source_id not in remaining_sources
+        if row.source_id is not None
+        and row.id in excluded_ids
+        and row.source_id not in remaining_sources
     }
 
     assembly = await load_source_graph_assembly(db, claim_id=claim_id)
@@ -685,7 +699,9 @@ async def _recompute(
     new_status: str | None = None
     new_confidence: float | None = None
     note: str | None = None
-    kept_rows = [row for row in evidence_rows if row.id not in excluded_ids]
+    kept_rows = [
+        row for row in evidence_rows if row.id not in excluded_ids and row.id not in revoked_ids
+    ]
     if not kept_rows:
         note = _NO_SOURCE_EVIDENCE
     else:
