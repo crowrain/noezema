@@ -225,10 +225,17 @@ T7.121a: датировочная строка подтверждает пери
 опоры (T7.84) и mutual-кластер дублей (T7.83) безусловны, как и витрина `answered_from_relied` — они
 от ключа не зависят; canonical v28 `8db816ee…` (прежний `2b77f249…`), хеш payload-файла — другое
 число (`82ffe53a…`, прежний `c65a27bf…`);
+config-v29 (T7.127, ADR-0028 дополнение) = config-v28 ровно с одной правкой —
+`research_proxy.rate_limit_max` 20 -> 60 (окно `rate_limit_window_seconds` = 3600 не менялось, новых ключей
+в секции нет; разницей файлов является ровно одна строка); 60 — ПРЕДЛОЖЕНИЕ по замеру прогона `.92` на
+config-v28 (22 успешных upstream-запроса и 7 отказов лимита за 5 сессий, пик 22 запроса в час при потолке
+20: лимит упирался в себя раньше, чем исчерпывался бюджет шагов), а не вывод из правила;
+canonical v29 `e0844baf…`, хеш payload-файла — другое число (`ea6e042a…`);
 **дефолт bootstrap'а остаётся config-v20, активация config-v21, config-v22, config-v23, config-v24,
-config-v25, config-v26, config-v27 или config-v28 — решение менеджера** (`activate-online` с payload config-v21, config-v22,
-config-v23, config-v24, config-v25, config-v26, config-v27 или config-v28, STATUS T7.97, T7.97a, T7.102, T7.105, T7.106, T7.108,
-T7.111, T7.119 и T7.121), откатом config-v28 служит payload config-v27 (он не менялся),
+config-v25, config-v26, config-v27, config-v28 или config-v29 — решение менеджера** (`activate-online` с payload config-v21, config-v22,
+config-v23, config-v24, config-v25, config-v26, config-v27, config-v28 или config-v29, STATUS T7.97, T7.97a, T7.102, T7.105, T7.106, T7.108,
+T7.111, T7.119, T7.121 и T7.127), откатом config-v29 служит payload config-v28 (он не менялся),
+откатом config-v28 служит payload config-v27 (он не менялся),
 откатом config-v27 служит payload config-v26 (он не менялся),
 а config-v19 (T7.82(б)) = config-v18 ровно с одной правкой — пин `prompts.curator` → curator-v9:
 факультативное поле ответа `relied_claim_ids` — честный перечень уже записанных утверждений из контекст-пака,
@@ -326,6 +333,28 @@ config-v20 — `2b065470…`, хеш файла — другое число; о�
   `research_upstream_request` поле — `upstream_host` (только хост, без порта); лимит upstream считается по строкам
   этого же журнала (fail-closed), при исчерпании — `research_fetch_rejected{reason:"upstream_rate_limit_exceeded"}`.
   Тесты поиска не делают ни одного внешнего запроса и не трогают эталонный SearXNG (`noezema-searxng` на `.87`).
+- Дополнение к предыдущему пункту (T7.127, ADR-0028 дополнение): отказ по лимиту поиска — тот же машинный код
+`rate_limited` и та же журнальная строка `research_fetch_rejected{reason:"upstream_rate_limit_exceeded"}`, но
+текст наблюдения теперь понимает исследователь: `apps/research_proxy/search.py::rate_limit_notice` называет
+лимит («N из M запросов»), окно в секундах и минутах, минуты до ближайшего освобождения
+(`minutes_until_release` — чистая функция: `oldest + window_seconds − now`, округление ВВЕРХ; пустое окно —
+«предсказывать не по чему», а не 0; срок уже истёк — 0) и выход (читать уже найденное через `research.fetch` либо
+заканчивать). Текст держится в 500 знаках — иначе его обрежет срезка наблюдения оркестратора (`str(exc)[:500]`).
+В payload отказа появился ключ `window_seconds` — это содержание payload: новых AuditEventType, новых колонок
+и новых журнальных типов нет. Состояние окна читается ОДНИМ запросом `upstream_window_state`
+(count + min(occurred_at) + now() окна), `count_upstream_requests` остался тонкой обёрткой (публичный контракт
+модуля не сломан). В отчёте честности (T7.118) отказы лимита считаются ОТДЕЛЬНОЙ метрикой
+`searches_rate_limited`: `searches_total`/`searches_official`/`searches_other` их по-прежнему включают, а
+`wasted_searches` и доля «пустых» — нет (`wasted_searches / (searches_total - searches_rate_limited)`);
+метрика аддитивная, `SCHEMA_VERSION` отчёта НЕ поднят — baseline прежней формы грузится и показывает
+«нет данных» (не 0 и не ошибку). Привязка отказа к сессии: интервал жизни сессии из строки `sessions` плюс
+совпадение параметра `q` из адреса отказа с запросом отклонённого `web.search` (журнальную строку пишет прокси,
+`session_id` у неё NULL; времена строк одной сессии совпадают — начало §7, потому времени события внутри сессии
+привязать нельзя). При перекрывающихся окнах и одинаковых запросах привязка между сессиями неоднозначна, но
+сумма по узлу не удваивается: строка журнала расходуется один раз. Тесты:
+`tests/unit/test_config_v29_payload_t7127.py`, `tests/unit/test_search_rate_limit_notice_t7127.py`,
+`tests/unit/test_rate_limit_search_attribution_t7127.py`, `tests/scenario/test_rate_limit_refusal_notice_t7127.py`,
+`tests/scenario/test_honesty_report_rate_limit_t7127.py`.
 - Гигиена шагов исследователя (T7.111, ADR-0036): два хостовых гейта цикла действий, оба отклоняют до
   создания строки действия способом T7.12 и оба стоят шаг (учёт T7.76 не менялся). (а) Почти-повтор
   `web.search`: Жаккарр >= 0.6 (`SEARCH_QUERY_NEAR_DUP_JACCARD`) по нормализованным множествам слов от
