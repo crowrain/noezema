@@ -374,11 +374,15 @@ async def test_valueless_rosstat_attachments_lose_support_links(
     assert payload["public_summary"] == "curator: 1 claims, 0 questions"
 
     # атрибуция живёт только на оставшихся связях: строгий режим на издании,
-    # третий режим — на блоге со списком источников (T7.107), порядок связей прямой
+    # блог со списком источников (T7.107), порядок связей прямой.
+    # T7.129a (ADR-0029 §26.3): на блоге было `bibliography_known_producer` (список источников
+    # страницы), стало `statement_names_producer`: утверждение само называет Росстат, а блог
+    # это значение носит. Первоисточник не изменился (rosstat); пятый режим не требует уже
+    # записанного первоисточника той же улики, поэтому решает раньше библиографии
     strict = await _pairing_of(scratch_url, CLAIM_AUG, URL_INTERFAX)
     assert strict is not None and strict["pairing"] == "value_and_primary_in_fragment", strict
     blog = await _pairing_of(scratch_url, CLAIM_AUG, URL_SMARTLAB)
-    assert blog is not None and blog["pairing"] == "bibliography_known_producer", blog
+    assert blog is not None and blog["pairing"] == "statement_names_producer", blog
     assert blog["primary_key"] == "rosstat", blog
     assert fake_llm.state()["queue_left"] == 0
 

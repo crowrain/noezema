@@ -106,15 +106,29 @@ URL_SBERCIB_2025 = "https://sbercib.ru/publication/inflyatsiya-v-2025-godu"
 URL_NBJ = "https://nbj.ru/publs/obshchaya_inflyatsiya_po_itogam_2025_goda_/71790/"
 URL_ALFA_INTL = "https://internationalinvestment.biz/analytics/8583-alfa-bank-uhudshil-prognoz-po-jekonomike-rossii.html"
 URL_EVENT_32879 = "https://cbr.ru/press/event/?id=32879"
+URL_FORBES_552221 = (
+    "https://www.forbes.ru/finansy/552221-cb-soobsil-o-roste-inflacionnyh-ozidanij-rossian-v-dekabre-2025-goda"
+)
 
 #: T7.120a (ADR-0029 §24): строгим пересказом остаётся только законное расширение T7.120 —
 #: прогноз Альфа-Банка на ретрансляционной странице. Улика cc75e97f на странице события ЦБ
 #: (5422d75c) — собственная публикация семьи `cbr` (входит в EVIDENCE_SELF ниже); якорь
 #: infom.org.ru больше не создаётся
 WRITE_ACTION = "будет записано происхождение значения улики"
-EVIDENCE_NEW_WRITES = ("5fab715e",)  # улика 07126d06 (Альфа-Банк)
+# T7.129a (ADR-0029 §26.3): к законному строгому пересказу Альфа-Банка добавилась улица
+# 6d9a12ff на forbes.ru — утверждение само называет производителя («по данным опроса „инФОМ“»,
+# корень семьи — Банк России), а страница называет 13,1 и 15,6 ровно в том же показателе
+# («оценка годовой наблюдаемой инфляции»). Было (до T7.129a): одна запись. Стало: две;
+# метка «Подтверждено слабо» у 6d9a12ff остаётся (подпись «Опубликовано производителем» —
+# за собственными публикациями), меняется только происхождение значения и группировка.
+EVIDENCE_NEW_WRITES = ("5fab715e", "e62b7834")  # 07126d06 (Альфа-Банк) + 6d9a12ff (семья cbr)
 EVIDENCE_SELF_CBR_EVENT = ("5422d75c",)  # cc75e97f на странице события ЦБ — публикация семьи cbr
+#: T7.129a: вторым якорем дело не кончилось бы, но для forbes-записи пятого сопряжения
+#: `resolve_primary_source` переиспользует существующий указатель Банка России — якорей ровно
+#: столько же, сколько до T7.129a
 NEW_ANCHOR_URIS = {"https://www.alfabank.ru/"}
+#: строка источника forbes-улики (родитель после apply проверяется отдельно)
+FORBES_SOURCE_ID = "d4a936ff-b4bb-446c-9cb0-430639e6287a"
 
 #: метки «было» на состоянии 817f2cc: утверждение → имя производителя из словаря
 #: T7.116 (часть б): `6d9a12ff` убран из таблицы — при T7.101–T7.115 он подписывался
@@ -130,12 +144,17 @@ WAS_PRODUCER: dict[str, str] = {
 #: «стало» после переатрибуции: T7.101 — добавлялась ровно одна подпись (c6729d4c);
 #: с T7.120/T7.120a — три: прогноз Альфа-Банка на реле-странице (строгий пересказ) и
 #: cc75e97f на странице события ЦБ (собственная публикация семьи `cbr`, подпись «Банк
-#: России» — не «инФОМ»: заблуждение T7.120 исправлено склейкой семьи)
+#: России» — не «инФОМ»: заблуждение T7.120 исправлено склейкой семьи);
+#: с T7.129a (ADR-0029 §26.3) — четыре: 6d9a12ff на forbes подписывается «Банк России»,
+#: потому что пятое сопряжение записало происхождение значения опроса «инФОМ» (корень семьи
+#: — cbr), а витрина называет строку записью о происхождении значения, а не страничным
+#: якорем (T7.109: запись сильнее указателя; правило T7.116 про указатель здесь ни при чём)
 BECAME_PRODUCER: dict[str, str] = {
     **WAS_PRODUCER,
     "c6729d4c": "Банк России",
     "07126d06": "Альфа-Банк",
     "cc75e97f": "Банк России",
+    "6d9a12ff": "Банк России",
 }
 
 
@@ -422,6 +441,22 @@ async def _basis_kinds(engine: AsyncEngine, claim_id: uuid.UUID) -> set[str]:
     return {str(r[0]) for r in rows}
 
 
+async def _source_parent_uri(engine: AsyncEngine, source_id: str) -> str:
+    async with engine.connect() as conn:
+        row = (
+            await conn.execute(
+                text(
+                    "SELECT p.canonical_uri FROM sources s "
+                    "LEFT JOIN sources p ON p.id = s.parent_source_id "
+                    "WHERE s.id = CAST(:id AS uuid)"
+                ),
+                {"id": source_id},
+            )
+        ).first()
+    assert row is not None
+    return str(row[0])
+
+
 async def _source_uri(engine: AsyncEngine, source_id: str) -> str:
     async with engine.connect() as conn:
         row = (
@@ -476,10 +511,11 @@ async def test_twenty_stand_claims_label_table_was_becomes(
     was_roles = await _snapshot_roles(engine)
     was_scopes = await _snapshot_scopes(engine)
     was_sources = await _snapshot_sources(engine)
-    # T7.120 (часть 2): «было» группировки трёх утверждений, чья группировка изменится
+    # T7.120 (часть 2): «было» группировки трёх утверждений, чья группировка изменится;
+    # T7.129a: четвёртое — 6d9a12ff (страница forbes сворачивается на якорь Банка России)
     was_kinds = {
         prefix: await _basis_kinds(engine, claim_ids[prefix])
-        for prefix in ("07126d06", "cc75e97f", "c6729d4c")
+        for prefix in ("07126d06", "cc75e97f", "c6729d4c", "6d9a12ff")
     }
 
     producer_was = {p: lab for p, lab in was_labels.items() if lab["label"] == PRODUCER_LABEL}
@@ -540,28 +576,35 @@ async def test_twenty_stand_claims_label_table_was_becomes(
     assert all(r.was_method == CURRENT_VALUE_METHOD for r in decided), decided
     assert {str(r.claim_id)[:8] for r in decided} == {"9266248e", "391c4388", "136a0ca0"}, decided
 
-    # строгое происхождение (T7.120, законно): только прогноз Альфа-Банка на реле;
-    # улица cc75e97f перешла из write_rows в self_rows (семья cbr, T7.120a)
+    # строгое происхождение (T7.120, законно): прогноз Альфа-Банка на реле;
+    # улица cc75e97f перешла из write_rows в self_rows (семья cbr, T7.120a);
+    # T7.129a: второй строкой — forbes-перепечатка опроса «инФОМ» для 6d9a12ff
+    # (пятое сопряжение `statement_names_producer`, ADR-0029 §26.3)
     write_rows = _rows_with(WRITE_ACTION)
-    assert len(write_rows) == 1, write_rows
+    assert len(write_rows) == 2, write_rows
     assert {(str(r.claim_id)[:8], r.canonical_uri) for r in write_rows} == {
         ("07126d06", URL_ALFA_INTL),
+        ("6d9a12ff", URL_FORBES_552221),
     }, write_rows
     assert all(r.now_status == "derivative" for r in write_rows), write_rows
+    assert {r.primary_name for r in write_rows} == {"Альфа-Банк", "Банк России"}, write_rows
 
     not_collected = _rows_with(NOT_COLLECTED_ACTION)
-    assert len(not_collected) == 33 - 3 - 1 - 2 - 5 - 8, [row.action for row in plan.rows]
+    assert len(not_collected) == 33 - 3 - 2 - 2 - 5 - 8, [row.action for row in plan.rows]
 
-    # ── apply: четыре записи (три собственные публикации семьи cbr + строгий пересказ
-    # Альфа-Банка) и каскад переоценки только для затронутой группы Альфа-Банка ──
+    # ── apply: пять записей (три собственные публикации семьи cbr + строгий пересказ
+    # Альфа-Банка + перепечатка опроса «инФОМ» на forbes, T7.129a) и каскад переоценки
+    # для группы Альфа-Банка и затронутой страницы forbes ──
     report = await _run_window(scratch_url, store, dry_run=False)
-    assert report.changed_evidence == 4, report.rows
-    # изменённый источник — строка реле-страницы Альфа-Банка (у неё появился родитель-якорь);
-    # сам якорь alfabank.ru создаётся отдельно и в changed_source_ids не входит
-    assert len(report.changed_source_ids or ()) == 1, report.rows
-    # каскад задел и 136a0ca0: его улики опираются на ту же реле-страницу
-    assert report.invalidated_heads == 2 and report.jobs_created == 2, report.rows
-    assert report.worker is not None and report.worker.completed == 2, report.worker
+    assert report.changed_evidence == 5, report.rows
+    # изменённые источники — строки источников двух затронутых пересказов: реле-страница
+    # Альфа-Банка и страница forbes; новый якорь alfabank.ru создаётся отдельно и в
+    # changed_source_ids не входит
+    assert len(report.changed_source_ids or ()) == 2, report.rows
+    # каскад задел и 136a0ca0: его улики опираются на ту же реле-страницу;
+    # T7.129a: плюс 6d9a12ff — его улица получила запись происхождения значения
+    assert report.invalidated_heads == 3 and report.jobs_created == 3, report.rows
+    assert report.worker is not None and report.worker.completed == 3, report.worker
 
     # записи появились на трёх собственных публикациях cbr-семьи и на улике Альфа-Банка;
     # скоупы остальных 29 улики не изменились
@@ -592,10 +635,14 @@ async def test_twenty_stand_claims_label_table_was_becomes(
         if row[0][:8] in EVIDENCE_NEW_WRITES
     }
     assert set(new_records) == set(EVIDENCE_NEW_WRITES), new_records
-    assert {rec["primary_key"] for rec in new_records.values()} == {"alfa"}, new_records
-    assert {rec["primary_name"] for rec in new_records.values()} == {"Альфа-Банк"}, new_records
+    # строгое сопряжение (T7.120) осталось строгим; новая запись — пятое сопряжение v17,
+    # записанное под именем КОРНЯ семьи (инФОМ → Банк России, ADR-0029 §24)
+    assert new_records["5fab715e"]["primary_key"] == "alfa", new_records
+    assert new_records["5fab715e"]["pairing"] == "value_and_primary_in_fragment", new_records
+    assert new_records["e62b7834"]["primary_key"] == "cbr", new_records
+    assert new_records["e62b7834"]["primary_name"] == "Банк России", new_records
+    assert new_records["e62b7834"]["pairing"] == "statement_names_producer", new_records
     for rec in new_records.values():
-        assert rec["pairing"] == "value_and_primary_in_fragment", rec
         assert rec["method"] == CURRENT_VALUE_METHOD, rec
         assert rec.get("parent_source_id"), rec
 
@@ -621,13 +668,14 @@ async def test_twenty_stand_claims_label_table_was_becomes(
     # плюс строки нового снимка переоценки ──
     assert await _snapshot_assessments(engine) == was_assessments
     now_groups = await _snapshot_groups(engine)
-    # два новых снимка переоценки: 1 (07126d06) + 2 (136a0ca0 — его улики держатся за ту же
-    # реле-страницу) строк участников (было T7.120: пять — каскад задел c6729d4c и cc75e97f
+    # новых снимков переоценки: 1 (07126d06) + 2 (136a0ca0 — его улики держатся за ту же
+    # реле-страницу) + 1 (6d9a12ff — страница forbes свернута на якорь Банка России, T7.129a)
+    # строк участников (было T7.120: пять — каскад задел c6729d4c и cc75e97f
     # из-за якоря инФОМ в группе ЦБ)
-    assert len(now_groups) == len(was_groups) + 3, (len(was_groups), len(now_groups))
+    assert len(now_groups) == len(was_groups) + 4, (len(was_groups), len(now_groups))
     now_kinds = {
         prefix: await _basis_kinds(engine, claim_ids[prefix])
-        for prefix in ("07126d06", "cc75e97f", "c6729d4c")
+        for prefix in ("07126d06", "cc75e97f", "c6729d4c", "6d9a12ff")
     }
     # страница реле с прогнозом Альфа-Банка: была одиночной группой — свернута указателем
     # на новый якорь alfabank.ru; группировки cc75e97f и c6729d4c не изменились: собственные
@@ -636,17 +684,26 @@ async def test_twenty_stand_claims_label_table_was_becomes(
     assert was_kinds["07126d06"] == {"single"} and now_kinds["07126d06"] == {"parent"}, was_kinds
     assert was_kinds["cc75e97f"] == now_kinds["cc75e97f"] == {"domain"}, was_kinds
     assert was_kinds["c6729d4c"] == now_kinds["c6729d4c"] == {"domain"}, was_kinds
+    # T7.129a: улица 6d9a12ff вела на документ ЦБ (страничный указатель) и ведёт на него же —
+    # вид группировки не изменился; изменилось то, что строку называет запись происхождения
+    # значения (витрина подписывает её по записи, T7.109)
+    assert was_kinds["6d9a12ff"] == now_kinds["6d9a12ff"] == {"parent"}, was_kinds
     now_roles = await _snapshot_roles(engine)
-    assert set(now_roles) == set(was_roles) and len(now_roles) == len(was_roles) + 3, (
+    assert set(now_roles) == set(was_roles) and len(now_roles) == len(was_roles) + 4, (
         len(was_roles),
         len(now_roles),
     )
     now_sources = await _snapshot_sources(engine)
     assert all(row in now_sources for row in was_sources), now_sources
     added_sources = [row for row in now_sources if row not in was_sources]
-    # единственный новый источник — якорь alfabank.ru (было T7.120: два, включая infom.org.ru)
+    # новый якорь ровно один — alfabank.ru (было T7.120: два, включая infom.org.ru);
+    # T7.129a: для записи пятого сопряжения на forbes нового якоря не потребовалось —
+    # `resolve_primary_source` переиспользует уже существующий указатель Банка России
     assert len(added_sources) == 1 and len(now_sources) == len(was_sources) + 1, added_sources
     assert {await _source_uri(engine, row[0]) for row in added_sources} == NEW_ANCHOR_URIS, added_sources
+    # родитель строки forbes остался прежним (документ прогноза ЦБ): изменилось только то, что
+    # строку теперь называет запись происхождения значения, а не страничный указатель (T7.109)
+    assert await _source_parent_uri(engine, FORBES_SOURCE_ID) == ANCHOR_CBR_PDF_URI
 
     # ── второй прогон идемпотентен (T7.101): дописывать на Infl_exp_26-09 нечего — заблуждение
     # T7.120 дописывало одну запись только потому, что первый прогон заводил якорь инФОМ, а

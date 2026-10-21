@@ -56,6 +56,8 @@ from apps.research_proxy.source_attribution import (
     BASIS_FRAGMENT_CHARS,
     MAX_SCAN_CHARS,
     OTHER_SOURCE_ACTOR_MARKERS,
+    RELAY_FORECAST_NOUN,
+    RELAY_FORECAST_VERBS,
     STATUS_AMBIGUOUS,
     STATUS_DERIVATIVE,
     STATUS_NO_VALUE_ATTRIBUTION,
@@ -71,6 +73,7 @@ from apps.research_proxy.source_attribution import (
     _relay_forecast_keys,
     collapse_family_candidates,
     family_home_hosts,
+    family_primary_key,
     is_home_host,
     named_primary_keys,
     normalize_scan_text,
@@ -82,6 +85,7 @@ from packages.memory.scope import (
     VALUE_ATTRIBUTION_PAIRING_BIBLIOGRAPHY,
     VALUE_ATTRIBUTION_PAIRING_KNOWN_PRODUCER_MENTIONED,
     VALUE_ATTRIBUTION_PAIRING_PUBLICATION,
+    VALUE_ATTRIBUTION_PAIRING_STATEMENT_NAMES_PRODUCER,
     VALUE_ATTRIBUTION_PAIRING_STRICT,
     build_self_publication,
 )
@@ -266,7 +270,18 @@ from packages.memory.scope import (
 #: числа или общая значимая основа показателя). Переатрибуция обязана пересмотреть записи v15,
 #: где то же число стояло в чужом показателе (стенд .92, сессия 8181a76a: hh-индекс 8,7 записан
 #: как «Опубликовано производителем (Росстат)» по фрагменту про рост реальных доходов).
-VALUE_ATTRIBUTION_METHOD_VERSION: Final = "host-value-attribution-v16"
+#: v17 (T7.129a, ADR-0029 §26.3): пятый режим fallback — «утверждение называет производителя»
+#: (`statement_names_producer`): закрытый список шаблонов формулировки («по данным P», «P:»,
+#: «по оценке P», «P сообщил / опубликовал / представил / привёл данные») называет производителем
+#: ровно одного производителя из словаря P, чьё значение стоит на странице тем же сравнением, что гейт
+#: «значение на связи». Режим вставлен после библиографии и перед упоминанием известного
+#: производителя; прежние решения и их порядок не изменены. Страничный детектор
+#: (`host-source-attribution-v10`) не тронут: он решает, кто публиковал страницу, а не чьё это
+#: значение (правило «обе версии вместе» относится к правкам словаря и гвардов, которые читают оба
+#: детектора — словарь здесь не менялся). Решения v16 отличаются от решений v17 → переатрибуция
+#: пересматривает записи эпохи v16 (стенд `.92` на сборке `686d1e8-v29`: утверждения 060d979a,
+#: 738548ca, a7cac406 и b262da08 получают записи пересказов своих производителей).
+VALUE_ATTRIBUTION_METHOD_VERSION: Final = "host-value-attribution-v17"
 
 #: честный отказ этого детектора: первоисточник в основании назван, но значение там другое — не то,
 #: на котором стоит утверждение. Отличие от `no_value_attribution` (атрибуции нет вовсе) нужно,
@@ -578,6 +593,8 @@ PAIRING_VALUE_AND_PRIMARY: Final = VALUE_ATTRIBUTION_PAIRING_STRICT
 PAIRING_PUBLICATION_WINDOW: Final = VALUE_ATTRIBUTION_PAIRING_PUBLICATION
 #: третий, самый узкий режим pairing (T7.107, ADR-0029 дополнение)
 PAIRING_BIBLIOGRAPHY_KNOWN_PRODUCER: Final = VALUE_ATTRIBUTION_PAIRING_BIBLIOGRAPHY
+#: pairing пятого режима (T7.129a, ADR-0029 §26.3): производителя назвало само утверждение
+PAIRING_STATEMENT_NAMES_PRODUCER: Final = VALUE_ATTRIBUTION_PAIRING_STATEMENT_NAMES_PRODUCER
 
 
 @dataclass(frozen=True)
@@ -1997,14 +2014,17 @@ def record_pairing_gate_passes(
     фрагменту про рост реальных доходов), снимается тем же путём.
 
     Честные границы проверки:
-    - режимы bibliography и упоминания известного производителя не обещают наличие значения
-      во фрагменте основания — гейт к ним не применяется (он про строгий режим и режим
-      публикации, где значение входит в pairing);
+    - режимы bibliography, упоминания известного производителя и «утверждение называет
+      производителя» (T7.129a) не обещают наличие значения во фрагменте основания — гейт к ним не
+      применяется (он про строгий режим и режим публикации, где значение входит в pairing). Для
+      пятого режима это особенно важно: его основание — область страницы вокруг подтверждённой
+      записи значения, а индексная форма T7.128 («106,35» для «6,35%») число утверждения в текст
+      основания не вносит, хотя само значение на странице подтверждено;
     - основание, обрезанное по потолку `_basis` (BASIS_FRAGMENT_CHARS), не позволяет ДОКАЗАТЬ
       отсутствие числа — запись сохраняется (fail-closed против удаления: «проверьте вручную»
       дешевле, чем молча снятое знание)."""
     if pairing not in (None, PAIRING_VALUE_AND_PRIMARY, PAIRING_PUBLICATION_WINDOW):
-        return True  # режимы 3–4: значение в основание не обещалось — снимать не за что
+        return True  # режимы 3–5: значение в основание не обещалось — снимать не за что
     if len(basis_fragment) >= BASIS_FRAGMENT_CHARS:
         return True  # основание обрезано: отсутствие числа не доказано — не удаляем
     match_values = claim_match_values(claim_statement)
@@ -2020,6 +2040,283 @@ def record_pairing_gate_passes(
     if not found:
         return False
     return _fragment_confirms_indicator(profile, basis_fragment, found)
+
+
+# ─── T7.129a (часть 2, ADR-0029 §26.3): утверждение называет производителя ────────────────────
+#
+# Стенд `.92` на сборке `686d1e8-v29`: четыре утверждения (060d979a, 738548ca, a7cac406, b262da08)
+# получили вторую «независимую» группу с оценкой E3. Их страницы пересказывали того же производителя,
+# чьё имя стоит В САМОЙ ФОРМУЛИРОВКЕ («по данным Росстата», «По данным hh.ru»), а НЕ рядом со
+# значением на странице: ни строгая пара, ни окно публикации, ни библиография, ни упоминание
+# известного производителя не срабатывают — все они требуют, чтобы производителя назвала страница.
+#
+# Этот режим читает УТВЕРЖДЕНИЕ, поэтому его запреты строже, чем у любого прежнего режима: закрытый
+# список шаблонов, имена только из словаря `PRIMARY_SOURCES`, ровно один производитель, вето
+# собственной оценки обеих сторон, обязательная совместимость страницы с показателем утверждения и
+# обязательное присутствие значения на странице тем же сравнением, что гейт «значение на связи»
+# (T7.108a/T7.109a/T7.113/T7.120 + индексная форма T7.128). Порядок прежних решений не изменён:
+# режим вызывается только когда строгая пара, окно публикации, ближайший первоисточник и
+# библиография уже отказали, и только перед режимом упоминания известного производителя.
+
+#: закрытый список шаблонов утверждения, который называет производителя (ADR-0029 §26.3).
+#: `{name}` подставляется алиасом записи словаря `PRIMARY_SOURCES`: имя вне словаря шаблоном не
+#: называется. Новые формы добавляются только решением пользователя (правило расширяется явными
+#: записями, как словарь первоисточников).
+STATEMENT_PRODUCER_TEMPLATES: Final[tuple[str, ...]] = (
+    # 1. «по данным P» (наблюдаемые формы: «По данным hh.ru, …», «(по данным Росстата)»)
+    r"по\s+данным[^.!?\n]{0,40}{name}",
+    # 2. «P:» в начале утверждения («Росстат: инфляция в сентябре составила 6,35%»)
+    r"^[^.,;:!?\n]{0,10}{name}[^,:;!?\n«»]{0,20}:",
+    # 3. «по оценке P»
+    r"по\s+оценк[а-яё]*[^.!?\n]{0,40}{name}",
+    # 4. «P сообщил / опубликовал / представил / привёл данные»
+    r"{name}[^.!?\n]{0,40}(?:сообщил[а-яё]*|опубликовал[а-яё]*|представил[а-яё]*|прив[а-яё]*\s+данны)",
+)
+
+#: окно вокруг вхождения значения на странице, в котором ищется основа показателя (исключение (б)):
+#: та же длина, что у окна публикации и у потолка предложной области co-location (`OWN_ASSESSMENT_
+#: PROXIMITY_CHARS`), новой константы нет
+STATEMENT_VALUE_REGION_CHARS: Final = OWN_ASSESSMENT_PROXIMITY_CHARS
+#: левая половина окна основания пятого режима: само число обязано попасть в те знаки, до которых
+#: `_basis` обрезает основание (`BASIS_FRAGMENT_CHARS`), поэтому окно заведомо уже сверочного
+STATEMENT_BASIS_LEFT_CHARS: Final = 140
+
+#: сколько вхождений значения одного утверждения рассматривается (защита от навигационных страниц
+#: с сотнями повторов числа): базис берётся по первому подтверждённому вхождению
+_STATEMENT_VALUE_REGIONS_LIMIT: Final = 20
+
+
+def _statement_producer_templates(key: str) -> tuple[re.Pattern[str], ...]:
+    """Шаблоны утверждения, собранные под алиасы одной записи словаря (закрытый список выше)."""
+    _spec, patterns = _ALIASES[key]
+    name = "(?:" + "|".join(f"(?:{pattern.pattern})" for pattern in patterns) + ")"
+    return tuple(
+        re.compile(template.replace("{name}", name), re.IGNORECASE)
+        for template in STATEMENT_PRODUCER_TEMPLATES
+    )
+
+
+def _statement_named_producer_keys(scanned_statement: str) -> frozenset[str]:
+    """Ключи словаря, которых утверждение называет производителем (шаблон + имя из словаря)."""
+    named: set[str] = set()
+    for key in named_primary_keys(scanned_statement):
+        if any(pattern.search(scanned_statement) for pattern in _statement_producer_templates(key)):
+            named.add(key)
+    return frozenset(named)
+
+
+def _other_forecast_author(scanned_statement: str) -> bool:
+    """Исключение (г): утверждение с горизонтом и другим автором прогноза.
+
+    «Горизонт» читается тем же словарём прогноза, что у relay-режима T7.98 (существительное
+    «прогноз» и конечные формы глаголов прогноза/ожидания), а «другой автор» — тем же признаком
+    третьего действующего лица, что у окна публикации (`OTHER_SOURCE_ACTOR_MARKERS` по фону с
+    замазанными алиасами словаря): «аналитики прогнозируют … (по данным Росстата)» значения
+    производителю не приписывает. Словарных производителей этот случай разбирает строго:
+    вызывающий требует, чтобы все названные в утверждении имена совпали с единственным."""
+    if not RELAY_FORECAST_NOUN.search(scanned_statement) and not any(
+        pattern.search(scanned_statement) for pattern in RELAY_FORECAST_VERBS
+    ):
+        return False
+    return _third_actor_present(scanned_statement)
+
+
+@dataclass(frozen=True)
+class _StatementValueRegion:
+    """Подтверждённая область страницы вокруг одной записи значения.
+
+    `check` — широкое окно (тот же запас, что у вето собственной оценки), нужное сверке
+    показателя (исключение (б)): она смотрит на контекст ЧИСЛА, а не на всю страницу.
+    `basis` — узкое окно, из которого собирается основание записи: `_basis` обрезает основание
+    по потолку `BASIS_FRAGMENT_CHARS`, и число обязано в эти знаки попасть, иначе основание
+    перестанет доказывать, какое именно значение подтверждено (срез, который сам себя обесценивает:
+    страница forbes называет 13,1 и 15,6 в середине широкого окна, а обрезок оставлял только
+    соседний абзац про накопления)."""
+
+    check: str
+    basis: str
+
+
+def _statement_value_windows(scanned: str, start: int, end: int) -> _StatementValueRegion:
+    """Два окна вокруг записи значения: широкое для сверки показателя, узкое для основания."""
+    basis_start = max(0, start - STATEMENT_BASIS_LEFT_CHARS)
+    return _StatementValueRegion(
+        check=scanned[max(0, start - STATEMENT_VALUE_REGION_CHARS) : end + STATEMENT_VALUE_REGION_CHARS],
+        basis=scanned[basis_start : end + (BASIS_FRAGMENT_CHARS - (start - basis_start))],
+    )
+
+
+def _value_occurrence_regions(scanned: str, value: str) -> list[_StatementValueRegion]:
+    """Области страницы вокруг отдельных записей значения (те же формы и границы числа, что у
+    гейта «значение на связи»: `_value_text_forms`, `_form_is_standalone`). Нужны, чтобы сверка
+    показателя (исключение (б)) смотрела на контекст ЧИСЛА, а не на всю страницу: страница
+    rambler называет и hh-индекс, и чужие доходы, и решение должно различать, какое именно число
+    стоит на пути утверждения."""
+    regions: list[_StatementValueRegion] = []
+    for form in _value_text_forms(value):
+        glued_space = " " in form
+        start = scanned.find(form)
+        while start != -1 and len(regions) < _STATEMENT_VALUE_REGIONS_LIMIT:
+            end = start + len(form)
+            if _form_is_standalone(scanned, start, end, glued_space=glued_space):
+                regions.append(_statement_value_windows(scanned, start, end))
+            start = scanned.find(form, start + 1)
+    return regions
+
+
+def _statement_basis_alias_patterns(root: str) -> tuple[re.Pattern[str], ...]:
+    """Алиасы производителя, по которым среди подтверждённых областей выбирается основание: все
+    записи семьи корня (T7.120a: «инФОМ» решается под именем Банка России, и страница может
+    называть любую из этих форм). Для записи вне семьи — ровно её собственные алиасы."""
+    patterns: list[re.Pattern[str]] = []
+    for key, (_spec, key_patterns) in _ALIASES.items():
+        if family_primary_key(key) == root:
+            patterns.extend(key_patterns)
+    return tuple(patterns)
+
+
+def _preferred_statement_basis(
+    regions: list[_StatementValueRegion], patterns: tuple[re.Pattern[str], ...], words: frozenset[str]
+) -> str:
+    """Какая из подтверждённых областей страницы становится основанием записи.
+
+    Все эти области уже прошли сверку показателя; из них выбираем лучшую: сначала та, где рядом с
+    числом стоит как можно больше значимых основ показателя утверждения (страница rambler называет
+    8,7 и в абзаце про доходы населения, и в абзаце про hh-индекс: основанием обязано стать место,
+    где значение стоит в показателе утверждения), затем та, где рядом с числом стоит имя
+    производителя P, затем первая по порядку появления на странице. Если ни одна подтверждённая
+    область имени не содержит (страница типа перепечатки таблиц, где производитель назван одной
+    строкой списка источников), остаётся лучшая по показателю — правило не требует имени рядом,
+    иначе режим противоречил бы самому себе."""
+    if not regions:
+        return ""
+
+    def rank(region: _StatementValueRegion) -> tuple[int, bool]:
+        return (
+            len(words & statement_indicator_words(region.check)),
+            any(pattern.search(region.check) for pattern in patterns),
+        )
+
+    # `max` оставляет ПЕРВОЕ вхождение максимума — при равенстве выигрывает ранняя область страницы
+    return max(regions, key=rank).basis
+
+
+def _statement_names_producer_decision(
+    *,
+    scanned_page: str,
+    canonical_uri: str | None,
+    values: tuple[str, ...],
+    match_values: frozenset[str],
+    bare_values: frozenset[str],
+    claim_statement: str | None,
+) -> ValueAttributionDecision | None:
+    """Пятый режим fallback (T7.129a): производителю принадлежит значение, если его назвало
+    само утверждение, а страница — нет. None — честный отказ (условие не собрано)."""
+    if not claim_statement:
+        return None  # формулировки нет — утверждение никого не называет
+    scanned_statement = normalize_scan_text(claim_statement)
+    named = _statement_named_producer_keys(scanned_statement)
+    if len(named) != 1:
+        return None  # ни один шаблон не собран либо в утверждении два разных производителя
+    key = next(iter(named))
+    root = family_primary_key(key)
+    if {family_primary_key(item) for item in named_primary_keys(scanned_statement)} != {root}:
+        # в формулировке назван ещё один словарьный производитель (в том числе автор прогноза,
+        # «прогноз Банка России» к значению Росстата) — единого производителя утверждения нет.
+        # Семья склейки (T7.120a) — ОДИН производитель: «инФОМ» и «Банк России» не разночтение,
+        # поэтому сравниваются корни семей, а не ключи
+        return None
+    spec = primary_source(root)
+    if spec is None:  # защита: решение не строится на несуществующей записи словаря
+        return None
+    if is_home_host(canonical_uri, _home_hosts(root)):
+        return None  # страница самого P (или его семьи) — первоисточник, а не пересказ
+    if _own_assessment_veto(
+        scanned=scanned_statement,
+        masked=_mask_site_disclaimers(scanned_statement),
+        match_values=match_values,
+    ):
+        # (а) рядом со значением в самом утверждении стоит собственная оценка — производитель
+        # утверждения не назван, и v17 не о чём говорить
+        return None
+    if _own_assessment_veto(
+        scanned=scanned_page,
+        masked=_mask_site_disclaimers(scanned_page),
+        match_values=match_values,
+    ):
+        # (в) собственная оценка другого актора ближе к значению страницы, чем названный
+        # производитель: тот же критерий окрестности, что у строгой ветки и bibliography
+        return None
+    if _other_forecast_author(scanned_statement):
+        return None  # (г) прогноз с другим автором
+    # (д) значение обязано стоять на странице — тем же сравнением, что гейт «значение на связи»
+    ranges = claim_range_tokens(match_values)
+    singles = (match_values - ranges) | bare_values
+    if not singles and not ranges:
+        return None  # числового профиля нет — сверять значение не с чем (поведение прежнего отказа)
+    found = set(claim_values_found_in_texts(values=singles, texts=(scanned_page,)))
+    ranges_ok = (
+        claim_ranges_found_in_texts(ranges=ranges, texts=(scanned_page,)) if ranges else frozenset()
+    )
+    # индексная форма процента T7.128: импорт отложен внутри функции — `index_value_form` читает
+    # формы числа из этого модуля, и модульный импорт замкнул бы цикл (направление зависимости
+    # оркестратор → research_proxy при этом не меняется)
+    from apps.research_proxy.index_value_form import (
+        index_form_confirms_value,
+        index_form_value,
+    )
+
+    index_ok = index_form_confirms_value(
+        statement=claim_statement, values=singles, texts=(scanned_page,)
+    )
+    if not found and not ranges_ok and not index_ok:
+        return None  # значения нет на странице
+    profile = claim_indicator_profile(claim_statement)
+    regions: list[_StatementValueRegion] = []
+    basis_words: frozenset[str] = frozenset()
+    if found or ranges_ok:
+        # (б) страница обязана называть значение в показателе утверждения: та же существующая
+        # сверка v16 (`claim_indicator_profile` / `_fragment_confirms_indicator`), только против
+        # области вокруг числа, а не против фрагмента с шаблоном
+        for value in sorted(found):
+            for region in _value_occurrence_regions(scanned_page, value):
+                if _fragment_confirms_indicator(profile, region.check, frozenset({value})):
+                    regions.append(region)
+        if not regions:
+            for start, end in _measured_value_spans(scanned_page, match_values):
+                window = _statement_value_windows(scanned_page, start, end)
+                if _fragment_confirms_indicator(profile, window.check, ranges_ok):
+                    regions.append(window)
+        if not regions:
+            return None  # то же число на странице стоит в чужом показателе
+        basis_words = profile.words if profile is not None else frozenset()
+    else:
+        # значение подтверждено только индексной формой (стенд garant 106,35 для «6,35%»):
+        # страница числа утверждения не содержит вовсе, поэтому существующая сверка показателя
+        # (б) к этой ветви неприменима — её охраняет закрытый список маркеров индексной формы
+        # (T7.128), который требует подпись строки таблицы или шапку столбца рядом с числом
+        index_numbers = {
+            number for number in (index_form_value(value) for value in index_ok) if number
+        }
+        for number in sorted(index_numbers):
+            regions.extend(_value_occurrence_regions(scanned_page, number))
+        if not regions:
+            return None  # защита: форма подтверждена, а её записи на странице не нашли
+    return ValueAttributionDecision(
+        status=STATUS_DERIVATIVE,
+        primary_key=spec.key,
+        primary_name=spec.name,
+        # родитель — заявленный производителем источник P (тот же якорь `home_uri`, что у
+        # строгого режима): правило не требует, чтобы P был записан другой уликой
+        parent_uri=spec.home_uri,
+        basis_fragment=_basis(
+            _preferred_statement_basis(
+                regions, _statement_basis_alias_patterns(root), basis_words
+            )
+        ),
+        claim_values=values,
+        pairing=PAIRING_STATEMENT_NAMES_PRODUCER,
+    )
 
 
 def attribute_value_in_fragment(
@@ -2090,7 +2387,18 @@ def attribute_value_in_fragment(
         отказа прежних — прежние режимы не ослаблены ни на пункт. С T7.109 между ними встаёт
         режим «ближайший первоисточник» (`_nearest_primary_decision`): он тоже рассматривается
         только после честного отказа строгого и публикационного режимов и ничего в них не
-        меняет; pairing его решения — строгий, новых статусов и ключей нет."""
+        меняет; pairing его решения — строгий, новых статусов и ключей нет.
+
+        Пятое сопряжение T7.129a (`_statement_names_producer_decision`, ADR-0029 §26.3) — между
+        библиографией и упоминанием (T7.116). Его отличие от третьего и четвёртого режимов: ему НЕ
+        нужен уже записанный первоисточник той же улики (`known_claim_primaries`) — решение берётся
+        из замкнутого списка шаблонов самого утверждения («по данным P», «P сообщил …» и два других)
+        и текста страницы, на которой это значение стоит в показателе утверждения. Поэтому он решает
+        раньше упоминания, а без `known_claim_primaries` цепочка на нём не обрывается: прежнее
+        «нет записанного первоисточника — отказа» стоит после него. Тексты режимов 3–5 общие:
+        полный текст страницы, если вызывающий его принёс, иначе фрагмент улики — поэтому подпись
+        решения (pairing) на первом проходе и при переатрибуции может различаться, первоисточник и
+        статус при этом те же (STATUS T7.129a)."""
         wider = _publication_decision(
             scanned=scanned, canonical_uri=canonical_uri, values=values, match_values=match_values
         )
@@ -2101,24 +2409,43 @@ def attribute_value_in_fragment(
         )
         if nearest is not None:
             return nearest
-        if not known_claim_primaries:
-            return refusal  # известного производителя утверждения нет — третьему режиму не на что опереться
+        # полный текст страницы, который читают режимы библиографии (T7.107), упоминания (T7.116)
+        # и новый режим T7.129a: у строки улики долговременного фрагмента нет, ограничение описано в STATUS T7.78
         bibliography_page = (
             normalize_scan_text(page_text)[:MAX_SCAN_CHARS] if page_text is not None else scanned
         )
-        bibliography = _bibliography_known_producer_decision(
+        if known_claim_primaries:
+            bibliography = _bibliography_known_producer_decision(
+                scanned_page=bibliography_page,
+                canonical_uri=canonical_uri,
+                values=values,
+                known_claim_primaries=known_claim_primaries,
+                match_values=match_values,
+            )
+            if bibliography is not None:
+                return bibliography
+        # T7.129a часть 2 (ADR-0029 §26.3): пятый режим — производителя назвало САМО УТВЕРЖДЕНИЕ
+        # закрытым шаблоном. Рассматривается только после отказа строгого режима, окна публикации,
+        # ближайшего первоисточника и библиографии, и ПЕРЕД упоминанием известного производителя;
+        # прежние режимы не ослаблены ни на пункт. В отличие от двух последних режимов ему не
+        # нужно, чтобы производитель был известен по другой улике: его называет формулировка,
+        # поэтому у режима больше запретов (§26.3).
+        statement_producer = _statement_names_producer_decision(
             scanned_page=bibliography_page,
             canonical_uri=canonical_uri,
             values=values,
-            known_claim_primaries=known_claim_primaries,
             match_values=match_values,
+            bare_values=bare_values,
+            claim_statement=claim_statement,
         )
-        if bibliography is not None:
-            return bibliography
+        if statement_producer is not None:
+            return statement_producer
+        if not known_claim_primaries:
+            return refusal  # четвёртому режиму тоже не на что опереться
         # T7.116 часть а: последний, четвёртый режим — известный производитель упомянут на
         # странице. Только после отказа всех прежних (strict → публикация → ближайший →
-        # bibliography); прежние режимы не ослаблены ни на пункт; тот же полный текст
-        # страницы, что читает bibliography-режим.
+        # bibliography → утверждение назвало производителя); прежние режимы не ослаблены ни на
+        # пункт; тот же полный текст страницы, что читает bibliography-режим.
         known_producer = _known_producer_mentioned_decision(
             scanned_page=bibliography_page,
             canonical_uri=canonical_uri,

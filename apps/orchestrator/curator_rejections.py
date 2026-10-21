@@ -59,7 +59,9 @@ pairing-фильтров атрибуции; утверждение без из�
 Дополнение T7.128 (часть 3, ADR-0034 §10 дополнение): процентное значение формулировки
 подтверждается связью и ИНДЕКСНОЙ формой — отдельным числом 100 + X («106,35» для «6,35%»)
 рядом с маркером индексной формы. Правило живёт в чистом модуле
-`apps/orchestrator/index_value_form.py`, вызывается из `link_value_gate`: решение остаётся
+`apps/research_proxy/index_value_form.py` (модуль перенесён туда из `apps/orchestrator` в T7.129a:
+то же сравнение читает детектор значений, обратный импорт запрещён; поведение не менялось),
+вызывается из `link_value_gate`: решение остаётся
 ОДНИМ на связь, строка причины снятия прежняя, журнал (`rejected_links`,
 `rejected_operations`) прежний. Те же текстовые формы и границы числа, что у T7.108a; только
 проценты, только положительные X с дробной частью и X < 100; обратное направление и форма
@@ -78,8 +80,8 @@ from collections import Counter
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Final
 
-from apps.orchestrator.index_value_form import index_form_confirms_value
 from apps.orchestrator.rejected_proposal import _claim_entry, _link_entry
+from apps.research_proxy.index_value_form import index_form_confirms_value
 from apps.research_proxy.value_attribution import (
     _claim_bare_values,  # T7.123: тот же «голый» профиль значения, что у pairing-фильтров T7.120
     claim_match_values,
@@ -235,7 +237,7 @@ def link_value_gate(
     # Росстата пишет годовую инфляцию индексом — строка «Индекс потребительских цен» и ячейка
     # «106,35» в столбце «к сентябрю 2025 г.», отдельного «6,35» на странице нет. Значение,
     # записанное в формулировке с процентной единицей, подтверждается и таким числом, если рядом
-    # с ним стоит маркер индексной формы (правило и его границы — apps/orchestrator/index_value_form.py).
+    # с ним стоит маркер индексной формы (правило и его границы — apps/research_proxy/index_value_form.py).
     # Решение по-прежнему ОДНО на связь и причина снятия прежняя; профиль токенов отчёта
     # (`statement_value_profile`) не меняется: индексная форма — путь решения, а не токен утверждения.
     if index_form_confirms_value(statement=statement, values=singles, texts=texts):

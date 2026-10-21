@@ -464,7 +464,7 @@ def test_value_method_version_bumped_page_method_untouched() -> None:
     """Смена поведения видна переатрибуции только через подъём версии метода значений:
     прежняя → текущая (сейчас v15 → v16, T7.126 часть а); страничный детектор не тронут
     (его версия не поднимается)."""
-    assert VALUE_ATTRIBUTION_METHOD_VERSION == "host-value-attribution-v16"
+    assert VALUE_ATTRIBUTION_METHOD_VERSION == "host-value-attribution-v17"
     assert ATTRIBUTION_METHOD_VERSION == "host-source-attribution-v10"
 
 

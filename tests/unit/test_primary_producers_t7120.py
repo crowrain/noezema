@@ -81,7 +81,7 @@ def _sentence(name: str) -> str:
 
 def test_method_versions_bumped_together() -> None:
     assert ATTRIBUTION_METHOD_VERSION == "host-source-attribution-v10"
-    assert VALUE_ATTRIBUTION_METHOD_VERSION == "host-value-attribution-v16"
+    assert VALUE_ATTRIBUTION_METHOD_VERSION == "host-value-attribution-v17"
 
 
 # ─── 1: самосогласованность десяти новых записей (t7) ───────────────────────────────────

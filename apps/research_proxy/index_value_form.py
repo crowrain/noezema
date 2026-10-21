@@ -31,6 +31,16 @@
 (`_value_text_forms`, `_form_is_standalone`): новой числовой логики модуль не заводил.
 
 Модуль чистый: ни БД, ни LLM (та же дисциплина, что у curator_rejections.py).
+
+T7.129a (перенос без изменения поведения): модуль лежит в `apps/research_proxy`, а не в
+`apps/orchestrator`. Причина — ровно то препятствие, на котором встало правило v17 (ADR-0029 §26.4):
+то же сравнение значения (гейт «значение на связи» и новый режим атрибуции значения) нужен детектору
+значений `apps/research_proxy/value_attribution.py`, а импорт оркестратора из research_proxy
+развернул бы направление зависимости; вторая копия гейта запрещена правилом об одном месте решения
+(ADR-0038 §13, тот же разбор, что у переноса словаря основ показателя — ADR-0029 §25.3). Направление
+импорта прежнее: оркестратор читает `research_proxy` (`apps/orchestrator/curator_rejections.py`),
+обратного импорта в цепочке атрибуции нет — его держит тест
+`tests/unit/test_statement_names_producer_t7129a.py::test_value_attribution_chain_does_not_import_orchestrator`.
 """
 
 from __future__ import annotations

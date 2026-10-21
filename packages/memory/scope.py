@@ -464,16 +464,29 @@ VALUE_ATTRIBUTION_SCHEMA = "host-value-attribution-v1"
 #: сработало, страница не домашняя для X и другой известный производитель на странице не
 #: назван. Форма записи — как у строгого режима (родитель → источник X), ключей scope новых
 #: нет.
+#: `statement_names_producer` (T7.129a, ADR-0029 §26.3) — пятый режим fallback: производителя
+#: называет САМО УТВЕРЖДЕНИЕ закрытым шаблоном («по данным P», «P:», «по оценке P»,
+#: «P сообщил/опубликовал/представил/привёл данные»), а страница — нет. Отличие от двух
+#: предыдущих режимов: не требуется, чтобы X был известен по другой улике (здесь его называет
+#: формулировка). Значение утверждения обязано стоять на странице тем же сравнением, что гейт
+#: «значение на связи» (T7.108a/T7.113/T7.120, включая индексную форму T7.128); действуют вето
+#: собственной оценки (страницы и утверждения) и сверка совместимости с показателем (v16),
+#: страница домашнего хоста P (или семьи) не приписывается, два производителя в утверждении —
+#: отказ. Родитель — заявленный производитель P (его якорь), как у строгого режима. Записями
+#: этого pairing сборщики `known_claim_primaries` не кормятся: цепочек «утверждение назвало
+#: производителя» нет.
 VALUE_ATTRIBUTION_PAIRING_STRICT: Final = "value_and_primary_in_fragment"
 VALUE_ATTRIBUTION_PAIRING_PUBLICATION: Final = "publication_window"
 VALUE_ATTRIBUTION_PAIRING_BIBLIOGRAPHY: Final = "bibliography_known_producer"
 VALUE_ATTRIBUTION_PAIRING_KNOWN_PRODUCER_MENTIONED: Final = "known_producer_mentioned"
+VALUE_ATTRIBUTION_PAIRING_STATEMENT_NAMES_PRODUCER: Final = "statement_names_producer"
 VALUE_ATTRIBUTION_PAIRINGS: Final[frozenset[str]] = frozenset(
     {
         VALUE_ATTRIBUTION_PAIRING_STRICT,
         VALUE_ATTRIBUTION_PAIRING_PUBLICATION,
         VALUE_ATTRIBUTION_PAIRING_BIBLIOGRAPHY,
         VALUE_ATTRIBUTION_PAIRING_KNOWN_PRODUCER_MENTIONED,
+        VALUE_ATTRIBUTION_PAIRING_STATEMENT_NAMES_PRODUCER,
     }
 )
 

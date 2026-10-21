@@ -16,7 +16,11 @@ from apps.research_proxy.source_attribution import (
     _attributed_keys,
     normalize_scan_text,
 )
-from apps.research_proxy.value_attribution import attribute_value_in_fragment
+from apps.research_proxy.value_attribution import (
+    PAIRING_STATEMENT_NAMES_PRODUCER,
+    PAIRING_VALUE_AND_PRIMARY,
+    attribute_value_in_fragment,
+)
 from tests.unit.test_attribution_fixtures_t785 import (
     STAND_URI,
     STATEMENT_63,
@@ -28,47 +32,85 @@ from tests.unit.test_attribution_fixtures_t785 import (
 
 pytestmark = pytest.mark.unit
 
-#: строгие решения той же таблицы (tests/unit/test_attribution_fixtures_t785.py): обе строки
-#: парного окна публикации (forbes 14,5 и kommersant 14,5) сюда сознательно НЕ включены —
-#: они решаются оконным режимом; всё остальное обязан давать строгий режим без окна вообще
-STRICT_TABLE: tuple[tuple[str, str, str, str | None], ...] = (
-    ("expert_5-59", STATEMENT_559, "derivative", "rosstat"),
-    ("interfax_1068021_a", STATEMENT_559, "derivative", "rosstat"),
-    ("interfax_1068021_b", STATEMENT_559, "derivative", "rosstat"),
-    ("ria_2068393962", STATEMENT_559, "derivative", "rosstat"),
-    ("sbercib_2025", STATEMENT_559, "derivative", "rosstat"),
+#: решения той же таблицы (tests/unit/test_attribution_fixtures_t785.py) без оконного режима: обе
+#: строки парного окна публикации (forbes 14,5 и kommersant 14,5) сюда сознательно НЕ включены —
+#: они решаются оконным режимом; всё остальное обязан давать строгий режим без окна вообще,
+#: КРОМЕ последних двух строк. Их строгий результат не изменился (значение по-прежнему не
+#: приписано), но с T7.129a (ADR-0029 §26.3) итог решает пятый режим «утверждение называет
+#: производителя»: было `value_not_attributed`/`no_value_attribution` → стало
+#: `derivative`→cbr с pairing пятого режима. Причина переворота та же, что в
+#: tests/unit/test_attribution_fixtures_t785.py: производителя 13,1/15,6 называет само
+#: утверждение («по данным опроса „инФОМ“»), обе формы значения стоят на странице в том же
+#: показателе, вето собственной оценки рядом со значением нет.
+STRICT_TABLE: tuple[tuple[str, str, str, str | None, str], ...] = (
+    ("expert_5-59", STATEMENT_559, "derivative", "rosstat", PAIRING_VALUE_AND_PRIMARY),
+    ("interfax_1068021_a", STATEMENT_559, "derivative", "rosstat", PAIRING_VALUE_AND_PRIMARY),
+    ("interfax_1068021_b", STATEMENT_559, "derivative", "rosstat", PAIRING_VALUE_AND_PRIMARY),
+    ("ria_2068393962", STATEMENT_559, "derivative", "rosstat", PAIRING_VALUE_AND_PRIMARY),
+    ("sbercib_2025", STATEMENT_559, "derivative", "rosstat", PAIRING_VALUE_AND_PRIMARY),
     # T7.98: на CPD назван собственный прогноз ЦБ (другое число) → первоисточник в основании
     # есть, значение не то: value_not_attributed вместо «атрибуции нет вовсе»
-    ("cbr_CPD_2025-12", STATEMENT_559, "value_not_attributed", None),
-    ("cbr_reginfl_64837", STATEMENT_559, "value_not_attributed", None),
-    ("garant_1963171", STATEMENT_559, "no_value_attribution", None),
-    ("nbj_71790", STATEMENT_559, "no_value_attribution", None),
-    ("cbr_Infl_exp_25-12", STATEMENT_145, "value_not_attributed", None),
+    (
+        "cbr_CPD_2025-12",
+        STATEMENT_559,
+        "value_not_attributed",
+        None,
+        PAIRING_VALUE_AND_PRIMARY,
+    ),
+    ("cbr_reginfl_64837", STATEMENT_559, "value_not_attributed", None, PAIRING_VALUE_AND_PRIMARY),
+    ("garant_1963171", STATEMENT_559, "no_value_attribution", None, PAIRING_VALUE_AND_PRIMARY),
+    ("nbj_71790", STATEMENT_559, "no_value_attribution", None, PAIRING_VALUE_AND_PRIMARY),
+    (
+        "cbr_Infl_exp_25-12",
+        STATEMENT_145,
+        "value_not_attributed",
+        None,
+        PAIRING_VALUE_AND_PRIMARY,
+    ),
     # страница самого ЦБ по опросу «инФОМ»: значение приписано самой странице — не пересказ
-    ("cbr_Infl_exp_25-12", STATEMENT_63, "self_primary", None),
-    ("forbes_552221", STATEMENT_131_156, "value_not_attributed", None),
-    ("kommersant_8294535", STATEMENT_131_156, "no_value_attribution", None),
+    ("cbr_Infl_exp_25-12", STATEMENT_63, "self_primary", None, PAIRING_VALUE_AND_PRIMARY),
+    (
+        "forbes_552221",
+        STATEMENT_131_156,
+        "derivative",
+        "cbr",
+        PAIRING_STATEMENT_NAMES_PRODUCER,
+    ),
+    (
+        "kommersant_8294535",
+        STATEMENT_131_156,
+        "derivative",
+        "cbr",
+        PAIRING_STATEMENT_NAMES_PRODUCER,
+    ),
 )
 
 
 # ─── 1: строгий режим не тронут: без оконного режима решения таблиц остаются теми же ──
 
 
-@pytest.mark.parametrize(("name", "statement", "status", "primary"), STRICT_TABLE)
+@pytest.mark.parametrize(("name", "statement", "status", "primary", "pairing"), STRICT_TABLE)
 def test_strict_decisions_survive_without_the_publication_window(
-    monkeypatch: pytest.MonkeyPatch, name: str, statement: str, status: str, primary: str | None
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    statement: str,
+    status: str,
+    primary: str | None,
+    pairing: str,
 ) -> None:
     """Оконный режим (и живущее в нём вето) выключен entirely — строгие решения не изменились.
 
     Это прямой контроль утверждения T7.85a «строгий режим не тронут»: вето вызывается только из
-    `_publication_decision`, а монkeypatch'ом мы оставляем от окна один лишь честный отказ."""
+    `_publication_decision`, а monkeypatch'ом мы оставляем от окна один лишь честный отказ.
+    Ожидание pairing берётся из таблицы: для двух последних строк его задаёт пятый режим,
+    заведённый T7.129a (комментарий у таблицы)."""
 
     monkeypatch.setattr(va, "_publication_decision", lambda **kwargs: None)
     decision = attribute_value_in_fragment(
         canonical_uri=STAND_URI[name], text=_text(name), claim_statement=statement
     )
     assert (decision.status, decision.primary_key) == (status, primary), (name, statement[:40])
-    assert decision.pairing == "value_and_primary_in_fragment", (name, statement[:40])
+    assert decision.pairing == pairing, (name, statement[:40])
 
 
 def test_publication_window_gates_are_unchanged() -> None:

@@ -139,7 +139,7 @@ RATIONALE_DERIV = (
 )
 
 SINCE_ISO = "2000-01-01T00:00:00+00:00"
-CURRENT_VALUE_METHOD = "host-value-attribution-v16"
+CURRENT_VALUE_METHOD = "host-value-attribution-v17"
 SELF_SCHEMA = "host-value-self-publication-v1"
 WEAK_LABEL = "Подтверждено слабо"
 

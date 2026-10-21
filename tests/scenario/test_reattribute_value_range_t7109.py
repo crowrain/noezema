@@ -242,7 +242,7 @@ async def test_range_claim_evidence_gets_parent_after_v8_reattribution(
     by_uri = {str(r["uri"]): r for r in origins}
     record = dict(by_uri[URL_INTERFAX]["origin"])
     assert record["primary_key"] == "cbr" and record["primary_name"] == "Банк России"
-    assert record["method"] == "host-value-attribution-v16"
+    assert record["method"] == "host-value-attribution-v17"
     assert record["pairing"] == "value_and_primary_in_fragment"
     assert str(record["parent_source_id"]) == cbr_page
     assert "6-7" in record["basis_fragment"].lower()  # диапазон прочитан на странице целиком
@@ -251,7 +251,7 @@ async def test_range_claim_evidence_gets_parent_after_v8_reattribution(
     self_record = dict(by_uri[URL_CBR]["selfp"])
     assert by_uri[URL_CBR]["origin"] is None
     assert self_record["primary_key"] == "cbr"
-    assert self_record["method"] == "host-value-attribution-v16"
+    assert self_record["method"] == "host-value-attribution-v17"
 
     # группа независимости: interfax теперь в группе прочитанной страницы ЦБ, страница ЦБ — одиночна
     groups = {str(g["basis"]) for g in await _group_snapshot(scratch_url, STATEMENT_RANGE)}

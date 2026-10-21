@@ -8,7 +8,7 @@
 текстовой формы не считает «6,35» внутри «106,35»), после раунда исправления куратор вернул
 пустое предложение, ответ потерялся.
 
-Закреплено тестом (правило и его границы — apps/orchestrator/index_value_form.py):
+Закреплено тестом (правило и его границы — apps/research_proxy/index_value_form.py):
 - процент утверждения подтверждается связью, если на странице отдельным числом стоит 100 + X
   («106,35» для «6,35%») И рядом с этим числом есть маркер индексной формы;
 - без маркера — связь снята (число 100 + X само по себе не подтверждение);
@@ -34,7 +34,7 @@ from apps.orchestrator.curator_rejections import (
     link_value_gate,
     statement_value_profile,
 )
-from apps.orchestrator.index_value_form import (
+from apps.research_proxy.index_value_form import (
     INDEX_FORM_MARKERS,
     INDEX_MARKER_WINDOW_CHARS,
     index_form_confirms_value,

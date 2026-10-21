@@ -41,6 +41,7 @@ from apps.research_proxy.source_attribution import (
 )
 from apps.research_proxy.value_attribution import (
     PAIRING_PUBLICATION_WINDOW,
+    PAIRING_STATEMENT_NAMES_PRODUCER,
     PAIRING_VALUE_AND_PRIMARY,
     VALUE_ATTRIBUTION_METHOD_VERSION,
     attribute_value_in_fragment,
@@ -208,9 +209,21 @@ def test_page_decisions_on_stand_texts() -> None:
         ),
         # отрицательная проверка: страница САМОГО ЦБ — не пересказ самого себя
         ("cbr_Infl_exp_25-12", STATEMENT_145, "value_not_attributed", None, PAIRING_VALUE_AND_PRIMARY),
-        # 13,1/15,6 названы в блоке без атрибуции первоисточника → честный отказ
-        ("forbes_552221", STATEMENT_131_156, "value_not_attributed", None, PAIRING_VALUE_AND_PRIMARY),
-        ("kommersant_8294535", STATEMENT_131_156, "no_value_attribution", None, PAIRING_VALUE_AND_PRIMARY),
+        # 13,1/15,6 названы в блоке без атрибуции первоисточника. Было (до T7.129a): честный
+        # отказ строгого режима — «value_not_attributed» на forbes и «no_value_attribution» на
+        # kommersant. Стало (ADR-0029 §26.3, метод v17): производителя называет само утверждение
+        # («по данным опроса „инФОМ“»), обе формы значения стоят на странице в том же показателе,
+        # вето собственной оценки рядом нет → пятый режим приписывает значение семье `cbr`
+        # (опрос инФОМ заказан и опубликован Банком России, T7.120a). Это ровно тот случай, ради
+        # которого правило проектировалось: переставшая быть независимой группа-пересказ.
+        ("forbes_552221", STATEMENT_131_156, "derivative", "cbr", PAIRING_STATEMENT_NAMES_PRODUCER),
+        (
+            "kommersant_8294535",
+            STATEMENT_131_156,
+            "derivative",
+            "cbr",
+            PAIRING_STATEMENT_NAMES_PRODUCER,
+        ),
         # 6,3: прогноз аналитиков из опроса ЦБ на странице ЦБ → self_primary (отрицательная проверка)
         ("cbr_Infl_exp_25-12", STATEMENT_63, "self_primary", None, PAIRING_VALUE_AND_PRIMARY),
         # на чужих страницах 6,3 без атрибуции этого числа → отказ
@@ -226,7 +239,7 @@ def test_value_decisions_on_stand_texts(
     )
     assert (decision.status, decision.primary_key) == (status, primary), (name, statement[:40])
     assert decision.pairing == pairing, (name, statement[:40])
-    assert VALUE_ATTRIBUTION_METHOD_VERSION == "host-value-attribution-v16"
+    assert VALUE_ATTRIBUTION_METHOD_VERSION == "host-value-attribution-v17"
 
 
 def test_publication_window_never_overrides_a_refusal_of_its_own_kind() -> None:

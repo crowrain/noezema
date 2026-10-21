@@ -18,10 +18,13 @@ from __future__ import annotations
 
 from apps.research_proxy.source_attribution import (
     STATUS_DERIVATIVE,
-    STATUS_NO_VALUE_ATTRIBUTION,
     STATUS_OWN_ASSESSMENT,
 )
-from apps.research_proxy.value_attribution import attribute_value_in_fragment
+from apps.research_proxy.value_attribution import (
+    PAIRING_STATEMENT_NAMES_PRODUCER,
+    PAIRING_VALUE_AND_PRIMARY,
+    attribute_value_in_fragment,
+)
 
 _CLAIM_22 = "Уровень безработицы в России по данным Росстата составляет 2,2%."
 _CLAIM_MINEC = "Инфляция в России в сентябре 2026 года составила 1,2% по данным Минэкономразвития."
@@ -86,11 +89,23 @@ def test_reporting_verb_middle_form_pairs_minec() -> None:
     assert decision.pairing == "value_and_primary_in_fragment", decision
 
 
-def test_bare_reporting_without_dictionary_alias_stays_refusal() -> None:
-    # тот же закрытый список без алиаса словаря — прежний честный отказ (pairing не ослаблен)
+def test_bare_reporting_without_dictionary_alias_stays_out_of_strict_pairing() -> None:
+    """Тот же закрытый список без алиаса словаря: строгой пары по-прежнему нет (T7.113 не ослаблен).
+
+    Было (до T7.129a): весь ответ — честный отказ `no_value_attribution`. Стало: производителя
+    называет само утверждение («…составила 1,2% по данным Минэкономразвития»), число стоит на
+    странице в том же показателе («инфляция в сентябре составила 1,2%»), вето собственной оценки
+    нет, страница не домашняя → решает пятый режим ADR-0029 §26.3. Голое «отчитался» по-прежнему
+    НЕ создаёт пару «значение + алиас словаря в одном фрагменте»: pairing строгого режима здесь
+    не выставлен — именно это охранял прежний тест."""
     decision = attribute_value_in_fragment(
         canonical_uri="https://www.gazeta.ru/economy",
         text="Экономический блок отчитался: инфляция в сентябре составила 1,2%.\n",
         claim_statement=_CLAIM_MINEC,
     )
-    assert decision.status == STATUS_NO_VALUE_ATTRIBUTION, decision
+    assert decision.pairing != PAIRING_VALUE_AND_PRIMARY, decision
+    assert (decision.status, decision.primary_key, decision.pairing) == (
+        STATUS_DERIVATIVE,
+        "minec",
+        PAIRING_STATEMENT_NAMES_PRODUCER,
+    ), decision
