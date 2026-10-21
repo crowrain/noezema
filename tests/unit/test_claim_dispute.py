@@ -102,13 +102,20 @@ def test_pair_resolves_only_among_the_sources_of_this_claim() -> None:
 
 
 def test_ambiguous_address_is_refused_not_guessed() -> None:
-    """Два источника с одним адресом — отказ, а не произвольный выбор оператора."""
+    """Одна страница в двух ролях — отказ, а не произвольный выбор строки оператором.
+
+    T7.129 (было → стало): раньше две строки `sources` с одним адресом давали
+    `dispute_source_not_found` («неоднозначно»), потому что роль обязана была быть ОДНОЙ
+    строкой. Теперь обе строки — одна страница и обе попадают в роль; если оператор
+    поставил этот адрес в обе роли, отказ стал честным `dispute_same_source`
+    (страница не бывает пересказом самой себя), а не отказом «не нашли источник».
+    """
     dupes = [_source("https://same.example/page", "a"), _source("https://same.example/page", "b")]
     with pytest.raises(dispute.DisputeError) as exc:
         dispute.resolve_dispute_pair(
             dupes, primary_uri="https://same.example/page", retelling_uri="https://same.example/page"
         )
-    assert exc.value.code == dispute.REFUSAL_SOURCE_NOT_FOUND
+    assert exc.value.code == dispute.REFUSAL_SAME_SOURCE
 
 
 def test_source_without_canonical_uri_is_not_a_target() -> None:

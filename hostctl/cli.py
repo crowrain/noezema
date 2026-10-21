@@ -2018,6 +2018,14 @@ def claim_dispute(claim_ref: str, primary: str, retelling: str, reason: str) -> 
         click.echo(f"  утверждение   {outcome.claim_id}")
         pair = f"{outcome.retelling_uri} → {outcome.primary_uri}"
         click.echo(f"  коррекция     {outcome.correction_id} (merge: {pair})")
+        if len(outcome.correction_ids) > 1:
+            # T7.129: адресу страницы соответствуют несколько строк `sources` (одно издание
+            # в нескольких прочтениях) — коррекций столько же, каждая названа.
+            click.echo(
+                f"                строк по этому адресу: {len(outcome.retelling_source_ids)}, "
+                f"коррекций: {len(outcome.correction_ids)} "
+                f"(ещё: {', '.join(str(i) for i in outcome.correction_ids[1:])})"
+            )
         click.echo(f"  актор         {outcome.actor}")
         click.echo(f"  причина       {outcome.reason}")
         click.echo(

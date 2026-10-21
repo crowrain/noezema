@@ -101,8 +101,41 @@ class ClaimSource:
 
 @dataclass(frozen=True)
 class DisputePair:
-    primary: ClaimSource
-    retelling: ClaimSource
+    """Роли спора, названные адресом (T7.129).
+
+    Адресу оператора может соответствовать НЕСКОЛЬКО строк `sources`: одна и та же
+    страница, прочитанная узлом несколько раз (разные `content_hash` — разные версии
+    содержимого, у каждой версии своя улика). Это ОДНА страница, а не двусмысленность:
+    роль держит кортеж строк, отсортированный по id (детерминированно), а коррекция
+    заводится на каждую строку — иначе оспоренной оказалась бы только одна версия.
+    """
+
+    primary_rows: tuple[ClaimSource, ...]
+    retelling_rows: tuple[ClaimSource, ...]
+
+    @property
+    def primary(self) -> ClaimSource:
+        """Представитель первоисточника — первая по id строка названного адреса."""
+        return self.primary_rows[0]
+
+    @property
+    def retelling(self) -> ClaimSource:
+        """Представитель пересказа — первая по id строка названного адреса."""
+        return self.retelling_rows[0]
+
+    @property
+    def merge_pairs(self) -> tuple[tuple[ClaimSource, ClaimSource], ...]:
+        """Пары «пересказ → первоисточник» для коррекций: каждая строка пересказа к
+        каждой строке первоисточника (обе группы — одна страница, склейка симметрична)."""
+        return tuple(
+            (retelling, primary)
+            for retelling in self.retelling_rows
+            for primary in self.primary_rows
+        )
+
+    @property
+    def source_ids(self) -> frozenset[uuid.UUID]:
+        return frozenset(s.source_id for s in (*self.primary_rows, *self.retelling_rows))
 
 
 @dataclass(frozen=True)
@@ -123,11 +156,16 @@ class DisputeOutcome:
     retelling_source_id: uuid.UUID
     primary_uri: str | None
     retelling_uri: str | None
+    #: T7.129: все коррекции спора (одна на каждую версию оспоренной страницы) и все
+    #: затронутые строки пересказа. `correction_id`/`retelling_source_id` — представитель
+    #: (первая по id строка): прежние читатели исхода (web, hostctl) не изменены.
+    correction_ids: tuple[uuid.UUID, ...] = ()
+    retelling_source_ids: frozenset[uuid.UUID] = frozenset()
 
     @property
     def source_ids(self) -> frozenset[uuid.UUID]:
         """Затронутые источники: оба (основание merge симметрично в группировке)."""
-        return frozenset({self.primary_source_id, self.retelling_source_id})
+        return frozenset({self.primary_source_id, self.retelling_source_id}) | self.retelling_source_ids
 
 
 @dataclass(frozen=True)
@@ -140,6 +178,9 @@ class CancelOutcome:
     jobs_created: int
     affected_claims: int
     source_graph_revision: int
+    #: T7.129: все снятые коррекции спора (спор по адресу их заводит несколько — по одной
+    #: на каждую версию страницы). `correction_id` — представитель, прежнее поле.
+    correction_ids: tuple[uuid.UUID, ...] = ()
 
 
 # ─── чистые функции (тестируются без БД) ──────────────────────────────────
@@ -201,26 +242,34 @@ def resolve_dispute_pair(
 
     Совпадение — по хосту, пути и query (схема http/https одной страницы не важна).
     Один и тот же источник, встреченный и как улика, и как производитель, считается
-    один раз (без двойного счёта); несколько РАЗНЫХ источников с одним адресом — отказ,
-    пока оператор не назвал их разными адресами.
+    один раз (без двойного счёта).
+
+    T7.129 (стенд `.92`, спор по адресу smart-lab.ru/company/mozgovik/blog/1359553.php):
+    address'у соответствуют НЕСКОЛЬКО строк `sources` — одна страница в нескольких
+    прочтениях (разные `content_hash`). Прежде это читалось как двусмысленность и давало
+    отказ «неоднозначно», то есть страницу оспорить было нельзя вовсе. Теперь роли держат
+    ВСЕ строки названного адреса: оператор спорит страницу, а хост заводит коррекцию на
+    каждую её версию (см. `DisputePair.merge_pairs`). Двусмысленность РАЗНЫХ адресов —
+    прежний отказ `dispute_source_not_found`; разные страницы с одним адресом по-прежнему
+    неразличимы, потому что адрес и есть идентичность страницы (`_uri_identity`).
     """
 
-    def _one(uri: str, role: str, candidates: Sequence[ClaimSource]) -> ClaimSource:
+    def _rows(uri: str, role: str, candidates: Sequence[ClaimSource]) -> tuple[ClaimSource, ...]:
         matches: dict[Any, ClaimSource] = {}
         for source in candidates:
             if _uri_matches(source.canonical_uri, uri):
                 matches[source.source_id] = source
         if not matches:
             raise DisputeError(REFUSAL_SOURCE_NOT_FOUND, detail=f"{role}: {uri}")
-        if len(matches) > 1:
-            raise DisputeError(REFUSAL_SOURCE_NOT_FOUND, detail=f"{role}: {uri} (неоднозначно)")
-        return next(iter(matches.values()))
+        return tuple(matches[sid] for sid in sorted(matches))
 
-    primary = _one(primary_uri, "primary", _primary_candidates(sources, producer_sources))
-    retelling = _one(retelling_uri, "retelling", sources)
-    if primary.source_id == retelling.source_id:
+    primary_rows = _rows(primary_uri, "primary", _primary_candidates(sources, producer_sources))
+    retelling_rows = _rows(retelling_uri, "retelling", sources)
+    if {s.source_id for s in primary_rows} & {s.source_id for s in retelling_rows}:
+        # одна и та же страница (одна строка или общий адрес обеих ролей) не бывает
+        # пересказом самой себя: выбор «другой строки того же адреса» здесь был бы ложью
         raise DisputeError(REFUSAL_SAME_SOURCE)
-    return DisputePair(primary=primary, retelling=retelling)
+    return DisputePair(primary_rows=primary_rows, retelling_rows=retelling_rows)
 
 
 def _primary_candidates(
@@ -617,12 +666,17 @@ async def dispute_claim(
         public_summary=f"operator dispute for claim {claim_id}: {reason_text[:120]}",
     )
 
-    existing = await _find_correction(
-        db, actor=actor, primary_id=pair.primary.source_id, retelling_id=pair.retelling.source_id
-    )
-    if existing is not None and existing.valid:
+    existing_by_pair = [
+        await _find_correction(
+            db, actor=actor, primary_id=primary.source_id, retelling_id=retelling.source_id
+        )
+        for retelling, primary in pair.merge_pairs
+    ]
+    replayed_rows = [row for row in existing_by_pair if row is not None and row.valid]
+    if len(replayed_rows) == len(existing_by_pair):
         # повтор: граф уже исправлен этим же оператором — ничего не меняем,
         # но перепроверку гарантируем (тот же детерминированный текст вопроса)
+        replayed_row = replayed_rows[0]
         question, created = await put_operator_question(
             db, raw_text=recheck_question_text(str(claim["statement"])), raw_priority=0
         )
@@ -632,7 +686,9 @@ async def dispute_claim(
             payload={
                 "action": "claim_dispute",
                 "claim_id": str(claim_id),
-                "correction_id": str(existing.id),
+                "correction_id": str(replayed_row.id),
+                "corrections": [str(row.id) for row in replayed_rows],
+                "page_source_ids": [str(source.source_id) for source in pair.retelling_rows],
                 "replayed": True,
                 "jobs_active": await _active_job_count(db, claim_id),
                 "question_id": str(question.id),
@@ -643,7 +699,7 @@ async def dispute_claim(
         return DisputeOutcome(
             claim_id=claim_id,
             statement=str(claim["statement"]),
-            correction_id=existing.id,
+            correction_id=replayed_row.id,
             actor=actor,
             reason=reason_text,
             replayed=True,
@@ -657,6 +713,8 @@ async def dispute_claim(
             retelling_source_id=pair.retelling.source_id,
             primary_uri=pair.primary.canonical_uri,
             retelling_uri=pair.retelling.canonical_uri,
+            correction_ids=tuple(row.id for row in replayed_rows),
+            retelling_source_ids=frozenset(s.source_id for s in pair.retelling_rows),
         )
 
     state, assessment_id = await _head_state(db, claim_id)
@@ -666,9 +724,7 @@ async def dispute_claim(
             detail=f"голова утверждения: {state or 'нет головы на активном снапшоте'}",
         )
 
-    groups = await _group_ids(
-        db, assessment_id, (pair.primary.source_id, pair.retelling.source_id)
-    )
+    groups = await _group_ids(db, assessment_id, sorted(pair.source_ids))
     primary_group = groups.get(pair.primary.source_id)
     if primary_group is None:
         # первоисточник назван производителем (T7.114): его группа в снимке —
@@ -677,34 +733,43 @@ async def dispute_claim(
             db, assessment_id=assessment_id, parent_id=pair.primary.source_id, claim_id=claim_id
         )
         primary_group = next(iter(derived)) if len(derived) == 1 else None
-    retelling_group = groups.get(pair.retelling.source_id)
-    if primary_group is not None and primary_group == retelling_group:
+    retelling_groups = {groups.get(source.source_id) for source in pair.retelling_rows}
+    if primary_group is not None and all(
+        group is not None and group == primary_group for group in retelling_groups
+    ):
+        # каждая версия оспоренной страницы уже стоит в группе первоисточника: спор не
+        # приносит ни одной новой склейки (T7.129: проверка по всем строкам адреса)
         raise DisputeError(REFUSAL_ALREADY_GROUPED)
 
-    if existing is not None:
-        # коррекция этого же оператора по этой же паре уже была и её снимали:
-        # строка оживает (history не переписывается), а не заводится вторая
-        existing.valid = True
-        existing.reason_audit_event_id = received.id
-        correction = existing
-    else:
-        correction = ORMSourceGraphCorrection(
-            id=uuid.uuid4(),
-            actor=actor,
-            kind=KIND_MERGE,
-            from_source_id=pair.retelling.source_id,
-            to_source_id=pair.primary.source_id,
-            basis_artifact_id=await _basis_artifact_id(db, claim_id, pair.retelling.source_id),
-            rules_version=RULES_ENGINE_VERSION,
-            valid=True,
-            reason_audit_event_id=received.id,
-        )
-        db.add(correction)
+    corrections: list[ORMSourceGraphCorrection] = []
+    for (retelling_source, primary_source), existing in zip(
+        pair.merge_pairs, existing_by_pair, strict=True
+    ):
+        if existing is not None:
+            # коррекция этого же оператора по этой же паре уже была и её снимали:
+            # строка оживает (history не переписывается), а не заводится вторая
+            existing.valid = True
+            existing.reason_audit_event_id = received.id
+            corrections.append(existing)
+        else:
+            correction = ORMSourceGraphCorrection(
+                id=uuid.uuid4(),
+                actor=actor,
+                kind=KIND_MERGE,
+                from_source_id=retelling_source.source_id,
+                to_source_id=primary_source.source_id,
+                basis_artifact_id=await _basis_artifact_id(
+                    db, claim_id, retelling_source.source_id
+                ),
+                rules_version=RULES_ENGINE_VERSION,
+                valid=True,
+                reason_audit_event_id=received.id,
+            )
+            db.add(correction)
+            corrections.append(correction)
     await db.flush()
 
-    cascade = await apply_source_graph_change(
-        db, audit, source_ids=frozenset({pair.primary.source_id, pair.retelling.source_id}), actor=actor
-    )
+    cascade = await apply_source_graph_change(db, audit, source_ids=pair.source_ids, actor=actor)
 
     question, created = await put_operator_question(
         db, raw_text=recheck_question_text(str(claim["statement"])), raw_priority=0
@@ -716,7 +781,9 @@ async def dispute_claim(
         payload={
             "action": "claim_dispute",
             "claim_id": str(claim_id),
-            "correction_id": str(correction.id),
+            "correction_id": str(corrections[0].id),
+            "corrections": [str(row.id) for row in corrections],
+            "page_source_ids": [str(source.source_id) for source in pair.retelling_rows],
             "kind": KIND_MERGE,
             "from_source_id": str(pair.retelling.source_id),
             "to_source_id": str(pair.primary.source_id),
@@ -736,7 +803,7 @@ async def dispute_claim(
     return DisputeOutcome(
         claim_id=claim_id,
         statement=str(claim["statement"]),
-        correction_id=correction.id,
+        correction_id=corrections[0].id,
         actor=actor,
         reason=reason_text,
         replayed=False,
@@ -750,16 +817,18 @@ async def dispute_claim(
         retelling_source_id=pair.retelling.source_id,
         primary_uri=pair.primary.canonical_uri,
         retelling_uri=pair.retelling.canonical_uri,
+        correction_ids=tuple(row.id for row in corrections),
+        retelling_source_ids=frozenset(source.source_id for source in pair.retelling_rows),
     )
 
 
-async def _valid_correction_for_claim(
+async def _valid_corrections_for_claim(
     db: AsyncSession, claim_id: uuid.UUID
-) -> ORMSourceGraphCorrection | None:
-    """Последняя действующая коррекция склейки, затрагивающая источники claim'а.
+) -> list[ORMSourceGraphCorrection]:
+    """Действующие коррекции склейки, затрагивающие источники claim'а (новые сначала).
 
-    Строка берётся ORM-запросом и блокируется: `valid` меняет именно она,
-    а не копия значений из raw-SQL выборки.
+    Строки берутся ORM-запросом и блокируются: `valid` меняют именно они,
+    а не копии значений из raw-SQL выборки.
     """
     source_ids = (
         (
@@ -775,8 +844,8 @@ async def _valid_correction_for_claim(
         .all()
     )
     if not source_ids:
-        return None
-    return (
+        return []
+    return list(
         (
             await db.execute(
                 select(ORMSourceGraphCorrection)
@@ -792,13 +861,54 @@ async def _valid_correction_for_claim(
                     ORMSourceGraphCorrection.created_at.desc(),
                     ORMSourceGraphCorrection.id.desc(),
                 )
-                .limit(1)
                 .with_for_update()
             )
         )
         .scalars()
-        .first()
+        .all()
     )
+
+
+async def _same_page_corrections(
+    db: AsyncSession, claim_id: uuid.UUID, correction: ORMSourceGraphCorrection
+) -> list[ORMSourceGraphCorrection]:
+    """Действующие коррекции того же спора по OTHER версиям той же страницы (T7.129).
+
+    Спор по адресу заводит по коррекции на каждую строку `sources` с этим адресом.
+    Отмена обязана снять весь набор: иначе «отозванный» спор продолжает склеивать
+    остальные версии страницы, а журнал сообщает об отменённой коррекции неверно.
+    Совпадение — по идентичности адреса (`_uri_identity`: схема не важна, важны хост,
+    путь и query), а не по дословному `canonical_uri`.
+    """
+
+    candidates = [
+        row
+        for row in await _valid_corrections_for_claim(db, claim_id)
+        if row.id != correction.id
+        and row.actor == correction.actor
+        and row.to_source_id == correction.to_source_id
+        and row.rules_version == correction.rules_version
+    ]
+    if not candidates:
+        return []
+    wanted_ids = {row.from_source_id for row in candidates} | {correction.from_source_id}
+    address_rows = (
+        await db.execute(
+            text("SELECT id, canonical_uri FROM sources WHERE id = ANY(:ids)"),
+            {"ids": list(wanted_ids)},
+        )
+    ).all()
+    addresses: dict[Any, str | None] = {row[0]: row[1] for row in address_rows}
+    representative = addresses.get(correction.from_source_id)
+    if not representative:
+        return []
+    wanted = _uri_identity(str(representative))
+    return [
+        row
+        for row in candidates
+        if addresses.get(row.from_source_id)
+        and _uri_identity(str(addresses[row.from_source_id])) == wanted
+    ]
 
 
 async def cancel_dispute(
@@ -833,22 +943,29 @@ async def cancel_dispute(
         public_summary=f"operator dispute cancel requested for claim {claim_id}",
     )
 
-    correction = await _valid_correction_for_claim(db, claim_id)
-    if correction is None:
+    corrections = await _valid_corrections_for_claim(db, claim_id)
+    if not corrections:
         raise DisputeError(REFUSAL_CORRECTION_NOT_FOUND)
+    representative = corrections[0]
+    cancelled = [representative, *await _same_page_corrections(db, claim_id, representative)]
 
-    correction.valid = False
+    for correction in cancelled:
+        # строка не удаляется — снимается флаг действенности (история знания не переписывается)
+        correction.valid = False
     await db.flush()
 
     cascade = await apply_source_graph_change(
         db,
         audit,
-        source_ids=frozenset({correction.from_source_id, correction.to_source_id}),
+        source_ids=frozenset(
+            {row.from_source_id for row in cancelled} | {row.to_source_id for row in cancelled}
+        ),
         actor=actor,
     )
     received.payload = {
         **dict(received.payload or {}),
-        "correction_id": str(correction.id),
+        "correction_id": str(representative.id),
+        "corrections": [str(row.id) for row in cancelled],
         "cancelled_by": actor,
     }
     await audit.record(
@@ -857,7 +974,8 @@ async def cancel_dispute(
         payload={
             "action": "claim_dispute_cancel",
             "claim_id": str(claim_id),
-            "correction_id": str(correction.id),
+            "correction_id": str(representative.id),
+            "corrections": [str(row.id) for row in cancelled],
             "kind": KIND_MERGE,
             "operator_reason": reason_text,
             "invalidated": cascade.invalidated,
@@ -873,13 +991,14 @@ async def cancel_dispute(
 
     return CancelOutcome(
         claim_id=claim_id,
-        correction_id=correction.id,
+        correction_id=representative.id,
         actor=actor,
         reason=reason_text,
         invalidated=cascade.invalidated,
         jobs_created=cascade.jobs_created,
         affected_claims=cascade.affected_claims,
         source_graph_revision=cascade.revision,
+        correction_ids=tuple(row.id for row in cancelled),
     )
 
 

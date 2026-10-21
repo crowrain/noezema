@@ -82,21 +82,31 @@ def test_producer_equal_to_an_evidence_is_counted_once() -> None:
     assert pair.retelling.source_id == CALIBER.source_id
 
 
-def test_two_different_sources_with_one_address_stay_ambiguous() -> None:
-    """Две РАЗНЫЕ строки источников с одним адресом — прежний отказ «неоднозначно»."""
+def test_two_source_rows_with_one_address_are_one_page_not_ambiguity() -> None:
+    """T7.129 (было → стало). Две строки `sources` с одним адресом — ОДНА страница.
+
+    Прежнее ожидание: отказ `dispute_source_not_found` с detail «(неоднозначно)», то есть
+    такую страницу оспорить было нельзя вовсе (стенд `.92`: smart-lab 1359553 лежит в трёх
+    строках — два прочтения http и одно https). Новое ожидание: роль держит обе строки,
+    отказ исчезает; двусмысленность РАЗНЫХ адресов по-прежнему отказ (тест выше).
+    """
     lookalike = dispute.ClaimSource(
         source_id=uuid.uuid5(uuid.NAMESPACE_URL, "lookalike"),
         canonical_uri=CALIBER.canonical_uri,
     )
-    with pytest.raises(dispute.DisputeError) as exc:
-        dispute.resolve_dispute_pair(
-            EVIDENCE,
-            primary_uri=CALIBER.canonical_uri or "",
-            retelling_uri=FINMARKET.canonical_uri or "",
-            producer_sources=[lookalike],
-        )
-    assert exc.value.code == dispute.REFUSAL_SOURCE_NOT_FOUND
-    assert "неоднозначно" in exc.value.detail
+    pair = dispute.resolve_dispute_pair(
+        EVIDENCE,
+        primary_uri=CALIBER.canonical_uri or "",
+        retelling_uri=FINMARKET.canonical_uri or "",
+        producer_sources=[lookalike],
+    )
+    assert {source.source_id for source in pair.primary_rows} == {
+        CALIBER.source_id,
+        lookalike.source_id,
+    }
+    assert pair.retelling.source_id == FINMARKET.source_id
+    # коррекция заведётся на КАЖДУЮ строку названного пересказа/первоисточника
+    assert len(pair.merge_pairs) == 2
 
 
 def test_empty_producers_keep_the_old_narrow_pair() -> None:

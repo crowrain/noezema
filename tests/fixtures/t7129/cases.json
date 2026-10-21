@@ -1,0 +1,95 @@
+{
+ "method_version_on_stand": "host-value-attribution-v16",
+ "source_fixture_dir": "fixtures-t7129 (снимок менеджера со стенда .92, 686d1e8-v29)",
+ "cases": [
+  {
+   "claim_id": "060d979a-26d2-4822-bdc6-2dd1f31dafa5",
+   "statement": "Официальная годовая инфляция в России в сентябре 2026 года составила 6,35% (по данным Росстата).",
+   "claim_type": "temporal_fact",
+   "evidence": [
+    {
+     "uri": "https://www.cbr.ru/press/reginfl/?id=70291",
+     "domain": "cbr.ru",
+     "page": "page-cbr-ru-press-reginfl-id-70291.normalized.txt",
+     "pairing_on_stand": "value_and_primary_in_fragment",
+     "primary_key_on_stand": "rosstat"
+    },
+    {
+     "uri": "https://rosstat.gov.ru/storage/mediabank/157_09-10-2026.html",
+     "domain": "gov.ru",
+     "page": "page-rosstat-gov-ru-storage-mediabank-157-09-10-2026-html.normalized.txt",
+     "pairing_on_stand": null,
+     "primary_key_on_stand": null
+    },
+    {
+     "uri": "https://base.garant.ru/415048373/",
+     "domain": "garant.ru",
+     "page": "page-base-garant-ru-415048373-.normalized.txt",
+     "pairing_on_stand": null,
+     "primary_key_on_stand": null
+    }
+   ],
+   "corrections": 1
+  },
+  {
+   "claim_id": "738548ca-df21-48f7-a99c-b382a9149992",
+   "statement": "Рост реальных заработных плат в России в июле 2026 года составил 3,3% в годовом выражении (по данным Росстата).",
+   "claim_type": "temporal_fact",
+   "evidence": [
+    {
+     "uri": "https://www.sberbank.ru/common/img/uploaded/news/2026/cmi/termometr_trud.html",
+     "domain": "sberbank.ru",
+     "page": "page-sberbank-ru-common-img-uploaded-news-2026-cmi-termometr-trud-html.normalized.txt",
+     "pairing_on_stand": null,
+     "primary_key_on_stand": null
+    }
+   ],
+   "corrections": 1
+  },
+  {
+   "claim_id": "a7cac406-f360-4d2d-94f5-71d861243b36",
+   "statement": "По данным hh.ru, hh-индекс в сентябре 2026 года составил 8,5.",
+   "claim_type": "temporal_fact",
+   "evidence": [
+    {
+     "uri": "https://smart-lab.ru/company/mozgovik/blog/1359553.php",
+     "domain": "smart-lab.ru",
+     "page": "page-smart-lab-ru-company-mozgovik-blog-1359553-php.normalized.txt",
+     "pairing_on_stand": null,
+     "primary_key_on_stand": null
+    },
+    {
+     "uri": "https://setka.ru/posts/01a11c97-43db-7b60-a22a-036755095369",
+     "domain": "setka.ru",
+     "page": "page-setka-ru-posts-01a11c97-43db-7b60-a22a-036755095369.normalized.txt",
+     "pairing_on_stand": null,
+     "primary_key_on_stand": null
+    }
+   ],
+   "corrections": 0
+  },
+  {
+   "claim_id": "b262da08-5d83-485f-9cc7-ee703bcd0dbb",
+   "statement": "По данным hh.ru, в августе 2026 года hh-индекс (конкуренция соискателей на вакансию) составил 8,7.",
+   "claim_type": "external_fact",
+   "evidence": [
+    {
+     "uri": "https://www.rambler.ru/pro/zarplata/57077146-u-kogo-upali-realnye-zarplaty-v-2026-godu/",
+     "domain": "rambler.ru",
+     "page": "page-rambler-ru-pro-zarplata-57077146-u-kogo-upali-realnye-zarplaty-v-2026-.normalized.txt",
+     "pairing_on_stand": null,
+     "primary_key_on_stand": null
+    },
+    {
+     "uri": "https://brainhire.ru/blog/rekruting/rynok-truda-rossii-2026",
+     "domain": "brainhire.ru",
+     "page": "page-brainhire-ru-blog-rekruting-rynok-truda-rossii-2026.normalized.txt",
+     "pairing_on_stand": null,
+     "primary_key_on_stand": null
+    }
+   ],
+   "corrections": 1
+  }
+ ],
+ "note": "в манифесте только те улики, чьи нормализованные страницы сохранены рядом; остальные улики стенда (interfax, ria, prufy и др.) в задаче не участвуют"
+}
