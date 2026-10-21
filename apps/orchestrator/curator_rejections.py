@@ -56,6 +56,15 @@ pairing-фильтров атрибуции; утверждение без из�
 гейте не было и нет (стенд 64837cb5/claim[3]: «9,6» не измеренное значение, гейт молчал,
 связь к чужой странице прошла).
 
+Дополнение T7.128 (часть 3, ADR-0034 §10 дополнение): процентное значение формулировки
+подтверждается связью и ИНДЕКСНОЙ формой — отдельным числом 100 + X («106,35» для «6,35%»)
+рядом с маркером индексной формы. Правило живёт в чистом модуле
+`apps/orchestrator/index_value_form.py`, вызывается из `link_value_gate`: решение остаётся
+ОДНИМ на связь, строка причины снятия прежняя, журнал (`rejected_links`,
+`rejected_operations`) прежний. Те же текстовые формы и границы числа, что у T7.108a; только
+проценты, только положительные X с дробной частью и X < 100; обратное направление и форма
+100 − X не введены (остатки названы в модуле и в ADR).
+
 Модуль чистый: никаких БД и LLM — только разбор строк и дайджесты (формы записей совпадают
 с дайджестом T7.84: те же `_claim_entry` / `_link_entry` из `rejected_proposal`, чтобы
 «digest операции» в записи отказа был тем же снимком операции, что видит оператор в отказе
@@ -69,6 +78,7 @@ from collections import Counter
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Final
 
+from apps.orchestrator.index_value_form import index_form_confirms_value
 from apps.orchestrator.rejected_proposal import _claim_entry, _link_entry
 from apps.research_proxy.value_attribution import (
     _claim_bare_values,  # T7.123: тот же «голый» профиль значения, что у pairing-фильтров T7.120
@@ -220,6 +230,15 @@ def link_value_gate(
     if claim_values_found_in_texts(values=singles, texts=texts):
         return VALUE_GATE_PRESENT
     if ranges and claim_ranges_found_in_texts(ranges=ranges, texts=texts):
+        return VALUE_GATE_PRESENT
+    # T7.128 (часть 3, ADR-0034 §10 дополнение): индексная форма процента. Стенд c4: релиз
+    # Росстата пишет годовую инфляцию индексом — строка «Индекс потребительских цен» и ячейка
+    # «106,35» в столбце «к сентябрю 2025 г.», отдельного «6,35» на странице нет. Значение,
+    # записанное в формулировке с процентной единицей, подтверждается и таким числом, если рядом
+    # с ним стоит маркер индексной формы (правило и его границы — apps/orchestrator/index_value_form.py).
+    # Решение по-прежнему ОДНО на связь и причина снятия прежняя; профиль токенов отчёта
+    # (`statement_value_profile`) не меняется: индексная форма — путь решения, а не токен утверждения.
+    if index_form_confirms_value(statement=statement, values=singles, texts=texts):
         return VALUE_GATE_PRESENT
     return VALUE_GATE_ABSENT
 

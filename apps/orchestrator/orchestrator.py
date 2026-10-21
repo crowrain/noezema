@@ -3094,6 +3094,11 @@ class Orchestrator:
                 # намерением повторно не отклоняется; принятый пустой ответ догоняет
                 # запасной путь опоры T7.115 из `c:`-ссылок финального ответа исследователя
                 declared_empty_check=False,
+                # T7.128 (часть 2): после раунда исправления опора спасает ответ — гейты группы
+                # (а) (значение на связи; период/дата прогноза/дата документа), снявшие ВСЕ
+                # операции, при РАЗРЕШЁННЫХ опорах дают частичное применение с нулём утверждений
+                # вместо отказа целиком. До раунда — прежний отказ (раунд предлагается).
+                relied_only_answer_allowed=True,
             )
             if isinstance(second_outcome, BoundaryRejected):
                 # Отказ ПОСЛЕ раунда — тот же event и прежние ключи для отказа ВТОРОГО
@@ -3347,6 +3352,7 @@ class Orchestrator:
         proposal: CuratorProposal,
         *,
         declared_empty_check: bool = True,
+        relied_only_answer_allowed: bool = False,
     ) -> BoundaryAccepted | BoundaryRejected:
         """Граничная проверка кураторского предложения до staging (T7.105,
         ADR-0034 вариант B; метод вынесен в T7.106 ради варианта C). Порядок и тексты
@@ -3367,6 +3373,17 @@ class Orchestrator:
         `curator_reject_kind` = "claims_empty_declared_in_summary"; проверка выполняется
         только на первом вызове (`declared_empty_check`), второй вызов после раунда
         исправления проходит без неё: ровно один раунд (ADR-0034 вариант C).
+
+        T7.128 (часть 2): `relied_only_answer_allowed` = True (только второй вызов, после раунда
+        исправления) разрешает фиксировать ответ ИЗ ОДНИХ ОПОРАХ, если гейты группы (а) —
+        «значение на связи» (T7.108) и период/дата прогноза/дата документа (T7.121/ADR-0038) —
+        сняли ВСЕ операции предложения, а `relied_claim_ids` разрешились в id контекст-пака этой
+        сессии. Такие гейты судят только свою операцию (в отличие от структурного гейта,
+        неразрешимой перепроверочной ссылки, `temporal_fact` без даты и движка правил — там
+        отказ целиком сохранён). Итог — обычный `BoundaryAccepted` со всеми операциями в `dropped`:
+        журнал становится обычной частичной применяемой записью T7.105 (`claims_applied: 0`,
+        `rejected_operations`, `relied_claim_ids`), новых ключей и событий нет; снятая операция
+        в знание не попадает. Без разрешённых опор поведение прежнее.
         """
         max_questions = int(snapshot.session_limits.get("max_new_questions_per_session", 4))
         # T7.84 (часть B, ADR-0033 §8): первым — только то, чему безразлично, каким ВИДОМ
@@ -3508,6 +3525,40 @@ class Orchestrator:
                 reasons=list(dropped.values())[:10],
             )
 
+        # T7.128 (часть 2): опора разрешается ДО гейтов, которые могут снять ВСЕ операции
+        # предложения: опоре нужно знать свой итог, когда хост решает, отказывать ли предложению
+        # целиком (см. `relied_only_answer_allowed`). Разрешение чистое (только контекст-пак и тот же
+        # разрешатель), поэтому порядок прочих шагов границы и их журналы не меняются.
+        # T7.82 (B), ADR-0032: опора на существующее знание (факультативное поле
+        # curator-v9). Хост принимает ТОЛЬКО id, видимые в контекст-паке этой сессии —
+        # тот же разрешатель, что у перепроверки (полный UUID или единственный
+        # hex-префикс). Это не перепроверка: ни claim_reverified, ни новой оценки, ни
+        # staging-операций. Разрешённые id и честные отказы записываются в payload уже
+        # существующего события CLAIM_CREATED — нового типа события и миграции нет,
+        # отказ отдельных id не отменяет остальное предложение (в отличие от того же
+        # гейта перепроверки: там спорный id блокирует всё предложение).
+        relied_claim_ids: list[str] = []
+        relied_claims_rejected: list[str] = []
+        if proposal.relied_claim_ids:
+            from packages.memory.service import resolve_claim_reference as _resolve_relied
+
+            visible_pack_ids = _pack_claim_ids(knowledge)
+            seen_relied: set[uuid.UUID] = set()
+            for k, raw_ref in enumerate(proposal.relied_claim_ids):
+                ref_id, ref_problem = _resolve_relied(raw_ref, visible_pack_ids)
+                if ref_id is None or ref_problem is not None:
+                    relied_claims_rejected.append(f"rely[{k}]: {ref_problem}")
+                    continue
+                if ref_id in seen_relied:
+                    continue  # дубл одного id — не повод шуметь в отказы
+                if len(relied_claim_ids) >= RELIED_CLAIMS_LIMIT:
+                    relied_claims_rejected.append(
+                        f"rely[{k}]: more than {RELIED_CLAIMS_LIMIT} relied ids"
+                    )
+                    continue
+                seen_relied.add(ref_id)
+                relied_claim_ids.append(str(ref_id))
+
         # T7.108 (часть а, ADR-0034 §10): значение на связи. `supports` утверждения остаётся
         # только если фрагмент ИЛИ весь сохранённый текст страницы содержит хотя бы одно
         # измеренное значение утверждения целым числовым токеном (то же сравнение чисел, что у
@@ -3543,7 +3594,15 @@ class Orchestrator:
         rejected_links_all = rejected_link_entries(proposal=proposal, removed_links=removed_links)
         # журнал активных снятых связей считается после гейта периода (T7.123): там связи
         # дополняются связями, снятыми гейтом периода, и покрываются записями снятых операций
-        if value_claim_drops and proposal.claims and len(dropped) == len(proposal.claims):
+        if (
+            value_claim_drops
+            and proposal.claims
+            and len(dropped) == len(proposal.claims)
+            # T7.128 (часть 2): гейт снял ВСЕ операции, но у предложения есть РАЗРЕШЁННЫЕ опоры —
+            # после раунда исправления хост не отказывает целиком, а фиксирует ответ из одних опор
+            # (снимает операцию гейтом, который судит только её). Группа (а) ADR-0034 §11.
+            and not (relied_only_answer_allowed and relied_claim_ids)
+        ):
             # все операции сняты из-за связей без значения — отказ предложения целиком
             # (тот же event, аддитивный `curator_reject_kind`; связи названы полностью:
             # записей операций при отказе целиком нет) -> вариант C (T7.106) догоняет раунд
@@ -3559,36 +3618,6 @@ class Orchestrator:
                 ),
                 reasons=[*list(dropped.values())[:10], *list(removed_links.values())[:10]],
             )
-
-        # T7.82 (B), ADR-0032: опора на существующее знание (факультативное поле
-        # curator-v9). Хост принимает ТОЛЬКО id, видимые в контекст-паке этой сессии —
-        # тот же разрешатель, что у перепроверки (полный UUID или единственный
-        # hex-префикс). Это не перепроверка: ни claim_reverified, ни новой оценки, ни
-        # staging-операций. Разрешённые id и честные отказы записываются в payload уже
-        # существующего события CLAIM_CREATED — нового типа события и миграции нет,
-        # отказ отдельных id не отменяет остальное предложение (в отличие от того же
-        # гейта перепроверки: там спорный id блокирует всё предложение).
-        relied_claim_ids: list[str] = []
-        relied_claims_rejected: list[str] = []
-        if proposal.relied_claim_ids:
-            from packages.memory.service import resolve_claim_reference as _resolve_relied
-
-            visible_pack_ids = _pack_claim_ids(knowledge)
-            seen_relied: set[uuid.UUID] = set()
-            for k, raw_ref in enumerate(proposal.relied_claim_ids):
-                ref_id, ref_problem = _resolve_relied(raw_ref, visible_pack_ids)
-                if ref_id is None or ref_problem is not None:
-                    relied_claims_rejected.append(f"rely[{k}]: {ref_problem}")
-                    continue
-                if ref_id in seen_relied:
-                    continue  # дубл одного id — не повод шуметь в отказы
-                if len(relied_claim_ids) >= RELIED_CLAIMS_LIMIT:
-                    relied_claims_rejected.append(
-                        f"rely[{k}]: more than {RELIED_CLAIMS_LIMIT} relied ids"
-                    )
-                    continue
-                seen_relied.add(ref_id)
-                relied_claim_ids.append(str(ref_id))
 
         # T7.83 (ADR-0033) + T7.83a: дубли по значению — честная склейка или честное
         # молчание. Операция без existing_claim_id, у которой РОВНО ОДИН кандидат
@@ -3798,7 +3827,15 @@ class Orchestrator:
             if int(entry["claim_index"]) not in value_claim_drops
             and int(entry["claim_index"]) not in period_drops
         ]
-        if period_drops and proposal.claims and len(dropped) == len(proposal.claims):
+        if (
+            period_drops
+            and proposal.claims
+            and len(dropped) == len(proposal.claims)
+            # T7.128 (часть 2): стенд c1 — гейт периода снял единственную операцию, а разрешение
+            # вопроса осталось в опоре. После раунда исправления опора спасает ответ; до раунда
+            # (`relied_only_answer_allowed` = False) поведение прежнее (ADR-0034 §11 группа (а)).
+            and not (relied_only_answer_allowed and relied_claim_ids)
+        ):
             # Сняты ВСЕ операции — отказ предложения целиком (тот же event, аддитивный
             # `curator_reject_kind` = "claim_period_not_near_value") -> вариант C догоняет
             # один раунд исправления (гейт действует и на втором предложении).
