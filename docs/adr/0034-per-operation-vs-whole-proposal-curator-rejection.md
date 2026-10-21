@@ -490,7 +490,8 @@ finmarket.ru/news/6727171 проходила гейт эпохи T7.108a по о
 
 **Одно решение на связь сохранено.** Правило — ветка внутри `link_value_gate`
 (`apps/orchestrator/curator_rejections.py`), реализованная чистым модулем
-`apps/orchestrator/index_value_form.py`: строка причины снятия, payload `rejected_links` /
+`apps/research_proxy/index_value_form.py` (модуль перенесён из `apps/orchestrator` в T7.129a,
+правило то же): строка причины снятия, payload `rejected_links` /
 `rejected_operations`, пороги и профиль токенов отчёта T7.124 (`statement_value_profile`) не
 изменены — индексная форма является путём решения гейта, а не токеном утверждения. Read-only
 аудит связей T7.124 (`apps/orchestrator/link_audit.py`) вызывает тот же `link_value_gate`,
