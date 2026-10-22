@@ -221,6 +221,7 @@ hostctl.cli wake-tick` — при занятой сессии он так же �
 | снимок юнитов | `/var/lib/noezema-dev/host/unit-state.json` |
 | оверлеи инструментов сессий | `/var/lib/noezema-dev/sandbox/<session_id>` (одноразовый на сессию) |
 | события сессий (аудит) | не в файле: таблица `audit_events` в базе и наружу — `GET /api/v1/timeline`, SSE `GET /api/v1/timeline/sse`, страница `/session/<id>` |
+| попытка сессии, которая не оставила строки `sessions` (отказ внутри фазы 1, отмена задачи) — T7.132 | `GET /api/v1/status` → ключ `last_failed_attempt` (класс и обрезанный текст отказа, `question_id`, счётчики вызовов; читается из базы и переживает рестарт веб-юнита), в базе — `audit_events` с `payload->>'unrecorded_attempt' = 'true'`, в журнале веб-юнита — строка «wake_now: задача сессии завершилась исключением» |
 
 ## ВМ с deny-by-default UFW (192.168.1.92)
 
