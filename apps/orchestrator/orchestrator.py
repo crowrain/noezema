@@ -20,7 +20,9 @@ M2 state (after this PR):
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
+import logging
 import os
 import re
 import uuid
@@ -57,6 +59,13 @@ from apps.orchestrator.curator_rejections import (
 )
 from apps.orchestrator.evidence import observation_to_evidence, reselect_assertion_fragment
 from apps.orchestrator.executor import arguments_hash
+from apps.orchestrator.failed_attempt import (
+    AttemptTrace,
+    build_attempt_trace_payload,
+    format_exception_redacted,
+    trace_event_type,
+    trace_public_summary,
+)
 from apps.orchestrator.host_availability import (
     classify_fetch_error,
     fetch_url_host,
@@ -214,6 +223,8 @@ from packages.memory.session_admission import register_session_admission
 from packages.policy.engine import PolicyEngine
 from packages.policy.profiles import CapabilityProfile, ProfileError, effective_profile
 from packages.policy.tools import get_tool
+
+logger = logging.getLogger(__name__)
 
 PLAN_TEMPLATE = "Исследовать вопрос, собрать evidence инструментами, предложить claims."
 
@@ -385,6 +396,10 @@ class Orchestrator:
         # T3.30: the lease TTL is injectable for tests (scenario regression:
         # an LLM call longer than the TTL must not starve the fenced commit)
         self.lease = LeaseService(ttl=lease_ttl if lease_ttl is not None else DEFAULT_LEASE_TTL)
+        # T7.132: снимок ТЕКУЩЕЙ попытки фазы 1 (см. apps/orchestrator/failed_attempt.py).
+        # Как и `self.prompts`, он живёт на экземпляре: одна сессия за раз (M1) делает это
+        # безопасным, — и именно поэтому он НЕ зависит от транзакции, которая может откатиться.
+        self._attempt_trace: AttemptTrace | None = None
 
     async def run_session(self, question_id: uuid.UUID | None = None) -> SessionOutcome:
         """M2 session lifecycle (T2.15-T2.21):
@@ -482,19 +497,37 @@ class Orchestrator:
             raise prompt_error
 
         # ── phase 1: lifecycle up to COMMITTING ───────────────────────────
+        # T7.132 (§5.2.2, §6.7): снимок попытки живёт ВНЕ транзакции фазы 1. Если фаза 1
+        # откатывается, её содержимое исчезает целиком — строка сессии, actions, model_runs и
+        # её же событие SESSION_FAILED, записанное незадолго до отказа. Снимок в памяти процесса
+        # переживает откат, и по нему пишется долговечный след отдельной короткой транзакцией
+        # (случай стенда 22.10 08:37–08:55: 17 минут работы и ни одной записи в базе).
+        trace = AttemptTrace(
+            session_id=session_id,
+            started_at=AttemptTrace.now(),
+            node_owner=self.node_owner,
+        )
+        self._attempt_trace = trace
         try:
-            async with self.session_factory() as db, transaction(db):
-                result = await self._run_to_committing(db, question_id, session_id)
-        except Exception:
-            # phase 1 crashed: the session row rolled back — release the
-            # admission record right away (a terminal state written inside
-            # phase 1 already released it via the trigger; idempotent).
-            # If the release itself fails (the DB is down), the lease
-            # expires and the activation sweeps the row.
-            with contextlib.suppress(Exception):
-                await self._release_session_admission(session_id)
-            raise
+            try:
+                async with self.session_factory() as db, transaction(db):
+                    result = await self._run_to_committing(db, question_id, session_id)
+            except BaseException as exc:
+                # phase 1 crashed: the session row rolled back — release the
+                # admission record right away (a terminal state written inside
+                # phase 1 already released it via the trigger; idempotent).
+                # If the release itself fails (the DB is down), the lease
+                # expires and the activation sweeps the row.
+                with contextlib.suppress(Exception):
+                    await self._release_session_admission(session_id)
+                # T7.132: след ставится ПОСЛЕ освобождения допуска и НИКОГДА не подменяет
+                # исходный отказ. `except BaseException`, а не `Exception`: отмена задачи
+                # (`CancelledError` — наследник BaseException) раньше не попадала ни в одну
+                # ветку и не оставляла ни следа, ни журнала.
+                await self._record_unrecorded_attempt(trace, exc)
+                raise
         finally:
+            self._attempt_trace = None
             # T7.58 (ADR-0023): the sandboxed executor's one-shot container is
             # destroyed on EVERY path out of phase 1 — a normal finish, an early
             # terminal `_finish`, a raised LeaseLost, any infra error. An
@@ -802,6 +835,9 @@ class Orchestrator:
             public_summary=f"question selected: {question.text[:120]}",
         )
         ctx.question_text = question.text
+        # T7.132: вопрос известен ДО того, как фаза 1 его зафиксирует; при откате он живёт только
+        # в снимке попытки (иначе след неудачной попытки не сказал бы оператору, ЧТО искали).
+        self._note_question_selected(question.id)
 
         # T7.21 (EVAL-3d, ADR-0010): the host tracks the fetch coverage
         # of the sources the QUESTION names (§3.7, §5.4, §11.2 — the
@@ -1189,6 +1225,7 @@ class Orchestrator:
         )
         record = None
         try:
+            self._note_model_call()
             async with LeaseHeartbeatGuard(self.lease, db, session.id, self.node_owner):
                 response, record = await self.gateway.chat(
                     system=extractor.text,
@@ -1535,6 +1572,7 @@ class Orchestrator:
         )
         record = None
         try:
+            self._note_model_call()
             async with LeaseHeartbeatGuard(self.lease, db, session.id, self.node_owner):
                 response, record = await self.gateway.chat(
                     system=verifier.text,
@@ -1673,6 +1711,7 @@ class Orchestrator:
         )
         record = None
         try:
+            self._note_model_call()
             async with LeaseHeartbeatGuard(self.lease, db, session.id, self.node_owner):
                 response, record = await self.gateway.chat(
                     system=planner.text,
@@ -1865,6 +1904,7 @@ class Orchestrator:
             try:
                 # T3.30: renew the lease in the background while the model
                 # call is in flight (§5.2.3: TTL = several heartbeat intervals)
+                self._note_model_call()
                 async with LeaseHeartbeatGuard(lease, db, session.id, self.node_owner):
                     response, record = await self.gateway.chat(
                         system=explorer.text,
@@ -2198,6 +2238,8 @@ class Orchestrator:
                 },
                 public_summary=f"action: {tool_name}",
             )
+            # T7.132: инструмент исполняется (аудит фазы 1 откатится вместе с ней, счётчик — нет).
+            self._note_tool_call()
             # T7.12: count the execution so a later identical call is denied
             tool_call_counts[rep_key] = rep_count + 1
 
@@ -3985,6 +4027,7 @@ class Orchestrator:
         метод, поэтому учитываются одинаково; ошибки не обрабатываются здесь —
         маркер аудита для каждой ошибки выбирает вызывающий код.
         """
+        self._note_model_call()
         async with LeaseHeartbeatGuard(self.lease, db, session.id, self.node_owner):
             proposal, record = await self.gateway.chat(
                 system=curator.text,
@@ -4157,6 +4200,99 @@ class Orchestrator:
         if closer is None:
             return
         await closer()
+
+    # ── T7.132: долговечный след неудачной попытки (§5.2.2, §6.7) ─────────
+
+    def _note_model_call(self) -> None:
+        """Счётчик вызовов модели текущей попытки (no-op вне фазы 1)."""
+        if self._attempt_trace is not None:
+            self._attempt_trace.note_model_call()
+
+    def _note_tool_call(self) -> None:
+        """Счётчик исполненных инструментов текущей попытки (no-op вне фазы 1)."""
+        if self._attempt_trace is not None:
+            self._attempt_trace.note_tool_call()
+
+    def _note_question_selected(self, question_id: uuid.UUID) -> None:
+        """Вопрос выбран — он переживёт откат фазы 1 только в следе (no-op вне фазы 1)."""
+        if self._attempt_trace is not None:
+            self._attempt_trace.note_question(question_id)
+
+    async def _record_unrecorded_attempt(self, trace: AttemptTrace, exc: BaseException) -> None:
+        """T7.132: след попытки, у которой не осталось строки `sessions` + строка в журнале процесса.
+
+        Порядок такой именно потому, что журнал — единственное, что было у попытки 22.10 (и то не
+        было: исключение осело только в памяти веб-процесса):
+
+        1. журнал процесса пишется ВСЕГДА и первым — если база лежит, след в ней поставить нельзя,
+           а_operator должен увидеть отказ хотя бы в логе;
+        2. долговечный след пишется ОТДЕЛЬНОЙ КОРОТКОЙ транзакцией (`self.session_factory()`), а не
+           той, что откатилась: иначе он делил бы судьбу фазы 1 — ровно та причина, по которой
+           случай 22.10 не нашёл ничего;
+        3. сначала проверяется, не появилась ли строка сессии: если фаза 1 всё-таки дошла до
+           COMMIT (исключение уже ПОСЛЕ фиксации, исход неизвестен), ложный failure писать
+           нельзя (§3 «Reconciliation», §5.2.2) — исход решает реконсиляция;
+        4. дублирования нет: там, где сессия сама честно записала `SESSION_FAILED` и зафиксировала
+           строку (`no_question`, отказ куратора, сбой коммита), строка есть и след не пишется.
+
+        След НИКОГДА не подменяет исходный отказ: собственная ошибка записи только логируется, а
+        исходное исключение уходит выше. Типы событий — существующие: `SESSION_CANCELLED` при
+        отмене и `SESSION_FAILED` при исключении (§6.7); отличительный ключ payload —
+        `unrecorded_attempt`.
+        """
+        cancelled = isinstance(exc, asyncio.CancelledError)
+        payload = build_attempt_trace_payload(trace, error=exc, cancelled=cancelled)
+        summary = trace_public_summary(payload)
+        if cancelled:
+            logger.warning(
+                "сессия %s отменена до фиксации строки (вызовов модели=%s, инструментов=%s): %s\n%s",
+                trace.session_id,
+                trace.model_calls,
+                trace.tool_calls,
+                summary,
+                format_exception_redacted(exc),
+            )
+        else:
+            # traceback — вычищенный (см. failed_attempt.format_exception_redacted): `exc_info`
+            # напечатал бы текст исключения как есть, а в нём живут заголовки авторизации шлюза.
+            logger.error(
+                "сессия %s сорвана до фиксации строки (вызовов модели=%s, инструментов=%s): %s\n%s",
+                trace.session_id,
+                trace.model_calls,
+                trace.tool_calls,
+                summary,
+                format_exception_redacted(exc),
+            )
+        try:
+            async with self.session_factory() as db, transaction(db):
+                committed = (
+                    await db.execute(
+                        text("SELECT 1 FROM sessions WHERE id = :id"),
+                        {"id": trace.session_id},
+                    )
+                ).first()
+                if committed is not None:
+                    # COMMIT фазы 1 всё-таки прошёл: это НЕ «попытка без строки», а неизвестный
+                    # исход фиксации — его разбирает реконсиляция (§5.2.2), след не нужен.
+                    logger.info(
+                        "T7.132: след не записан: строка сессии %s зафиксирована; исход решает "
+                        "реконсиляция (%s)",
+                        trace.session_id,
+                        summary,
+                    )
+                    return
+                await AuditService(db).record(
+                    trace_event_type(cancelled=cancelled),
+                    session_id=None,
+                    payload=payload,
+                    actor=self.node_owner,
+                    public_summary=summary,
+                )
+        except Exception:
+            # журнал — единственное, что остаётся, если не удалось записать и след
+            logger.exception(
+                "T7.132: след неудачной попытки %s не записан: %s", trace.session_id, summary
+            )
 
     async def _release_session_admission(self, session_id: uuid.UUID) -> None:
         """T7.20 (ADR-0009): drop the admission record when phase 1 ends

@@ -51,6 +51,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
+from apps.orchestrator.failed_attempt import TRACE_MARKER, format_exception_redacted
 from apps.orchestrator.node_guard import NodeSessionGuard, NodeSessionGuardError
 from apps.orchestrator.orchestrator import Orchestrator, SessionOutcome
 from apps.orchestrator.scheduler import (
@@ -1416,6 +1417,56 @@ async def _save_node_state(db: AsyncSession, state: str) -> None:
     await db.flush()
 
 
+#: Типы существующих событий, которыми оркестратор оставляет след попытки без строки `sessions`
+#: (T7.132, apps/orchestrator/failed_attempt.py). Нового AuditEventType нет.
+_UNRECORDED_ATTEMPT_EVENT_TYPES = ("session_failed", "session_cancelled")
+
+
+async def last_unrecorded_attempt(db: AsyncSession) -> JsonDict | None:
+    """Последняя неудачная ПОПЫТКА сессии, не оставившая строки `sessions` (T7.132).
+
+    Читается из БД, а не из памяти процесса: `node.last_error` живёт до рестарта веб-сервиса,
+    а оператор должен видеть причину и после него. Отличие от честного терминального события
+    сессии — ключ payload `unrecorded_attempt` (у честных событий его нет).
+    """
+    placeholders = ", ".join(f":t{i}" for i in range(len(_UNRECORDED_ATTEMPT_EVENT_TYPES)))
+    params: JsonDict = {f"t{i}": value for i, value in enumerate(_UNRECORDED_ATTEMPT_EVENT_TYPES)}
+    params["marker"] = TRACE_MARKER
+    row = (
+        (
+            await db.execute(
+                text(
+                    "SELECT type, occurred_at, sequence, payload FROM audit_events "
+                    f"WHERE type IN ({placeholders}) "
+                    "AND payload ->> :marker = 'true' "
+                    "ORDER BY occurred_at DESC, sequence DESC LIMIT 1"
+                ),
+                params,
+            )
+        )
+        .mappings()
+        .first()
+    )
+    if row is None:
+        return None
+    payload = row["payload"] if isinstance(row["payload"], dict) else {}
+    return {
+        "event_type": row["type"],
+        "occurred_at": row["occurred_at"].isoformat(),
+        "error_class": payload.get("error_class"),
+        "error": payload.get("error"),
+        "question_id": payload.get("question_id"),
+        "attempt_session_id": payload.get("attempt_session_id"),
+        "cancelled": payload.get("cancelled"),
+        "model_calls": payload.get("model_calls"),
+        "tool_calls": payload.get("tool_calls"),
+        "attempt_started_at": payload.get("attempt_started_at"),
+        "attempt_finished_at": payload.get("attempt_finished_at"),
+        "attempt_duration_seconds": payload.get("attempt_duration_seconds"),
+        "node_owner": payload.get("node_owner"),
+    }
+
+
 def create_app(
     db_url: str | None = None,
     orchestrator: Orchestrator | None = None,
@@ -1550,6 +1601,10 @@ def create_app(
                 "counts": counts,
                 # T3.29: wake bookkeeping (backoff/pause observability)
                 "wake": await WakeScheduler(db, node_owner=_node_owner, data_root=_data_root).status(),
+                # T7.132: последняя неудачная ПОПЫТКА сессии, не оставившая строки `sessions`
+                # («wake now» принят, узел работал, в базе — ничего). Читается из БД, поэтому
+                # видна и после рестарта веб-сервиса, в отличие от `last_error` выше.
+                "last_failed_attempt": await last_unrecorded_attempt(db),
             }
         # T3.20/T3.24: host status (recovery banner + warnings) is a host
         # view, not a DB query — it must survive a DB outage (fail-closed)
@@ -1812,8 +1867,26 @@ def create_app(
         # session and set the resulting node state.
         if task.cancelled():
             final_state = "cancelled"
+            # T7.132: раньше отмена задачи уходит молча — в журнале веб-процесса не оставалось
+            # ни строки, ни исключения. Теперь журнал есть всегда, а долговечный след пишет
+            # оркестратор отдельной транзакцией (`unrecorded_attempt` в payload события).
+            logger.warning(
+                "wake_now: задача сессии отменена (остановка процесса?) — попытка могла не "
+                "оставить строки sessions; след ищет оператор: audit_events, "
+                "payload->>'unrecorded_attempt' = 'true'"
+            )
         elif task.exception() is not None:
+            exc = task.exception()
             final_state = "failed"
+            # traceback печатается ЗАМАЛЧЕННЫМ: `exc_info` вывел бы текст исключения как есть,
+            # а в нём живут заголовки авторизации шлюза (T7.132, часть 2, пункт «д»).
+            logger.error(
+                "wake_now: задача сессии завершилась исключением %s — узел честно вернулся в idle, "
+                "но оператор видит причину из журнала аудита (след unrecorded_attempt), а не только "
+                "из памяти этого процесса\n%s",
+                type(exc).__name__ if exc is not None else "Unknown",
+                format_exception_redacted(exc) if exc is not None else "",
+            )
         else:
             final_state = task.result().final_state.value
         async with factory() as db:
