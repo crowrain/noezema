@@ -72,7 +72,7 @@ def live_fetch(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(svc, "FetchClient", FakeFetchClient)
 
 VALUE_SCHEMA = "host-value-attribution-v1"
-CURRENT_VALUE_METHOD = "host-value-attribution-v17"
+CURRENT_VALUE_METHOD = "host-value-attribution-v18"
 
 COUNT_TABLES = (
     "sources",

@@ -1,6 +1,6 @@
 """Unit: T7.129a (часть 3, ADR-0029 §26.3) — пятый режим «утверждение называет производителя».
 
-Метод `host-value-attribution-v17`: производителем значения считается тот, кого назвало САМО
+Метод `host-value-attribution-v18`: производителем значения считается тот, кого назвало САМО
 утверждение, если страница это имя у значения не называет. Правила закрытые: имена только из
 `PRIMARY_SOURCES`, шаблоны утверждения — закрытый список из четырёх (см.
 `STATEMENT_PRODUCER_TEMPLATES`), значение ищется тем же сравнением, что гейт «значение на связи»
@@ -350,7 +350,7 @@ def test_new_pairing_record_survives_build_scope_and_parse_roundtrip() -> None:
     parsed = parse_value_attribution(scope)
     assert parsed == record
     assert parsed is not None and parsed.pairing == VALUE_ATTRIBUTION_PAIRING_STATEMENT_NAMES_PRODUCER
-    assert parsed.method == VALUE_ATTRIBUTION_METHOD_VERSION == "host-value-attribution-v17"
+    assert parsed.method == VALUE_ATTRIBUTION_METHOD_VERSION == "host-value-attribution-v18"
     assert parsed.parent_source_id == parent_source_id
     assert parsed.basis_fragment == record.basis_fragment
     assert VALUE_ATTRIBUTION_PAIRING_STATEMENT_NAMES_PRODUCER in VALUE_ATTRIBUTION_PAIRINGS

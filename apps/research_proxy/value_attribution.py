@@ -281,7 +281,12 @@ from packages.memory.scope import (
 #: детектора — словарь здесь не менялся). Решения v16 отличаются от решений v17 → переатрибуция
 #: пересматривает записи эпохи v16 (стенд `.92` на сборке `686d1e8-v29`: утверждения 060d979a,
 #: 738548ca, a7cac406 и b262da08 получают записи пересказов своих производителей).
-VALUE_ATTRIBUTION_METHOD_VERSION: Final = "host-value-attribution-v17"
+#: Решения v17 отличаются от решений v18 двумя правками T7.130 (ADR-0029 §27): (а) утверждение,
+#: называющее P издателем опроса, больше не попадает под исключение (г) «прогноз с другим автором»
+#: (стенд `363be67-v29`: 4adb10fe «7,1% по данным макроэкономического опроса Банка России» на
+#: sbercib.ru), и (б) вето собственной оценки смотрит на ЧИСЛО маркера, а не только на его
+#: соседство со значением утверждения. Страничный детектор не тронут и здесь.
+VALUE_ATTRIBUTION_METHOD_VERSION: Final = "host-value-attribution-v18"
 
 #: честный отказ этого детектора: первоисточник в основании назван, но значение там другое — не то,
 #: на котором стоит утверждение. Отличие от `no_value_attribution` (атрибуции нет вовсе) нужно,
@@ -1083,8 +1088,32 @@ def _measured_value_spans(text: str, match_values: frozenset[str]) -> list[tuple
     return spans
 
 
+def _marker_attaches_to_other_number(
+    *,
+    marker: tuple[int, int],
+    value: tuple[int, int],
+    other_spans: tuple[tuple[int, int], ...],
+) -> bool:
+    """T7.130 (часть 3б, ADR-0029 §27): маркер собственной оценки относится к ДРУГОМУ числу.
+
+    Собственная оценка отвечает на вопрос «чьё это число» только тогда, когда она стоит у СВОЕГО
+    числа. Если к маркеру ближе измеренное число, НЕ входящее в значения утверждения
+    («…что выше оценки SberCIB (6,8%)» рядом с 7,1%), маркер описывает чужую цифру, а не значение
+    утверждения, и вето не даёт. Равные расстояния решают в пользу вето (строгий `<`): сомнение
+    толкуется против автоматической склейки. Своего числа у маркера нет — решает прежнее правило
+    окрестности (T7.113)."""
+    def gap(span: tuple[int, int]) -> int:
+        return max(0, span[0] - marker[1], marker[0] - span[1])
+
+    return any(gap(span) < gap(value) for span in other_spans)
+
+
 def _own_assessment_veto(
-    *, scanned: str, masked: str, match_values: frozenset[str]
+    *,
+    scanned: str,
+    masked: str,
+    match_values: frozenset[str],
+    by_own_number: bool = False,
 ) -> bool:
     """T7.113 (часть а, ADR-0029 дополнение): вето собственной оценки — окрестность значения.
 
@@ -1098,6 +1127,18 @@ def _own_assessment_veto(
     отвечают на вопрос «чьё это число» (ADR-0029 «Риски», STATUS T7.113). Настоящая оценка рядом
     с числом («по нашим расчётам … 2,2%») ветоет по-прежнему.
 
+    `by_own_number` (T7.130 часть 3б, ADR-0029 §27) — только для пятого режима «утверждение
+    называет производителя»: маркер выбывает из окрестности значения, если его собственное число —
+    ДРУГОЕ измеренное число, стоящее к маркеру ближе (`_marker_attaches_to_other_number`).
+    «…и оценки SberCIB (6,8%)» в одном предложении с 7,1% — это оценка чужого прогноза, а не отказ
+    признавать 7,1% чужим значением. Остальные режимы (строгая пара, окно публикации,
+    библиография) флаг не включают: их поведение T7.78…T7.120 сохранено без изменений.
+
+    Дополнение T7.130 (часть 3б): из окрестности значения маркер выбывает, если его собственное
+    число — ДРУГОЕ измеренное число страницы, стоящее к маркеру ближе (`_marker_attaches_to_other_
+    number`): «оценки SberCIB (6,8%)» в одном предложении с 7,1% — это оценка чужого прогноза, а не
+    отказ признавать 7,1 чужим значением.
+
     Утверждение без измеренного значения: вето по всему основанию, как прежде (окрестностей нет,
     проверять «рядом с чем» нечего — поведение T7.78…T7.107 сохранено целиком). Значение есть у
     утверждения, но его нет на странице: вето молчит — отказ назовёт pairing (значения на
@@ -1108,9 +1149,24 @@ def _own_assessment_veto(
     spans = _measured_value_spans(scanned, match_values)
     if not spans:
         return False
+    other_spans: tuple[tuple[int, int], ...] = ()
+    if by_own_number:
+        other_spans = tuple(
+            (start, end)
+            for start, end, tokens in _measured_spans(scanned)
+            if not tokens & match_values
+        )
     return any(
         match.start() < end + OWN_ASSESSMENT_PROXIMITY_CHARS
         and match.end() > start - OWN_ASSESSMENT_PROXIMITY_CHARS
+        and not (
+            by_own_number
+            and _marker_attaches_to_other_number(
+                marker=(match.start(), match.end()),
+                value=(start, end),
+                other_spans=other_spans,
+            )
+        )
         for pattern in _OWN_ASSESSMENT
         for match in pattern.finditer(masked)
         for start, end in spans
@@ -2105,6 +2161,36 @@ def _statement_named_producer_keys(scanned_statement: str) -> frozenset[str]:
     return frozenset(named)
 
 
+#: закрытый список шаблонов «P — ИЗДАТЕЛЬ опроса» (T7.130 часть 3а, ADR-0029 §27): случай, когда
+#: исключение (г) «прогноз с другим автором» не применяется. Консенсус-прогноз, собранный
+#: ведомством по его же опросу, — публикация ведомства: «аналитики» в такой формулировке — респонденты
+#: опроса P, а не другой автор прогноза. Имена — только алиасы записей `PRIMARY_SOURCES`, форма —
+#: закрытая (новые формы добавляются только решением пользователя, как словарь первоисточников).
+SURVEY_PUBLISHER_TEMPLATES: Final[tuple[str, ...]] = (
+    # «по данным … опроса P» / «по данным макроэкономического обследования P»
+    r"по\s+данным[^.!?\n]{0,40}(?:опрос[а-яё]*|обследован[а-яё]*)[^.!?\n]{0,40}{name}",
+    # «консенсус-прогноз … опроса P» (тот же случай без «по данным»)
+    r"(?:консенсус[-\s]прогноз|прогноз|оценк[а-яё]*)[^.!?\n]{0,40}(?:опрос[а-яё]*|обследован[а-яё]*)[^.!?\n]{0,40}{name}",
+    # «опрошенные P аналитики»
+    r"опрошенн[а-яё]*[^.!?\n]{0,40}{name}",
+)
+
+
+def _survey_publisher_templates(key: str) -> tuple[re.Pattern[str], ...]:
+    """Шаблоны «издатель опроса», собранные под алиасы одной записи словаря."""
+    _spec, patterns = _ALIASES[key]
+    name = "(?:" + "|".join(f"(?:{pattern.pattern})" for pattern in patterns) + ")"
+    return tuple(
+        re.compile(template.replace("{name}", name), re.IGNORECASE)
+        for template in SURVEY_PUBLISHER_TEMPLATES
+    )
+
+
+def _statement_names_producer_as_survey_publisher(scanned_statement: str, key: str) -> bool:
+    """Названо ли P издателем опроса, чей консенсус-прогноз стоит в утверждении (T7.130, 3а)."""
+    return any(pattern.search(scanned_statement) for pattern in _survey_publisher_templates(key))
+
+
 def _other_forecast_author(scanned_statement: str) -> bool:
     """Исключение (г): утверждение с горизонтом и другим автором прогноза.
 
@@ -2235,20 +2321,27 @@ def _statement_names_producer_decision(
         scanned=scanned_statement,
         masked=_mask_site_disclaimers(scanned_statement),
         match_values=match_values,
+        by_own_number=True,
     ):
         # (а) рядом со значением в самом утверждении стоит собственная оценка — производитель
-        # утверждения не назван, и v17 не о чём говорить
+        # утверждения не назван, и v17 не о чём говорить (T7.130: маркер у другого числа не ветоет)
         return None
     if _own_assessment_veto(
         scanned=scanned_page,
         masked=_mask_site_disclaimers(scanned_page),
         match_values=match_values,
+        by_own_number=True,
     ):
         # (в) собственная оценка другого актора ближе к значению страницы, чем названный
         # производитель: тот же критерий окрестности, что у строгой ветки и bibliography
         return None
-    if _other_forecast_author(scanned_statement):
-        return None  # (г) прогноз с другим автором
+    if _other_forecast_author(scanned_statement) and not _statement_names_producer_as_survey_publisher(
+        scanned_statement, root
+    ):
+        # (г) прогноз с другим автором. T7.130 (часть 3а): если утверждение называет P издателем
+        # опроса («по данным … опроса Банка России», «опрошенные Банком России аналитики»),
+        # «другого автора» нет — аналитики есть респонденты опроса P, а P есть публикатор значения
+        return None
     # (д) значение обязано стоять на странице — тем же сравнением, что гейт «значение на связи»
     ranges = claim_range_tokens(match_values)
     singles = (match_values - ranges) | bare_values

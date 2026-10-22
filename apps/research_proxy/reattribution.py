@@ -236,10 +236,12 @@ async def _candidates(db: AsyncSession, since: datetime) -> list[dict[str, Any]]
 async def _operator_corrected_source_ids(db: AsyncSession) -> frozenset[uuid.UUID]:
     """Источники, которых касается действующая коррекция оператора (ADR-0031).
 
-    Строка `source_graph_corrections` — решение оператора о графе независимости, а не гипотеза
-    детектора: переатрибуция обязана оставить в покое и источник, и улики на нём (на стенде это
-    пара nbj → sbercib по утверждению c970bc08). Молча перерешить такой источник — значит отменить
-    решение оператора без журнала."""
+    Строка `source_graph_corrections` — решение оператора о ГРАФЕ независимости, а не гипотеза
+    детектора. Страничный указатель `sources.parent_source_id` — свойство страницы, общее для всех
+    утверждений, поэтому он остаётся замороженным для источника целиком (на стенде это пара
+    nbj → sbercib по утверждению c970bc08). Улики замораживаются строже и уже ПО УТВЕРЖДЕНИЮ:
+    спор поднимается на конкретном утверждении, и чужое решение оператора эта улика не касается —
+    см. `_operator_claim_locks` (T7.130, ADR-0031 дополнение)."""
     rows = (
         (
             await db.execute(
@@ -257,6 +259,90 @@ async def _operator_corrected_source_ids(db: AsyncSession) -> frozenset[uuid.UUI
         .all()
     )
     return frozenset(row for row in rows if isinstance(row, uuid.UUID))
+
+
+@dataclass(frozen=True)
+class _OperatorLocks:
+    """Блокировка улик по ADR-0031 (T7.130): пары (утверждение, источник) и источники без связи.
+
+    `claims` — пары, которых касается действующая коррекция оператора; `unlinked` — источники
+    коррекций, чьё утверждение не читается (нет события-причины или в нём нет `claim_id`). Для
+    вторых сохраняется прежнее поведение — источник заморожен для ВСЕХ утверждений (fail-closed:
+    ничего не ослабляется там, где связь не доказана)."""
+
+    claims: frozenset[tuple[uuid.UUID, uuid.UUID]]
+    unlinked: frozenset[uuid.UUID]
+
+    def blocks(self, *, claim_id: uuid.UUID, source_id: uuid.UUID) -> bool:
+        return source_id in self.unlinked or (claim_id, source_id) in self.claims
+
+
+#: ссылка коррекции на событие-причину: спор пишет `operator_command_received` с `claim_id`
+#: в payload и кладёт его id в `source_graph_corrections.reason_audit_event_id`
+#: (`packages/memory/dispute.py`, при повторе спора ссылка переустанавливается). Это и есть связь
+#: коррекции с утверждением — без новых таблиц, колонок и типов журнала (СТОП T7.130 не сработал).
+OPERATOR_CORRECTION_CLAIM_KEY: Final = "claim_id"
+
+
+async def _operator_claim_locks(db: AsyncSession) -> _OperatorLocks:
+    """Пары (утверждение, источник) под блокировкой ADR-0031 и источники без связи с утверждением."""
+    rows = (
+        (
+            await db.execute(
+                text(
+                    "SELECT side.source_id AS source_id, "
+                    "  ae.payload ->> :claim_key AS claim_id "
+                    "FROM source_graph_corrections c "
+                    "  CROSS JOIN LATERAL (VALUES (c.from_source_id), (c.to_source_id)) "
+                    "    AS side(source_id) "
+                    "  LEFT JOIN audit_events ae ON ae.id = c.reason_audit_event_id "
+                    "WHERE c.valid AND c.actor LIKE :prefix"
+                ),
+                {"prefix": f"{OPERATOR_ACTOR_PREFIX}%", "claim_key": OPERATOR_CORRECTION_CLAIM_KEY},
+            )
+        )
+        .mappings()
+        .all()
+    )
+    claims: set[tuple[uuid.UUID, uuid.UUID]] = set()
+    unlinked: set[uuid.UUID] = set()
+    for row in rows:
+        source_id = row["source_id"]
+        if not isinstance(source_id, uuid.UUID):
+            continue
+        try:
+            claim_id = uuid.UUID(str(row["claim_id"] or ""))
+        except ValueError:
+            unlinked.add(source_id)  # связь не читается — морозим источник для всех утверждений
+            continue
+        claims.add((claim_id, source_id))
+    return _OperatorLocks(claims=frozenset(claims), unlinked=frozenset(unlinked))
+
+
+def _operator_guard(claim_id: uuid.UUID) -> str:
+    """SQL-предзащита ADR-0031 для одной улики (T7.130).
+
+    Не писать, если источник заморожен коррекцией оператора ИМЕННО этого утверждения либо
+    коррекцией, чьё утверждение не читается (`ae.id IS NULL`, пустой `claim_id`). Коррекция другого
+    утверждения запись не блокирует: перешагивать своё решение оператора автоматический прогон
+    не вправе, чужое — не перешагивает, потому что оно к этой улике не относится."""
+    return (
+        "  AND NOT EXISTS (SELECT 1 FROM source_graph_corrections c "
+        "      LEFT JOIN audit_events ae ON ae.id = c.reason_audit_event_id "
+        "      WHERE c.valid AND c.actor LIKE :prefix "
+        "        AND (c.from_source_id = :sid OR c.to_source_id = :sid) "
+        "        AND (ae.id IS NULL OR COALESCE(ae.payload ->> :claim_key, '') = '' "
+        "             OR ae.payload ->> :claim_key = :claim))"
+    )
+
+
+def _operator_guard_params(claim_id: uuid.UUID) -> dict[str, Any]:
+    """Параметры предзащиты: payload хранит `claim_id` строкой, поэтому сравнение текстовое."""
+    return {
+        "prefix": f"{OPERATOR_ACTOR_PREFIX}%",
+        "claim_key": OPERATOR_CORRECTION_CLAIM_KEY,
+        "claim": str(claim_id),
+    }
 
 
 async def _current_state(db: AsyncSession, source_id: uuid.UUID) -> dict[str, Any] | None:
@@ -872,7 +958,9 @@ async def _plan_evidence_window(
     shas = await _read_pages(db, since)
     content_types = await _source_content_types(db, set(shas))
     texts, missing = await _open_pages(store, shas, content_types)
-    corrected = await _operator_corrected_source_ids(db)
+    # T7.130 (ADR-0031 дополнение): улики заморожены только там, где спор оператора касается ИМЕННО
+    # этого утверждения; тот же источник под коррекцией другого утверждения переатрибуцируется
+    locks = await _operator_claim_locks(db)
 
     for source_id in sorted(texts):
         page_text = texts[source_id]
@@ -907,7 +995,7 @@ async def _plan_evidence_window(
                 if recorded_self_method
                 else NO_DECISION_YET
             )
-            if source_id in corrected:
+            if locks.blocks(claim_id=uuid.UUID(claim_id), source_id=source_id):
                 rows.append(
                     EvidenceAttributionRow(
                         claim_id=claim_id,
@@ -1226,16 +1314,14 @@ async def reattribute_evidence_window(
                                 "SELECT id FROM evidence WHERE id = :id AND source_id = :sid "
                                 "  AND jsonb_typeof(scope -> 'value_attribution') IS NULL "
                                 "  AND COALESCE(scope -> 'value_self_publication' ->> 'method', '') <> :method "
-                                "  AND NOT EXISTS (SELECT 1 FROM source_graph_corrections c "
-                                "      WHERE c.valid AND c.actor LIKE :prefix "
-                                "        AND (c.from_source_id = :sid OR c.to_source_id = :sid)) "
-                                "FOR UPDATE"
+                                + _operator_guard(item.claim_id)
+                                + "FOR UPDATE"
                             ),
                             {
                                 "id": item.evidence_id,
                                 "sid": item.source_id,
                                 "method": CURRENT_VALUE_METHOD_VERSION,
-                                "prefix": f"{OPERATOR_ACTOR_PREFIX}%",
+                                **_operator_guard_params(item.claim_id),
                             },
                         )
                     )
@@ -1284,16 +1370,14 @@ async def reattribute_evidence_window(
                                 "SELECT id FROM evidence WHERE id = :id AND source_id = :sid "
                                 "  AND jsonb_typeof(scope -> 'value_attribution') IS NOT NULL "
                                 "  AND COALESCE(scope -> 'value_attribution' ->> 'method', '') <> :method "
-                                "  AND NOT EXISTS (SELECT 1 FROM source_graph_corrections c "
-                                "      WHERE c.valid AND c.actor LIKE :prefix "
-                                "        AND (c.from_source_id = :sid OR c.to_source_id = :sid)) "
-                                "FOR UPDATE"
+                                + _operator_guard(item.claim_id)
+                                + "FOR UPDATE"
                             ),
                             {
                                 "id": item.evidence_id,
                                 "sid": item.source_id,
                                 "method": CURRENT_VALUE_METHOD_VERSION,
-                                "prefix": f"{OPERATOR_ACTOR_PREFIX}%",
+                                **_operator_guard_params(item.claim_id),
                             },
                         )
                     )
@@ -1334,16 +1418,14 @@ async def reattribute_evidence_window(
                             "FROM evidence WHERE id = :id AND source_id = :sid "
                             "  AND (jsonb_typeof(scope -> 'value_attribution') IS NULL "
                             "       OR COALESCE(scope -> 'value_attribution' ->> 'method', '') <> :method) "
-                            "  AND NOT EXISTS (SELECT 1 FROM source_graph_corrections c "
-                            "      WHERE c.valid AND c.actor LIKE :prefix "
-                            "        AND (c.from_source_id = :sid OR c.to_source_id = :sid)) "
-                            "FOR UPDATE"
+                            + _operator_guard(item.claim_id)
+                            + "FOR UPDATE"
                         ),
                         {
                             "id": item.evidence_id,
                             "sid": item.source_id,
                             "method": CURRENT_VALUE_METHOD_VERSION,
-                            "prefix": f"{OPERATOR_ACTOR_PREFIX}%",
+                            **_operator_guard_params(item.claim_id),
                         },
                     )
                 )

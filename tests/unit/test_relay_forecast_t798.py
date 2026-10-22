@@ -256,4 +256,4 @@ def test_relay_is_forecast_specific_no_forecast_word_no_candidate() -> None:
 
 def test_method_versions_bumped_for_reattribution_window() -> None:
     assert ATTRIBUTION_METHOD_VERSION == "host-source-attribution-v10"
-    assert VALUE_ATTRIBUTION_METHOD_VERSION == "host-value-attribution-v17"
+    assert VALUE_ATTRIBUTION_METHOD_VERSION == "host-value-attribution-v18"

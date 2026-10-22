@@ -199,5 +199,5 @@ def test_nearest_mode_single_claim_vs_range_end_no_longer_glues() -> None:
 
 
 def test_versions_after_t7109a() -> None:
-    assert VALUE_ATTRIBUTION_METHOD_VERSION == "host-value-attribution-v17"
+    assert VALUE_ATTRIBUTION_METHOD_VERSION == "host-value-attribution-v18"
     assert ATTRIBUTION_METHOD_VERSION == "host-source-attribution-v10"

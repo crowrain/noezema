@@ -1,0 +1,191 @@
+{
+  "method_version_on_stand": "host-value-attribution-v17",
+  "run_on_stand": "363be67-v29",
+  "source_fixture_dir": "/home/denis/dsh1/fixtures-t7130 (снимок менеджера, только чтение)",
+  "cases": [
+    {
+      "claim_id": "9c43a83b-dfbb-4125-bcb8-df8685ab8583",
+      "statement": "Рост реальных заработных плат в России за январь-июль 2026 года составил 6,0% в годовом выражении (по данным Росстата).",
+      "claim_type": "temporal_fact",
+      "evidence": [
+        {
+          "evidence_id": "6892bf62-c7fa-4b30-8917-ced35a009391",
+          "source_id": "06458af5-6b9b-4e18-8aef-c29bb2ebb69b",
+          "uri": "https://www.finmarket.ru/news/6717673",
+          "domain": "finmarket.ru",
+          "page": "page-finmarket-ru-news-6717673.normalized.txt",
+          "value_attribution_on_stand": null,
+          "under_operator_correction": [
+            {
+              "correction_id": "ec30f06f-671a-4876-94c1-5b4a07477679",
+              "reason_audit_event_id": "42e02f89-0dfa-4527-9d5a-9d7f54b5933a",
+              "claim_id_in_event_payload": "738548ca"
+            },
+            {
+              "correction_id": "4d685d65-ad59-41ae-8faa-2df883ac913c",
+              "reason_audit_event_id": "29f600f7-6463-4f8a-b88c-cd28a41d6114",
+              "claim_id_in_event_payload": "738548ca"
+            }
+          ]
+        },
+        {
+          "evidence_id": "ed12682b-7525-4410-986d-ec0b0646a6a1",
+          "source_id": "9a30dee3-77ea-4ab8-b42b-73ecf8324cb9",
+          "uri": "https://ria.ru/20260930/zarplaty-2121304415.html",
+          "domain": "ria.ru",
+          "page": null,
+          "value_attribution_on_stand": {
+            "method": "host-value-attribution-v17",
+            "schema": "host-value-attribution-v1",
+            "pairing": "statement_names_producer",
+            "primary_key": "rosstat",
+            "primary_uri": "https://rosstat.gov.ru/",
+            "primary_name": "Росстат",
+            "basis_fragment": "средняя начисленная заработная плата, скорректированная на уровень инфляции. По итогам января-июля реальные зарплаты в России выросли на 6% в годовом выражении. При этом среднемесячная начисленная заработная плата работников организаций в июле составила 109,5 тысячи рублей и по сравнению с соотве",
+            "parent_source_id": "8a812953-df23-408f-9267-46072bca3dc3"
+          },
+          "under_operator_correction": [
+            {
+              "correction_id": "4d685d65-ad59-41ae-8faa-2df883ac913c",
+              "reason_audit_event_id": "29f600f7-6463-4f8a-b88c-cd28a41d6114",
+              "claim_id_in_event_payload": "738548ca"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "claim_id": "738548ca-df21-48f7-a99c-b382a9149992",
+      "statement": "Рост реальных заработных плат в России в июле 2026 года составил 3,3% в годовом выражении (по данным Росстата).",
+      "claim_type": "temporal_fact",
+      "evidence": [
+        {
+          "evidence_id": "c77323ce-523c-4c8f-9ea1-783f4b932fd3",
+          "source_id": "06458af5-6b9b-4e18-8aef-c29bb2ebb69b",
+          "uri": "https://www.finmarket.ru/news/6717673",
+          "domain": "finmarket.ru",
+          "page": "page-finmarket-ru-news-6717673.normalized.txt",
+          "value_attribution_on_stand": {
+            "method": "host-value-attribution-v16",
+            "schema": "host-value-attribution-v1",
+            "pairing": "value_and_primary_in_fragment",
+            "primary_key": "rosstat",
+            "primary_uri": "https://rosstat.gov.ru/",
+            "primary_name": "Росстат",
+            "basis_fragment": "RU - Рост реального размера (с поправкой на инфляцию) заработной платы в РФ в июле 2026 года составил 3,3% в годовом выражении после 3,4% в июне, 4,5% в мае, 5,1% в апреле, 8,1% в марте, 8,6% в феврале, также 8,6% в январе, сообщил в среду Росстат",
+            "parent_source_id": "9ce9b6b2-8560-4b53-8d1a-0c8bd6b21501"
+          },
+          "under_operator_correction": [
+            {
+              "correction_id": "ec30f06f-671a-4876-94c1-5b4a07477679",
+              "reason_audit_event_id": "42e02f89-0dfa-4527-9d5a-9d7f54b5933a",
+              "claim_id_in_event_payload": "738548ca"
+            },
+            {
+              "correction_id": "4d685d65-ad59-41ae-8faa-2df883ac913c",
+              "reason_audit_event_id": "29f600f7-6463-4f8a-b88c-cd28a41d6114",
+              "claim_id_in_event_payload": "738548ca"
+            }
+          ]
+        },
+        {
+          "evidence_id": "c7d4fecc-5518-491c-88fa-0a28f935e2f4",
+          "source_id": "878b0fac-ebe6-4aa2-9e6f-e21d4894e6ee",
+          "uri": "https://www.sberbank.ru/common/img/uploaded/news/2026/cmi/termometr_trud.html",
+          "domain": "sberbank.ru",
+          "page": null,
+          "value_attribution_on_stand": null,
+          "under_operator_correction": [
+            {
+              "correction_id": "ec30f06f-671a-4876-94c1-5b4a07477679",
+              "reason_audit_event_id": "42e02f89-0dfa-4527-9d5a-9d7f54b5933a",
+              "claim_id_in_event_payload": "738548ca"
+            }
+          ]
+        },
+        {
+          "evidence_id": "64f4fbd8-8735-431d-9c11-344ca2e2ca39",
+          "source_id": "9a30dee3-77ea-4ab8-b42b-73ecf8324cb9",
+          "uri": "https://ria.ru/20260930/zarplaty-2121304415.html",
+          "domain": "ria.ru",
+          "page": null,
+          "value_attribution_on_stand": {
+            "method": "host-value-attribution-v17",
+            "schema": "host-value-attribution-v1",
+            "pairing": "statement_names_producer",
+            "primary_key": "rosstat",
+            "primary_uri": "https://rosstat.gov.ru/",
+            "primary_name": "Росстат",
+            "basis_fragment": "елигия Спорт 19:10 30.09.2026 Реальные зарплаты в России в июле выросли на 3,3 процента Росстат: реальные зарплаты в июле замедлили рост до 3,3% в годовом выражении © РИА Новости / Алексей Сухоруков Банкноты номиналом 5000 рублей © РИА Новости / Алексей Сухоруков Банкноты номиналом 5000 рублей. Архи",
+            "parent_source_id": "8a812953-df23-408f-9267-46072bca3dc3"
+          },
+          "under_operator_correction": [
+            {
+              "correction_id": "4d685d65-ad59-41ae-8faa-2df883ac913c",
+              "reason_audit_event_id": "29f600f7-6463-4f8a-b88c-cd28a41d6114",
+              "claim_id_in_event_payload": "738548ca"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "claim_id": "4adb10fe-cff1-4fae-a341-4081b4f7f5a9",
+      "statement": "Консенсус-прогноз аналитиков по годовой инфляции в России на 2026 год составляет 7,1% (по данным макроэкономического опроса Банка России за октябрь 2026 года).",
+      "claim_type": "external_fact",
+      "evidence": [
+        {
+          "evidence_id": "34ebeaec-32c0-4139-bbd7-c70720cf6a0e",
+          "source_id": "6b2a71f9-0a26-4fe9-9b74-5808ae6070c9",
+          "uri": "https://cbr.ru/statistics/ddkp/mo_br/",
+          "domain": "cbr.ru",
+          "page": null,
+          "value_attribution_on_stand": null,
+          "under_operator_correction": [
+            {
+              "correction_id": "4f01c40b-1312-4ede-be1a-6a46b3e5a0ab",
+              "reason_audit_event_id": "150c7ca4-58b8-4d1a-8e63-8ec590a19c2b",
+              "claim_id_in_event_payload": "4adb10fe"
+            },
+            {
+              "correction_id": "60978fe1-3161-486f-9c02-e8818d9b0257",
+              "reason_audit_event_id": "150c7ca4-58b8-4d1a-8e63-8ec590a19c2b",
+              "claim_id_in_event_payload": "4adb10fe"
+            }
+          ]
+        },
+        {
+          "evidence_id": "c8948515-42ba-4fd5-9f08-b6ab19bad8db",
+          "source_id": "ada80c67-a16e-4780-b72f-cbb3b68eae7a",
+          "uri": "https://sbercib.ru/publication/inflyatsiya-v-rossii-v-2026-godu-dinamika-i-prognozi",
+          "domain": "sbercib.ru",
+          "page": "page-sbercib-ru-publication-inflyatsiya-v-rossii-v-2026-godu-dinamika-i-pro.normalized.txt",
+          "value_attribution_on_stand": null,
+          "under_operator_correction": [
+            {
+              "correction_id": "60978fe1-3161-486f-9c02-e8818d9b0257",
+              "reason_audit_event_id": "150c7ca4-58b8-4d1a-8e63-8ec590a19c2b",
+              "claim_id_in_event_payload": "4adb10fe"
+            }
+          ]
+        },
+        {
+          "evidence_id": "ea5780fa-5563-4178-a9c7-0bbe94838461",
+          "source_id": "5ef6d6c1-a692-439f-8984-d30ac19679b2",
+          "uri": "https://sbercib.ru/publication/inflyatsiya-v-rossii-v-2026-godu-dinamika-i-prognozi",
+          "domain": "sbercib.ru",
+          "page": "page-sbercib-ru-publication-inflyatsiya-v-rossii-v-2026-godu-dinamika-i-pro.normalized.txt",
+          "value_attribution_on_stand": null,
+          "under_operator_correction": [
+            {
+              "correction_id": "4f01c40b-1312-4ede-be1a-6a46b3e5a0ab",
+              "reason_audit_event_id": "150c7ca4-58b8-4d1a-8e63-8ec590a19c2b",
+              "claim_id_in_event_payload": "4adb10fe"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "note": "Снимок нужен чтобы зафиксировать ПРИЧИНУ отказа, а не только решение: у обеих спорных улик в scope нет value_attribution, при этом строка sources стоит под действующей merge-коррекцией оператора. `claim_id_in_event_payload` — ссылка, из которой планировщик улик (T7.130) берёт утверждение коррекции: `source_graph_corrections.reason_audit_event_id` -> `audit_events.payload ->> 'claim_id'`; читалась со стенда только для чтения, миграции нет. Утверждение 9c43a83b стоит под коррекцией 738548ca — чужой спор не должен был держать его улики."
+}
