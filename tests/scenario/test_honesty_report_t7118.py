@@ -126,6 +126,8 @@ async def _snapshot_id(engine: AsyncEngine) -> uuid.UUID:
 async def _seed_world(engine: AsyncEngine) -> None:
     """Синтетический мир отчёта: 3 вопроса, 3 сессии, 5 источников, 6 утверждений, лента шагов."""
     snapshot = await _snapshot_id(engine)
+    # прогоны сессии S1: нужны, чтобы повесить на них действия с их собственным временем (T7.131)
+    run_explorer, run_curator = uuid.uuid4(), uuid.uuid4()
     for qid, text_value in ((Q_SALARY, SALARY_TEXT), (Q_INFLATION, INFLATION_TEXT), (Q_CONTROL, CONTROL_TEXT)):
         await _execute(
             engine,
@@ -148,8 +150,21 @@ async def _seed_world(engine: AsyncEngine) -> None:
         "output_tokens) VALUES "
         "(:t1, :s1, :u1, 'explorer', '{}', 1000, 300), (:t2, :s1, :u2, 'curator', '{}', 900, 200), "
         "(:t3, :s2, :u3, 'explorer', '{}', 400, 100)",
-        t1=uuid.uuid4(), t2=uuid.uuid4(), t3=uuid.uuid4(), s1=S1, s2=S2,
+        t1=run_explorer, t2=run_curator, t3=uuid.uuid4(), s1=S1, s2=S2,
         u1=uuid.uuid4(), u2=uuid.uuid4(), u3=uuid.uuid4(),
+    )
+    # T7.131: у сессии есть РЕАЛЬНОЕ время инструментов — 18 минут (1080 с). Строка `sessions`
+    # при этом говорит про 900 с: обе её метки проставляет фиксация длинной транзакции фазы 1
+    # (AGENTS §7), поэтому отчёт обязан брать штампы действий, а не интервал строки.
+    await _execute(
+        engine,
+        "INSERT INTO actions (id, session_id, model_run_id, idempotency_key, idempotency_class, "
+        "tool, arguments_hash, policy_decision, state, started_at, finished_at) VALUES "
+        "(:a1, :s1, :r1, 't7118-a1', 'observation', 'web.search', 'h', 'allow', 'completed', "
+        " now() - interval '34 minutes', now() - interval '20 minutes'),"
+        "(:a2, :s1, :r2, 't7118-a2', 'observation', 'research.fetch', 'h', 'allow', 'completed', "
+        " now() - interval '20 minutes', now() - interval '16 minutes')",
+        a1=uuid.uuid4(), a2=uuid.uuid4(), s1=S1, r1=run_explorer, r2=run_curator,
     )
     await _execute(
         engine,
@@ -463,7 +478,12 @@ async def test_step_counters_counted_like_the_manager_gates_count(migrated_db) -
         assert second.fetch_known_bad_host == 1  # frankmedia.example уже отказывал в S1
         assert second.fetch_fail_total == 1
         session_row = sessions[str(S1)[:8]]
-        assert session_row.duration_seconds == 900.0
+        # T7.131 «было → стало»: было 900.0 (интервал строки `sessions`: 35 минут назад —
+        # 20 минут назад), стало 1080.0 — реальное время инструментов сессии (`actions`).
+        # Метки строки проставляет фиксация длинной транзакции фазы 1, поэтому прежняя цифра
+        # была длительностью записи строки, а не работы (ловушка `created_at`, AGENTS §7).
+        assert session_row.duration_seconds == 1080.0
+        assert session_row.duration_source == "actions"
         assert session_row.model_calls == 2
         assert (session_row.input_tokens, session_row.output_tokens) == (1900, 500)
     finally:

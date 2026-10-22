@@ -9,6 +9,15 @@
 UPDATE / DELETE, ни audit-событий, ни новых типов событий (закрытый AuditEventType не
 расширяется), ни миграций.
 
+Состояние ответа вопроса (T7.131) — трёхзначное, как и карточка витрины: «Ответ есть»
+(вопрос создал, перепроверил или принял повторно хотя бы одно утверждение), «Ответ по уже
+записанным знаниям» (своих записей нет, но куратор ответа оперся на уже записанное — тот же
+смысл, что витринный `answered_from_relied`, T7.121) и «Ответ не записан». В `totals` это
+`questions_answered` (оба первых состояния) и аддитивная `questions_answered_relied_only`.
+Длительность сессии берётся из единственного стенового источника времени внутри сессии —
+штампов её инструментов (`actions`); где их нет, печатается «длительность недоступна», а не
+ложное число (см. `_session_action_span`).
+
 Слои (AGENTS §7, «packages/ не импортирует apps/»): карточные запросы `apps/web/answer.py`
 и `apps/web/knowledge.py` здесь ПОВТОРЕНЫ текстом запроса (CTE причастности утверждений,
 опорные утверждения из payload `claim_created`, причины оценок из ленты, JOIN'ы фактов
@@ -64,7 +73,7 @@ from urllib.parse import parse_qs, urlsplit
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from packages.domain.models.enums import AuditEventType
+from packages.domain.models.enums import AuditEventType, QuestionState, SessionState
 from packages.domain.sanitization import mask_nul
 from packages.memory.scope import parse_self_publication, parse_value_attribution
 from packages.memory.source_graph import load_source_graph_assembly
@@ -509,6 +518,9 @@ class ReportSession:
     started_at: str | None
     finished_at: str | None
     duration_seconds: float | None
+    #: Откуда взята длительность (T7.131): `actions` — штампы инструментов сессии
+    #: (реальное время шагов); `None` — надёжного источника нет, длительность недоступна.
+    duration_source: str | None
     model_calls: int
     input_tokens: int
     output_tokens: int
@@ -524,7 +536,14 @@ class QuestionReport:
     state_label: str
     priority: int
     created_at: str | None
-    answered: bool  # ответ есть / ответ не записан
+    answered: bool  # ответ есть (свои записи ИЛИ опора на уже записанное) / ответ не записан
+    #: Три честных состояния ответа (T7.131): `answered` | `relied_only` | `none`.
+    #: `relied_only` — тот же смысл, что витринный `answered_from_relied` (T7.121):
+    #: своих записей у ответа нет, но ответ весь состоит из уже записанного знания.
+    answer_state: str
+    #: `answer_state == "relied_only"` отдельным счётчиком: `questions_answered` считает
+    #: оба первых состояния, эта метрика отделяет «только опора» от «есть свои записи».
+    answered_relied_only: bool
     missing_sessions: bool
     sessions: list[ReportSession]
     claims: dict[str, list[ReportClaim]]  # created/reused/reverified/relied
@@ -880,6 +899,106 @@ async def _session_steps(
 # ─── карточные запросы (реплики apps/web/answer.py; поведение карточки не трогают) ──────
 
 
+#: Закрытые множества карточки (`WORKING_QUESTION_STATES`, `FAILED_SESSION_STATES` из
+#: `apps/web/answer.py`) собраны из тех же доменных enum'ов, а не переписаны текстом:
+#: `packages/` не импортирует `apps/`, но оба слоя читают один словарь домена.
+WORKING_QUESTION_STATES: Final[frozenset[str]] = frozenset(
+    {QuestionState.SELECTED.value, QuestionState.RESEARCHING.value}
+)
+FAILED_SESSION_STATES: Final[frozenset[str]] = frozenset(
+    {SessionState.FAILED.value, SessionState.CANCELLED.value}
+)
+
+#: Три честных состояния ответа (T7.131) и их человеческие подписи.
+ANSWER_STATE_LABELS: Final[dict[str, str]] = {
+    "answered": "Ответ есть",
+    "relied_only": "Ответ по уже записанным знаниям",
+    "none": "Ответ не записан",
+}
+
+#: Откуда берётся длительность сессии (T7.131): штампы инструментов этой сессии.
+DURATION_SOURCE_ACTIONS: Final = "actions"
+
+
+def is_terminal_session_state(state: object) -> bool:
+    """Терминальность состояния сессии — по перечислению домена (как карточка)."""
+    try:
+        return SessionState(str(state)).is_terminal
+    except ValueError:
+        return False
+
+
+def answer_state(
+    *,
+    has_own_answer_claims: bool,
+    relied_claim_count: int,
+    question_state: str,
+    session_states: Sequence[str],
+) -> str:
+    """Состояние ответа вопроса: `answered` | `relied_only` | `none` (T7.131).
+
+    Предикат повторяет `build_answer_result` карточки (`apps/web/answer.py`, T7.74 и
+    T7.121 часть 5): ответом считается не только записанное этим вопросом, но и
+    перепроверенное/принятое повторно (корзины created/reused/reverified), а если своих
+    записей нет, но куратор ответа оперся на уже записанное (`relied_claim_ids`), «Ответ
+    не записан» был бы неправдой — это «Ответ по уже записанным знаниям», тот же смысл,
+    что витринный `answered_from_relied`. Совпадение предикатов закреплено сценарным
+    тестом T7.131 на одной и той же записи (карточка и отчёт), а не словами.
+
+    `session_states` — состояния сессий вопроса в хронологическом порядке отчёта
+    (старшие первыми), то есть последняя сессия — последней элемент. Работа ещё идёт
+    (есть нетерминальная сессия или вопрос в рабочем состоянии) и последняя попытка
+    провалилась — состояния ответа нет: опору нечем показать.
+    """
+    if has_own_answer_claims:
+        return "answered"
+    if any(not is_terminal_session_state(state) for state in session_states):
+        return "none"
+    if str(question_state) in WORKING_QUESTION_STATES:
+        return "none"
+    latest = str(session_states[-1]) if session_states else ""
+    if latest in FAILED_SESSION_STATES:
+        return "none"
+    if session_states and relied_claim_count > 0:
+        return "relied_only"
+    return "none"
+
+
+async def _session_action_span(db: AsyncSession, session_id: uuid.UUID) -> tuple[datetime, datetime] | None:
+    """Реальный интервал работы сессии по штампам её инструментов (`actions`, T7.131).
+
+    Единственный по-настоящему стеновый (wall-clock) источник времени внутри сессии:
+    `actions.started_at` и `actions.finished_at` оркестратор пишет каждым шагом значением
+    `datetime.now(UTC)` в момент обращения к инструменту, а не временем фиксации строки.
+    Строка `sessions` и её лента штампуются временем фиксации длинной транзакции фазы 1
+    (замер контрольного прогона `.92` 22.10: сессия c2 показала 295 с вместо ≈18 минут),
+    у `model_runs` и `audit_events` одной транзакции `created_at` вообще одинаковый
+    (AGENTS §7), а журнал прокси пишется без `session_id` (T7.127). Ни одного действия со
+    штампом — надёжного источника нет: длительность не печатается числом, а честно
+    называется недоступной.
+    """
+    row = (
+        (
+            await db.execute(
+                text(
+                    "SELECT min(started_at) AS first_started,"
+                    " max(coalesce(finished_at, started_at)) AS last_finished"
+                    " FROM actions WHERE session_id = :s AND started_at IS NOT NULL"
+                ),
+                {"s": str(session_id)},
+            )
+        )
+        .mappings()
+        .first()
+    )
+    if row is None:
+        return None
+    first, last = row["first_started"], row["last_finished"]
+    if not isinstance(first, datetime) or not isinstance(last, datetime) or last < first:
+        return None
+    return first, last
+
+
 async def _sessions_of_questions(
     db: AsyncSession, question_ids: Sequence[uuid.UUID], since: datetime | None
 ) -> list[Any]:
@@ -972,7 +1091,11 @@ async def _touched_claims(
 
 async def _relied_claims(db: AsyncSession, session_ids: Sequence[uuid.UUID]) -> list[Any]:
     """Опорные утверждения — реплика `_relied_claims_rows` из `apps/web/answer.py` (T7.82):
-    payload `relied_claim_ids` события `claim_created` этих сессий."""
+    payload `relied_claim_ids` события `claim_created` этих сессий.
+
+    С T7.131 здесь тот же `JOIN claims`, что у карточки: опора считается только если строка
+    утверждения существует (карточка считает `relied_claim_count` именно так, а предикат
+    «Ответ по уже записанным знаниям» обязан совпадать с карточкой, а не быть строже)."""
     if not session_ids:
         return []
     clause, params = _in_params("s", [str(sid) for sid in session_ids])
@@ -991,6 +1114,7 @@ async def _relied_claims(db: AsyncSession, session_ids: Sequence[uuid.UUID]) -> 
                     )
                     SELECT DISTINCT claim_ref FROM ev
                     WHERE claim_ref ~* '^[0-9a-f]{{8}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{12}}$'
+                      AND EXISTS (SELECT 1 FROM claims c WHERE c.id::text = ev.claim_ref)
                     ORDER BY claim_ref
                     """
                 ),
@@ -1287,9 +1411,11 @@ async def collect_honesty_report(
                 finished_at=finished_at,
             )
             globally_bad_hosts |= bad_hosts
-            duration: float | None = None
-            if started_at is not None and finished_at is not None:
-                duration = (finished_at - started_at).total_seconds()
+            # T7.131: длительность — по реальному времени шагов сессии, а не по строке
+            # `sessions`: её `started_at`/`finished_at` штампуется фиксацией фазы 1.
+            span = await _session_action_span(db, session_id)
+            duration: float | None = (span[1] - span[0]).total_seconds() if span else None
+            duration_source: str | None = DURATION_SOURCE_ACTIONS if span else None
             calls, input_tokens, output_tokens = model_stats.get(
                 str(session_id), (0, 0, 0)
             )
@@ -1302,6 +1428,7 @@ async def collect_honesty_report(
                     started_at=_iso(started_at),
                     finished_at=_iso(finished_at),
                     duration_seconds=round(duration, 1) if duration is not None else None,
+                    duration_source=duration_source,
                     model_calls=calls,
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
@@ -1513,7 +1640,15 @@ async def collect_honesty_report(
                 )
             claims_buckets[relation] = claims
 
-        answered = any(claims_buckets[relation] for relation in ("created", "reused", "reverified"))
+        own_answer = any(claims_buckets[relation] for relation in ("created", "reused", "reverified"))
+        # T7.131: три честных состояния вместо двух. Опора на уже записанное — тоже ответ:
+        # «Ответ не записан» при work=answered_from_relied был бы неправдой (стенд c1, 22.10).
+        state_of_answer = answer_state(
+            has_own_answer_claims=own_answer,
+            relied_claim_count=len(claimed_rows),
+            question_state=str(row["state"]),
+            session_states=[session.state for session in sessions_report],
+        )
         report_questions.append(
             QuestionReport(
                 question_id=str(question_id)[:8],
@@ -1523,7 +1658,9 @@ async def collect_honesty_report(
                 state_label=_QUESTION_STATE_LABELS.get(str(row["state"]), str(row["state"])),
                 priority=int(row["priority"]),
                 created_at=_iso(row["created_at"]),
-                answered=answered,
+                answered=state_of_answer in ("answered", "relied_only"),
+                answer_state=state_of_answer,
+                answered_relied_only=state_of_answer == "relied_only",
                 missing_sessions=not session_ids,
                 sessions=sessions_report,
                 claims=claims_buckets,
@@ -1551,6 +1688,10 @@ def _compute_totals(questions: Sequence[QuestionReport]) -> dict[str, float]:
     sums: dict[str, int] = {
         "questions": len(questions),
         "questions_answered": 0,
+        # T7.131: из них «только опора на уже записанное» (answer_state == relied_only).
+        # Аддитивная метрика: SCHEMA_VERSION не поднят, baseline прежней формы показывает
+        # по ней «нет данных», а не 0 и не ошибку (тот же приём, что у searches_rate_limited).
+        "questions_answered_relied_only": 0,
         "sessions": 0,
         "model_calls": 0,
         "model_input_tokens": 0,
@@ -1584,6 +1725,7 @@ def _compute_totals(questions: Sequence[QuestionReport]) -> dict[str, float]:
     }
     for question in questions:
         sums["questions_answered"] += 1 if question.answered else 0
+        sums["questions_answered_relied_only"] += 1 if question.answered_relied_only else 0
         sums["sessions"] += len(question.sessions)
         for session in question.sessions:
             sums["model_calls"] += session.model_calls
@@ -1662,16 +1804,30 @@ def render_markdown(report: HonestyReport, baseline: Mapping[str, Any] | None = 
     lines.append("")
 
     for question in report.questions:
-        answered = "Ответ есть" if question.answered else "Ответ не записан"
+        # T7.131: три состояния вместо двух — «Ответ по уже записанным знаниям» раньше
+        # читался как «Ответ не записан» и был неправдой (стенд c1: 8 опор, карточка
+        # `answered_from_relied`).
+        answered = ANSWER_STATE_LABELS.get(question.answer_state, "Ответ не записан")
         lines.append(f"## Вопрос {question.question_id} — {answered}")
         lines.append(f"текст: {question.text_head}")
         lines.append(f"состояние: {question.state_label} ({question.state}); приоритет {question.priority}")
+        if question.answered_relied_only:
+            lines.append(
+                "- новых записей этот срез не сделал: ответ целиком оперся на уже записанное"
+                " знание (корзина «опертые» ниже, карточка `answered_from_relied`)"
+            )
         if question.missing_sessions:
             lines.append("сессий под критерий отбора нет — карточка пуста по этому срезу")
         lines.append("")
         for session in question.sessions:
+            # T7.131: длительность — только если есть надёжный источник реального времени
+            # (штампы инструментов сессии). Разница строки `sessions` была бы ложным числом:
+            # её `started_at`/`finished_at` дают фиксацию транзакции фазы 1 (замер `.92`:
+            # 295 с вместо ≈18 минут), поэтому вместо числа — честная метка.
             duration = (
-                f"{session.duration_seconds:.0f} c" if session.duration_seconds is not None else "—"
+                f"{session.duration_seconds:.0f} c"
+                if session.duration_source == DURATION_SOURCE_ACTIONS and session.duration_seconds is not None
+                else "— · длительность недоступна"
             )
             lines.append(
                 f"### Сессия {session.session_id} · {session.state_label}"
@@ -1744,7 +1900,8 @@ def render_markdown(report: HonestyReport, baseline: Mapping[str, Any] | None = 
     totals = report.totals
     lines.append("## Итог прогона")
     lines.append(
-        f"- вопросов {int(totals['questions'])}, с записанным ответом {int(totals['questions_answered'])}; "
+        f"- вопросов {int(totals['questions'])}, с записанным ответом {int(totals['questions_answered'])}"
+        f" (из них только опора на уже записанное {int(totals['questions_answered_relied_only'])}); "
         f"сессий {int(totals['sessions'])}; модель: вызовов {int(totals['model_calls'])}, "
         f"токены {int(totals['model_input_tokens'])}+{int(totals['model_output_tokens'])}"
     )
@@ -1806,6 +1963,12 @@ def render_markdown(report: HonestyReport, baseline: Mapping[str, Any] | None = 
     lines.append(
         "Флаги — эвристики отчёта, а не вердикты оценки: каждая требует ручной проверки "
         "(см. шапку `packages/memory/honesty_report.py` про ограничения Ф1–Ф3)."
+    )
+    lines.append(
+        "Длительность сессии — по штампам инструментов этой сессии (`actions.started_at`/"
+        "`actions.finished_at`, их пишет оркестратор каждым шагом): строка `sessions` и её лента "
+        "штампуются фиксацией длинной транзакции фазы 1 и для длительности не годятся. Нет "
+        "действий со штампом — вместо числа печатается «длительность недоступна»."
     )
     return "\n".join(lines)
 
