@@ -71,7 +71,14 @@ scp /tmp/noezema.bundle <user>@192.168.1.92:/tmp/
 cd ~/noezema
 git fetch /tmp/noezema.bundle refs/remotes/origin/main:refs/remotes/bundle/main
 git merge --ff-only bundle/main
+env UV_CACHE_DIR="$PWD/.uv-cache" uv pip install --python .venv/bin/python -e .
 ```
+
+- последняя команда переустанавливает prod-зависимости из `pyproject.toml` в venv стенда
+  (та же, что внутри `bootstrap.sh`); обязательна, когда в привезённом коммите менялись
+  зависимости — например, T7.133 добавил рантайм-зависимость `pypdf>=6.21,<7`, без неё
+  чтение PDF на стенде падает на первом же `research.fetch`. Команда идемпотентна и при
+  неизменных зависимостях ничего не меняет; после неё — перезапуск юнитов стенда.
 
 - fetch идёт по файлу, поэтому remote `origin` стенду для обновления не нужен; `bundle/main` —
   локальная ссылка на доставленный `origin/main`;

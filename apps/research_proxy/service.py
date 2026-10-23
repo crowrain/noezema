@@ -298,6 +298,14 @@ class ResearchProxyService:
                     "final_url": result.final_url,
                     "sha256": original_sha,
                     "normalized_sha256": normalized_sha,
+                    # T7.133 (аддитивный ключ существующего события): честная причина,
+                    # почему нормализованного текста нет или он пуст (закрытый набор
+                    # normalization.refusal); новых AuditEventType нет
+                    **(
+                        {"normalization_refusal": normalized.refusal}
+                        if normalized.refusal is not None
+                        else {}
+                    ),
                     "source_id": source_id,
                     "mode": mode,
                     "idempotent": idempotent,
@@ -354,6 +362,13 @@ class ResearchProxyService:
             "normalized_sha256": normalized_sha,
             "normalized_text_sha256": normalized.text_sha256,
             "transform_chain": list(normalized.transform_chain),
+            # T7.133: причина пустого/отсутствующего текста (закрытый набор) — оркестратор
+            # ставит её в наблюдение вместо неверного «normalized artifact unreadable»
+            **(
+                {"normalization_refusal": normalized.refusal}
+                if normalized.refusal is not None
+                else {}
+            ),
             "content_type": result.content_type,
             "redirects": result.redirects,
             "trust_class": UNTRUSTED_EXTERNAL,

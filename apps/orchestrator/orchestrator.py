@@ -101,7 +101,7 @@ from apps.orchestrator.value_duplicate import (
     find_value_duplicates,
 )
 from apps.research_proxy.derivative_pointer import resolve_primary_source
-from apps.research_proxy.normalization import PARSER_FINGERPRINT
+from apps.research_proxy.normalization import PARSER_FINGERPRINT, refusal_observation_message
 from apps.research_proxy.source_attribution import (
     STATUS_NO_VALUE_ATTRIBUTION,
     STATUS_SELF_PRIMARY,
@@ -1389,9 +1389,25 @@ class Orchestrator:
         # host-side read of the normalized text (content-addressed store;
         # the envelope carries the hash, the store is the only source)
         store = getattr(service, "store", None)
-        nsha = str(envelope.get("normalized_sha256", ""))
+        # T7.133: прежний `str(envelope.get(...))` превращал None в "None", лез в
+        # хранилище по ключу "None" и врал «normalized artifact unreadable» на PDF и
+        # неизвестных форматах. Теперь: отсутствие sha — честная причина отказа из
+        # конверта прокси; «artifact unreadable» остаётся ТОЛЬКО когда артефакт по
+        # настоящему адресу не читается; пустой читаемый артефакт (sha пустой строки)
+        # различает заглушку защиты от ботов и настоящую пустую страницу.
+        nsha = envelope.get("normalized_sha256")
+        if not nsha:
+            return Observation(
+                tool="research.fetch",
+                ok=False,
+                error=refusal_observation_message(
+                    envelope.get("normalization_refusal"),
+                    str(envelope.get("content_type") or ""),
+                ),
+            )
+        nsha = str(nsha)
         text_body = ""
-        if store is not None and nsha:
+        if store is not None:
             try:
                 text_body = store.get(nsha).decode("utf-8", "replace")
             except Exception:
@@ -1404,7 +1420,10 @@ class Orchestrator:
             return Observation(
                 tool="research.fetch",
                 ok=False,
-                error="no normalized text available for this content",
+                error=refusal_observation_message(
+                    envelope.get("normalization_refusal"),
+                    str(envelope.get("content_type") or ""),
+                ),
             )
         budget = RESEARCH_CONTEXT_BUDGET
         truncated = len(text_body.encode("utf-8")) > budget
