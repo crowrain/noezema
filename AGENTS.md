@@ -402,6 +402,15 @@ config-v20 — `2b065470…`, хеш файла — другое число; о�
   config-v30 (`max_response_bytes` 16 МиБ) по решению пользователя — команда в README dev-стенда,
   «Обновление кода на стенде». Тесты: `tests/unit/test_pdf_normalization_t7133.py`,
   `tests/unit/test_config_v30_payload_t7133.py`, `tests/scenario/test_fetch_refusal_messages_t7133.py`.
+- Дополнение к предыдущему пункту (T7.133a, 2026-10-23): нормализация и запись тела в
+  хранилище выполняются ВНЕ событийного цикла (`asyncio.to_thread` в `service.py`) — на
+  стенде сессия, API и веб в одном цикле, синхронный разбор PDF на 15,4 с подвешивал их;
+  хэши, цепочки и журнал — байт в байт прежние. Третий свой предел PDF — бюджет времени
+  `PDF_MAX_SECONDS` = 20 (по замеру osn-06-2026; короче аренды 30 с, которая во время
+  инструмента не продлевается): срок проверяется между страницами, при исчерпании текст
+  усекается с меткой `pdf-truncated:time` в цепочке. Тесты:
+  `tests/unit/test_pdf_time_budget_t7133a.py`, `tests/unit/test_normalize_offload_t7133a.py`,
+  `tests/scenario/test_fetch_loop_not_blocked_t7133a.py`.
 - Дополнение к предыдущим трём пунктам (T7.119, ADR-0037, 2026-10-16): потолок шагов для вопросов вида
 «официальные + независимые» — `session_limits.max_explorer_steps_official_independent` (config-v27 = 20);
 классификация — чистая функция `apps/orchestrator/research_hints.py` на НОРМАЛИЗУЮЩИХ ФУНКЦИЯХ тех же
