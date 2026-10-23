@@ -35,6 +35,13 @@ or empty the reason rides in ``NormalizedContent.refusal`` (closed set,
 module constants) so the research.fetch observation says the truth
 (unsupported format / PDF without a text layer / bot-challenge stub /
 empty page) instead of the false "normalized artifact unreadable".
+
+T7.133a (замечание приёмки T7.133): разбор PDF идёт постранично и проверяет бюджет
+времени PDF_MAX_SECONDS между страницами; при исчерпании текст усекается с меткой
+`pdf-truncated:time` в цепочке (та же форма, что pages/chars); исключения — прежний
+честный отказ. Вызов нормализации (и хэширование/запись тела в хранилище) уведён из
+событийного цикла в поток (`asyncio.to_thread` в `service.py`) — результат, цепочки
+и хэши байт в байт прежние.
 """
 
 from __future__ import annotations
@@ -44,6 +51,8 @@ import hashlib
 import io
 import json
 import re
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from typing import Final
@@ -152,6 +161,16 @@ PDF_MAX_PAGES: Final = 400
 #: предельный объём извлечённого текста: максимальный реальный документ —
 #: 628 206 знаков; в контекст модели текст режется и так бюджетом RESEARCH_CONTEXT_BUDGET
 PDF_MAX_TEXT_CHARS: Final = 1_000_000
+#: T7.133a: бюджет времени разбора PDF (секунды). Замер osn-06-2026 (290 строк,
+#: 3,4 МиБ — крупнейший реальный документ стенда): 15,4 с извлечения (замер
+#: менеджера) / 15,0 с повторный замер, т.е. ~53 мс/страницу, 400 страниц
+#: (PDF_MAX_PAGES) — ~21 с. 20 с покрывают максимальный реальный документ
+#: с запасом ~30 % и держат один разбор внутри аренды сессии
+#: (DEFAULT_LEASE_TTL = 30 с: во время исполнения инструмента аренда не
+#: продлевается, продление — только вокруг вызовов модели и на шаге цикла).
+#: С config-v30 (16 МиБ) PDF могут быть в 4-5 раз больше — без бюджета разбор
+#: ушёл бы на минуту и дольше; такие документы теперь усекаются по сроку.
+PDF_MAX_SECONDS: Final = 20
 #: разделитель страниц в тексте (стоит между страницами, начиная со второй)
 PDF_PAGE_SEPARATOR: Final = "\n\n<<<PAGE {page}>>>\n\n"
 #: пометка усечения в конце текста (дублируется меткой в цепочке преобразований)
@@ -225,13 +244,28 @@ def _pdf_refusal(reason: str) -> NormalizedContent:
     return NormalizedContent(text=None, transform_chain=("fetch",), text_sha256=None, refusal=reason)
 
 
-def _normalize_pdf(data: bytes) -> NormalizedContent:
+def _normalize_pdf(
+    data: bytes,
+    *,
+    budget_seconds: float = PDF_MAX_SECONDS,
+    clock: Callable[[], float] = time.monotonic,
+) -> NormalizedContent:
     """Извлекает текст из PDF через pypdf (non-strict) с закрытыми пределами.
 
     Страницы идут по порядку за разделителем `PDF_PAGE_SEPARATOR`; число страниц и
     усечение (если оно случилось) метятся в цепочке преобразований. Любое исключение
     pypdf — честный отказ (`REFUSAL_PDF_UNREADABLE`), а не падение fetch; PDF без
     единого знака текста (скан) — `REFUSAL_PDF_NO_TEXT_LAYER`.
+
+    T7.133a: срок разбора считается с `clock` (по умолчанию monotonic) и проверяется
+    МЕЖДУ страницами — после извлечения каждой страницы, до перехода к следующей.
+    При исчерпании текста accumulated до этого момента остаётся, текст помечается
+    усечением, в цепочке — `pdf-truncated:time:<бюджет>` (та же форма, что
+    `pdf-truncated:pages` / `pdf-truncated:chars`; приоритет меток — pages, chars,
+    time: первая случившаяся остановка и есть причина остановки). Бюджет и часы —
+    именованные аргументы только для тестов; `normalize_content` вызывает разбор
+    с закрытой константой и обычными часами, результат для реальных документов не
+    меняется, пока разбор укладывается в срок.
     """
     try:
         reader = PdfReader(io.BytesIO(data), strict=False)
@@ -240,16 +274,24 @@ def _normalize_pdf(data: bytes) -> NormalizedContent:
         if reader.is_encrypted and not reader.decrypt(""):
             return _pdf_refusal(REFUSAL_PDF_UNREADABLE)
         page_count = len(reader.pages)
+        start = clock()
         pieces: list[str] = []
         used = 0
         truncated_pages = False
         truncated_chars = False
+        truncated_time = False
         for index in range(page_count):
             if index >= PDF_MAX_PAGES:
                 truncated_pages = True
                 break
             page_text = (reader.pages[index].extract_text() or "").strip()
+            # срок проверяется между страницами: текущая страница уже разобрана
+            # (её текст честнее выбросить нельзя), к следующей — только в срок
+            expired = clock() - start >= budget_seconds
             if not page_text:
+                if expired:
+                    truncated_time = True
+                    break
                 continue
             separator = "" if not pieces else PDF_PAGE_SEPARATOR.format(page=index + 1)
             cost = len(separator) + len(page_text)
@@ -261,6 +303,9 @@ def _normalize_pdf(data: bytes) -> NormalizedContent:
                 break
             pieces.append(separator + page_text)
             used += cost
+            if expired:
+                truncated_time = True
+                break
     except Exception:
         # стабильный контракт pypdf по ошибкам шире списка PdfError (ошибки
         # фильтров, декодеров, рекурсии); любая из них — честный отказ
@@ -274,6 +319,9 @@ def _normalize_pdf(data: bytes) -> NormalizedContent:
         text += PDF_TRUNCATION_MARKER
     if truncated_chars:
         chain.append(f"pdf-truncated:chars:{PDF_MAX_TEXT_CHARS}")
+        text += PDF_TRUNCATION_MARKER
+    if truncated_time:
+        chain.append(f"pdf-truncated:time:{budget_seconds:g}")
         text += PDF_TRUNCATION_MARKER
     text = text.strip()
     sha = hashlib.sha256(text.encode("utf-8")).hexdigest()

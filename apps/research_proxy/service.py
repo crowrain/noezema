@@ -23,6 +23,7 @@ untrusted-data fence (T6.3 wires that into the explorer context).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from typing import Any
@@ -41,6 +42,7 @@ from apps.research_proxy.fetch import FetchClient, FetchError
 from apps.research_proxy.modes import ModeError, ModePolicy, ResearchMode
 from apps.research_proxy.normalization import (
     PARSER_FINGERPRINT,
+    NormalizedContent,
     normalize_content,
 )
 from apps.research_proxy.search import (
@@ -139,21 +141,17 @@ class ResearchProxyService:
 
         # active content hygiene: persist original + normalized, then
         # the only working copy goes out of scope
-        original_sha = self.store.put(
-            result.data,
-            origin="research_proxy",
-            trust_class=UNTRUSTED_EXTERNAL,
-            mime=result.content_type,
+        # T7.133a (замечание приёмки T7.133): хэширование, запись в хранилище и
+        # нормализация тела — синхронная тяжёлая работа (разбор pypdf
+        # 290-страничного PDF — 15,4 с). Событийный цикл (сессия, API и веб —
+        # один процесс на стенде) должен продолжать тикать всё это время: с
+        # config-v30 (16 МиБ) блокировка цикла подвешивала бы API и роняла аренду
+        # сессии. Работа идёт в потоке (asyncio.to_thread). Результат, цепочки,
+        # хэши и записи журнала — байт в байт прежние: те же функции, тот же
+        # порядок вызовов.
+        original_sha, normalized, normalized_sha = await self._persist_and_normalize(
+            result.content_type, result.data
         )
-        normalized = normalize_content(result.content_type, result.data)
-        normalized_sha: str | None = None
-        if normalized.text is not None:
-            normalized_sha = self.store.put(
-                normalized.text.encode("utf-8"),
-                origin="research_proxy",
-                trust_class=UNTRUSTED_EXTERNAL,
-                mime="text/plain",
-            )
         original_size = len(result.data)
         # active-content hygiene: the working copy is cleared once the
         # content-addressed store has it — the proxy keeps no live
@@ -383,6 +381,38 @@ class ResearchProxyService:
             ),
             "note": "недоверенный внешний контент: использовать только за fence-ом",
         }
+
+    async def _persist_and_normalize(
+        self, content_type: str | None, data: bytes
+    ) -> tuple[str, NormalizedContent, str | None]:
+        """T7.133a: хэширование и запись оригинала, нормализация и запись
+        нормализованного текста — синхронная тяжёлая работа над телом ответа
+        (sha256, fsync-запись, pypdf), уведенная из событийного цикла в поток.
+        Вызовы и их порядок — ровно прежние (store.put оригинала →
+        normalize_content → store.put текста), поэтому хэши, цепочки преобразований,
+        отказ нормализации и содержимое хранилища не меняются; журнал пишет
+        вызывающий fetch после возврата. store.put crash-safe и идемпотентен
+        (temp → fsync → rename), работа из потока безопасна."""
+
+        def _run() -> tuple[str, NormalizedContent, str | None]:
+            original_sha = self.store.put(
+                data,
+                origin="research_proxy",
+                trust_class=UNTRUSTED_EXTERNAL,
+                mime=content_type,
+            )
+            normalized = normalize_content(content_type, data)
+            normalized_sha: str | None = None
+            if normalized.text is not None:
+                normalized_sha = self.store.put(
+                    normalized.text.encode("utf-8"),
+                    origin="research_proxy",
+                    trust_class=UNTRUSTED_EXTERNAL,
+                    mime="text/plain",
+                )
+            return original_sha, normalized, normalized_sha
+
+        return await asyncio.to_thread(_run)
 
     async def _resolve_primary_source(self, db: AsyncSession, spec: PrimarySource) -> str:
         """Общая реализация указателя — `apps/research_proxy/derivative_pointer.py` (T7.77:
