@@ -75,6 +75,36 @@ from packages.domain.services.config import ConfigError, ConfigService
 #: the context marking says it is untrusted, T6.3)
 UNTRUSTED_EXTERNAL = "external"
 
+#: T7.134 (§5.12): ОБЩИЙ потолок ОДНОГО чтения — загрузка + сохранение + нормализация
+#: одним сроком. Закрытая константа хоста, не конфиг: это внутренний предел операции,
+#: а не политика стенда (правда конфигурации не менялась).
+#:
+#: Почему 90 с. Замер стенда, прогон `c91ac6b-v30` (23.10 2026): `research.fetch`
+#: `Rab_sila_2026.pdf` — 42,4 с, `osn-08-2026.pdf` — 79,96 с (загрузка + разбор);
+#: раньше ни один из этих шагов общим сроком не ограничивали: `timeout_seconds` канала
+#: (10 с) — per-read у httpx, он сбрасывается на каждом чанке, а дедлайн `FetchClient`
+#: проверяется только ПЕРЕД очередным переходом, не во время чтения тела. 90 с покрывает
+#: худший стендовый замер с запасом, при этом в разы короче срока фазы
+#: (`session_limits.phase_deadline_seconds`, config-v27 = 2400 с) и втрое больше TTL
+#: аренды (30 с), которую с T7.134 продлевает guard. Больше — незачем: страница,
+#: которая читается дольше, для ответа на вопрос всё равно не прочитана.
+FETCH_TOTAL_BUDGET_SECONDS = 90.0
+
+
+def read_budget_notice(seconds: float = FETCH_TOTAL_BUDGET_SECONDS) -> str:
+    """Честный отказ чтения, не уложившегося в общий срок (T7.134, §5.12).
+
+    Текст называет АДРЕС, а не хост, и не начинается с `timeout:`. Классификатор
+    недоступности хоста (`apps/orchestrator/host_availability.py`) метит хост по кодам
+    401/403/429 и по префиксу `timeout:` — прежнее поведение для ТРАНСПОРТНОГО таймаута
+    сохранено; здесь же отказ — свойство конкретной страницы (тот же класс, что
+    переразмер и нечитаемый артефакт, T7.111), поэтому хост доступным не перестает быть.
+    """
+    return (
+        f"страница читается слишком долго ({seconds:g} с); "
+        "не возвращайся к этому адресу в этой сессии"
+    )
+
 
 class ResearchProxyError(RuntimeError):
     """The fetch was refused or failed (reason in ``.reason``)."""
@@ -128,6 +158,28 @@ class ResearchProxyService:
                 raise ResearchProxyError(str(exc), "rejected") from exc
         mode = mode_policy.mode.value
 
+        # T7.134 (§5.12): ОДНО чтение целиком (загрузка + сохранение + нормализация)
+        # идёт под общим сроком `FETCH_TOTAL_BUDGET_SECONDS`. По исчерпании — честный
+        # отказ инструмента (`read_budget_notice`), а не падение: сессия получает
+        # наблюдение с причиной и продолжает работать. Записи журнала при этом
+        # остаются прежними: `research_fetch_rejected` с машиной причиной и без
+        # строки источника (артефакт не сохранён).
+        try:
+            budget = FETCH_TOTAL_BUDGET_SECONDS
+            async with asyncio.timeout(budget):
+                envelope = await self._fetch_within_budget(url, policy, mode)
+        except TimeoutError as exc:
+            async with self.session_factory() as db, transaction(db):
+                await self._reject(db, url, f"read budget exceeded: {budget:g} s")
+            raise ResearchProxyError(read_budget_notice(budget), "failed") from exc
+        return envelope
+
+    async def _fetch_within_budget(self, url: str, policy: SSRFPolicy, mode: str) -> dict[str, Any]:
+        """Тело `fetch` (T7.134): вся тяжёлая часть чтения под общим сроком.
+
+        Порядок записей, цепочек и хэшей не изменён — изменена только обрамляющая
+        часть: метод вызывается внутри `asyncio.timeout(FETCH_TOTAL_BUDGET_SECONDS)`.
+        """
         client = FetchClient(policy)
         try:
             result = await client.fetch(url)

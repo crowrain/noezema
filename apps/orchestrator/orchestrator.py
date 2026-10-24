@@ -265,6 +265,24 @@ RATIONALE_SIGNAL_CHARS = 6_000
 #: предсказуемыми; сверх потолка id честно записывается отказной причиной).
 RELIED_CLAIMS_LIMIT = 8
 
+#: T7.134 (§5.2.3): инструменты, чьё ИСПОЛНЕНИЕ может длиться дольше доли TTL аренды,
+#: и при этом во время долгой работы НЕ трогает сессию вызывающего (продление пишет
+#: именно в неё). Замер стенда (прогон `c91ac6b-v30`, 23.10 2026): `research.fetch`
+#: 42,4 с и 79,96 с против TTL 30 с — аренда истекла посреди шага, следующий heartbeat
+#: отклонён, сессия потеряна. Исполнение кода в sandbox — прежний потолок 60 с
+#: (`resource_limits.timeout_seconds`) плюс 15 с хозяйского запаса, то есть тоже за TTL.
+#: Медленный upstream `web.search` (per-read таймаут httpx сбрасывается на каждом
+#: чанке, total-срока у канала нет) — тот же класс.
+#:
+#: В набор НЕ входят `memory.search` и staging-инструменты (`question.create`,
+#: `message.reply`): они работают на переданной сессии вызывающего, а продление из
+#: дочерней задачи на той же `AsyncSession` — это одновременное использование сессии
+#: (T7.47b: такой отмены/переплетения нельзя допускать). Они и быстры: один запрос.
+#: `research.fetch` guard'ом оборачивается не здесь, а внутри `_research_fetch` —
+#: ровно вокруг обращения к прокси; журнал чтения (`research_content_read`) пишется
+#: на сессии вызывающего и под guard'ом идти не должен.
+LEASE_GUARDED_TOOLS: frozenset[str] = frozenset({"python.execute", "shell.execute", "web.search"})
+
 
 def filter_offered_tools(base_tools: list[str], *, has_message: bool) -> list[str]:
     """T7.13 (EVAL-3b P.6): the per-step tool list the explorer is shown.
@@ -1381,8 +1399,20 @@ class Orchestrator:
         assert hasattr(self.research_service, "fetch")  # ResearchProxyService
         service: Any = self.research_service
         url = str(args.get("url", ""))
+        # T7.134 (§5.2.3, замер стенда `c91ac6b-v30`): загрузка + сохранение + нормализация
+        # могут длиться ДЕСЯТКИ секунд (42,4 с и 79,96 с против TTL 30 с). Без продления
+        # аренда истекала посреди чтения, и первый же heartbeat после шага отказывал —
+        # сессия терялась (LeaseLost), вопрос не получал ответа. Guard — тот же механизм,
+        # что вокруг вызова модели, и ровно вокруг обращения к прокси: прокси работает в
+        # СВОИХ сессиях (`session_factory`), сессия вызывающего в это время не занята, а
+        # `research_content_read` (ниже) пишется на сессии вызывающего и под guard'ом
+        # идти не должен. Отказ продления после срока фазы — прежний LeaseLost: он идёт
+        # наружу, а не в отказную наблюдения (аренда уже не наша).
         try:
-            envelope = await service.fetch(url)
+            async with LeaseHeartbeatGuard(self.lease, db, session.id, self.node_owner):
+                envelope = await service.fetch(url)
+        except LeaseLost:
+            raise
         except Exception as exc:
             return Observation(tool="research.fetch", ok=False, error=str(exc)[:500])
 
@@ -2276,7 +2306,19 @@ class Orchestrator:
                 # T7.71 (§5.12.1): navigation through the same proxy. Host-side for the same reason as
                 # research.fetch — the sandbox container always has network=none, and the egress plus its
                 # rate limit and journal belong to the node, not to the session.
-                obs = await self._web_search(args)
+                #
+                # T7.134 (§5.2.3): под тем же guard'ом, что и вызов модели: у канала per-read
+                # таймаут httpx, сбрасываемый на каждом чанке, — медленный движок держит шаг
+                # дольше доли TTL. Сессию вызывающего поиск не трогает (свои сессии прокси).
+                async with LeaseHeartbeatGuard(lease, db, session.id, self.node_owner):
+                    obs = await self._web_search(args)
+            elif tool_name in LEASE_GUARDED_TOOLS:
+                # T7.134 (§5.2.3): исполнение кода (sandbox / dev-подставка) — прежний потолок
+                # 60 с + хозяйские 15 с запаса против 30 с TTL: шаг переживал аренду, и первый же
+                # heartbeat после инструмента отказывал («heartbeat refused for session …»).
+                # Порядок журнала, результат и счётчик шагов — прежние; guard ничего не пишет.
+                async with LeaseHeartbeatGuard(lease, db, session.id, self.node_owner):
+                    obs = await self.executor.execute(tool_name, args, db=db)
             else:
                 obs = await self.executor.execute(tool_name, args, db=db)
             if tool_name == "research.fetch" and obs.ok:
