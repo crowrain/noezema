@@ -42,12 +42,7 @@ from apps.orchestrator.curator_correction import (
     CorrectionOverLimit,
     build_correction_section,
 )
-from apps.orchestrator.curator_declared_claims import (
-    CURATOR_REJECT_KIND_DECLARED_EMPTY,
-    DECLARED_EMPTY_PUBLIC_SUMMARY,
-    DECLARED_EMPTY_REASON,
-    summary_declares_new_claim,
-)
+from apps.orchestrator.curator_declared_claims import empty_proposal_defect
 from apps.orchestrator.curator_period_gate import claim_period_rejections_by_links
 from apps.orchestrator.curator_rejections import (
     claim_index_from_line,
@@ -3044,6 +3039,9 @@ class Orchestrator:
             db, session, ctx, snapshot, knowledge, proposal
         )
         correction_round: JsonDict | None = None
+        # T7.136 (часть 3): объявленная опора ПЕРВОГО предложения — она нужна, только если
+        # раунд исправления вернёт пустой ответ (см. `_relied_from_rejected_proposal`).
+        first_declared_relied: list[str] = list(proposal.relied_claim_ids)
         accepted: BoundaryAccepted
         if isinstance(outcome, BoundaryRejected):
             # T7.106 (ADR-0034 вариант C, решение пользователя 2026-10-13): хост
@@ -3193,9 +3191,11 @@ class Orchestrator:
                 snapshot,
                 knowledge,
                 second,
-                # T7.123 (часть 3): ровно один раунд — пустое предложение с объявленным
-                # намерением повторно не отклоняется; принятый пустой ответ догоняет
-                # запасной путь опоры T7.115 из `c:`-ссылок финального ответа исследователя
+                # T7.123 (часть 3) и T7.136 (часть 2): ровно один раунд — пустое предложение
+                # ни новым объявленным намерением, ни новой оборванной на потолке сводкой
+                # повторно не отклоняется; принятый пустой ответ догоняет запасные пути опоры —
+                # T7.115 из `c:`-ссылок финального ответа исследователя и T7.136 (часть 3) из
+                # опоры этого отклонённого первого ответа
                 declared_empty_check=False,
                 # T7.128 (часть 2): после раунда исправления опора спасает ответ — гейты группы
                 # (а) (значение на связи; период/дата прогноза/дата документа), снявшие ВСЕ
@@ -3235,6 +3235,28 @@ class Orchestrator:
         # добавленные ответом id названы аддитивным ключом `relied_from_explorer` ниже.
         relied_pack_ids = _pack_claim_ids(knowledge)
         from packages.memory.service import resolve_claim_reference
+
+        # T7.136 (часть 3, ADR-0038 дополнение): пустой ответ раунда исправления НЕ теряет
+        # опору отклонённого первого предложения (стенды 2d682ab0, abef06b7). Переносится
+        # только то, что видит разрешатель контекст-пака этой сессии; перенесённые id
+        # называются аддитивным ключом `relied_from_rejected_proposal` того же события
+        # `claim_created` и считаются ВСЕГДА после того, как раунд действительно состоялся
+        # (`correction_round is not None`) и итоговое предложение пусто (ни операций, ни
+        # своей опоры). Раунда не было / ответ не пуст — ключа нет, сессии прежние байт в
+        # байт. Дальнейший запасной путь T7.115 видит уже перенесённые id как занятые.
+        relied_from_rejected_proposal: list[str] = []
+        if (
+            correction_round is not None
+            and not proposal.claims
+            and not relied_claim_ids
+            and first_declared_relied
+        ):
+            relied_from_rejected_proposal, carried_rejections = _relied_from_rejected_proposal(
+                first_declared_relied, relied_pack_ids, RELIED_CLAIMS_LIMIT
+            )
+            if relied_from_rejected_proposal:
+                relied_claim_ids = [*relied_claim_ids, *relied_from_rejected_proposal]
+            relied_claims_rejected = [*relied_claims_rejected, *carried_rejections]
 
         session_operation_ids: set[uuid.UUID] = set()
         for op_index, staged_claim in enumerate(staged_claims):
@@ -3402,6 +3424,11 @@ class Orchestrator:
         # непустым — сессии без ссылок в ответе остаются байт в байт прежними.
         if relied_from_explorer:
             claim_event_payload["relied_from_explorer"] = relied_from_explorer
+        # T7.136 (часть 3, ADR-0038 дополнение): какие id опоры хост перенёс из ОТКЛОНЁННОГО
+        # первого предложения, когда раунд исправления вернул пустой ответ. Как и другие новые
+        # ключи, пишется только непустым — прежние сессии остаются байт в байт прежними.
+        if relied_from_rejected_proposal:
+            claim_event_payload["relied_from_rejected_proposal"] = relied_from_rejected_proposal
         # T7.83 (ADR-0033): ключ появляется только при непустом решении гейта —
         # прежние сессии и их аудит остаются байт-в-байт прежними
         if value_duplicates:
@@ -3471,11 +3498,13 @@ class Orchestrator:
         LLM-вызовам (_curator_chat), не к этой проверке. Ни одна staging-операция не
         исполняется, пока весь исход проверки не определён.
 
-        T7.123 (часть 3): пустое предложение (`claims` пуст, опоры нет) с объявленным в
-        сводке намерением записать утверждение — отказ ЦЕЛИКОМ с аддитивным
-        `curator_reject_kind` = "claims_empty_declared_in_summary"; проверка выполняется
-        только на первом вызове (`declared_empty_check`), второй вызов после раунда
-        исправления проходит без неё: ровно один раунд (ADR-0034 вариант C).
+        T7.123 (часть 3) и T7.136 (часть 2): пустое предложение (`claims` пуст, опоры нет)
+        с объявленным в сводке намерением записать утверждение ИЛИ с оборванной на потолке
+        поля сводкой — отказ ЦЕЛИКОМ с аддитивным `curator_reject_kind`
+        ("claims_empty_declared_in_summary" / "claims_empty_summary_cut_at_limit"); проверка
+        выполняется только на первом вызове (`declared_empty_check`), второй вызов после раунда
+        исправления проходит без неё: ровно один раунд (ADR-0034 вариант C), третьего вызова
+        нет ни при каком основании.
 
         T7.128 (часть 2): `relied_only_answer_allowed` = True (только второй вызов, после раунда
         исправления) разрешает фиксировать ответ ИЗ ОДНИХ ОПОРАХ, если гейты группы (а) —
@@ -3518,28 +3547,28 @@ class Orchestrator:
                 reasons=problems[:10],
             )
 
-        # T7.123 (часть 3, ADR-0038 дополнение): пустое предложение с объявленным намерением.
-        # Модель написала в сводке, что создаёт новое утверждение, и при этом вернула пустые
-        # `claims` без опоры (стенд b7e93ff6): это дефект ответа, а не честный отказ —
-        # предложение отклоняется целиком (тот же event, аддитивный `curator_reject_kind`)
-        # и догоняется ровно одним раундом исправления варианта C. На втором вызове
-        # (`declared_empty_check=False`) проверка молчит: если claims пусты и после раунда,
-        # предложение принимается прежним пустым, и работает запасной путь опоры T7.115.
-        if (
-            declared_empty_check
-            and not proposal.claims
-            and not proposal.relied_claim_ids
-            and summary_declares_new_claim(proposal.summary)
-        ):
-            return BoundaryRejected(
-                payload={
-                    "curator_rejected": [DECLARED_EMPTY_REASON],
-                    "curator_reject_kind": CURATOR_REJECT_KIND_DECLARED_EMPTY,
-                    "rejected_proposal": rejected_proposal_digest(proposal),
-                },
-                public_summary=DECLARED_EMPTY_PUBLIC_SUMMARY,
-                reasons=[DECLARED_EMPTY_REASON],
-            )
+        # T7.123 (часть 3) + T7.136 (часть 2, ADR-0038 дополнение): пустое предложение с
+        # объявленным намерением ИЛИ с оборванной на потолке сводкой. Модель написала в сводке,
+        # что создаёт новое утверждение (стенд b7e93ff6), либо вела рассуждение прямо в `summary`
+        # и оборвала её на `max_length` поля, не донеся claims (стенд 33298707, контрольный
+        # прогон aaca104-v30; сводка кончалась ровно на «Нельзя за»): это дефект ответа, а не
+        # честный отказ — предложение отклоняется целиком (тот же event, аддитивный
+        # `curator_reject_kind`) и догоняется ровно одним раундом исправления варианта C. На
+        # втором вызове (`declared_empty_check=False`) проверка молчит: если claims пусты и после
+        # раунда, предложение принимается прежним пустым, и работает запасной путь опоры T7.115
+        # (для T7.136 — ещё и перенос опоры отклонённого первого предложения, часть 3).
+        if declared_empty_check:
+            defect = empty_proposal_defect(proposal)
+            if defect is not None:
+                return BoundaryRejected(
+                    payload={
+                        "curator_rejected": [defect.reason],
+                        "curator_reject_kind": defect.kind,
+                        "rejected_proposal": rejected_proposal_digest(proposal),
+                    },
+                    public_summary=defect.public_summary,
+                    reasons=[defect.reason],
+                )
 
         # T7.34 (ADR-0018): reverify references — resolved BEFORE the
         # rules pre-check (the reverify is validated under the ANCHOR's
@@ -4540,6 +4569,45 @@ def _relied_from_answer(
         used_total += 1
         added.append(str(ref_id))
     return added, rejected
+
+
+def _relied_from_rejected_proposal(
+    declared_ids: list[str],
+    visible_pack_ids: list[uuid.UUID],
+    limit: int,
+) -> tuple[list[str], list[str]]:
+    """T7.136 (часть 3, ADR-0038 дополнение): опора ОТКЛОНЁННОГО первого предложения.
+
+    Стенды 2d682ab0 и abef06b7 (оба — отказ ЦЕЛИКОМ по гейту периода/даты прогноза, затем раунд
+    исправления): первое предложение называло `relied_claim_ids`, пустой ответ раунда исправления
+    — нет, а в финальном ответе исследователя ссылок `c:` не было. Опора терялась целиком:
+    запасной путь T7.115 не срабатывает, карточка вопроса говорит «Ответ не записан», хотя
+    утверждения контекст-пака, на которые куратор опирался, никуда не делись.
+
+    Хост переносит ТОЛЬКО то, что проходит тот же разрешатель `resolve_claim_reference` и тот же
+    набор видимости контекст-пака `_pack_claim_ids`, что у опоры куратора T7.82: невидимый,
+    неоднозначный или неразбираемый id НЕ переносится и называется в отказах (префикс
+    `rejected_proposal[k]:`) — догадок нет. Дубли одного id молча схлопываются, потолок общий
+    (`RELIED_CLAIMS_LIMIT`). Пустой вход даёт пустой выход: ключ payload не появляется.
+    """
+    from packages.memory.service import resolve_claim_reference
+
+    carried: list[str] = []
+    rejected: list[str] = []
+    seen: set[uuid.UUID] = set()
+    for k, raw in enumerate(declared_ids):
+        ref_id, problem = resolve_claim_reference(raw, visible_pack_ids)
+        if ref_id is None or problem is not None:
+            rejected.append(f"rejected_proposal[{k}]: {problem or 'unresolvable claim reference'}")
+            continue
+        if ref_id in seen:
+            continue
+        if len(carried) >= limit:
+            rejected.append(f"rejected_proposal[{k}]: more than {limit} relied ids")
+            continue
+        seen.add(ref_id)
+        carried.append(str(ref_id))
+    return carried, rejected
 
 
 def _cap_args(value: object) -> str:
