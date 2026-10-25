@@ -671,6 +671,17 @@ function renderClaim(claim,inactive){
   }
   const meta=[claim.type_label,claim.grade_label,claim.freshness_label].filter(Boolean).join(' · ');
   if(meta){ const m=document.createElement('div'); m.className='muted'; m.textContent=meta; row.appendChild(m); }
+  // T7.135a (ADR-0035 §22.7): подпись серии прогнозов — строку целиком составил сервер
+  // (`forecast_series_text`), JS печатает её дословно своей фразы не собирает.
+  // Актуальная запись нейтральна (muted), устаревшая и недатированная заметны тем же
+  // классом предупреждения, что и снятая оператором связь.
+  if(claim.forecast_series_text){
+    const fs=document.createElement('div');
+    fs.className=(claim.forecast_series==='actual')?'muted':'warn';
+    fs.textContent=claim.forecast_series_text;
+    if(claim.forecast_series_hint) fs.title=claim.forecast_series_hint;
+    row.appendChild(fs);
+  }
   const link=document.createElement('a'); link.href='/claim/'+esc(claim.id);
   link.textContent='подробнее об этом выводе'; row.appendChild(link);
   return row;
