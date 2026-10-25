@@ -38,6 +38,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.orchestrator.value_duplicate import declared_scope_metric, statement_values
 from apps.web import estimates as estimate_rules
+from apps.web import forecast_series as forecast_rules
 from apps.web import labels as ui_labels
 from apps.web import search_ledger
 from apps.web.knowledge import (
@@ -1475,6 +1476,35 @@ async def question_answer(db: AsyncSession, question_id: uuid.UUID) -> JsonDict 
         folded_claims = _fold_value_duplicates(
             claims=claims, relied_claims=relied_claims, facts=fold_facts
         )
+
+        # T7.135 (ADR-0035 §22): серия прогнозов карточки — самый поздний по дате прогноза
+        # получает подпись «актуальный прогноз», более ранние датированные записи и записи без
+        # даты — свою метку и место после актуальной. Только показ: оценки, связи и сами
+        # записи не тронуты, ничего не скрывается и не удаляется. Дату прогноза карточка
+        # берёт из формулировки (шаблоны даты документа гейта периода) и из записанного
+        # якоря `as_of`; `created_at` датой прогноза не считается и в подборщик не приходит
+        # вовсе. Свёрнутые дубли (T7.99) в сравнении не участвуют: витрина сравнивает то,
+        # что показывает.
+        forecast_rows = {str(row["id"]): row for row in [*claim_rows, *relied_rows]}
+        forecast_marks = forecast_rules.forecast_marks(
+            [
+                forecast_rules.ForecastRecord(
+                    claim_id=claim_id,
+                    statement=str(forecast_rows[claim_id]["statement"]),
+                    as_of=forecast_rows[claim_id]["as_of"],
+                    metric=declared_scope_metric(forecast_rows[claim_id].get("assessed_scope")),
+                )
+                for claim_id in sorted(
+                    {
+                        str(item.get("id") or "")
+                        for item in [*claims, *relied_claims]
+                        if str(item.get("id") or "") in forecast_rows
+                    }
+                )
+            ]
+        )
+        claims[:] = forecast_rules.apply_forecast_series(claims, forecast_marks)
+        relied_claims[:] = forecast_rules.apply_forecast_series(relied_claims, forecast_marks)
 
         # T7.88 (ADR-0035 вариант D): подраздел «Независимые оценки» — одна фиксированная
         # выборка на всю карту (бюджет T7.74), подбор и тексты — чистый модуль apps.web.estimates.

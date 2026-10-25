@@ -24,6 +24,7 @@ import apps.orchestrator.scheduler as scheduler
 import apps.web.answer as web_answer
 import apps.web.api as web_api
 import apps.web.estimates as web_estimates
+import apps.web.forecast_series as web_forecast_series
 import apps.web.host_status as host_status
 import apps.web.knowledge as knowledge
 import packages.memory.dispute as memory_dispute
@@ -195,6 +196,9 @@ def _sources() -> dict[str, list[str]]:
         # T7.99 (ADR-0033 §13): подписи свёрнутой повторной записи карточки ответа —
         # закрытый набор построителя карточки apps/web/answer.py.
         "claim_duplicate": list(web_answer.DUPLICATE_KEYS),
+        # T7.135 (ADR-0035 §22): подписи серии прогнозов карточки ответа — закрытый
+        # набор витринного модуля apps/web/forecast_series.py.
+        "forecast_series": list(web_forecast_series.FORECAST_SERIES_KEYS),
     }
 
 
