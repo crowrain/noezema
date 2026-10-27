@@ -1,6 +1,6 @@
 """Aktorovopros: closed catalog of named actors and per-session actor-search tracking (T7.137).
 
-Why this module exists (ADR-0036 §2, measurement of 2026-10-27): sessions whose QUESTION names
+Why this module exists (ADR-0036 §10, measurement of 2026-10-27): sessions whose QUESTION names
 several catalog actors burn steps on repeated AGGREGATE searches — one query naming four or five
 banks at once. The fixture replay (manager's fixture, 71 finished sessions, 423 executed searches)
 shows 41 aggregate searches of which 22 (54 %) were followed by no read at all, versus 30 % for
@@ -13,7 +13,7 @@ The catalog is CLOSED and lives IN CODE, decided against configs: it names the a
 put in the benchmark questions (Bank of Russia, Sber/SberCIB, VTB, Alfa-Bank, Gazprombank,
 Rosstat, hh.ru, SuperJob, Minek, Minfin). A question naming an actor outside the catalog is NOT
 gated at all — the gate can only fire on catalog names; the limitation and the upgrade path are
-recorded in ADR-0036 §2. Recognition reuses the SAME normalization as the near-duplicate gate
+recorded in ADR-0036 §10. Recognition reuses the SAME normalization as the near-duplicate gate
 (`content_word_stems` / `normalize_search_query`), so «Банка России», «SberCIB», «Альфа-Банка»,
 «Газпромбанка» are found by the same stem logic the gates already trust; bare «банк» without a
 qualifier is deliberately NOT an actor.
@@ -95,7 +95,7 @@ def named_query_actors(query: str) -> tuple[str, ...]:
     return named_actors(query)
 
 
-#: Threshold of the multi-actor rule (ADR-0036 §2): the gate fires only on questions naming at
+#: Threshold of the multi-actor rule (ADR-0036 §10): the gate fires only on questions naming at
 #: least this many catalog actors, and an AGGREGATE query is one naming at least this many of
 #: them. Fixed in code (not a config threshold) by decision: it is part of the rule's meaning,
 #: and configs were off-limits for this task.

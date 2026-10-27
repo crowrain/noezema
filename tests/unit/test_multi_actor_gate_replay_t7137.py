@@ -3,7 +3,7 @@
 пара «текст вопроса -> список выполненных web.search (запрос, успешно ли)» по всем 71 завершённой
 сессии; целые файлы фикстур в репозиторий не переносятся.
 
-Ожидаемые числа — таблица замера части 1 (ADR-0036 §2), они ВПИСАНЫ в тест, а не вычисляются из
+Ожидаемые числа — таблица замера части 1 (ADR-0036 §10), они ВПИСАНЫ в тест, а не вычисляются из
 того же кода: повторный сводный поиск (первый сводный уже выполнен успешно) — 26 отказов; из них
 в сессии 09b513d2 — пять (поиск №6 и далее), и ни один поиск, называющий <= 2 названных акторов,
 не отказывается; в сессиях вопросов, называющих < 3 акторов каталога, гейт молчит.
@@ -18,7 +18,7 @@ from typing import Any
 import pytest
 
 from apps.orchestrator.question_actors import ActorSearchTracker, named_query_actors, named_question_actors
-from apps.orchestrator.tool_context import render_search_multi_actor_repeat_note
+from apps.orchestrator.tool_context import render_search_multi_actor_repeat_note, search_near_duplicate
 
 pytestmark = [pytest.mark.unit]
 
@@ -114,6 +114,29 @@ def test_note_at_second_aggregate_of_09b513d2_names_uncovered_actors() -> None:
     assert "Без отдельного поиска пока: Банк России, Сбербанк, Газпромбанк." in note
     assert "Сводный поиск по нескольким акторам находит старые обзорные статьи" in note
     assert "Не вставляй в запрос уже известные числа" in note
+
+
+def test_denied_aggregates_never_would_hit_near_duplicate_gate() -> None:
+    """Непересечение счётчиков двух гейтов (часть 3, обоснование порядка): НИ ОДНА из 26
+    отказанных сводных формулировок не является почти-дубликатом ранее выполненного поиска —
+    значит, стоящий первым гейт почти-дубликата отпустил бы их все, и отказ засчитывается ровно
+    одному счётчику честности (ADR-0036 §10)."""
+    for session in _sessions():
+        named = named_question_actors(str(session["question_text"]))
+        if len(named) < 3:
+            continue
+        tracker = ActorSearchTracker(named=named)
+        executed: list[tuple[str, int]] = []
+        for ordinal, search in enumerate(session["searches"], start=1):
+            query = str(search["q"])
+            if tracker.repeat_refusal(query) is not None:
+                assert search_near_duplicate(query, executed) is None, (
+                    f"сессия {str(session['session_id'])[:8]} поиск #{ordinal}: формулировка "
+                    "попала бы в оба гейта сразу"
+                )
+            if search["ok"]:
+                tracker.mark_executed(query, ordinal)
+                executed.append((query, ordinal))
 
 
 def test_gate_silent_for_sessions_of_questions_naming_fewer_than_three_actors() -> None:
