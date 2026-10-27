@@ -163,7 +163,9 @@ async def test_card_names_the_current_forecast_and_labels_the_stale_ones(
         assert relied[str(VTB_UNDATED_ID)]["forecast_series_text"] == UNDATED_VTB
         assert relied[str(VTB_UNDATED_ID)]["forecast_series"] == "undated"
 
-        # сравнения нет: одиночные производители и запись без фразы-горизонта
+        # сравнения нет: на этой карте у Альфа-Банка, Газпромбанка и Банка России по
+        # одной записи (комментарий T7.138: запись Банка России молчит как одиночная,
+        # а не из-за отсутствия фразы-горизонта)
         for claim_id in (ALFA_ID, GPB_ID, CBR_ID):
             for key in ("forecast_series", "forecast_series_label", "forecast_series_hint", "forecast_series_text"):
                 assert key not in relied[str(claim_id)], (claim_id, key)

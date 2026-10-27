@@ -16,7 +16,14 @@
 * тот же производитель — закрытый словарь `PRIMARY_SOURCES`
   (`named_primary_keys` + `family_primary_key`, корень семьи); формулировка обязана
   называть РОВНО ОДИН производитель словаря: названы два или ни одного — витрина
-  молчит, чужое авторство прогнозу она не приписывает;
+  молчит, чужое авторство прогнозу она не приписывает. Единственное исключение —
+  мост Сбербанка (дополнение T7.138, ADR-0035 §22.8): если словарь не нашёл ни
+  одного производителя (или нашёл ровно `sbercib`), а формулировка называет Сбербанк
+  словами ЗАКРЫТОГО шаблона форм имени из каталога акторов
+  (`question_actors.names_sberbank` — одна правда о формах имени, своего словаря
+  здесь нет), запись сворачивается в ту же серию `sbercib`: на стенде «Сбербанк
+  понизил прогноз инфляции…» и «SberCIB (Сбербанк) повысил прогноз…» — одна и та же
+  публикация. «СберИндекс» — другой производитель словаря, мост к нему не применяется;
 * тот же показатель — объявленные метки `assessed_scope`, если обе заданы; иначе
   общая основа показателя из существующего словаря (`statement_indicator_words`)
   по закрытому списку `_SERIES_INDICATOR_STEMS`, плюс существующие вето территорий
@@ -24,16 +31,40 @@
   одной формулировке»;
 * тот же горизонт — год целевой фразы («по итогам N года», «на конец N года»,
   «к концу N года», «за N год»); это уже распознаваемые гейтом периода цели
-  (`curator_period_gate`), своего словаря горизонтов здесь нет. Формулировка без
-  явной цели (`«на 2026 год»` гейт целью не считает) в сравнение не идёт.
+  (`curator_period_gate`), своего словаря горизонтов здесь нет. Дополнение T7.138:
+  ВНУТРИ ВИТРИНЫ горизонтом считается и фраза «на N год» (закрытый список
+  `_VITRINE_HORIZON_RES`) — карточка ответа называет прогноз именно так. Гейт периода
+  НЕ тронут: для него «на N год» по-прежнему цель прогноза, а не период значения.
+
+Роль записи (дополнение T7.138, ADR-0035 §22.8) — закрытая тройка, своей классификации
+значений витрина не заводит:
+
+* СВОЙ ПРОГНОЗ производителя — обычная серия производителя;
+* ОПРОС / КОНСЕНСУС — в формулировке названы «консенсус», «опрос» или «опрошенные»
+  (закрытый список `_SURVEY_MARKER_RES`). Это отдельная серия «опрос <производитель>»:
+  опрос аналитиков, который публикует ведомство, НИКОГДА не сравнивается с прогнозом
+  самого ведомства (на стенде — «Консенсус-прогноз аналитиков … по данным
+  макроэкономического опроса Банка России» против прогноза Банка России по итогам
+  заседания). Между собой опросы одного производителя сравниваются по тем же правилам;
+* ЧУЖОЕ ОЖИДАНИЕ — имя производителя найдено только внутри придаточного
+  «<глагол ожидания>, что …» (глаголы — тот же закрытый список гейта
+  `_FORECAST_VERB_FORMS`): «Инвестбанкир Евгений Коган предполагает, что Банк России
+  повысит прогноз…» — это не прогноз Банка России, и в серию Банка России такая запись
+  не входит вовсе. «Аналитики ВТБ ожидают, что инфляция составит…» — ВТБ назван ДО
+  придаточного, это прогноз ВТБ.
 
 Откуда берётся дата прогноза (порядок фиксирован):
 
 1. дата, названная в самой формулировке после маркера даты документа, — шаблоны
    «прогноз по состоянию на …», «прогноз от …», «по данным публикации от …»
    (токены гейта с `doc_date`, T7.121a);
-2. записанная якорная дата утверждения `as_of`;
-3. иначе запись считается недатированной.
+2. дата решения, названная в формулировке (дополнение T7.138): «по итогам заседания
+   <дата>» и «в <месяце> N года <повысил/понизил/сохранил/…> прогноз» — закрытые
+   маркеры `_DECISION_MEETING_LEAD_RES` и `_DECISION_VERB_TAIL_RE`; кандидатом
+   становится только токен, уже выданный `statement_period_tokens`, своего разбора
+   дат здесь нет;
+3. записанная якорная дата утверждения `as_of`;
+4. иначе запись считается недатированной.
 
 Даты карточка никогда не берёт из `created_at`: время создания строки в базе — это
 момент, когда запись появилась в знаниях, а не момент, когда прогноз был сделан.
@@ -44,15 +75,20 @@
 from __future__ import annotations
 
 import datetime as dt
-from collections.abc import Mapping, Sequence
+import re
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Final
 
+from apps.orchestrator.curator_period_gate import (
+    _FORECAST_VERB_FORMS as FORECAST_VERB_FORMS,
+)
 from apps.orchestrator.curator_period_gate import (
     PeriodToken,
     has_forecast_marker,
     statement_period_tokens,
 )
+from apps.orchestrator.question_actors import names_sberbank
 from apps.orchestrator.value_duplicate import (
     _indicator_qualifier_group_ids,
     _indicator_qualifier_words,
@@ -96,6 +132,71 @@ _SERIES_INDICATOR_STEMS: Final[tuple[str, ...]] = (
     "безработ",
     "доход",
 )
+
+#: Горизонт витрины, которого нет у гейта периода (T7.138 2а, ADR-0035 §22.8): ЗАКРЫТЫЙ
+#: список фраз, для которых карточка ответа считает горизонт прогноза. Гейт периода
+#: (`curator_period_gate._TARGET_PHRASE_RES`) не изменён: «на N год» для него по-прежнему
+#: цель прогноза, а не период значения, и гейт даты прогноза по этой фразе ничего не
+#: требует. Здесь фраза работает только для записей, которые уже прошли проверку маркера
+#: прогноза, роли и показателя: молчание сохраняется, если показателя в формулировке нет.
+_VITRINE_HORIZON_RES: Final[tuple[re.Pattern[str], ...]] = (
+    re.compile(r"\bна[ ]+((?:19|20)\d{2})[ ]+год[а-яё]*", re.IGNORECASE),
+)
+
+#: Признак ОПРОСА / КОНСЕНСУСА в формулировке (T7.138 2в) — ЗАКРЫТЫЙ список слов.
+_SURVEY_MARKER_RES: Final[tuple[re.Pattern[str], ...]] = (
+    re.compile(r"\bконсенсус[а-яё]*", re.IGNORECASE),
+    re.compile(r"\bопрос[а-яё]*", re.IGNORECASE),
+    re.compile(r"\bопрошенн[а-яё]*", re.IGNORECASE),
+)
+
+#: Префикс ключа серии-опроса (внутри витрины) и подпись в строке текста: опрос
+#: публикует производитель, но это НЕ его собственный прогноз (ключей подписей
+#: `forecast_series` не добавляется: строка остаётся собранной из прежних).
+SURVEY_SERIES_PREFIX: Final[str] = "опрос:"
+SURVEY_NAME_SUFFIX: Final[str] = "опрос"
+
+#: Придаточное чужого ожидания (T7.138 2в): «<глагол ожидания>, что …». Глаголы — ОН ЖЕ
+#: закрытый список гейта периода (`_FORECAST_VERB_FORMS`), второго списка глаголов здесь
+#: нет. Запятая перед «что» факультативна, промежуток коротким держится сознательно:
+#: придаточное обязано начинаться сразу после сказуемого ожидания.
+_EXPECTATION_CLAUSE_RE: Final = re.compile(
+    r"\b(?:"
+    + "|".join(sorted(FORECAST_VERB_FORMS, key=len, reverse=True))
+    + r")[^.;]{0,16}?\bчто\b",
+    re.IGNORECASE,
+)
+
+#: Маркеры «даты решения» рядом с токеном периода (T7.138 2г) — ЗАКРЫТЫЕ списки. Кандидат
+#: берётся ТОЛЬКО из токенов, уже выданных `statement_period_tokens` (kind=date или month с
+#: годом, не `doc_date`): своего разбора дат витрина не пишет.
+_DECISION_LEAD_WINDOW: Final = 48
+_DECISION_TAIL_WINDOW: Final = 72
+_DECISION_MEETING_LEAD_RES: Final[tuple[re.Pattern[str], ...]] = (
+    # «по итогам заседания 23 октября 2026 года», «по итогам внеочередного заседания …»
+    re.compile(
+        r"по[ ]+итогам[ ]+(?:внеочередного[ ]+|обычного[ ]+|очередного[ ]+)?заседани[а-яё]*[^.;]{0,24}\Z",
+        re.IGNORECASE,
+    ),
+)
+#: «Банк России в июле 2026 года повысил прогноз инфляции…»: предлог перед месяцем …
+_DECISION_PREPOSITION_LEAD_RES: Final[tuple[re.Pattern[str], ...]] = (
+    re.compile(r"[\s(,:;]во[ ]+\Z", re.IGNORECASE),
+    re.compile(r"[\s(,:;]в[ ]+\Z", re.IGNORECASE),
+)
+#: … обязано продолжиться глаголом изменения прогноза, а не любым сказуемым.
+_DECISION_VERB_TAIL_RES: Final[tuple[re.Pattern[str], ...]] = (
+    re.compile(
+        r"\s*(?:год[а-яё]*)?\s*(?:[а-яё]+\s+){0,3}?"
+        r"(?:повысил|понизил|сохранил|улучшил|ухудшил|пересмотрел|повысив|понизив|сохранив)"
+        r"[а-яё]*[^.;]{0,40}?\bпрогн[а-яё]*",
+        re.IGNORECASE,
+    ),
+)
+
+#: Мост Сбербанка (T7.138 2б): производитель словаря, в который сворачивается формулировка,
+#: называющая Сбербанк словом каталога акторов, но не называющая ни одного производителя.
+_SBER_LINK_ROOT: Final[str] = "sbercib"
 
 #: Родительный падеж месяцев для «от <дата>».
 _MONTH_GENITIVE: Final[tuple[str, ...]] = (
@@ -141,7 +242,7 @@ class ForecastMark:
 @dataclass(frozen=True)
 class _Forecast:
     record: ForecastRecord
-    producer_key: str
+    series_key: str
     producer_name: str
     horizon: frozenset[int]
     date: dt.date | None
@@ -174,38 +275,127 @@ def _token_date(token: PeriodToken) -> tuple[dt.date, str] | None:
     return when, _render_date(day, month, token.year)
 
 
+def _fold(text: str) -> str:
+    """Одно и то же сложение регистра и «ё» для поиска маркеров вокруг токена периода."""
+    return text.lower().replace("ё", "е")
+
+
+def _label_occurrences(folded: str, label: str) -> Iterable[tuple[int, int]]:
+    """Все вхождения подписи токена в формулировке (токен гейта позиции не несёт)."""
+    needle = _fold(label)
+    if not needle:
+        return ()
+    found: list[tuple[int, int]] = []
+    at = folded.find(needle)
+    while at >= 0:
+        found.append((at, at + len(needle)))
+        at = folded.find(needle, at + 1)
+    return found
+
+
+def _decision_date(statement: str, tokens: Sequence[PeriodToken]) -> tuple[dt.date, str] | None:
+    """Дата решения, названная в формулировке (T7.138 2г, ADR-0035 §22.8).
+
+    Кандидат — только токен гейта периода (`kind=date` или `month` с годом), НЕ помеченный
+    как дата документа. Он становится датой прогноза, если рядом стоит закрытый маркер:
+    «по итогам заседания <дата>» либо «в <месяце> N года <глагол изменения> прогноз».
+    При нескольких кандидатах берётся самая поздняя — как у даты документа."""
+    folded = _fold(statement)
+    candidates: list[tuple[dt.date, str]] = []
+    for token in tokens:
+        if token.doc_date or not token.is_forecast_date_capable:
+            continue
+        for start, end in _label_occurrences(folded, token.label):
+            lead = folded[max(0, start - _DECISION_LEAD_WINDOW) : start]
+            tail = folded[end : end + _DECISION_TAIL_WINDOW]
+            meeting = any(pattern.search(lead) for pattern in _DECISION_MEETING_LEAD_RES)
+            by_verb = any(pattern.search(lead) for pattern in _DECISION_PREPOSITION_LEAD_RES) and any(
+                pattern.match(tail) for pattern in _DECISION_VERB_TAIL_RES
+            )
+            if not (meeting or by_verb):
+                continue
+            found = _token_date(token)
+            if found is not None:
+                candidates.append(found)
+    return max(candidates, key=lambda found: found[0]) if candidates else None
+
+
 def _forecast_date(statement: str, as_of: dt.datetime | dt.date | None) -> tuple[dt.date, str] | None:
-    """Дата прогноза: сначала названная в формулировке, потом записанный якорь `as_of`."""
+    """Дата прогноза: названная в формулировке дата документа, потом дата решения
+    (T7.138 2г), потом записанный якорь `as_of`; иначе — никакой."""
+    tokens = statement_period_tokens(statement)
     candidates = [
         found
-        for token in statement_period_tokens(statement)
-        if token.doc_date and token.is_forecast_date_capable
-        and (found := _token_date(token)) is not None
+        for token in tokens
+        if token.doc_date and token.is_forecast_date_capable and (found := _token_date(token)) is not None
     ]
     if candidates:
         return max(candidates, key=lambda found: found[0])
+    decision = _decision_date(statement, tokens)
+    if decision is not None:
+        return decision
     anchored = _as_date(as_of)
     if anchored is None:
         return None
     return anchored, _render_date(anchored.day, anchored.month, anchored.year)
 
 
-def _producer(statement: str) -> tuple[str, str] | None:
-    """Производитель формулировки по закрытому словарю (ровно один, корень семьи)."""
-    roots = {family_primary_key(key) for key in named_primary_keys(statement)}
+def _producer_roots(statement: str) -> frozenset[str]:
+    """Корни семьи производителей, названных формулировкой (закрытый словарь)."""
+    return frozenset(family_primary_key(key) for key in named_primary_keys(statement))
+
+
+def _producer(statement: str, roots: frozenset[str]) -> tuple[str, str] | None:
+    """Производитель формулировки по закрытому словарю (ровно один, корень семьи).
+
+    Мост Сбербанка (T7.138 2б, ADR-0035 §22.8): если словарь не назвал ни одного
+    производителя, а формулировка называет Сбербанк словом закрытого шаблона каталога
+    акторов, производителем считается `sbercib`: на стенде «Сбербанк понизил прогноз…» —
+    та же публикация SberCIB, что «SberCIB (Сбербанк) повысил прогноз…». Мост НЕ
+    применяется, когда словарь назвал другого производителя (в том числе `sberindex`):
+    чужое авторство витрина не приписывает."""
+    if not roots:
+        if names_sberbank(statement):
+            return _SBER_LINK_ROOT, _SOURCE_NAMES[_SBER_LINK_ROOT]
+        return None
     if len(roots) != 1:
         return None
     root = next(iter(roots))
     return root, _SOURCE_NAMES.get(root, root)
 
 
+def _names_survey(statement: str) -> bool:
+    """Опрос / консенсус (T7.138 2в): закрытый список слов в формулировке."""
+    return any(pattern.search(statement) for pattern in _SURVEY_MARKER_RES)
+
+
+def _names_foreign_expectation(statement: str, root: str) -> bool:
+    """Чужое ожидание (T7.138 2в): производитель назван ТОЛЬКО внутри придаточного
+    «<глагол ожидания>, что …». Имена ищутся тем же словарём `PRIMARY_SOURCES`, что и
+    везде: «Коган предполагает, что Банк России повысит прогноз…» — не прогноз Банка
+    России; «Аналитики ВТБ ожидают, что инфляция составит…» — прогноз ВТБ (имя ДО
+    придаточного)."""
+    for clause in _EXPECTATION_CLAUSE_RE.finditer(statement):
+        cut = clause.end()
+        before = _producer_roots(statement[:cut])
+        if root in before:
+            continue
+        if root in _producer_roots(statement[cut:]):
+            return True
+    return False
+
+
 def _horizon(statement: str) -> frozenset[int]:
-    """Горизонт прогноза: годы целевых фраз, уже распознаваемых гейтом периода."""
-    return frozenset(
+    """Горизонт прогноза: годы целевых фраз гейта периода плюс закрытая витринная фраза
+    «на N год» (T7.138 2а); сам гейт не изменён."""
+    years = {
         token.year
         for token in statement_period_tokens(statement)
         if token.kind == "target" and token.year is not None
-    )
+    }
+    for pattern in _VITRINE_HORIZON_RES:
+        years.update(int(match.group(1)) for match in pattern.finditer(statement))
+    return frozenset(years)
 
 
 def _names_indicator(stems: frozenset[str], core: str) -> bool:
@@ -245,7 +435,7 @@ def _same_indicator(left: ForecastRecord, right: ForecastRecord) -> bool:
 
 
 def _read(record: ForecastRecord) -> _Forecast | None:
-    """Прогноз ли это, кто его сделал, на какой горизонт и когда он датирован."""
+    """Прогноз ли это, кто его сделал, в какой роли, на какой горизонт и когда он датирован."""
     statement = record.statement
     if not statement or not has_forecast_marker(statement):
         return None
@@ -253,17 +443,27 @@ def _read(record: ForecastRecord) -> _Forecast | None:
         # запись называет реализованное значение — это запись измерения, а не прогноз
         # (то же решение ролей, что у подраздела «Независимые оценки», T7.88b/T7.94)
         return None
-    producer = _producer(statement)
+    roots = _producer_roots(statement)
+    producer = _producer(statement, roots)
     if producer is None:
+        return None
+    series_key, producer_name = producer
+    if _names_foreign_expectation(statement, series_key):
+        # имя производителя названо только внутри «<глагол ожидания>, что …»: чужое
+        # ожидание о производителе витрина его прогнозом не считает (T7.138 2в)
         return None
     horizon = _horizon(statement)
     if not horizon:
         return None
+    if _names_survey(statement):
+        # опрос производителя — отдельная серия, со своим прогнозом не смешивается
+        series_key = f"{SURVEY_SERIES_PREFIX}{series_key}"
+        producer_name = f"{producer_name} ({SURVEY_NAME_SUFFIX})"
     found = _forecast_date(statement, record.as_of)
     return _Forecast(
         record=record,
-        producer_key=producer[0],
-        producer_name=producer[1],
+        series_key=series_key,
+        producer_name=producer_name,
         horizon=horizon,
         date=None if found is None else found[0],
         date_label="" if found is None else found[1],
@@ -303,7 +503,7 @@ def forecast_marks(records: Sequence[ForecastRecord]) -> dict[str, ForecastMark]
         for group in groups:
             head = group[0]
             if (
-                head.producer_key == forecast.producer_key
+                head.series_key == forecast.series_key
                 and bool(head.horizon & forecast.horizon)
                 and _same_indicator(head.record, forecast.record)
             ):
@@ -327,7 +527,7 @@ def forecast_marks(records: Sequence[ForecastRecord]) -> dict[str, ForecastMark]
             (forecast for forecast in dated if forecast.date == latest_date),
             key=lambda forecast: forecast.record.claim_id,
         )[0]
-        series = f"{reference.producer_key}:{index}"
+        series = f"{reference.series_key}:{index}"
         for forecast in group:
             when = forecast.date
             if when is None:

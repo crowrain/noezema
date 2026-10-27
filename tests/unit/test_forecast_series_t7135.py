@@ -76,9 +76,17 @@ CBR_TARGET_OLD = (
     "Банк России прогнозирует инфляцию в России по итогам 2026 года на уровне 7,0% "
     "(прогноз по состоянию на 1 сентября 2026 года)."
 )
-SBER_NO_DICT_LATER = (
+SBER_PLAIN_NAME_LATER = (
     "Сбербанк повысил прогноз инфляции в России на конец 2026 года до 8% "
     "(прогноз по состоянию на 25 октября 2026 года)."
+)
+OTHER_BROKER_LATER = (
+    "Аналитики БКС Мир инвестиций прогнозируют инфляцию в России на конец 2026 года "
+    "на уровне 7,9% (прогноз по состоянию на 25 октября 2026 года)."
+)
+CBR_HORIZON_PHRASE = (
+    "Банк России ожидает инфляцию в России на 2026 год на уровне 7,4% "
+    "(прогноз по состоянию на 20 октября 2026 года)."
 )
 OBSERVED_EXPECTATIONS = (
     "Инфляционные ожидания населения России в сентябре 2026 года составили 14,2% "
@@ -205,19 +213,27 @@ def test_different_indicator_is_never_compared() -> None:
     assert forecast_marks([_record("current", VTB_DATED), _record("rate", VTB_RATE)]) == {}
 
 
-def test_record_without_a_horizon_phrase_is_not_compared() -> None:
-    """«на 2026 год» целью периода не считается: витрина не угадывает горизонт и не
-    ставит такую запись даже актуальной — она остаётся без подписи."""
+def test_a_horizon_phrase_without_a_gate_target_is_a_horizon_now() -> None:
+    """Было → стало (T7.138 2а, ADR-0035 §22.8).
+
+    Было: витрина брала горизонт только из целевых фраз гейта периода («по итогам N года»),
+    и запись с «на 2026 год» оставалась вне серии без подписи — прежний тест
+    `test_record_without_a_horizon_phrase_is_not_compared` закреплял именно это.
+    Стало: «на N год» читается внутри витрины, такая запись встаёт в ту же серию своего
+    производителя и становится актуальной по дате своего прогноза; гейт периода при этом не
+    тронут (проверка — `test_the_period_gate_still_does_not_see_a_target_in_na_year`)."""
     marks = forecast_marks(
         [
             _record("target_new", CBR_TARGET_NEW),
             _record("target_old", CBR_TARGET_OLD),
-            _record("no_target", CBR_NO_TARGET, as_of=dt.date(2026, 10, 20)),
+            _record("horizon", CBR_HORIZON_PHRASE),
         ]
     )
-    assert marks["target_new"].kind == "actual"
+    assert marks["horizon"].kind == "actual"
+    assert marks["horizon"].date_label == "20 октября 2026"
+    assert marks["target_new"].kind == "outdated"
+    assert marks["target_new"].date_label == "20 октября 2026"
     assert marks["target_old"].kind == "outdated"
-    assert "no_target" not in marks
 
 
 # ─── (в) дата прогноза: формулировка, затем якорь; время создания — никогда ────────────────
@@ -278,21 +294,49 @@ def test_measurement_of_expectations_is_not_a_forecast() -> None:
     assert {marks["dated"].kind, marks["undated"].kind} == {"actual", "undated"}
 
 
-def test_producer_outside_the_dictionary_stays_silent() -> None:
-    """«Сбербанк» без «CIB» закрытый словарь производителей не называет: своя подпись
-    такому прогнозу не ставится, чужое авторство ему не приписывается — и его более
-    поздняя дата не делает записью «актуальный» уже названный прогноз SberCIB."""
+def test_producer_outside_both_dictionaries_stays_silent() -> None:
+    """Закрытый словарь производителей остался закрытым: имя, которого нет ни в словаре
+    производителей, ни в каталоге названных акторов, подписи не даёт — своя подпись такой
+    записи не ставится, чужое авторство ей не приписывается, и её более поздняя дата не
+    делает записью «актуальный» уже названный прогноз SberCIB."""
     marks = forecast_marks(
         [
-            _record("sber", SBER_NO_DICT_LATER),
+            _record("broker", OTHER_BROKER_LATER),
             _record("current", SBER_CURRENT),
             _record("stale", SBER_STALE),
         ]
     )
-    assert "sber" not in marks
+    assert "broker" not in marks
     assert marks["current"].kind == "actual"
     assert marks["stale"].kind == "outdated"
     assert marks["stale"].date_label == "20 октября 2026"
+
+
+def test_sberbank_name_without_cib_joins_the_sbercib_series() -> None:
+    """Было → стало (T7.138 2б, ADR-0035 §22.8).
+
+    Было: «Сбербанк» без «CIB» закрытым словарём производителей не назывался, и прогноз
+    оставался без подписи — прежний тест `test_producer_outside_the_dictionary_stays_silent`
+    закреплял именно это (перечитывание замера среза: на стенде так молчала запись
+    `858e0b97` «Сбербанк повысил прогноз инфляции…»).
+    Стало: «Сбербанк» — имя закрытого каталога названных акторов
+    (`apps/orchestrator/question_actors.py::names_sberbank`), и витрина сворачивает его в ту
+    же серию `sbercib`; форма имени берётся из того же шаблона, что и распознавание акторов,
+    отдельного списка форм в витрине нет. Это решение менеджера, обратимое пользователем
+    (ADR-0035 §22.8). Более поздняя дата такой записи теперь делает её актуальной, а
+    публикацию SberCIB — устаревшей."""
+    marks = forecast_marks(
+        [
+            _record("sber", SBER_PLAIN_NAME_LATER),
+            _record("current", SBER_CURRENT),
+            _record("stale", SBER_STALE),
+        ]
+    )
+    assert marks["sber"].kind == "actual"
+    assert marks["sber"].producer == "SberCIB"
+    assert marks["current"].kind == "outdated"
+    assert marks["stale"].kind == "outdated"
+    assert marks["stale"].date_label == "25 октября 2026"
 
 
 # ─── (д) записи без метки не получают ни одного нового поля ────────────────────────────────
