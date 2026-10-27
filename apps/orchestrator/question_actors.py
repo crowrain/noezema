@@ -1,4 +1,4 @@
-"""Aktorovopros: closed catalog of named actors and per-session actor-search tracking (T7.137).
+"""Question actors: closed catalog of named actors and per-session actor-search tracking (T7.137).
 
 Why this module exists (ADR-0036 §10, measurement of 2026-10-27): sessions whose QUESTION names
 several catalog actors burn steps on repeated AGGREGATE searches — one query naming four or five
@@ -17,6 +17,18 @@ recorded in ADR-0036 §10. Recognition reuses the SAME normalization as the near
 (`content_word_stems` / `normalize_search_query`), so «Банка России», «SberCIB», «Альфа-Банка»,
 «Газпромбанка» are found by the same stem logic the gates already trust; bare «банк» without a
 qualifier is deliberately NOT an actor.
+
+Amendment T7.137a (measurement of 2026-10-28, ADR-0036 §10a): a fixed-prefix stem is a truncation,
+and a truncated base is not always the name — «Газпром» collapses to the stem of «Газпромбанк», so
+«Газпром нефть» and «акции Газпрома» named Gazprombank; «альфа» named Alfa-Bank in
+«альфа-коэффициент»; and the same truncation MISSED names the stand really saw: mixed-script
+«СберCIB» mixed-script form, «в Сбере», singular «Центральный банк» without «России», «Минэк».
+For every name whose truncated base is ambiguous (Sberbank, Alfa-Bank, Gazprombank) recognition now
+goes through EXPLICIT CLOSED WORD TEMPLATES — the same device `_BANK_OF_RUSSIA_RE` already used —
+and not through stems; the unambiguous names keep stem recognition. The templates are the one truth
+about Sberbank name forms: the vitrine forecast series (apps/web/forecast_series.py, T7.138 2б)
+bridges «Сбербанк»/«Сбера» to the `sbercib` producer through `names_sberbank`, it does not keep its
+own copy of the forms.
 """
 
 from __future__ import annotations
@@ -32,11 +44,39 @@ from apps.orchestrator.tool_context import content_word_stems
 #: precedent as `research_hints._OFFICIAL_CENTRAL_BANK_RE` — «банки России» is not the marker).
 _BANK_OF_RUSSIA_RE: Final = re.compile(r"\bбанк(?:а|у|ом|е)?\s+россии\b")
 
+#: T7.137a: the same actor named without the «России» half — «Центральный банк» in the SINGULAR.
+#: Adjective endings are listed one by one on purpose: the plural «центральные банки» (and
+#: «центральных банков») stays a non-marker, as «банки России» already was.
+_CENTRAL_BANK_SINGULAR_RE: Final = re.compile(
+    r"\bцентральн(?:ый|ого|ому|ым|ом|ая|ой|ую|ое)\s+банк(?:а|у|ом|е)?\b"
+)
+
+#: T7.137a: closed word templates instead of stems for names whose truncated base is ambiguous.
+#: Sberbank — the forms the stand saw («Сбербанк», «Сбера», «в Сбере», «Сберу», mixed-script
+#: «СберCIB»); `(?![а-яё])` and the «индекс» refusal keep «СберИндекс» (dictionary key `sberindex`,
+#: a DIFFERENT producer) out of this template.
+SBERBANK_NAME: Final[str] = "Сбербанк"
+_SBERBANK_RE: Final = re.compile(
+    r"(?<![а-яё])сбер(?:банк[а-яё]{0,4}|а|е|у|ом)?(?![а-яё])(?!\s*индекс[а-яё]*)"
+    r"|(?<![a-z])sber[\s-]*cib\b|(?<![a-z])sberbank\b",
+    re.IGNORECASE,
+)
+_ALFA_BANK_RE: Final = re.compile(
+    r"(?<![а-яё])альфа[\s\-–—]?банк[а-яё]*(?![а-яё])|(?<![a-z])alfa[\s-]?bank\b",
+    re.IGNORECASE,
+)
+_GAZPROMBANK_RE: Final = re.compile(
+    r"(?<![а-яё])газпромбанк[а-яё]*(?![а-яё])|(?<![a-z])gazprom[\s-]?bank\b",
+    re.IGNORECASE,
+)
+
 
 @dataclass(frozen=True)
 class CatalogActor:
     """One closed-catalog actor: display name for notes, recognized word stems, and an optional
-    adjacency pattern for two-word names whose parts alone are ordinary words («банк», «россии»)."""
+    adjacency pattern for two-word names whose parts alone are ordinary words («банк», «россии»).
+    T7.137a: a name whose truncated base is ambiguous carries a CLOSED WORD TEMPLATE instead of
+    stems; such an entry has no stems at all, so nothing but the template can name it."""
 
     name: str
     stems: frozenset[str]
@@ -48,24 +88,41 @@ def _actor(name: str, words: str, phrase: re.Pattern[str] | None = None) -> Cata
     return CatalogActor(name=name, stems=frozenset(content_word_stems(words)), phrase=phrase)
 
 
+def _actor_by_template(name: str, template: re.Pattern[str]) -> CatalogActor:
+    """Catalog entry recognized ONLY by its closed word template (T7.137a)."""
+    return CatalogActor(name=name, stems=frozenset(), phrase=template)
+
+
 #: The closed catalog (order is stable: notes list actors in this order). Forms are the ones the
 #: stand actually saw in question texts and search queries; stems collapse the rest of the cases.
+#: Sberbank, Alfa-Bank and Gazprombank are template-only since T7.137a (see the module docstring):
+#: their bases «сбер», «альфа», «газпром» are shared with other names, so a stem over-names them.
 ACTOR_CATALOG: Final[tuple[CatalogActor, ...]] = (
     _actor(
         "Банк России",
         "ЦБ Центробанк Центробанка cbr",
-        _BANK_OF_RUSSIA_RE,
+        re.compile(_BANK_OF_RUSSIA_RE.pattern + "|" + _CENTRAL_BANK_SINGULAR_RE.pattern),
     ),
-    _actor("Сбербанк", "Сбер Сбербанк Сбера SberCIB"),
+    _actor_by_template("Сбербанк", _SBERBANK_RE),
     _actor("ВТБ", "ВТБ"),
-    _actor("Альфа-Банк", "Альфа"),
-    _actor("Газпромбанк", "Газпромбанк Газпрома"),
+    _actor_by_template("Альфа-Банк", _ALFA_BANK_RE),
+    _actor_by_template("Газпромбанк", _GAZPROMBANK_RE),
     _actor("Росстат", "Росстат Росстата"),
     _actor("hh.ru", "hh HeadHunter"),
     _actor("SuperJob", "SuperJob"),
-    _actor("Минэкономразвития", "Минэкономразвития"),
+    _actor("Минэкономразвития", "Минэкономразвития Минэк"),
     _actor("Минфин", "Минфин Минфина"),
 )
+
+
+def names_sberbank(text: str) -> bool:
+    """Does a text name Sberbank by one of the closed name forms of the catalog entry?
+    Exported for the vitrine forecast series (T7.138 2б, `apps/web/forecast_series.py`): the bridge
+    «Сбербанк» -> producer `sbercib` must recognize name forms the SAME way the catalog does, so
+    there is one truth about those forms and no second normalization dictionary."""
+    if not text:
+        return False
+    return _SBERBANK_RE.search(text.lower().replace("ё", "е")) is not None
 
 
 def named_actors(text: str) -> tuple[str, ...]:
