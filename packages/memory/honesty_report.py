@@ -505,6 +505,9 @@ class SessionSteps:
     gate_near_duplicate: int = 0
     gate_host_unavailable: int = 0
     gate_tool_repeated: int = 0
+    #: отказы гейта повторного сводного поиска (T7.137): второй и далее сводный web.search
+    #: по нескольким названным вопросом акторам; прежние счётчики ворот не тронуты
+    gate_multi_actor_repeat: int = 0
     other_tools: int = 0
     args_unparsed: int = 0
 
@@ -739,7 +742,8 @@ async def _session_steps(
       нормализованного текста, уже встречавшиеся в этой сессии (хэши — из событий
       `research_content_read`);
     * `gate_*` — отказы ворот ДО исполнения (`action_failed` с `denied: True`):
-      почти-дубликат поиска, «недавно недоступен» хост, повторный вызов инструмента.
+      почти-дубликат поиска, «недавно недоступен» хост, повторный вызов инструмента,
+      повторный сводный поиск по названным акторам (T7.137).
     Возвращает (счётчики, множество хостов, отказавших этим видом в этой сессии).
     """
     step_types = (
@@ -782,6 +786,9 @@ async def _session_steps(
         "search_query_near_duplicate": 0,
         "host_unavailable_in_session": 0,
         "tool_call_repeated": 0,
+        # T7.137: повторный сводный поиск по нескольким названным акторам (аддитивный ключ;
+        # прежние ключи и их значения не тронуты, SCHEMA_VERSION не поднят)
+        "search_query_multi_actor_repeat": 0,
     }
     steps = SessionSteps()
     for row in rows:
@@ -824,6 +831,7 @@ async def _session_steps(
     steps.gate_near_duplicate = gate_counts["search_query_near_duplicate"]
     steps.gate_host_unavailable = gate_counts["host_unavailable_in_session"]
     steps.gate_tool_repeated = gate_counts["tool_call_repeated"]
+    steps.gate_multi_actor_repeat = gate_counts["search_query_multi_actor_repeat"]
 
     # T7.127: поиски, отклонённые лимитом поиска узла. Журнал отказов прокси пишется без
     # session_id, поэтому привязка — интервал жизни сессии + текст запроса (однократное
@@ -1711,6 +1719,7 @@ def _compute_totals(questions: Sequence[QuestionReport]) -> dict[str, float]:
         "gate_near_duplicate": 0,
         "gate_host_unavailable": 0,
         "gate_tool_repeated": 0,
+        "gate_multi_actor_repeat": 0,
         "other_tools": 0,
         "args_unparsed": 0,
         "claims_created": 0,
@@ -1737,6 +1746,7 @@ def _compute_totals(questions: Sequence[QuestionReport]) -> dict[str, float]:
                 "fetch_ok_total", "fetch_ok_official", "fetch_ok_other", "fetch_fail_total",
                 "repeated_failed_host_fetches", "fetch_known_bad_host", "repeated_reads",
                 "gate_near_duplicate", "gate_host_unavailable", "gate_tool_repeated",
+                "gate_multi_actor_repeat",
                 "other_tools", "args_unparsed",
             )
             for name in step_fields:
@@ -1858,7 +1868,9 @@ def render_markdown(report: HonestyReport, baseline: Mapping[str, Any] | None = 
             lines.append(
                 f"- отказы ворот: почти-дубликат поиска {steps.gate_near_duplicate}, "
                 f"«недавно недоступен» {steps.gate_host_unavailable}, "
-                f"повтор вызова {steps.gate_tool_repeated}; других инструментов {steps.other_tools}"
+                f"повтор вызова {steps.gate_tool_repeated}, "
+                f"повтор сводного поиска {steps.gate_multi_actor_repeat}; "
+                f"других инструментов {steps.other_tools}"
             )
         for relation, label in (
             ("created", "созданные"),

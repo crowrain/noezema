@@ -68,6 +68,7 @@ from apps.orchestrator.host_availability import (
     render_host_availability_section,
     render_host_unavailable_note,
 )
+from apps.orchestrator.question_actors import ActorSearchTracker, named_question_actors
 from apps.orchestrator.rejected_proposal import rejected_proposal_digest
 from apps.orchestrator.research_hints import (
     classify_official_independent,
@@ -83,8 +84,10 @@ from apps.orchestrator.tool_context import (
     TOOL_CONTEXT_ADDENDA_CHARS,
     fetch_url_key,
     render_repeat_fetch_note,
+    render_search_multi_actor_repeat_note,
     render_search_near_duplicate_note,
     render_step_budget,
+    render_step_context,
     render_tool_argument_schemas,
     search_near_duplicate,
 )
@@ -1905,6 +1908,14 @@ class Orchestrator:
         # (вид отказа, шаг первой неудачи). 404, нечитаемый артефакт и транспортный сбой — свойства
         # страницы/канала, а не хоста: classify_fetch_error их не считает.
         unavailable_hosts: dict[str, tuple[str, int]] = {}
+        # T7.137 (решение пользователя 2026-10-27): названные вопросом акторы закрытого каталога
+        # (`apps/orchestrator/question_actors.py`, ADR-0036 §2). Повторный сводный web.search
+        # (запрос называет >= 3 названных акторов, а первый сводный уже выполнен) отклоняется до
+        # исполнения: замер 41 сводного поиска по фикстурам, 22 из них (54 %) ни одного чтения
+        # следом — против 30 % у поисков по одному актору. Покрытие отдельными поисками кормит
+        # секцию контекста «Дата и названные акторы» и заметку отказа. Как в T7.111: запоминаются
+        # только успешно выполненные поиски — неудачный не вооружает гейт и не даёт покрытия.
+        actor_tracker = ActorSearchTracker(named_question_actors(ctx.question_text))
         for step in range(1, max_steps + 1):
             steps = step
 
@@ -1929,6 +1940,13 @@ class Orchestrator:
             # getting denied. With nothing to reply to, it is dropped from
             # the per-step tool list the model is shown.
             allowed_tools = filter_offered_tools(base_tools, has_message=bool(ctx.messages))
+            # T7.137 (часть 4): короткая секция контекста — дата узла (хостовые часы, параметром;
+            # тесты детерминированы) и покрытие названных вопросом акторов отдельными поисками.
+            step_ctx_note = render_step_context(
+                datetime.now(UTC).date().isoformat(),
+                actor_tracker.named,
+                actor_tracker.uncovered(),
+            )
             user_ctx = self._explorer_context(
                 ctx,
                 allowed_tools,
@@ -1937,6 +1955,7 @@ class Orchestrator:
                 step_limit=max_steps,
                 host_note=host_note,
                 hints_note=hints_note,
+                step_context_note=step_ctx_note,
             )
             fingerprint = build_model_fingerprint(
                 self.profile,
@@ -2205,6 +2224,41 @@ class Orchestrator:
                     )
                     continue
 
+            # T7.137 (часть 3): повторный СВОДНЫЙ web.search — запрос называет >= 3 акторов,
+            # названных вопросом, при том что первый сводный поиск этой сессии уже ВЫПОЛНЕН
+            # успешно. Отклонение до исполнения тем же способом, что T7.12/T7.111 (ACTION_FAILED
+            # с `denied: True`, без строки действия), отказ стоит шаг (учёт T7.76 не менялся).
+            # Гейт стоит ПОСЛЕ гейта почти-дубликата: тот проверяет равенство основ и отклоняет
+            # перефразу первым, а этот — сводные запросы с новыми словами; один и тот же запрос
+            # не может быть отказан дважды, и ни один выполненный запрос не попадает в оба
+            # счётчика честности (ADR-0036 §2). Вопросы с < 3 названными акторами и запросы
+            # с <= 2 названными акторами гейт не трогает никогда.
+            if tool_name == "web.search":
+                refusal = actor_tracker.repeat_refusal(str(args.get("query", "")))
+                if refusal is not None:
+                    prior_query, prior_step = refusal
+                    uncovered_actors = actor_tracker.uncovered()
+                    await audit.record(
+                        AuditEventType.ACTION_FAILED,
+                        session_id=session.id,
+                        payload={
+                            "denied": True,
+                            "reason": "search_query_multi_actor_repeat",
+                            "tool": tool_name,
+                            "arguments_hash": args_hash,
+                            "prior_query": prior_query[:200],
+                            "prior_step": prior_step,
+                            "uncovered_actors": list(uncovered_actors),
+                        },
+                        public_summary=f"search multi-actor repeat (denied): {tool_name}",
+                    )
+                    ctx.observations.append(
+                        render_search_multi_actor_repeat_note(
+                            step, prior_query, prior_step, uncovered_actors
+                        )
+                    )
+                    continue
+
             # T7.111 (часть 2а): research.fetch к хосту, который уже отказывал в этой сессии
             # (401/403/429/таймаут — см. classify_fetch_error), отклоняется до исполнения в той
             # же форме; шаг стоит шаг. 404, нечитаемый артефакт и размер страницы — свойства
@@ -2415,6 +2469,9 @@ class Orchestrator:
                 # движка, лимит) не записывается: его результатов выше нет, и перезапуск
                 # другой формулировкой — законное восстановление стратегии.
                 session_search_queries.append((str(args.get("query", "")), step))
+                # T7.137: выполненная запись в трекер акторов — отдельный поиск (<= 2 названных
+                # акторов) расширяет покрытие, первый сводный вооружает гейт повторных сводных.
+                actor_tracker.mark_executed(str(args.get("query", "")), step)
                 # T7.71 (§5.12.1): a search hit is navigation, not knowledge and not evidence —
                 # observation_to_evidence has no mapping for web.search by design (asserted in tests), so
                 # nothing below turns it into an evidence/source/artifact row. The rendered fenced block
@@ -2579,6 +2636,7 @@ class Orchestrator:
         step_limit: int | None = None,
         host_note: str = "",
         hints_note: str = "",
+        step_context_note: str = "",
     ) -> str:
         # the bounded context pack (T3.8) carries the question/plan,
         # relevant claims and pending/invalid (labeled) claims; the
@@ -2652,6 +2710,11 @@ class Orchestrator:
                 # T7.119 (часть 3): секция «Независимые источники по теме» — фиксированная позиция,
                 # как у бюджета шага и «Недавно недоступны»: вырезание наблюдений её не прячет
                 parts.append(hints_str)
+            if step_context_note:
+                # T7.137 (часть 4): секция «Дата и названные акторы» — фиксированная позиция рядом
+                # с бюджетом шага; короткая (<= 400 знаков), EXPLORER_CONTEXT_BUDGET не поднимали —
+                # секции host/hints уже помещались в существующий запас, помещается и эта
+                parts.append(step_context_note)
             if pack_str:
                 parts.append(pack_str)
             if observations:
