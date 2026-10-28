@@ -70,6 +70,12 @@ from apps.orchestrator.host_availability import (
 )
 from apps.orchestrator.question_actors import ActorSearchTracker, named_question_actors
 from apps.orchestrator.rejected_proposal import rejected_proposal_digest
+from apps.orchestrator.relied_supplement import (
+    SupplementRecord,
+    claims_evidence_ids,
+    fresher_forecast_supplement,
+    relied_from_dropped_operations,
+)
 from apps.orchestrator.research_hints import (
     classify_official_independent,
     effective_explorer_step_cap,
@@ -3330,6 +3336,39 @@ class Orchestrator:
             )
             if op_target is not None:
                 session_operation_ids.add(op_target)
+
+        # ── T7.139 (часть 2, ADR-0038 §16): перенос опоры снятой перепроверки ──
+        # Хост снял операцию с `existing_claim_id` (перепроверку/склейку) — утверждение
+        # под этим id УЖЕ ЗАПИСАНО и остаётся в знании: хост переносит его id в опору
+        # ответа («использовано без перепроверки»). ADR-0034 вариант B снял ОПЕРАЦИЮ, а
+        # не знание, поэтому перенос не возвращает операцию и не ослабляет снятие;
+        # причина снятия не важна (дата прогноза, период, значение). Операции без
+        # `existing_claim_id` в ПРЕДЛОЖЕНИИ не переносятся — записи под ними нет;
+        # id из `pending_claims`/`contradictions` и невидимые — именованный отказ
+        # `dropped_operation[k]: …` в существующем `relied_claims_rejected`. Разрешение —
+        # строго по id секции `claims_evidence` пака; id действующей операции этой
+        # сессии не дублируется; потолок RELIED_CLAIMS_LIMIT общий, и перенесённые id
+        # дальнейший запасной путь T7.115 видит занятыми. Итоговый список — аддитивный
+        # ключ `relied_from_dropped_operations`, пишется только непустым.
+        claims_evidence_section = pack.section("claims_evidence") if pack is not None else None
+        pack_evidence_ids = claims_evidence_ids(
+            list(claims_evidence_section.chunk_ids) if claims_evidence_section is not None else []
+        )
+        relied_from_dropped, dropped_operation_rejections = relied_from_dropped_operations(
+            [
+                (index, str(proposal.claims[index].existing_claim_id))
+                for index in sorted(dropped)
+                if proposal.claims[index].existing_claim_id is not None
+            ],
+            pack_evidence_ids,
+            relied_claim_ids,
+            session_operation_ids,
+            RELIED_CLAIMS_LIMIT,
+        )
+        if relied_from_dropped or dropped_operation_rejections:
+            relied_claim_ids = [*relied_claim_ids, *relied_from_dropped]
+            relied_claims_rejected = [*relied_claims_rejected, *dropped_operation_rejections]
+
         relied_from_explorer, answer_rejections = _relied_from_answer(
             ctx.final_answer_rationale,
             relied_pack_ids,
@@ -3469,6 +3508,98 @@ class Orchestrator:
                 proposed_questions=1,
             )
 
+        # ── T7.139 (часть 3, ADR-0038 §16): свежий прогноз той же серии ──
+        # Карточка ответа несёт только те прогнозы, которые куратор записал или назвал
+        # опорой; в пакете этой сессии может стоять БОЛЕЕ СВЕЖИЙ прогноз той же серии
+        # (стенд 008d93ac: карточка потеряла свежий прогноз Банка России от 23.10.2026).
+        # Метки серий считает витрина `apps/web/forecast_series.forecast_marks` по
+        # ОБЪЕДИНЕНИЮ карточных и паковых записей (одинокая карточная запись серии без
+        # паковой не получила бы метки вовсе) — единственный источник правила серии.
+        # Паковая запись добавляется в опору, только если она `actual`, среди карточных
+        # записей её серии есть хотя бы одна и ВСЕ карточные записи серии `outdated`
+        # (карточка `undated` или уже `actual` — не добавляем; другой производитель или
+        # горизонт — другая серия, опрос ведомства ≠ собственный прогноз ведомства).
+        # Формулировки и даты берутся одним запросом к `claims`; потолок общий.
+        # Итог — аддитивный ключ `relied_fresher_forecast` ([{claim_id, series, replaces}]),
+        # пишется только непустым; отказы — в существующем `relied_claims_rejected`.
+        relied_fresher_forecast: list[JsonDict] = []
+        if pack_evidence_ids:
+            card_records: list[SupplementRecord] = []
+            card_claim_ids: set[str] = set()
+
+            def _add_card_claim(claim_ref: str) -> None:
+                if claim_ref not in card_claim_ids:
+                    card_claim_ids.add(claim_ref)
+                    card_records.append(SupplementRecord(claim_id=claim_ref, statement="", as_of=None))
+
+            for card_op_index in (i for i in range(len(staged_claims)) if i not in dropped):
+                staged_claim = staged_claims[card_op_index]
+                if staged_claim.existing_claim_id is None:
+                    # новая запись карточки: id ещё не выдан — тот же ключ `new<i>`,
+                    # что в причинных строках границы; формулировка и as_of предложения
+                    card_records.append(
+                        SupplementRecord(
+                            claim_id=f"new{card_op_index}",
+                            statement=staged_claim.statement,
+                            as_of=staged_claim.as_of,
+                        )
+                    )
+                    continue
+                op_target, _problem = resolve_claim_reference(
+                    str(staged_claim.existing_claim_id), relied_pack_ids
+                )
+                if op_target is not None:
+                    _add_card_claim(str(op_target))
+            for relied_id in relied_claim_ids:
+                _add_card_claim(str(relied_id))
+            pack_only_ids = [cid for cid in pack_evidence_ids if str(cid) not in card_claim_ids]
+            fetch_ids = sorted({*card_claim_ids, *(str(cid) for cid in pack_only_ids)})
+            claim_rows: dict[str, Any] = {}
+            if fetch_ids:
+                claim_rows = {
+                    str(row["id"]): row
+                    for row in (
+                        await db.execute(
+                            text("SELECT id, statement, as_of FROM claims WHERE id = ANY(:ids)"),
+                            {"ids": fetch_ids},
+                        )
+                    )
+                    .mappings()
+                    .all()
+                }
+            card_db_records = [
+                SupplementRecord(
+                    claim_id=record.claim_id,
+                    statement=str(claim_rows[record.claim_id]["statement"]),
+                    as_of=claim_rows[record.claim_id]["as_of"],
+                )
+                if record.claim_id in claim_rows
+                else record
+                for record in card_records
+                # запись предложения (`new<i>`) уже несёт формулировку и дату — её берём
+                # как есть; карточный id без строки в `claims` (запись не коммитилась при
+                # гонке снятия) — пропускаем
+                if record.claim_id in claim_rows or record.statement
+            ]
+            pack_db_records = [
+                SupplementRecord(
+                    claim_id=str(cid),
+                    statement=str(claim_rows[str(cid)]["statement"]),
+                    as_of=claim_rows[str(cid)]["as_of"],
+                )
+                for cid in pack_only_ids
+                if str(cid) in claim_rows
+            ]
+            relied_fresher_forecast, fresher_rejections = fresher_forecast_supplement(
+                card_db_records, pack_db_records, len(relied_claim_ids), RELIED_CLAIMS_LIMIT
+            )
+            if relied_fresher_forecast:
+                relied_claim_ids = [
+                    *relied_claim_ids, *[str(entry["claim_id"]) for entry in relied_fresher_forecast]
+                ]
+            if fresher_rejections:
+                relied_claims_rejected = [*relied_claims_rejected, *fresher_rejections]
+
         claim_event_payload: JsonDict = {
             "claims": [c.model_dump(mode="json") for c in proposal.claims],
             "evidence_links": [link.model_dump() for link in proposal.evidence_links],
@@ -3492,6 +3623,15 @@ class Orchestrator:
         # ключи, пишется только непустым — прежние сессии остаются байт в байт прежними.
         if relied_from_rejected_proposal:
             claim_event_payload["relied_from_rejected_proposal"] = relied_from_rejected_proposal
+        # T7.139 (часть 2, ADR-0038 §16): id, которые хост перенёс в опору из снятых
+        # операций-перепроверок («использовано без перепроверки»). Как и другие новые
+        # ключи, пишется только непустым — прежние сессии остаются байт в байт прежними.
+        if relied_from_dropped:
+            claim_event_payload["relied_from_dropped_operations"] = relied_from_dropped
+        # T7.139 (часть 3, ADR-0038 §16): какие свежие прогнозы той же серии хост добавил
+        # в опору: [{claim_id, series, replaces}] — что замещает в карточке. Непустым.
+        if relied_fresher_forecast:
+            claim_event_payload["relied_fresher_forecast"] = relied_fresher_forecast
         # T7.83 (ADR-0033): ключ появляется только при непустом решении гейта —
         # прежние сессии и их аудит остаются байт-в-байт прежними
         if value_duplicates:
